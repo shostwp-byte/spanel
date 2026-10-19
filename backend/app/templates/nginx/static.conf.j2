@@ -1,0 +1,86 @@
+server {
+    listen {% if bind_address and bind_address != "*" %}{{ bind_address }}:{% endif %}80;
+{% if ipv6 %}    listen [::]:80;
+{% endif %}    server_name {{ server_names | join(' ') }};
+    root {{ document_root_path }};
+    index index.html index.htm;
+
+    server_tokens off;
+    disable_symlinks if_not_owner from={{ root_path }};
+
+{% if http_flood_enabled %}
+    # SPANEL HTTP FLOOD BEGIN
+    limit_req zone={{ http_flood_zone }}{% if http_flood_burst > 0 %} burst={{ http_flood_burst }}{% endif %} nodelay;
+    limit_conn spanel_conn_flood {{ http_flood_connections }};
+    limit_req_status 429;
+    limit_conn_status 429;
+{{ http_flood_challenge_block }}
+    # SPANEL HTTP FLOOD END
+{% endif %}
+
+{% if waf_enabled %}
+    # SPANEL WAF BEGIN
+    modsecurity on;
+    modsecurity_rules_file {{ waf_rules_file }};
+    # SPANEL WAF END
+{% endif %}
+
+    access_log /var/log/nginx/{{ domain }}.access.log;
+    error_log /var/log/nginx/{{ domain }}.error.log;
+
+    client_max_body_size 1100M;
+
+    # SPANEL ACME CHALLENGE
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/spanel-acme;
+        default_type text/plain;
+        try_files $uri =404;
+        access_log off;
+        auth_basic off;
+    }
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), bluetooth=(), magnetometer=(), gyroscope=(), accelerometer=()" always;
+
+    autoindex off;
+
+    location ~* \.(?:sql|bak|backup|old|orig|save|swp|swo|ini|log|conf|env|sh|inc)$ {
+        deny all;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+
+    # Static-only site: refuse to execute any PHP / CGI even if a script
+    # somehow lands in the document root.
+    location ~* \.(?:php|phtml|phar|php3|php4|php5|php7|php8|cgi|pl|py)$ {
+        deny all;
+        return 403;
+    }
+
+    # SPANEL CUSTOM INCLUDE
+    include {{ custom_include_path }};
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~* \.(jpg|jpeg|gif|png|css|js|ico|webp|svg|woff|woff2|ttf|eot)$ {
+        # Was `expires -1`, which nginx renders as Cache-Control: no-cache, so
+        # every asset was refetched on every page view. The shortest of the
+        # three on purpose: a hand-written static site is the one most likely
+        # to have its stylesheet edited in place under an unchanged name, and a
+        # day already spares a repeat visitor nearly all the round trips.
+        expires 1d;
+        access_log off;
+    }
+}

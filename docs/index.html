@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="vi" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SPanel v1.0.60 — Tài liệu & Hướng dẫn Chính thức</title>
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <style>
+    :root {
+      --bg: #0b1120;
+      --bg-surface: #111827;
+      --bg-card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --accent: #10b981;
+      --code-bg: #090d16;
+    }
+    [data-theme="light"] {
+      --bg: #f8fafc;
+      --bg-surface: #ffffff;
+      --bg-card: #f1f5f9;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #475569;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --accent: #059669;
+      --code-bg: #0f172a;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+    }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 800;
+      font-size: 20px;
+      color: var(--text);
+    }
+    .brand img { width: 32px; height: 32px; border-radius: 8px; }
+    .badge {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: rgba(59, 130, 246, 0.16);
+      color: var(--primary);
+      border: 1px solid rgba(59, 130, 246, 0.35);
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex-wrap: wrap;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text);
+      transition: all 0.15s ease;
+    }
+    .btn-primary {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+    }
+    .btn-primary:hover { background: var(--primary-hover); text-decoration: none; }
+    .container {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 40px 20px 80px;
+    }
+    .hero {
+      text-align: center;
+      padding: 48px 20px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      margin-bottom: 40px;
+    }
+    .hero h1 {
+      font-size: clamp(28px, 4vw, 44px);
+      font-weight: 800;
+      margin-bottom: 16px;
+      letter-spacing: -0.02em;
+    }
+    .hero p {
+      max-width: 780px;
+      margin: 0 auto 28px;
+      color: var(--text-muted);
+      font-size: 17px;
+    }
+    .install-box {
+      max-width: 840px;
+      margin: 0 auto;
+      background: var(--code-bg);
+      color: #e2e8f0;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      text-align: left;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13.5px;
+    }
+    .section-title {
+      font-size: 24px;
+      font-weight: 800;
+      margin: 44px 0 20px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+      gap: 20px;
+    }
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+    }
+    .card h3 {
+      font-size: 18px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card p, .card li {
+      color: var(--text-muted);
+      font-size: 14.5px;
+    }
+    .card ul { padding-left: 18px; margin-top: 8px; }
+    .card li { margin-bottom: 6px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-top: 12px;
+    }
+    th, td {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      font-size: 14px;
+    }
+    th { background: var(--bg-card); font-weight: 700; }
+    footer {
+      text-align: center;
+      padding: 32px 20px;
+      border-top: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+    @media (max-width: 640px) {
+      .install-box { flex-direction: column; align-items: stretch; }
+      header { padding: 12px 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <img src="favicon.png" alt="SPanel Logo" />
+      <span>SPanel Docs</span>
+      <span class="badge">v1.0.60</span>
+    </div>
+    <nav class="nav-links">
+      <a href="#features">Tính năng</a>
+      <a href="#roles">Phân quyền 3 cấp</a>
+      <a href="#install">Cài đặt & Cập nhật</a>
+      <a href="#cli">Lệnh CLI</a>
+      <a href="https://github.com/shostwp-byte/spanel" target="_blank" rel="noopener noreferrer" class="btn btn-primary">GitHub Repository</a>
+      <button class="btn" id="themeBtn" type="button">Sáng / Tối</button>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <h1>Bảng điều khiển Web Hosting Đa tầng cho Ubuntu 24.04 LTS</h1>
+      <p>
+        Quản trị toàn diện máy chủ với kiến trúc 3 cấp độ (<strong>Admin / Reseller / End User</strong>),
+        giao diện quản lý Tên miền &amp; Subdomain chuẩn DirectAdmin, bảo mật cô lập đặc quyền
+        <code>spanel-helper</code>, tích hợp WHMCS và tối ưu hoàn hảo trên di động.
+      </p>
+      <div class="install-box">
+        <code id="installCmd">curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh -o /tmp/spanel-install.sh &amp;&amp; sudo bash /tmp/spanel-install.sh</code>
+        <button class="btn btn-primary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('installCmd').innerText); this.innerText='Đã sao chép!'; setTimeout(()=>this.innerText='Sao chép lệnh', 2000);">Sao chép lệnh</button>
+      </div>
+    </section>
+
+    <h2 class="section-title" id="features">1. Các Nhóm Tính năng Cốt lõi</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>🌐 Quản lý Domains &amp; Subdomains chuẩn DirectAdmin</h3>
+        <ul>
+          <li><strong>Domain Setup (<code>/website</code>):</strong> Thêm tên miền mới, đổi tên miền (Rename Domain), bật/tắt Force SSL, chọn phiên bản PHP (5.6 – 8.5), bật/tắt <code>Open_basedir</code> và tuỳ chỉnh cột hiển thị (<code>Columns ⌄</code>).</li>
+          <li><strong>Subdomain Management (<code>/subdomains</code>):</strong> Thanh chọn tên miền nhanh ở đầu trang, tạo Subdomain tự động chuẩn hoá tiền tố và tuỳ chỉnh Document Root.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>👥 Kiến trúc Đa tầng Admin / Reseller / User</h3>
+        <ul>
+          <li><strong>Admin:</strong> Quản trị toàn máy chủ, Resource &amp; Process Monitor, IP Manager, Name Servers, Custom HTTPD, Server TLS, Packages, Add-ons &amp; Panel Updates.</li>
+          <li><strong>Reseller:</strong> Tạo &amp; quản lý khách hàng thuộc đại lý, gói hosting riêng, White-Label Branding (Logo, Favicon, Tên Panel) và đổi mật khẩu hàng loạt.</li>
+          <li><strong>End User:</strong> Giao diện quản trị trực quan, tự động ẩn các menu nếu Add-on chưa được Admin kích hoạt.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🛡️ Bảo mật Đa lớp &amp; Cô lập Đặc quyền</h3>
+        <ul>
+          <li>Tiến trình <code>spanel-api</code> chạy dưới user <code>spanel</code> không quyền root; mọi tác vụ hệ thống đi qua <code>spanel-helper</code> kiểm duyệt chặt chẽ.</li>
+          <li>Tường lửa <code>iptables + ipset</code> hiệu năng cao kèm danh sách chặn IP tự động và Fail2ban.</li>
+          <li>WAF ModSecurity + OWASP CRS theo từng website, quét mã độc ClamAV + LMD, bảo mật 2FA TOTP &amp; Passkey.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>📬 Email, DNS, Backup &amp; Di chuyển Dữ liệu</h3>
+        <ul>
+          <li><strong>Email Suite:</strong> Exim4, Dovecot, Rspamd lọc thư rác, Forwarders, Autoresponders, DKIM/DMARC tự động và SPanel Webmail SSO (cổng <code>2096</code>).</li>
+          <li><strong>PowerDNS:</strong> Quản lý DNS Zone trực tiếp trên máy chủ (A, AAAA, CNAME, MX, TXT, SRV, CAA, NS).</li>
+          <li><strong>Backup &amp; Migration:</strong> Sao lưu tự động lên S3 / SFTP và nhập trực tiếp bản sao lưu từ <strong>DirectAdmin</strong> &amp; <strong>cPanel</strong>.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🔔 Thông báo Phân loại &amp; Giao diện Mobile</h3>
+        <ul>
+          <li>Phân luồng thông báo độc lập cho <strong>Admin</strong>, <strong>Reseller</strong> và <strong>End User</strong> kèm bộ lọc theo danh mục (Hệ thống, Bảo mật, Sao lưu, Tài nguyên).</li>
+          <li>Thiết kế <strong>Mobile Responsive</strong> tối ưu cho điện thoại (<code>&lt;= 640px</code>) và máy tính bảng: bảng tự thu gọn cột phụ, hộp thoại cuộn mượt theo khung nhìn.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🔌 Tích hợp WHMCS &amp; Trợ lý AI MCP</h3>
+        <ul>
+          <li>Module WHMCS có sẵn tại <code>modules/servers/spanel/</code> hỗ trợ cấp phát, tạm khoá, nâng gói, đồng bộ dung lượng và đăng nhập 1-click (SSO).</li>
+          <li>Hỗ trợ giao thức <strong>MCP (Model Context Protocol)</strong> giúp kết nối Claude Code, Cursor, VS Code trực tiếp vào SPanel bằng token cá nhân.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 class="section-title" id="roles">2. Danh mục Tài liệu Chuyên sâu trong Kho lưu trữ</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Tệp tài liệu</th>
+          <th>Mô tả nội dung</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><a href="README.md"><code>docs/README.md</code></a></td>
+          <td>Tổng quan kiến trúc hệ thống, sơ đồ luồng hoạt động và bảng ngăn xếp công nghệ (Tech Stack).</td>
+        </tr>
+        <tr>
+          <td><a href="FEATURES.md"><code>docs/FEATURES.md</code></a></td>
+          <td>Chi tiết tính năng theo 3 vai trò Admin / Reseller / User, quản lý Domains &amp; Subdomains, thông báo phân loại và danh sách Add-ons.</td>
+        </tr>
+        <tr>
+          <td><a href="INSTALLATION_AND_UPDATE.md"><code>docs/INSTALLATION_AND_UPDATE.md</code></a></td>
+          <td>Hướng dẫn cài đặt trên VPS Ubuntu 24.04 LTS mới, cài đặt tự động (Unattended) và quy trình cập nhật trực tuyến (Online Update).</td>
+        </tr>
+        <tr>
+          <td><a href="ADMIN_AND_CLI_GUIDE.md"><code>docs/ADMIN_AND_CLI_GUIDE.md</code></a></td>
+          <td>Mô hình bảo mật <code>spanel-helper</code>, bộ lệnh cứu hộ <code>spanel</code> qua SSH, tường lửa, tự động tối ưu hiệu năng và công cụ Migration.</td>
+        </tr>
+        <tr>
+          <td><a href="API_AND_WHMCS.md"><code>docs/API_AND_WHMCS.md</code></a></td>
+          <td>Hướng dẫn tích hợp module WHMCS, đặc tả các Endpoint Provisioning API và kết nối trợ lý AI qua MCP.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 class="section-title" id="install">3. Cài đặt &amp; Cập nhật Nhanh trên VPS</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>🚀 Cài đặt Tự động (Unattended)</h3>
+        <p>Chạy bằng quyền <code>root</code> trên máy chủ Ubuntu 24.04 LTS mới:</p>
+        <pre style="margin-top:10px;padding:12px;background:var(--code-bg);color:#e2e8f0;border-radius:8px;overflow-x:auto;font-size:12.5px;">curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh | sudo bash -s -- \
+  --admin-user admin \
+  --admin-pass 'MatKhauManh@2026!' \
+  --php-default 8.4</pre>
+      </div>
+      <div class="card">
+        <h3>🔄 Cập nhật Phiên bản Mới (Online Update)</h3>
+        <p>Cập nhật trực tiếp trong giao diện <strong>Admin → Cài đặt → Cập nhật</strong> hoặc chạy lệnh SSH:</p>
+        <pre style="margin-top:10px;padding:12px;background:var(--code-bg);color:#e2e8f0;border-radius:8px;overflow-x:auto;font-size:12.5px;">sudo spanel-update</pre>
+        <p style="margin-top:8px;">Bảo toàn 100% dữ liệu, cấu hình <code>.env</code>, tự động chạy migration DB và tự động rollback nếu gặp lỗi.</p>
+      </div>
+    </div>
+
+    <h2 class="section-title" id="cli">4. Các Lệnh Quản trị &amp; Cứu hộ Thường dùng qua SSH</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Lệnh thực thi</th>
+          <th>Công dụng</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>sudo spanel</code></td>
+          <td>Mở menu cứu hộ tương tác qua SSH (xem thông tin đăng nhập, khởi động lại dịch vụ, sửa quyền, cấp SSL).</td>
+        </tr>
+        <tr>
+          <td><code>sudo spanel change-admin-password</code></td>
+          <td>Đặt lại mật khẩu đăng nhập cho tài khoản <code>admin</code> của SPanel.</td>
+        </tr>
+        <tr>
+          <td><code>sudo spanel change-ip &lt;IP_CŨ&gt; &lt;IP_MỚI&gt;</code></td>
+          <td>Cập nhật địa chỉ IP máy chủ hàng loạt cho toàn bộ cấu hình Nginx vhost và DNS Zone.</td>
+        </tr>
+        <tr>
+          <td><code>sudo spanel-rescue-firewall</code></td>
+          <td>Sao lưu luật tường lửa hiện tại và khôi phục bộ luật tối thiểu khi bị khoá ngoài máy chủ.</td>
+        </tr>
+        <tr>
+          <td><code>sudo spanel-update</code></td>
+          <td>Kiểm tra và nâng cấp SPanel lên bản phát hành mới nhất từ kho GitHub.</td>
+        </tr>
+      </tbody>
+    </table>
+  </main>
+
+  <footer>
+    SPanel v1.0.60 — Phát hành theo giấy phép GNU AGPLv3 ·
+    <a href="https://github.com/shostwp-byte/spanel" target="_blank" rel="noopener noreferrer">https://github.com/shostwp-byte/spanel</a>
+  </footer>
+
+  <script>
+    document.getElementById('themeBtn').addEventListener('click', function () {
+      var html = document.documentElement;
+      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+    });
+  </script>
+</body>
+</html>

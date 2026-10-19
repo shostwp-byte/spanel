@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <title>{{ domain }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow">
+  <style>
+    :root {
+      --bg1: #f9fafb;
+      --bg2: #fefce8;
+      --bg3: #e0f2fe;
+      --accent-green: #22c55e;
+      --accent-yellow: #eab308;
+      --accent-orange: #f97316;
+      --card-bg: rgba(255, 255, 255, 0.9);
+      --card-border: rgba(15, 23, 42, 0.06);
+      --card-shadow: 0 18px 45px rgba(15, 23, 42, 0.12);
+      --text-main: #0f172a;
+      --text-muted: #6b7280;
+      --chip-bg: rgba(255, 255, 255, 0.9);
+      --chip-border: rgba(15, 23, 42, 0.08);
+      --footer-chip-bg: rgba(255, 255, 255, 0.8);
+    }
+    :root[data-theme="dark"] {
+      --bg1: #020617;
+      --bg2: #020617;
+      --bg3: #020617;
+      --card-bg: rgba(15, 23, 42, 0.96);
+      --card-border: rgba(148, 163, 184, 0.28);
+      --card-shadow: 0 26px 70px rgba(0, 0, 0, 0.9);
+      --text-main: #f9fafb;
+      --text-muted: #9ca3af;
+      --chip-bg: rgba(15, 23, 42, 0.96);
+      --chip-border: rgba(148, 163, 184, 0.5);
+      --footer-chip-bg: rgba(15, 23, 42, 0.96);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      color: var(--text-main);
+      overflow: hidden;
+      position: relative;
+      background: linear-gradient(180deg, var(--bg1) 0%, var(--bg2) 45%, var(--bg3) 100%);
+    }
+    .spot {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: 0.35;
+      animation: float 18s ease-in-out infinite alternate;
+      pointer-events: none;
+    }
+    .spot.green { width: 420px; height: 420px; background: var(--accent-green); top: 5%; left: 10%; animation-delay: 0s; }
+    .spot.yellow { width: 380px; height: 380px; background: var(--accent-yellow); bottom: 10%; right: 10%; animation-delay: 2s; }
+    .spot.orange { width: 320px; height: 320px; background: var(--accent-orange); top: 60%; left: 50%; animation-delay: 4s; }
+    @keyframes float {
+      0% { transform: translateY(0) scale(1); }
+      50% { transform: translateY(-30px) scale(1.03); opacity: 0.45; }
+      100% { transform: translateY(20px) scale(1.08); opacity: 0.3; }
+    }
+    .theme-toggle {
+      position: fixed;
+      top: 20px;
+      right: 24px;
+      z-index: 10;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+      background: rgba(255, 255, 255, 0.8);
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.3s ease, border-color 0.3s ease;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+    }
+    :root[data-theme="dark"] .theme-toggle { background: rgba(15, 23, 42, 0.9); border-color: rgba(148, 163, 184, 0.4); box-shadow: 0 0 18px rgba(255, 255, 255, 0.04); }
+    .theme-icon { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; color: var(--text-main); opacity: 0.5; transition: opacity 0.2s ease; }
+    :root[data-theme="light"] .theme-icon.sun, :root[data-theme="dark"] .theme-icon.moon { opacity: 1; }
+    .theme-icon svg { width: 100%; height: 100%; stroke: currentColor; fill: none; stroke-width: 1.6; }
+    .card {
+      position: relative;
+      z-index: 1;
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      background: var(--card-bg);
+      border-radius: 16px;
+      box-shadow: var(--card-shadow);
+      padding: 48px 38px 36px;
+      max-width: 480px;
+      width: 100%;
+      border: 1px solid var(--card-border);
+    }
+    .title { font-size: 20px; font-weight: 600; margin-bottom: 10px; }
+    .subtitle { font-size: 14px; color: var(--text-muted); margin-bottom: 26px; line-height: 1.6; }
+    .host {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace;
+      font-size: 13px;
+      padding: 6px 10px;
+      background: var(--chip-bg);
+      border-radius: 999px;
+      border: 1px solid var(--chip-border);
+      display: inline-block;
+      margin-bottom: 24px;
+      color: var(--text-main);
+    }
+    .loader { display: flex; justify-content: center; gap: 10px; margin-bottom: 24px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; opacity: 0.4; animation: pulse 1.6s infinite; }
+    .dot:nth-child(1) { background: var(--accent-yellow); }
+    .dot:nth-child(2) { background: var(--accent-orange); animation-delay: 0.2s; }
+    .dot:nth-child(3) { background: var(--accent-green); animation-delay: 0.4s; }
+    @keyframes pulse {
+      0%, 80%, 100% { opacity: 0.35; transform: scale(1); }
+      40% { opacity: 1; transform: scale(1.4); }
+    }
+    .message { font-size: 15px; font-weight: 500; transition: opacity 0.6s ease; min-height: 24px; margin-bottom: 8px; }
+    .footer { margin-top: 16px; font-size: 12px; color: var(--text-muted); }
+    .footer code { background: var(--footer-chip-bg); border-radius: 4px; padding: 0 4px; font-size: 11px; }
+    code { background: rgba(0,0,0,0.03); border-radius: 4px; padding: 0 4px; font-size: 12px; }
+    :root[data-theme="dark"] code { background: rgba(15,23,42,0.9); }
+    @media (max-width: 480px) { .card { padding: 32px 20px 24px; } .title { font-size: 19px; } }
+  </style>
+</head>
+<body>
+  <div class="spot green"></div>
+  <div class="spot yellow"></div>
+  <div class="spot orange"></div>
+
+  <div class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" title="Toggle light/dark theme">
+    <span class="theme-icon sun">
+      <svg viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="4"></circle>
+        <g stroke-linecap="round">
+          <line x1="12" y1="2" x2="12" y2="4"></line>
+          <line x1="12" y1="20" x2="12" y2="22"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="2" y1="12" x2="4" y2="12"></line>
+          <line x1="20" y1="12" x2="22" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </g>
+      </svg>
+    </span>
+    <span class="theme-icon moon">
+      <svg viewBox="0 0 24 24">
+        <path d="M20 14.5A7.5 7.5 0 0 1 10.5 5a7.5 7.5 0 1 0 9.5 9.5Z" />
+      </svg>
+    </span>
+  </div>
+
+  <main class="card">
+    <h1 class="title">This site is waiting for content</h1>
+    <p class="subtitle">Deploy your files when they're ready to shine.</p>
+    <div class="host">{{ domain }}</div>
+    <div class="loader">
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+    </div>
+    <div class="message" id="message">Coming soon: an awesome project.</div>
+    <div class="footer">If you see this page, your DNS and server setup has been completed correctly.</div>
+  </main>
+
+  <script>
+    const messages = [
+      "Coming soon: an awesome project.",
+      "A cool project is on the way.",
+      "Preparing something amazing for you...",
+      "Stay tuned for updates!",
+      "Building something special behind the scenes...",
+      "Almost ready to launch!",
+      "Magic is happening... please wait a bit!",
+      "Good things take time — we're almost there.",
+      "The future home of something great.",
+      "Just polishing the final details...",
+      "Something new is loading...",
+      "We're crafting an experience you'll love.",
+      "Innovation in progress...",
+      "Your next favorite website is on its way.",
+    ];
+    let index = 0;
+    const msgEl = document.getElementById("message");
+    function cycle() {
+      msgEl.style.opacity = 0;
+      setTimeout(() => {
+        index = (index + 1) % messages.length;
+        msgEl.textContent = messages[index];
+        msgEl.style.opacity = 1;
+      }, 600);
+    }
+    setInterval(cycle, 4000);
+    (function () {
+      const root = document.documentElement;
+      const toggle = document.getElementById("theme-toggle");
+      function applyTheme(theme) { root.setAttribute("data-theme", theme); }
+      try {
+        const stored = localStorage.getItem("placeholder-theme");
+        if (stored === "dark" || stored === "light") { applyTheme(stored); }
+        else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) { applyTheme("dark"); }
+      } catch (e) {}
+      toggle.addEventListener("click", function () {
+        const current = root.getAttribute("data-theme") === "dark" ? "dark" : "light";
+        const next = current === "dark" ? "light" : "dark";
+        applyTheme(next);
+        try { localStorage.setItem("placeholder-theme", next); } catch (e) {}
+      });
+    })();
+  </script>
+</body>
+</html>

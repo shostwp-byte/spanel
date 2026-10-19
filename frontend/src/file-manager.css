@@ -1,0 +1,983 @@
+.file-manager {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.file-panel {
+  display: grid;
+  gap: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  min-width: 0;
+  box-shadow: none;
+}
+
+.file-controls {
+  display: grid;
+  grid-template-columns: minmax(240px, 340px) minmax(0, 1fr);
+  gap: 6px 8px;
+  align-items: start;
+}
+
+.compact-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.compact-actions button {
+  padding: 9px 10px;
+}
+
+.file-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+  grid-column: 1 / -1;
+}
+
+.file-toolbar select {
+  width: auto;
+  min-width: 84px;
+}
+
+.file-toolbar button,
+.file-toolbar .upload-button,
+.file-toolbar select {
+  min-height: 30px;
+  height: 30px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.file-job-list {
+  display: grid;
+  gap: 5px;
+  grid-column: 1 / -1;
+}
+
+.file-job {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.file-job svg {
+  flex: none;
+  color: var(--primary);
+}
+
+.file-job span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-job small {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.file-job.done {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success);
+}
+
+.file-job.error {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.path-pill {
+  margin: 0;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px;
+  color: var(--text-secondary);
+  font-weight: 700;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.breadcrumb-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  grid-column: 1 / -1;
+  border-radius: var(--radius-sm);
+}
+
+.crumb {
+  min-height: 26px;
+  height: 26px;
+  padding: 0 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.crumb:hover:not(:disabled) {
+  background: var(--primary-light);
+  border-color: var(--primary-border);
+  color: var(--primary-text);
+}
+
+.crumb:disabled {
+  background: var(--primary-light);
+  border-color: var(--primary-border);
+  color: var(--primary-text);
+  opacity: 1;
+}
+
+.file-controls .file-meta {
+  min-height: 34px;
+  align-items: center;
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  background: var(--surface-alt);
+  border-color: var(--border);
+  color: var(--text-secondary);
+  gap: 4px 10px;
+  font-size: 12px;
+}
+
+.file-controls .file-meta span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-controls .file-meta strong {
+  color: var(--text);
+}
+
+/* The same grid as a row, so "755" and "4.1 KB" sit under words that say what
+   they are. They were two unlabelled columns floating between the file name
+   and the buttons, and a number with no heading is a number you have to work
+   out. */
+.file-list-header {
+  /* Every row is a grid of its own. With an auto last column each one
+     sized it to its own buttons - two for a folder, four for an archive -
+     so mode, size and date sat up to 120px apart from row to row and under
+     no heading. A fixed actions column (four buttons, right-aligned) puts
+     every row's columns where the header's are; the scrollbar gutter is
+     reserved on both so a long, scrolling list does not shift them 10px. */
+  overflow: hidden;
+  scrollbar-gutter: stable;
+  display: grid;
+  grid-template-columns: 20px minmax(200px, 1fr) 62px 82px 112px 264px;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-bottom: 0;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.file-list-header label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.file-list-count { text-align: right; }
+/* Perms and Rename on twenty-one rows is forty-two bordered boxes down the
+   middle of the page. They keep their labels - a file manager is not the place
+   to make people hover to find out what a control does - and lose the box
+   until the pointer is on the row. */
+.file-row-actions .mini:not(.danger) {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-secondary);
+}
+.file-item:hover .file-row-actions .mini:not(.danger),
+.file-row-actions .mini:not(.danger):focus-visible {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.file-list-header input,
+.file-item > input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  min-height: 0;
+  padding: 0;
+  accent-color: var(--primary);
+}
+
+.file-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  scrollbar-gutter: stable;
+  gap: 0;
+  max-height: min(68vh, 760px);
+  overflow: auto;
+  padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+}
+
+.file-item {
+  display: grid;
+  grid-template-columns: 20px minmax(200px, 1fr) 62px 82px 112px 264px;
+  gap: 8px;
+  align-items: center;
+  background: var(--surface);
+  color: var(--text);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  min-height: 36px;
+  padding: 4px 8px;
+  justify-content: stretch;
+  text-align: left;
+  transition: var(--transition);
+}
+
+.file-item:last-child {
+  border-bottom: 0;
+}
+
+.file-item:hover {
+  background: var(--surface);
+}
+
+.file-item.selected {
+  background: var(--surface);
+}
+
+.file-list button.file-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: unset;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent !important;
+  color: var(--text) !important;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.5;
+  justify-content: flex-start;
+  box-shadow: none;
+}
+
+.file-list button.file-name:hover {
+  background: transparent !important;
+  color: var(--primary) !important;
+}
+
+.file-list button.file-name:focus,
+.file-list button.file-name:active {
+  background: transparent !important;
+  color: var(--primary) !important;
+  box-shadow: none !important;
+}
+
+.file-list button.file-name strong {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-list button.file-name svg {
+  color: var(--primary);
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+}
+
+.file-size,
+.file-modified {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.file-modified {
+  font-variant-numeric: tabular-nums;
+}
+
+.file-mode {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+button.file-mode {
+  justify-self: start;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 6px;
+  min-height: 0;
+  height: auto;
+  cursor: pointer;
+}
+
+button.file-mode:hover:not(:disabled) {
+  background: var(--surface-sunken);
+  border-color: var(--border-hover);
+  color: var(--text);
+}
+
+button.file-mode:disabled {
+  cursor: default;
+  min-height: 0;
+  height: auto;
+}
+
+.file-delete {
+  color: var(--danger);
+}
+
+.file-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+.file-row-actions .mini {
+  min-height: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 7px;
+}
+
+.file-row-actions .mini.danger {
+  background: var(--surface);
+  border: 1px solid var(--danger-border);
+  color: var(--danger);
+  min-width: 26px;
+  width: 26px;
+  padding: 0;
+}
+
+.file-row-actions .mini.danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.file-row-actions .mini:disabled {
+  height: 26px;
+  min-height: 26px;
+}
+
+.empty-box {
+  background: var(--surface);
+  border: 1px dashed var(--border-hover);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  padding: 20px;
+  text-align: center;
+  font-weight: 700;
+}
+
+/* The host div is turned into the Ace editor itself, so it carries .ace_editor.
+   Ace scrolls virtually through .ace_scrollbar-v/-h: never give .ace_scroller
+   its own overflow, or a second (native) scrollbar appears and the last lines
+   become unreachable. */
+.code-editor-host.ace_editor {
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  font: 13px/22px var(--font-mono);
+}
+
+.code-editor-host .ace_gutter {
+  background: var(--editor-gutter-bg);
+  color: var(--editor-gutter-fg);
+  border-right: 1px solid var(--editor-border);
+}
+
+.code-editor-host .ace_marker-layer .ace_active-line,
+.code-editor-host .ace_gutter-active-line {
+  background: var(--editor-active-line);
+}
+
+/* Selected text keeps its syntax colours; only the background changes. Do not
+   try to repaint the selected text on top of Ace: a flat copy of the line has
+   no tab expansion and no token styling, so it drifts out of alignment. */
+.code-editor-host .ace_marker-layer .ace_selection {
+  background: var(--editor-selection) !important;
+  opacity: 1;
+}
+
+.code-editor-host .ace_marker-layer .ace_selected-word {
+  border: 1px solid var(--editor-selection);
+}
+
+/* Search match highlighting for ext-searchbox */
+.code-editor-host .ace_search {
+  background: var(--editor-gutter-bg);
+  border: 1px solid var(--editor-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+.code-editor-host .ace_search_field {
+  background: var(--editor-bg);
+  border: 1px solid var(--editor-border);
+  border-radius: 3px;
+  padding: 2px 6px;
+}
+.code-editor-host .ace_searchbtn {
+  background: transparent;
+  border: none;
+  color: var(--editor-gutter-fg);
+  cursor: pointer;
+  padding: 0 4px;
+}
+.code-editor-host .ace_searchbtn:hover {
+  color: var(--editor-fg);
+}
+.code-editor-host .ace_replace {
+  background: var(--editor-bg);
+  border: 1px solid var(--editor-border);
+  border-radius: 3px;
+  padding: 2px 6px;
+}
+
+.standalone-editor-page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh; /* beats the global `main { min-height: 100vh }` on mobile */
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface-alt);
+  color: var(--text);
+}
+
+.standalone-editor-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 14px;
+  flex: 0 0 auto;
+}
+
+.standalone-editor-title {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.standalone-editor-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.standalone-editor-title span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.file-list .empty-box {
+  border: 0;
+  border-radius: 0;
+  padding: 28px 16px;
+}
+
+.standalone-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.standalone-editor-actions button {
+  height: 34px;
+  min-height: 34px;
+}
+
+.editor-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 9px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.standalone-editor-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 10px;
+}
+
+.standalone-editor-body .code-editor-host {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+@media (max-width: 1100px) {
+  .file-manager,
+  .file-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .file-list {
+    max-height: 360px;
+  }
+
+  .file-item {
+    grid-template-columns: 22px minmax(0, 1fr);
+    gap: 6px 8px;
+  }
+
+  .file-list-header {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .file-list-header span:not(.file-list-count) { display: none; }
+
+  .file-size,
+  .file-mode,
+  .file-row-actions {
+    grid-column: 2;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 760px) {
+  .file-manager {
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .file-panel {
+    max-width: 100%;
+    overflow: hidden;
+    padding: 8px;
+  }
+
+  .file-controls {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+    min-width: 0;
+  }
+
+  .file-controls > * {
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .file-controls select {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .file-controls .file-meta {
+    display: grid;
+    gap: 3px;
+    min-height: 0;
+    padding: 7px 8px;
+  }
+
+  .file-controls .file-meta span {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.45;
+  }
+
+  .path-pill.breadcrumb-line {
+    flex-wrap: nowrap;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .crumb {
+    flex: 0 0 auto;
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .file-toolbar {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    width: 100%;
+  }
+
+  .file-toolbar button,
+  .file-toolbar .upload-button,
+  .file-toolbar select {
+    flex: none;
+    width: 100%;
+    min-width: 0;
+    padding: 0 6px;
+    font-size: 12px;
+  }
+
+  .file-list-header {
+    align-items: center;
+    flex-direction: row;
+    gap: 8px;
+  }
+
+  .file-list {
+    max-height: none;
+    overflow-x: hidden;
+    overflow-y: visible;
+  }
+
+  .file-item {
+    grid-template-columns: 18px minmax(0, 1fr);
+    gap: 4px 8px;
+    min-height: 0;
+    padding: 8px;
+    align-items: start;
+  }
+
+  .file-item > input[type=checkbox] {
+    grid-column: 1;
+    grid-row: 1;
+    margin-top: 4px;
+  }
+
+  .file-list button.file-name {
+    grid-column: 2;
+    grid-row: 1;
+    align-items: flex-start;
+    max-width: 100%;
+    min-height: 24px;
+    line-height: 1.35;
+  }
+
+  .file-list button.file-name strong {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.35;
+  }
+
+  .file-list button.file-name svg {
+    margin-top: 2px;
+  }
+
+  .file-size {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .file-mode {
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: end;
+  }
+
+  .file-row-actions {
+    grid-column: 2;
+    grid-row: 3;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+    width: 100%;
+  }
+
+  .file-row-actions .mini,
+  .file-row-actions .mini.danger {
+    height: 30px;
+    min-height: 30px;
+    overflow: hidden;
+    padding: 0 6px;
+    text-overflow: ellipsis;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .file-row-actions .mini.danger {
+    padding: 0;
+  }
+
+  .standalone-editor-top {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .standalone-editor-actions {
+    justify-content: flex-start;
+  }
+}
+
+/* --- Permissions (chmod) dialog ------------------------------------------ */
+.chmod-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: var(--overlay);
+  backdrop-filter: blur(2px);
+}
+
+.chmod-dialog {
+  display: grid;
+  gap: 12px;
+  width: min(380px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 18px 48px rgba(15, 23, 42, .28);
+}
+
+.chmod-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chmod-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.chmod-head p {
+  margin: 3px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.chmod-grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.chmod-grid th {
+  padding: 4px 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.chmod-grid thead th {
+  text-align: center;
+}
+
+.chmod-grid tbody th {
+  text-align: left;
+  color: var(--text);
+}
+
+.chmod-grid td {
+  padding: 4px 6px;
+  text-align: center;
+}
+
+.chmod-grid tbody tr + tr th,
+.chmod-grid tbody tr + tr td {
+  border-top: 1px solid var(--border);
+}
+
+.chmod-grid input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+.chmod-grid input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: .4;
+}
+
+.chmod-value {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+}
+
+.chmod-value label {
+  display: grid;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.chmod-value input {
+  width: 84px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.chmod-value code {
+  padding-bottom: 8px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  color: var(--text-muted);
+}
+
+.chmod-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chmod-presets .mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+
+.chmod-presets .mini small {
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  opacity: .75;
+}
+
+.chmod-setgid {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.chmod-setgid input[type="checkbox"] {
+  margin-top: 2px;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+  flex: none;
+}
+
+.chmod-note {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.chmod-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.chmod-note.warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 9px;
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-sm);
+  color: var(--warning-text);
+}
+
+.chmod-note.warn svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* Job cards keep a dismiss control, so a failure can be cleared by hand the
+   same way a completed one clears itself. */
+.file-job > span {
+  flex: 1 1 auto;
+}
+
+.file-job-dismiss {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  opacity: .6;
+  cursor: pointer;
+}
+
+.file-job-dismiss:hover:not(:disabled) {
+  background: var(--surface);
+  border-color: var(--border-hover);
+  opacity: 1;
+}

@@ -1,0 +1,26 @@
+[tool.pytest.ini_options]
+# `app` lives under backend/, not on sys.path by default. `python -m pytest`
+# happens to work by accident - `-m` prepends the CWD - but the bare `pytest`
+# console script that CI runs does not, so every test file failed to collect
+# with "No module named 'app'". This is pytest's own, invocation-independent
+# fix: always put backend/ (relative to this file) on sys.path.
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "UP", "I"]
+ignore = [
+    "E501",   # long lines (handled separately)
+    "S101",   # assert (used by tests)
+    "S603",   # subprocess call: validated argv list
+    "S607",   # subprocess.run with partial path: explicit binaries on PATH
+    "B008",   # FastAPI Depends(...) in defaults is idiomatic
+]
+
+[tool.ruff.lint.per-file-ignores]
+"backend/app/services/shell.py" = ["S602"]  # we never invoke a shell
+"backend/tests/*" = ["S105", "S106"]
