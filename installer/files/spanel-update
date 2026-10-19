@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# spanel-update: Safe Transactional Online Updater with Pre-Update Snapshot,
+# Stealth Update Server Protection, Post-Update Healthcheck, and Automatic Rollback.
+
+set -euo pipefail
+
+STATE_FILE="${UPDATE_STATE_FILE:-/var/lib/spanel/update-status.json}"
+SOURCE_CONFIG_FILE="${UPDATE_SOURCE_FILE:-/var/lib/spanel/update-source.json}"
+APP_DIR="${APP_DIR:-/opt/spanel}"
+SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+ROLLBACK_SNAPSHOT_ID=""
+WORK_DIR=""
+CURL_CFG=""
+
+cleanup_temp() {
+  [[ -n "$CURL_CFG" && -f "$CURL_CFG" ]] && rm -f "$CURL_CFG" 2>/dev/null || true
+  [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR" 2>/dev/null || true
+}
+trap cleanup_temp EXIT
+
+sanitize_msg() {
+  printf '%s' "${1:-}" | sed -E 's#https?://[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g; s#git@[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g'
+}
+
+log_step() {
+  local msg
+  msg="$(sanitize_msg "$1")"
+  echo "==> ${msg}"
+}
+
+update_state() {
+  local status="$1" phase="$2" pct="$3" msg="$4"
+  msg="$(sanitize_msg "$msg")"
+  if command -v python3 >/dev/null 2>&1 && [[ -d "$(dirname "$STATE_FILE")" ]]; then
+    python3 - "$STATE_FILE" "$status" "$phase" "$pct" "$msg" "${ROLLBACK_SNAPSHOT_ID:-}" <<'PY' || true
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+status, phase, pct, message, snap_id = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6]
+try:
+    state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+except Exception:
+    state = {}
+
+now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+state.update({
+    "last_update_status": status,
+    "progress_phase": phase,
+    "progress_percent": pct,
+    "progress_message": message,
+    "last_update_message": message,
+})
+if snap_id:
+    state["rollback_snapshot_id"] = snap_id
+if status in {"completed", "failed", "rolled_back"}:
+    state["last_update_finished_at"] = now
+path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  fi
+}
+
+check_panel_health() {
+  local port="2222" waited=0
+  if [[ -f "${APP_DIR}/backend/.env" ]]; then
+    port="$(awk -F= '$1=="PANEL_PORT"{print $2; exit}' "${APP_DIR}/backend/.env" 2>/dev/null || echo "2222")"
+  fi
+  [[ -z "$port" ]] && port="2222"
+  while [[ $waited -lt 30 ]]; do
+    if systemctl is-active --quiet spanel-api 2>/dev/null; then
+      if curl -fsSk --connect-timeout 2 --max-time 4 "http://127.0.0.1:${port}/api/health" >/dev/null 2>&1 \
+         || curl -fsSk --connect-timeout 2 --max-time 4 "https://127.0.0.1:${port}/api/health" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+trigger_auto_rollback() {
+  local reason
+  reason="$(sanitize_msg "${1:-Update failed}")"
+  log_step "PHÁT HIỆN SỰ CỐ: ${reason}"
+  if [[ -n "$ROLLBACK_SNAPSHOT_ID" && -x "/usr/local/sbin/spanel-helper" ]]; then
+    log_step "Đang kích hoạt AUTO-ROLLBACK về điểm khôi phục ${ROLLBACK_SNAPSHOT_ID}..."
+    update_state "rolling_back" "rolling_back" 95 "Phát hiện lỗi cập nhật! Đang tự động khôi phục về bản sao lưu ${ROLLBACK_SNAPSHOT_ID}..."
+    if env SUDO_USER=spanel /usr/local/sbin/spanel-helper panel-snapshot-restore "$ROLLBACK_SNAPSHOT_ID" >/dev/null 2>&1; then
+      if check_panel_health; then
+        log_step "AUTO-ROLLBACK THÀNH CÔNG: Hệ thống đã được khôi phục an toàn về ${ROLLBACK_SNAPSHOT_ID}."
+        update_state "rolled_back" "rolled_back" 100 "Cập nhật gặp sự cố (${reason}). Hệ thống đã tự động Rollback an toàn về bản ${ROLLBACK_SNAPSHOT_ID}."
+        exit 1
+      fi
+    fi
+  fi
+  update_state "failed" "failed" 100 "${reason}"
+  exit 1
+}
+
+main() {
+  [[ $EUID -eq 0 ]] || { echo "ERROR: Please run as root" >&2; exit 1; }
+
+  # Read protected update source config without exposing URLs in logs
+  local cfg_json
+  cfg_json="$(python3 - "$SOURCE_CONFIG_FILE" "$STATE_FILE" <<'PY' 2>/dev/null || true
+import json, os, sys
+from pathlib import Path
+
+src_path, st_path = Path(sys.argv[1]), Path(sys.argv[2])
+src = {}
+st = {}
+try:
+    if src_path.exists():
+        src = json.loads(src_path.read_text(encoding="utf-8"))
+except Exception:
+    pass
+try:
+    if st_path.exists():
+        st = json.loads(st_path.read_text(encoding="utf-8"))
+except Exception:
+    pass
+
+server_url = (src.get("server_url") or os.environ.get("SPANEL_UPDATE_SERVER_URL") or os.environ.get("REPO_URL") or "https://github.com/shostwp-byte/spanel.git").strip()
+channel = (src.get("channel") or os.environ.get("UPDATE_CHANNEL") or "release").strip()
+auth_token = (src.get("auth_token") or os.environ.get("SPANEL_UPDATE_TOKEN") or "").strip()
+download_url = (st.get("download_url") or "").strip()
+expected_sha256 = (st.get("expected_sha256") or "").strip()
+latest_tag = (st.get("latest_tag") or "").strip()
+
+print(json.dumps({
+    "server_url": server_url,
+    "channel": channel,
+    "auth_token": auth_token,
+    "download_url": download_url,
+    "expected_sha256": expected_sha256,
+    "latest_tag": latest_tag,
+}))
+PY
+)"
+
+  local repo_url channel auth_token download_url expected_sha256 latest_tag
+  repo_url="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("server_url",""))' "$cfg_json" 2>/dev/null || echo "https://github.com/shostwp-byte/spanel.git")"
+  channel="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("channel","release"))' "$cfg_json" 2>/dev/null || echo "release")"
+  auth_token="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("auth_token",""))' "$cfg_json" 2>/dev/null || echo "")"
+  download_url="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("download_url",""))' "$cfg_json" 2>/dev/null || echo "")"
+  expected_sha256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("expected_sha256",""))' "$cfg_json" 2>/dev/null || echo "")"
+  latest_tag="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("latest_tag",""))' "$cfg_json" 2>/dev/null || echo "")"
+
+  local branch="${BRANCH:-main}" tag="${RELEASE_TAG:-$latest_tag}"
+  local pattern="${RELEASE_PATTERN:-v[0-9]*.[0-9]*.[0-9]*}"
+  local args=("$@") ref="" url="" url_ref="" script=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --release) channel="release"; shift ;;
+      --tag) [[ $# -ge 2 ]] && { channel="tag"; tag="$2"; shift 2; } || shift ;;
+      --branch) [[ $# -ge 2 ]] && { channel="branch"; branch="$2"; shift 2; } || shift ;;
+      --channel) [[ $# -ge 2 ]] && { channel="$2"; shift 2; } || shift ;;
+      *) shift ;;
+    esac
+  done
+
+  # STEP 1: Pre-flight Check & Pre-Update Snapshot (15%)
+  log_step "Bước 1/5: Kiểm tra dung lượng đĩa và khởi tạo Snapshot dự phòng..."
+  update_state "running" "snapshot" 15 "Đang tạo bản sao lưu dự phòng (Pre-Update Snapshot)..."
+
+  local free_kb
+  free_kb="$(df -Pk "$APP_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 1048576)"
+  if [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb < 307200 )); then
+    trigger_auto_rollback "Không đủ dung lượng ổ cứng trống tối thiểu (cần >= 300MB) để cập nhật an toàn."
+  fi
+
+  if [[ -x "/usr/local/sbin/spanel-helper" ]]; then
+    ROLLBACK_SNAPSHOT_ID="$(env SUDO_USER=spanel /usr/local/sbin/spanel-helper panel-snapshot-create pre-update 2>/dev/null | tail -n 1 || true)"
+  fi
+  if [[ -n "$ROLLBACK_SNAPSHOT_ID" ]]; then
+    log_step "Đã tạo điểm khôi phục an toàn: ${ROLLBACK_SNAPSHOT_ID}"
+  fi
+
+  # STEP 2: Resolve Release & Download in Isolated Staging (35%)
+  log_step "Bước 2/5: Kết nối máy chủ cập nhật chỉ định (kênh bảo mật TLS) và tải gói cập nhật..."
+  update_state "running" "downloading" 35 "Đang tải gói cập nhật từ máy chủ chỉ định và kiểm tra mã băm SHA-256..."
+
+  WORK_DIR="$(mktemp -d /tmp/spanel-updater.XXXXXX)"
+  mkdir -p "$WORK_DIR/installer"
+  script="$WORK_DIR/installer/update.sh"
+
+  case "$channel" in
+    release|stable|beta)
+      if [[ -n "$tag" && "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        ref="$tag"
+      else
+        command -v git >/dev/null 2>&1 || trigger_auto_rollback "Thiếu công cụ git trên máy chủ."
+        ref="$(git ls-remote --tags --refs "$repo_url" "refs/tags/${pattern}" 2>/dev/null | awk '{ sub("refs/tags/", "", $2); print $2 }' | sort -V | tail -n 1 || true)"
+      fi
+      if [[ -n "$ref" ]]; then
+        url_ref="refs/tags/${ref}"
+      else
+        channel="branch"
+        ref="${branch:-main}"
+        url_ref="refs/heads/${ref}"
+      fi
+      ;;
+    tag)
+      ref="$tag"
+      url_ref="refs/tags/${tag}"
+      ;;
+    branch)
+      ref="$branch"
+      url_ref="refs/heads/${branch}"
+      ;;
+    *)
+      ref="$branch"
+      url_ref="refs/heads/main"
+      ;;
+  esac
+
+  if [[ -n "${SPANEL_UPDATER_URL:-}" ]]; then
+    url="${SPANEL_UPDATER_URL//\{ref\}/$ref}"
+  else
+    case "$repo_url" in
+      https://github.com/*) url="${repo_url%.git}"; url="https://raw.githubusercontent.com/${url#https://github.com/}/${url_ref}/installer/update.sh" ;;
+      git@github.com:*) url="https://github.com/${repo_url#git@github.com:}"; url="${url%.git}"; url="https://raw.githubusercontent.com/${url#https://github.com/}/${url_ref}/installer/update.sh" ;;
+      *) url="${repo_url%/}/installer/update.sh" ;;
+    esac
+  fi
+
+  # Write stealth curl config (mode 0600) so URL & auth token are never visible in ps aux
+  CURL_CFG="$(mktemp /tmp/spanel-curl.XXXXXX)"
+  chmod 0600 "$CURL_CFG"
+  {
+    printf 'url = "%s"\n' "$url"
+    printf 'user-agent = "SPanel-Updater/1.0"\n'
+    if [[ -n "$auth_token" ]]; then
+      printf 'header = "Authorization: Bearer %s"\n' "$auth_token"
+      printf 'header = "X-SPanel-Update-Token: %s"\n' "$auth_token"
+    fi
+  } >"$CURL_CFG"
+
+  if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 120 -o "$script" -K "$CURL_CFG" 2>/dev/null; then
+    trigger_auto_rollback "Không thể tải gói cập nhật từ máy chủ chỉ định. Hệ thống giữ nguyên trạng thái hiện tại."
+  fi
+
+  if [[ -n "$expected_sha256" && "${#expected_sha256}" -eq 64 ]]; then
+    local actual_sha256
+    actual_sha256="$(sha256sum "$script" | awk '{print $1}')"
+    if [[ "${actual_sha256,,}" != "${expected_sha256,,}" ]]; then
+      trigger_auto_rollback "Mã kiểm tra toàn vẹn SHA-256 không khớp! Đã hủy bỏ gói cập nhật để bảo vệ máy chủ."
+    fi
+    log_step "Đã xác thực chữ ký băm SHA-256 hợp lệ."
+  fi
+
+  # STEP 3: Staging Validation (60%)
+  log_step "Bước 3/5: Kiểm tra tính toàn vẹn và cú pháp kịch bản tại vùng đệm Staging..."
+  update_state "running" "validating" 60 "Đang kiểm tra tính hợp lệ của gói cập nhật tại vùng đệm Staging..."
+
+  if [[ "$(head -n 1 "$script")" != "#!/usr/bin/env bash" ]] \
+     || ! grep -q 'SPANEL_UPDATE_STABLE_COPY' "$script" \
+     || ! bash -n "$script"; then
+    trigger_auto_rollback "Gói tải về từ máy chủ cập nhật không hợp lệ hoặc bị hỏng. Không có thay đổi nào được thực thi."
+  fi
+  chmod 0700 "$script"
+
+  # STEP 4: Atomic Application & Service Sync (80%)
+  log_step "Bước 4/5: Đang áp dụng bản cập nhật (${ref}) và đồng bộ dịch vụ..."
+  update_state "running" "applying" 80 "Đang áp dụng bản cập nhật ${ref} và nâng cấp dịch vụ..."
+
+  local rc=0
+  if [[ "${ args[*] }" != *"--tag"* && "${ args[*] }" != *"--branch"* && "$channel" != "branch" ]]; then
+    /bin/bash "$script" --tag "$ref" "${args[@]}" 2>&1 | sed -u -E 's#https?://[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g' || rc=$?
+  else
+    /bin/bash "$script" --branch "${branch:-main}" "${args[@]}" 2>&1 | sed -u -E 's#https?://[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g' || rc=$?
+  fi
+
+  if [[ $rc -ne 0 ]]; then
+    trigger_auto_rollback "Quá trình áp dụng bản cập nhật trả về mã lỗi (${rc})."
+  fi
+
+  # STEP 5: Post-Update Healthcheck Gate (92%)
+  log_step "Bước 5/5: Kiểm tra sức khỏe dịch vụ Panel (/api/health) sau cập nhật..."
+  update_state "running" "healthcheck" 92 "Đang kiểm tra phản hồi sức khỏe của Panel sau khi khởi động lại..."
+
+  if ! check_panel_health; then
+    trigger_auto_rollback "Dịch vụ spanel-api không phản hồi Healthcheck sau 30 giây."
+  fi
+
+  log_step "Hoàn tất cập nhật phiên bản ${ref} an toàn!"
+  update_state "completed" "completed" 100 "Cập nhật phiên bản ${ref} hoàn tất và vượt qua kiểm tra Healthcheck."
+  return 0
+}
+
+main "$@"; exit $?

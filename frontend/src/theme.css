@@ -1,0 +1,363 @@
+/* ============================================================
+   spanel theme layer — typography + light/dark tokens.
+   Loaded after style.css / brand.css so :root here wins.
+   ============================================================ */
+
+/* ==================== Typography, shared by both themes ====================
+   One scale, named by role rather than by size, so a heading and a hint cannot
+   drift apart page by page. 14px body is the size control panels are read at -
+   cPanel, Plesk and CloudPanel all sit at 13-14 - and the 16px default was
+   costing about a fifth of every list before anyone scrolled.
+
+   Tabular figures are not a detail here. This panel is columns of numbers -
+   sizes, ports, quotas, load averages, percentages - and proportional digits
+   make a column of them ragged, so a changing figure jitters in place. */
+:root{
+  --font-sans:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:'JetBrains Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+
+  --text-xs:12px;      /* badges, chips */
+  --text-sm:13px;      /* meta, table cells */
+  --text-hint:13px;    /* hints */
+  --text-base:14px;    /* body, labels */
+  --text-lg:16px;      /* card heading */
+  --text-xl:22px;      /* page title */
+  --leading:1.6;
+  --measure:76ch;
+}
+
+/* ============================ LIGHT (default) ============================ */
+:root{
+  color-scheme:light;
+  --radius-sm:8px;
+  --radius-md:12px;
+  --radius-lg:16px;
+  --radius-xl:24px;
+  --radius:12px;
+  --sidebar-width:290px;
+  --topbar-height:64px;
+
+  --primary:#4f46e5;
+  --primary-hover:#4338ca;
+  --primary-active:#3730a3;
+  --primary-ink:#4338ca;
+  --primary-ink-hover:#312e81;
+  --primary-contrast:#ffffff;
+  --primary-light:#e0e7ff;
+  --primary-soft:#c7d2fe;
+  --accent:#4f46e5;
+  --brand-ink:#0f172a;
+  --danger:#ef4444;
+  --danger-hover:#dc2626;
+  --danger-bg:#fef2f2;
+  --danger-border:#fecaca;
+  --danger-text:#991b1b;
+  --success:#10b981;
+  --success-hover:#059669;
+  --success-bg:#ecfdf5;
+  --success-border:#a7f3d0;
+  --success-text:#065f46;
+  --warning:#f59e0b;
+  --warning-bg:#fffbeb;
+  --warning-border:#fde68a;
+  --warning-text:#92400e;
+  --info:#0ea5e9;
+  --info-bg:#f0f9ff;
+  --info-border:#bae6fd;
+  --info-text:#075985;
+  --text:#0f172a;
+  --text-secondary:#475569;
+  --text-muted:#64748b;
+  --text-inverse:#ffffff;
+  --bg:#f8fafc;
+  --surface:rgba(255, 255, 255, 0.7);
+  --surface-alt:#f1f5f9;
+  --surface-hover:#e2e8f0;
+  --surface-muted:#f1f5f9;
+  --surface-sunken:#f1f5f9;
+  --border:rgba(15, 23, 42, 0.08);
+  --border-hover:rgba(15, 23, 42, 0.15);
+  --border-strong:rgba(15, 23, 42, 0.25);
+  --ring:rgba(79, 70, 229, 0.3);
+  --overlay:rgba(15, 23, 42, 0.45);
+  --nav-bg:rgba(255, 255, 255, 0.85);
+  --nav-border:var(--border);
+  --nav-hover:var(--surface-hover);
+  --nav-active:var(--primary-light);
+  --nav-text:var(--text-secondary);
+  --nav-text-strong:var(--text);
+  --nav-muted:var(--text-muted);
+  --nav-accent:var(--primary);
+  --shadow-sm:0 1px 3px rgba(0,0,0,.04), 0 1px 2px rgba(0,0,0,.02);
+  --shadow-md:0 4px 12px rgba(0,0,0,.03), 0 2px 4px rgba(0,0,0,.02);
+  --shadow-lg:0 12px 32px rgba(0,0,0,.05), 0 4px 8px rgba(0,0,0,.02);
+  --topbar-bg:rgba(255, 255, 255, 0.75);
+  --console-bg:#0f172a;
+  --console-surface:#1e293b;
+  --console-border:#334155;
+  --console-text:#f8fafc;
+  --console-muted:#94a3b8;
+  --disabled-bg:#f1f5f9;
+  --disabled-fg:#94a3b8;
+  --disabled-border:#e2e8f0;
+  --scrollbar-thumb:#cbd5e1;
+  --scrollbar-thumb-hover:#94a3b8;
+  --scrollbar-track:transparent;
+  --tooltip-bg:#111a2b;
+  --tooltip-fg:#ffffff;
+  --editor-bg:#ffffff;
+  --editor-fg:#111a2b;
+  --editor-border:#dde2e9;
+  --editor-gutter-bg:#eef1f5;
+  --editor-gutter-fg:#525d6f;
+  --editor-active-line:#e8f0fc;
+  --editor-selection:#b3cdf3;
+  /* spanel's older names, kept pointing at the palette above. */
+  --primary-fg:var(--primary-contrast);
+  --primary-text:var(--primary-ink);
+  --primary-border:var(--primary-soft);
+  --primary-light-hover:#cfe0f8;
+  --brand-blue:var(--primary);
+  --brand-blue-deep:var(--primary-active);
+  --brand-yellow:#f6c431;
+  --brand-yellow-soft:#fff8db;
+  --brand-deep:var(--brand-ink);
+  --brand-navy:var(--brand-ink);
+  --code-bg:var(--console-bg);
+  --code-fg:var(--console-text);
+  --code-border:var(--console-border);
+  --code-muted:var(--console-muted);
+}
+
+/* ============================ DARK ============================ */
+/* Applied when the user picks dark, or when the OS prefers dark and the
+   user has not explicitly chosen light. Blue-black ground, every fill solid. */
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --primary:#6366f1;
+  --primary-hover:#818cf8;
+  --primary-active:#a5b4fc;
+  --primary-ink:#818cf8;
+  --primary-ink-hover:#a5b4fc;
+  --primary-contrast:#ffffff;
+  --primary-light:#312e81;
+  --primary-soft:#3730a3;
+  --accent:#818cf8;
+  --brand-ink:#f8fafc;
+  --danger:#f87171;
+  --danger-hover:#fca5a5;
+  --danger-bg:#450a0a;
+  --danger-border:#7f1d1d;
+  --danger-text:#fecaca;
+  --success:#34d399;
+  --success-hover:#6ee7b7;
+  --success-bg:#064e3b;
+  --success-border:#065f46;
+  --success-text:#a7f3d0;
+  --warning:#fbbf24;
+  --warning-bg:#451a03;
+  --warning-border:#78350f;
+  --warning-text:#fde68a;
+  --info:#38bdf8;
+  --info-bg:#082f49;
+  --info-border:#0c4a6e;
+  --info-text:#bae6fd;
+  --text:#f8fafc;
+  --text-secondary:#cbd5e1;
+  --text-muted:#94a3b8;
+  --text-inverse:#0f172a;
+  --bg:#020617;
+  --surface:rgba(15, 23, 42, 0.7);
+  --surface-alt:#1e293b;
+  --surface-hover:rgba(30, 41, 59, 0.8);
+  --surface-muted:#1e293b;
+  --surface-sunken:#0f172a;
+  --border:#334155;
+  --border-hover:#475569;
+  --border-strong:#64748b;
+  --ring:rgba(99,102,241,.40);
+  --overlay:rgba(0,0,0,.62);
+  --nav-bg:rgba(2, 6, 23, 0.85);
+  --nav-border:rgba(255, 255, 255, 0.05);
+  --nav-hover:rgba(255, 255, 255, 0.1);
+  --nav-active:rgba(255, 255, 255, 0.15);
+  --nav-text:#cbd5e1;
+  --nav-text-strong:#ffffff;
+  --nav-muted:#64748b;
+  --nav-accent:#818cf8;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+  --shadow-md:0 8px 24px rgba(0,0,0,.5);
+  --shadow-lg:0 20px 48px rgba(0,0,0,.62);
+  --topbar-bg:rgba(15, 23, 42, 0.75);
+  --console-bg:#0f172a;
+  --console-surface:#1e293b;
+  --console-border:#334155;
+  --console-text:#f8fafc;
+  --console-muted:#94a3b8;
+  --disabled-bg:#1e293b;
+  --disabled-fg:#64748b;
+  --disabled-border:#334155;
+  --scrollbar-thumb:#334155;
+  --scrollbar-thumb-hover:#475569;
+  --tooltip-bg:#263041;
+  --tooltip-fg:#e7ebf1;
+  --editor-bg:#0e141d;
+  --editor-fg:#e7ebf1;
+  --editor-border:#263041;
+  --editor-gutter-bg:#121923;
+  --editor-gutter-fg:#98a3b3;
+  --editor-active-line:#172a44;
+  --editor-selection:#1f4a80;
+  --primary-light-hover:#1b3b69;
+  --brand-yellow:#f6c431;
+  --brand-yellow-soft:#332b12;
+}
+
+/* Follow the OS when no explicit choice is stored. */
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --primary:#2767c8;
+    --primary-hover:#2f73d8;
+    --primary-active:#3a7fe0;
+    --primary-ink:#6aa8f5;
+    --primary-ink-hover:#93c0f8;
+    --primary-contrast:#ffffff;
+    --primary-light:#16325a;
+    --primary-soft:#1f4a80;
+    --accent:#6aa8f5;
+    --brand-ink:#e7ebf1;
+    --danger:#f0796b;
+    --danger-hover:#f4938f;
+    --danger-bg:#3a1f1c;
+    --danger-border:#6b3630;
+    --danger-text:#f3a99f;
+    --success:#3ecf8e;
+    --success-hover:#5cdaa2;
+    --success-bg:#16302a;
+    --success-border:#2f5e4c;
+    --success-text:#74dcae;
+    --warning:#e0a533;
+    --warning-bg:#332815;
+    --warning-border:#5f4a22;
+    --warning-text:#f0c471;
+    --info:#4fb3e6;
+    --info-bg:#10283a;
+    --info-border:#1f4a66;
+    --info-text:#8fcff0;
+    --text:#e7ebf1;
+    --text-secondary:#b6c0cd;
+    --text-muted:#98a3b3;
+    --text-inverse:#111a2b;
+    --bg:#0b1018;
+    --surface:#121923;
+    --surface-alt:#18202c;
+    --surface-hover:#172a44;
+    --surface-muted:#1f2733;
+    --surface-sunken:#0e141d;
+    --border:#263041;
+    --border-hover:#364255;
+    --border-strong:#4a576b;
+    --ring:rgba(90,162,255,.40);
+    --overlay:rgba(0,0,0,.62);
+    --nav-bg:#0e1520;
+    --nav-border:#1d2735;
+    --nav-hover:#161f2d;
+    --nav-active:#1b2f4d;
+    --nav-text:#c9d3e1;
+    --nav-text-strong:#ffffff;
+    --nav-muted:#8e9bb0;
+    --nav-accent:#6aa8f5;
+    --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+    --shadow-md:0 8px 24px rgba(0,0,0,.5);
+    --shadow-lg:0 20px 48px rgba(0,0,0,.62);
+    --topbar-bg:#121923;
+    --console-bg:#0d0d0d;
+    --console-surface:#181818;
+    --console-border:#333333;
+    --console-text:#f0f0f0;
+    --console-muted:#a3a3a3;
+    --disabled-bg:#1f2733;
+    --disabled-fg:#6b7789;
+    --disabled-border:#263041;
+    --scrollbar-thumb:#2c3748;
+    --scrollbar-thumb-hover:#3c4a5e;
+    --tooltip-bg:#263041;
+    --tooltip-fg:#e7ebf1;
+    --editor-bg:#0e141d;
+    --editor-fg:#e7ebf1;
+    --editor-border:#263041;
+    --editor-gutter-bg:#121923;
+    --editor-gutter-fg:#98a3b3;
+    --editor-active-line:#172a44;
+    --editor-selection:#1f4a80;
+    --primary-light-hover:#1b3b69;
+    --brand-yellow:#f6c431;
+    --brand-yellow-soft:#332b12;
+  }
+}
+
+/* ============================ Base ============================ */
+:root{
+  font-family:var(--font-sans);
+  color:var(--text);
+  background:var(--bg);
+}
+body{
+  font-family:var(--font-sans);
+  font-size:var(--text-base);
+  line-height:var(--leading);
+  /* See the note on the scale: this panel is columns of numbers. */
+  font-variant-numeric:tabular-nums;
+  background:var(--bg);
+  color:var(--text);
+  transition:background-color .2s ease,color .2s ease;
+}
+h1,h2,h3,h4,h5,h6,button,input,select,textarea{font-family:inherit}
+/* Headings were four different sizes decided page by page. */
+h1{font-size:var(--text-xl);line-height:1.3}
+h2{font-size:var(--text-lg);line-height:1.35}
+h3{font-size:var(--text-base);line-height:1.4}
+code,pre,kbd,samp{font-family:var(--font-mono)}
+::selection{background:var(--primary);color:var(--primary-fg)}
+a{color:var(--primary-text)}
+a:hover{color:var(--primary)}
+
+/* Scrollbars follow the theme */
+*{scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--scrollbar-track)}
+::-webkit-scrollbar-thumb{background:var(--scrollbar-thumb);border-radius:999px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:var(--scrollbar-thumb-hover);background-clip:content-box}
+
+/* ==================== Theme toggle control ==================== */
+/* The language switch is the same control with letters instead of a glyph, so
+   it shares these rules outright. Two buttons that sit next to each other and
+   do the same kind of thing have to stay identical, and a copy of the box
+   drifts the first time one side is adjusted. */
+.theme-toggle,.language-toggle{
+  display:inline-grid;place-items:center;
+  width:36px;height:34px;min-height:34px;padding:0;flex:none;
+  background:var(--surface);color:var(--text-secondary);
+  border:1px solid var(--border);border-radius:var(--radius-sm);
+  cursor:pointer;transition:background-color .18s ease,color .18s ease,border-color .18s ease;
+}
+.theme-toggle:hover:not(:disabled),.language-toggle:hover:not(:disabled){background:var(--primary-light);color:var(--primary-text);border-color:var(--primary-border)}
+.theme-toggle:focus-visible,.language-toggle:focus-visible{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px var(--ring)}
+.theme-toggle svg{width:16px;height:16px}
+.login-card .theme-toggle,.login-page .theme-toggle,
+.login-card .language-toggle,.login-page .language-toggle{width:38px;height:38px;min-height:38px}
+.login-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.login-card-head .login-brand{flex:1;min-width:0}
+
+/* Loading stays neutral so it never reads as an error banner. */
+.loading{background:var(--surface-alt);color:var(--text-secondary);border-color:var(--border)}
+.loading span{border-color:var(--primary-border);border-top-color:var(--primary)}
+
+/* ============ Dark-mode corrections for hard-coded surfaces ============ */
+:root[data-theme="dark"] .brand-mark.has-logo,
+:root[data-theme="dark"] .brand-preview{background:var(--surface-alt)}
+:root[data-theme="dark"] img.theme-invert-safe{filter:none}
+
+/* Ace editor + xterm live in their own dark themes; just match the frame. */
+.ace_editor{border-color:var(--border)}

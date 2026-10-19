@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# Keep a memory spike from taking the web server down with it.
+#
+# Written after a real incident: on a 7.9 GB server with no swap, clamd grew to
+# 2.1 GB, a customer's PHP cron job asked for memory, and the kernel's OOM
+# killer took clamd first and then an nginx worker. Twenty-six customer sites
+# stopped answering for two and a half minutes. Nothing was misconfigured - the
+# machine simply had no slack and no policy about who should die first.
+#
+# Three things, each small, each independently useful:
+#
+#   swap            Somewhere for cold pages to go, so a spike stalls instead
+#                   of killing. A server with no swap has no gear between
+#                   "fine" and "something dies".
+#
+#   MemoryMax       A ceiling on clamd, which is by far the largest single
+#                   consumer on a hosting box and the one whose appetite is
+#                   least related to serving customers. Sized from RAM, never
+#                   below what its signature database actually needs - a cap
+#                   that clamd cannot live inside is worse than no cap, because
+#                   it turns one outage into a restart loop.
+#
+#   OOMScoreAdjust  If the kernel must still choose, it should choose the
+#                   malware scanner over the web server. In the incident it did
+#                   the opposite by default.
+#
+# Safe to run repeatedly. Never fails the installer: every step that could go
+# wrong on an unusual host is skipped with a reason rather than aborting.
+#
+# Opt out entirely:  touch /etc/spanel/no-memory-guard
+# Opt out of swap:   touch /etc/spanel/no-swap
+
+set -uo pipefail
+
+SWAPFILE="/swapfile"
+OPT_OUT="/etc/spanel/no-memory-guard"
+SWAP_OPT_OUT="/etc/spanel/no-swap"
+
+say() { echo "  $*"; }
+
+if [[ $EUID -ne 0 ]]; then
+  echo "spanel-memory-guard must run as root" >&2
+  exit 1
+fi
+
+if [[ -e "$OPT_OUT" ]]; then
+  say "memory guard: disabled by $OPT_OUT"
+  exit 0
+fi
+
+ram_mb() { awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo; }
+
+# --- swap -------------------------------------------------------------------
+
+ensure_swap() {
+  local ram free_mb size fstype virt
+  if [[ -e "$SWAP_OPT_OUT" ]]; then
+    say "swap: disabled by $SWAP_OPT_OUT"
+    return 0
+  fi
+  # Any swap at all - a partition, zram, another file - means the operator has
+  # a policy already. Do not add a second one on top of it.
+  if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+    say "swap: already configured, leaving it alone"
+    return 0
+  fi
+  # Containers share the host kernel and cannot swapon. Trying is a guaranteed
+  # failure, not a maybe.
+  #
+  # Read stdout and ignore the exit code on purpose: systemd-detect-virt prints
+  # "none" AND exits 1 when there is no container, so a `|| echo none` fallback
+  # appends a second "none" and every bare-metal server looks like a container.
+  # Measured: the first version of this check skipped swap on a KVM guest.
+  virt="$(systemd-detect-virt --container 2>/dev/null)"
+  if [[ -n "$virt" && "$virt" != "none" ]]; then
+    say "swap: skipped, this is a $virt container and cannot manage its own swap"
+    return 0
+  fi
+  fstype="$(findmnt -no FSTYPE / 2>/dev/null || echo unknown)"
+  case "$fstype" in
+    ext2|ext3|ext4|xfs) ;;
+    *)
+      # btrfs needs a nocow, uncompressed file created a particular way, and
+      # zfs cannot host one safely at all. Neither is worth guessing at on
+      # somebody's production server.
+      say "swap: skipped, root filesystem is $fstype and needs a swapfile created by hand"
+      return 0
+      ;;
+  esac
+  if [[ -e "$SWAPFILE" ]]; then
+    say "swap: $SWAPFILE already exists but is not active, leaving it alone"
+    return 0
+  fi
+
+  ram="$(ram_mb)"
+  if (( ram <= 2048 )); then
+    size="$ram"
+  else
+    size=$(( ram / 2 ))
+    (( size < 2048 )) && size=2048
+    (( size > 8192 )) && size=8192
+  fi
+
+  free_mb="$(df -Pm / | awk 'NR==2 {print $4}')"
+  # Leave real room behind: a hosting box that fills its disk creating swap has
+  # traded one outage for a worse one.
+  if (( free_mb < size + 10240 )); then
+    say "swap: skipped, only ${free_mb}MB free on / and ${size}MB of swap would leave too little"
+    return 0
+  fi
+
+  say "swap: creating ${size}MB at $SWAPFILE"
+  if ! fallocate -l "${size}M" "$SWAPFILE" 2>/dev/null; then
+    dd if=/dev/zero of="$SWAPFILE" bs=1M count="$size" status=none 2>/dev/null || {
+      say "swap: could not allocate the file, skipping"
+      rm -f "$SWAPFILE"
+      return 0
+    }
+  fi
+  chmod 0600 "$SWAPFILE"
+  if ! mkswap "$SWAPFILE" >/dev/null 2>&1; then
+    say "swap: mkswap failed, skipping"
+    rm -f "$SWAPFILE"
+    return 0
+  fi
+  if ! swapon "$SWAPFILE" 2>/dev/null; then
+    say "swap: swapon was refused by this kernel, skipping"
+    rm -f "$SWAPFILE"
+    return 0
+  fi
+  if ! grep -qE "^[^#]*[[:space:]]swap[[:space:]]" /etc/fstab 2>/dev/null; then
+    printf '%s none swap sw 0 0\n' "$SWAPFILE" >>/etc/fstab
+  fi
+  # Default swappiness of 60 would page out things a busy PHP-FPM pool wants.
+  # 10 keeps swap as the emergency it is meant to be.
+  install -d -m 0755 /etc/sysctl.d
+  printf 'vm.swappiness=10\n' >/etc/sysctl.d/60-spanel-swap.conf
+  sysctl -q vm.swappiness=10 2>/dev/null || true
+  say "swap: active, ${size}MB, vm.swappiness=10"
+}
+
+# --- who the kernel should pick, and how large clamd may grow ---------------
+
+dropin() {
+  local unit="$1" name="$2"
+  install -d -m 0755 "/etc/systemd/system/${unit}.d"
+  cat >"/etc/systemd/system/${unit}.d/${name}"
+}
+
+CLAMD_MAX_MB=""
+
+ensure_clamav_limits() {
+  local ram max high
+  # `systemctl list-unit-files | grep -q` looks obvious and is wrong here:
+  # grep -q exits as soon as it matches, systemctl takes SIGPIPE, and with
+  # `set -o pipefail` the pipeline reports 141 - so a match reads as a miss.
+  # Measured: exit=141 on a server where the unit was plainly installed.
+  # `systemctl cat` needs no pipeline and answers the actual question.
+  if ! systemctl cat clamav-daemon.service >/dev/null 2>&1; then
+    say "clamd: not installed on this server, nothing to limit"
+    return 0
+  fi
+  ram="$(ram_mb)"
+  # ClamAV's signature database alone is comfortably over a gigabyte resident.
+  # A ceiling under that does not protect anything - it just makes clamd die,
+  # restart, reload the database and die again. 2048MB is the floor for that
+  # reason, and the cap only ever rises from there.
+  max=$(( ram * 35 / 100 ))
+  (( max < 2048 )) && max=2048
+  # Never promise clamd more than the machine can spare for it.
+  if (( ram > 3072 )) && (( max > ram - 2048 )); then
+    max=$(( ram - 2048 ))
+  fi
+  high=$(( max * 80 / 100 ))
+
+  dropin clamav-daemon.service 50-spanel-memory.conf <<CONF
+# Written by spanel-memory-guard. The packaged drop-in (extend.conf) is left
+# alone; this file only adds limits.
+#
+# MemoryHigh throttles and reclaims first, which is usually enough. MemoryMax
+# is the hard stop. Both are sized from this machine's RAM, and never below
+# what the signature database needs - a cap clamd cannot live inside would turn
+# an outage into a restart loop.
+#
+# OOMScoreAdjust says who the kernel should pick if it still has to choose. A
+# malware scanner is a better answer than the web server every customer is
+# being served by.
+[Service]
+MemoryHigh=${high}M
+MemoryMax=${max}M
+OOMScoreAdjust=500
+Restart=on-failure
+RestartSec=30s
+CONF
+  CLAMD_MAX_MB="$max"
+  say "clamd: MemoryHigh=${high}M MemoryMax=${max}M OOMScoreAdjust=500"
+}
+
+ensure_nginx_protection() {
+  systemctl cat nginx.service >/dev/null 2>&1 || return 0
+  dropin nginx.service 50-spanel-oom.conf <<'CONF'
+# Written by spanel-memory-guard. nginx is the process every hosted site is
+# answered by; it should be close to the last thing the kernel reaches for.
+# This does not make it immune, it moves it down the list.
+[Service]
+OOMScoreAdjust=-500
+CONF
+  say "nginx: OOMScoreAdjust=-500"
+}
+
+# A drop-in only takes effect the next time the unit starts, and the server
+# that most needs this protection is the one already running. Set the value on
+# the live processes too, so it is in force now rather than after the next
+# restart. nginx workers inherit the master's value, so respawned ones keep it.
+apply_oom_now() {
+  local unit="$1" value="$2" pattern="$3" pid n=0
+  for pid in $(pgrep -x "$pattern" 2>/dev/null); do
+    if printf '%s
+' "$value" >"/proc/$pid/oom_score_adj" 2>/dev/null; then
+      n=$(( n + 1 ))
+    fi
+  done
+  (( n > 0 )) && say "$unit: applied OOMScoreAdjust=$value to $n running process(es) now"
+  return 0
+}
+
+main() {
+  say "memory guard: $(ram_mb)MB RAM"
+  ensure_swap
+  ensure_clamav_limits
+  ensure_nginx_protection
+  systemctl daemon-reload 2>/dev/null || true
+  # Apply the ceiling to a clamd that is already running, so the limit takes
+  # effect without a restart that would drop its signature database.
+  if [[ -n "$CLAMD_MAX_MB" ]] && systemctl is-active --quiet clamav-daemon 2>/dev/null; then
+    systemctl set-property --runtime clamav-daemon.service "MemoryMax=${CLAMD_MAX_MB}M" 2>/dev/null || true
+  fi
+  apply_oom_now nginx -500 nginx
+  apply_oom_now clamd 500 clamd
+  say "memory guard: done"
+}
+
+main "$@"

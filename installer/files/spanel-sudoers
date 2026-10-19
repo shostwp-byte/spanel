@@ -1,0 +1,22 @@
+# /etc/sudoers.d/spanel
+# Installed by installer/install.sh as root:root mode 0440.
+# Grants the 'spanel' system user the right to run a single root-owned
+# helper script with no password. The helper does its own validation.
+#
+# Threat model:
+# - The wildcard "*" lets spanel pass any args to spanel-helper. That is
+#   safe because the helper enforces the security boundary itself: it runs
+#   under `set -euo pipefail`, validates every argv with anchored regexes,
+#   resolves user-supplied paths with `readlink -m`, and downgrades to
+#   www-data / panel Linux users via `runuser` whenever it touches
+#   site files.
+# - The helper script must remain root-owned mode 0755 (no group write).
+#   `installer/install.sh` enforces those perms; do not loosen them.
+# - Adding a new subcommand requires editing only spanel-helper.sh; this
+#   sudoers file does not need to enumerate subcommands.
+
+Defaults:spanel !requiretty
+Defaults:spanel env_reset
+Defaults:spanel secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+spanel ALL=(root) NOPASSWD: /usr/local/sbin/spanel-helper *

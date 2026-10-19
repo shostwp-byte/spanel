@@ -1,0 +1,147 @@
+server {
+    listen {% if bind_address and bind_address != "*" %}{{ bind_address }}:{% endif %}80;
+{% if ipv6 %}    listen [::]:80;
+{% endif %}    server_name {{ server_names | join(' ') }};
+    root {{ document_root_path }};
+    index index.php index.html;
+
+    server_tokens off;
+    disable_symlinks if_not_owner from={{ root_path }};
+
+{% if http_flood_enabled %}
+    # SPANEL HTTP FLOOD BEGIN
+    limit_req zone={{ http_flood_zone }}{% if http_flood_burst > 0 %} burst={{ http_flood_burst }}{% endif %} nodelay;
+    limit_conn spanel_conn_flood {{ http_flood_connections }};
+    limit_conn spanel_vhost_cap 150;
+    limit_req zone=spanel_db_scrape_guard burst=20 nodelay;
+    if ($spanel_scrape_challenge = 1) { return 429; }
+    limit_req_status 429;
+    limit_conn_status 429;
+{{ http_flood_challenge_block }}
+    # SPANEL HTTP FLOOD END
+{% endif %}
+
+{% if waf_enabled %}
+    # SPANEL WAF BEGIN
+    modsecurity on;
+    modsecurity_rules_file {{ waf_rules_file }};
+    # SPANEL WAF END
+{% endif %}
+
+    access_log /var/log/nginx/{{ domain }}.access.log;
+    error_log /var/log/nginx/{{ domain }}.error.log;
+
+    client_max_body_size 1100M;
+
+    # SPANEL ACME CHALLENGE
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/spanel-acme;
+        default_type text/plain;
+        try_files $uri =404;
+        access_log off;
+        auth_basic off;
+    }
+
+    # SPANEL FASTCGI CACHE SERVER BEGIN
+    set $spanel_skip_cache 0;
+    if ($request_method = POST) { set $spanel_skip_cache 1; }
+    if ($query_string != "") { set $spanel_skip_cache 1; }
+    if ($http_cache_control ~* "no-cache|no-store|max-age=0") { set $spanel_skip_cache 1; }
+    if ($http_pragma = "no-cache") { set $spanel_skip_cache 1; }
+    if ($request_uri ~* "/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?\.xml") { set $spanel_skip_cache 1; }
+    if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wordpress_logged_in|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|edd_items_in_cart") { set $spanel_skip_cache 1; }
+    add_header X-FastCGI-Cache $upstream_cache_status always;
+    # SPANEL FASTCGI CACHE SERVER END
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), bluetooth=(), magnetometer=(), gyroscope=(), accelerometer=()" always;
+    add_header Content-Security-Policy "default-src 'self' https: data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https: blob:; font-src 'self' data: https:; connect-src 'self' https:; frame-src 'self' https: blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self' https:; frame-ancestors 'self'; upgrade-insecure-requests" always;
+
+    autoindex off;
+
+    location = /xmlrpc.php {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+
+    location = /wp-config.php {
+        deny all;
+    }
+
+    location = /readme.html {
+        deny all;
+    }
+
+    location = /license.txt {
+        deny all;
+    }
+
+    location ~* /(?:uploads|files)/.*\.php$ {
+        deny all;
+    }
+
+    location ~* ^/(?:wp-admin/includes|wp-includes)/.*\.php$ {
+        deny all;
+    }
+
+    location ~* \.(?:sql|bak|backup|old|orig|save|swp|swo|ini|log|conf|env|sh|inc)$ {
+        deny all;
+    }
+
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_pass unix:{{ php_fpm_socket }};
+        fastcgi_connect_timeout 5s;
+        fastcgi_read_timeout 300;
+        # SPANEL FASTCGI CACHE LOCATION BEGIN
+        fastcgi_cache SPANEL_FASTCGI;
+        fastcgi_cache_methods GET HEAD;
+        fastcgi_cache_valid 200 301 302 10m;
+        fastcgi_cache_valid 404 1m;
+        fastcgi_cache_min_uses 1;
+        fastcgi_cache_use_stale error timeout invalid_header updating http_500 http_503 http_429;
+        fastcgi_cache_background_update on;
+        fastcgi_cache_revalidate on;
+        fastcgi_cache_bypass $spanel_skip_cache;
+        fastcgi_no_cache $spanel_skip_cache;
+        fastcgi_no_cache $upstream_http_set_cookie;
+        fastcgi_cache_lock on;
+        fastcgi_cache_lock_timeout 5s;
+        fastcgi_cache_lock_age 5s;
+        # SPANEL FASTCGI CACHE LOCATION END
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+
+    # SPANEL CUSTOM INCLUDE
+    include {{ custom_include_path }};
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~* \.(jpg|jpeg|gif|png|css|js|ico|webp|svg|woff|woff2|ttf|eot)$ {
+        # This used to be `expires -1`, which nginx renders as an Expires date
+        # in the past plus Cache-Control: no-cache - so every image, stylesheet
+        # and font was fetched again on every page view. WordPress fingerprints
+        # its CSS and JS with ?ver=, and writes a new filename rather than
+        # overwriting an upload, so a long lifetime here is safe: changing a
+        # file changes its URL.
+        expires 30d;
+        access_log off;
+    }
+}
