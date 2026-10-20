@@ -1971,6 +1971,159 @@ table.table {
   }
 }
 
+/* Package Import Modal (DirectAdmin / cPanel / Plesk) */
+.pkg-import-modal-card {
+  width: min(980px, 96vw) !important;
+  max-width: 980px !important;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0 !important;
+  overflow: hidden;
+}
+
+.pkg-import-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  background: var(--surface-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+.pkg-import-body {
+  padding: 18px 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.pkg-import-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 20px;
+  background: var(--surface-alt);
+  border-top: 1px solid var(--border);
+}
+
+.pkg-panel-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pkg-panel-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 11px 14px;
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.16s ease;
+}
+
+.pkg-panel-card:hover {
+  border-color: var(--primary);
+  background: var(--surface-alt);
+}
+
+.pkg-panel-card.active {
+  border-color: var(--primary);
+  background: var(--primary-subtle, rgba(37, 99, 235, 0.08));
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+.pkg-panel-card-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pkg-panel-card-desc {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.pkg-import-method-tabs {
+  display: inline-flex;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 4px;
+  align-self: flex-start;
+}
+
+.pkg-import-method-tab {
+  border: none !important;
+  background: transparent !important;
+  color: var(--text-secondary) !important;
+  font-size: 12.5px !important;
+  font-weight: 600 !important;
+  padding: 6px 14px !important;
+  min-height: 30px !important;
+  border-radius: 6px !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  box-shadow: none !important;
+}
+
+.pkg-import-method-tab.active {
+  background: var(--primary) !important;
+  color: #ffffff !important;
+}
+
+.pkg-upload-dropzone {
+  border: 1.5px dashed var(--border-strong, var(--border));
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: var(--surface-alt);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.pkg-preview-box {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.pkg-preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--surface-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+@media (max-width: 720px) {
+  .pkg-panel-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
 
 /* ---------- Mobile & Multi-Device UX/UI Polish ---------- */
 /* Topbar Left (Hamburger + Page Title) & Right Utility Group */
