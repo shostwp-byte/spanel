@@ -276,5 +276,8 @@ def serve_spa(full_path: str):
         raise HTTPException(status_code=404, detail="Not found")
     index = frontend_dist / "index.html"
     if index.exists():
-        return FileResponse(index)
+        return FileResponse(
+            index,
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
     return {"detail": "Frontend build not found", "path": str(index)}

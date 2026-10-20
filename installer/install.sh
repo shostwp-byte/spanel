@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SPANEL_INSTALLER_VERSION="${SPANEL_INSTALLER_VERSION:-v1.0.6}"
+SPANEL_INSTALLER_VERSION="${SPANEL_INSTALLER_VERSION:-v1.0.7}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Please run this installer as root"
@@ -1423,7 +1423,7 @@ source_version() {
 write_update_state() {
   local version now
   version="$(source_version)"
-  version="${version:-1.0.6}"
+  version="${version:-1.0.7}"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   install -d -o spanel -g spanel -m 0750 /var/lib/spanel /var/lib/spanel/geoip
   cat >/var/lib/spanel/update-status.json <<STATE

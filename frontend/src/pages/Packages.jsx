@@ -1043,7 +1043,15 @@ export function PackagesPage({ mode = 'users' }) {
   const selectedImportCount = parsedPackages.filter(p => p._selected).length;
 
   return (
-    <div className="section">
+    <div
+      className="section"
+      style={{
+        backdropFilter: 'none',
+        WebkitBackdropFilter: 'none',
+        transform: 'none',
+        animation: 'none',
+      }}
+    >
       <div className="section-title" style={{ marginBottom: '16px', alignItems: 'center', flexWrap: 'wrap' }}>
         <div>
           <h2 style={{ margin: 0 }}>
@@ -1452,13 +1460,56 @@ export function PackagesPage({ mode = 'users' }) {
         <div
           className="modal-backdrop pkg-import-modal-backdrop"
           onClick={() => setShowImportModal(false)}
-          style={{ zIndex: 9999 }}
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            width: '100vw',
+            height: '100vh',
+            zIndex: 99999,
+            background: 'rgba(15, 23, 42, 0.68)',
+            backdropFilter: 'blur(4px)',
+            WebkitBackdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '20px',
+            boxSizing: 'border-box',
+          }}
         >
           <div
             className="modal-card pkg-import-modal-card"
             onClick={e => e.stopPropagation()}
+            style={{
+              width: 'min(880px, 95vw)',
+              maxWidth: '880px',
+              maxHeight: 'calc(100vh - 40px)',
+              margin: 'auto',
+              display: 'flex',
+              flexDirection: 'column',
+              padding: 0,
+              overflow: 'hidden',
+              background: 'var(--bg-elevated, var(--surface-solid, #ffffff))',
+              border: '1px solid var(--border)',
+              borderRadius: '14px',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.45)',
+            }}
           >
-            <div className="pkg-import-header">
+            <div
+              className="pkg-import-header"
+              style={{
+                padding: '16px 20px',
+                borderBottom: '1px solid var(--border)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '12px',
+                background: 'var(--surface-alt)',
+                flexShrink: 0,
+              }}
+            >
               <div>
                 <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px' }}>
                   <Upload size={18} style={{ color: 'var(--primary)' }} />
@@ -1479,21 +1530,46 @@ export function PackagesPage({ mode = 'users' }) {
               </button>
             </div>
 
-            <div className="pkg-import-body">
+            <div
+              className="pkg-import-body"
+              style={{
+                padding: '18px 20px',
+                overflowY: 'auto',
+                flex: '1 1 auto',
+                minHeight: 0,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '16px',
+              }}
+            >
               {/* Step 1: Select Source Panel */}
               <div>
                 <label style={{ display: 'block', fontSize: '12.5px', fontWeight: 700, marginBottom: '8px', color: 'var(--text)' }}>
                   1. {t('Select Source Control Panel')}
                 </label>
-                <div className="pkg-panel-cards">
+                <div
+                  className="pkg-panel-cards"
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                    gap: '10px',
+                  }}
+                >
                   <div
                     className={`pkg-panel-card ${importPanel === 'directadmin' ? 'active' : ''}`}
                     onClick={() => setImportPanel('directadmin')}
+                    style={{
+                      border: importPanel === 'directadmin' ? '2px solid var(--primary)' : '1.5px solid var(--border)',
+                      borderRadius: '10px',
+                      padding: '12px 14px',
+                      background: importPanel === 'directadmin' ? 'var(--primary-subtle, rgba(37, 99, 235, 0.08))' : 'var(--bg-elevated, var(--surface))',
+                      cursor: 'pointer',
+                    }}
                   >
-                    <div className="pkg-panel-card-title">
+                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
                       <Server size={15} style={{ color: '#2563eb' }} /> DirectAdmin
                     </div>
-                    <div className="pkg-panel-card-desc">
+                    <div className="pkg-panel-card-desc" style={{ fontSize: '11.5px', color: 'var(--text-secondary)', lineHeight: 1.35 }}>
                       {t('Supports .pkg files (/usr/local/directadmin/data/users/*/packages/*.pkg) & DirectAdmin API :2222')}
                     </div>
                   </div>
@@ -1501,11 +1577,18 @@ export function PackagesPage({ mode = 'users' }) {
                   <div
                     className={`pkg-panel-card ${importPanel === 'cpanel' ? 'active' : ''}`}
                     onClick={() => setImportPanel('cpanel')}
+                    style={{
+                      border: importPanel === 'cpanel' ? '2px solid var(--primary)' : '1.5px solid var(--border)',
+                      borderRadius: '10px',
+                      padding: '12px 14px',
+                      background: importPanel === 'cpanel' ? 'var(--primary-subtle, rgba(37, 99, 235, 0.08))' : 'var(--bg-elevated, var(--surface))',
+                      cursor: 'pointer',
+                    }}
                   >
-                    <div className="pkg-panel-card-title">
+                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
                       <FileSpreadsheet size={15} style={{ color: '#ea580c' }} /> cPanel / WHM
                     </div>
-                    <div className="pkg-panel-card-desc">
+                    <div className="pkg-panel-card-desc" style={{ fontSize: '11.5px', color: 'var(--text-secondary)', lineHeight: 1.35 }}>
                       {t('Supports /var/cpanel/packages/* files, WHM listpkgs JSON & WHM API :2087')}
                     </div>
                   </div>
@@ -1513,11 +1596,18 @@ export function PackagesPage({ mode = 'users' }) {
                   <div
                     className={`pkg-panel-card ${importPanel === 'plesk' ? 'active' : ''}`}
                     onClick={() => setImportPanel('plesk')}
+                    style={{
+                      border: importPanel === 'plesk' ? '2px solid var(--primary)' : '1.5px solid var(--border)',
+                      borderRadius: '10px',
+                      padding: '12px 14px',
+                      background: importPanel === 'plesk' ? 'var(--primary-subtle, rgba(37, 99, 235, 0.08))' : 'var(--bg-elevated, var(--surface))',
+                      cursor: 'pointer',
+                    }}
                   >
-                    <div className="pkg-panel-card-title">
+                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
                       <Globe size={15} style={{ color: '#0891b2' }} /> Plesk Obsidian
                     </div>
-                    <div className="pkg-panel-card-desc">
+                    <div className="pkg-panel-card-desc" style={{ fontSize: '11.5px', color: 'var(--text-secondary)', lineHeight: 1.35 }}>
                       {t('Supports Plesk Service/Reseller Plan XML, REST JSON (/api/v2/serviceplans) & API :8443')}
                     </div>
                   </div>
@@ -1526,7 +1616,7 @@ export function PackagesPage({ mode = 'users' }) {
 
               {/* Step 2: Select Import Method */}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
-                <div className="pkg-import-method-tabs">
+                <div className="pkg-import-method-tabs" style={{ display: 'inline-flex', background: 'var(--surface-alt)', border: '1px solid var(--border)', borderRadius: '8px', padding: '3px', gap: '4px' }}>
                   <button
                     type="button"
                     className={`pkg-import-method-tab ${importMethod === 'file' ? 'active' : ''}`}
@@ -1557,7 +1647,7 @@ export function PackagesPage({ mode = 'users' }) {
               {/* Method A: Upload Files or Paste Raw Configuration */}
               {importMethod === 'file' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                  <div className="pkg-upload-dropzone">
+                  <div className="pkg-upload-dropzone" style={{ border: '1.5px dashed var(--border)', borderRadius: '10px', padding: '16px', background: 'var(--surface-alt)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
                     <div>
                       <strong style={{ fontSize: '13.5px', display: 'block', color: 'var(--text)' }}>
                         {t('Select one or multiple package files from your computer')}
@@ -1621,8 +1711,25 @@ export function PackagesPage({ mode = 'users' }) {
                 <form
                   onSubmit={handleFetchRemotePackages}
                   className="pkg-remote-form-card"
+                  style={{
+                    background: 'var(--surface-alt)',
+                    border: '1px solid var(--border)',
+                    borderRadius: '10px',
+                    padding: '16px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '14px',
+                  }}
                 >
-                  <div className="pkg-remote-form-grid">
+                  <div
+                    className="pkg-remote-form-grid"
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                      gap: '14px',
+                      alignItems: 'end',
+                    }}
+                  >
                     <div>
                       <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
                         {t('Remote Panel URL')}
@@ -1703,7 +1810,18 @@ export function PackagesPage({ mode = 'users' }) {
                     </div>
                   </div>
 
-                  <div className="pkg-remote-action-bar">
+                  <div
+                    className="pkg-remote-action-bar"
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '12px',
+                      flexWrap: 'wrap',
+                      paddingTop: '10px',
+                      borderTop: '1px solid var(--border)',
+                    }}
+                  >
                     <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '12.5px', color: 'var(--text-secondary)', cursor: 'pointer', margin: 0 }}>
                       <input
                         type="checkbox"
@@ -1873,7 +1991,20 @@ export function PackagesPage({ mode = 'users' }) {
               )}
             </div>
 
-            <div className="pkg-import-footer">
+            <div
+              className="pkg-import-footer"
+              style={{
+                padding: '14px 20px',
+                borderTop: '1px solid var(--border)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '10px',
+                background: 'var(--surface-alt)',
+                flexWrap: 'wrap',
+                flexShrink: 0,
+              }}
+            >
               <div className="muted" style={{ fontSize: '12px' }}>
                 {t('Tip: Click "Load to Editor" on any row to customize Cgroups v2 & App Runtime limits before saving.')}
               </div>

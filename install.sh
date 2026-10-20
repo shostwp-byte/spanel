@@ -14,7 +14,7 @@ if [[ -n "${SPANEL_VERSION:-}" ]]; then
   archive_url="${SPANEL_GITHUB}/archive/refs/tags/${SPANEL_VERSION}.tar.gz"
 else
   branch="${SPANEL_BRANCH:-main}"
-  echo "==> Installing SPanel (v1.0.6 - branch ${branch}) from ${SPANEL_GITHUB}"
+  echo "==> Installing SPanel (v1.0.7 - branch ${branch}) from ${SPANEL_GITHUB}"
   archive_url="${SPANEL_GITHUB}/archive/refs/heads/${branch}.tar.gz"
 fi
 

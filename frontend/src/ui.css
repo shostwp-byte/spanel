@@ -1976,6 +1976,7 @@ table.table {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
   transform: none !important;
+  animation: none !important;
 }
 .section:hover {
   transform: none !important;
@@ -1989,7 +1990,7 @@ table.table {
   bottom: 0 !important;
   width: 100vw !important;
   height: 100vh !important;
-  z-index: 9999 !important;
+  z-index: 99999 !important;
   background: rgba(15, 23, 42, 0.68) !important;
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);

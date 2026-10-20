@@ -149,7 +149,7 @@ PY
   expected_sha256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("expected_sha256",""))' "$cfg_json" 2>/dev/null || echo "")"
   latest_tag="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("latest_tag",""))' "$cfg_json" 2>/dev/null || echo "")"
 
-  local branch="${BRANCH:-main}" tag="${RELEASE_TAG:-$latest_tag}"
+  local branch="${BRANCH:-main}" tag="${RELEASE_TAG:-}"
   local pattern="${RELEASE_PATTERN:-v[0-9]*.[0-9]*.[0-9]*}"
   local args=("$@") ref="" url="" url_ref="" script=""
 
@@ -196,7 +196,12 @@ PY
         command -v git >/dev/null 2>&1 || trigger_auto_rollback "Thiếu công cụ git trên máy chủ."
         ref="$(git ls-remote --tags --refs "$repo_url" "refs/tags/${pattern}" 2>/dev/null | awk '{ sub("refs/tags/", "", $2); print $2 }' | sort -V | tail -n 1 || true)"
       fi
+      local head_sha="" tag_sha=""
+      head_sha="$(git ls-remote "$repo_url" "refs/heads/${branch:-main}" 2>/dev/null | awk 'NR==1 { print $1 }' || true)"
       if [[ -n "$ref" ]]; then
+        tag_sha="$(git ls-remote "$repo_url" "refs/tags/${ref}^{}" "refs/tags/${ref}" 2>/dev/null | tail -n 1 | awk '{ print $1 }' || true)"
+      fi
+      if [[ -n "$ref" && ( -z "$head_sha" || "$head_sha" == "$tag_sha" ) ]]; then
         url_ref="refs/tags/${ref}"
       else
         channel="branch"

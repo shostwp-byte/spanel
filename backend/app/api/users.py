@@ -393,6 +393,10 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
     resource_monitor.apply_user_cgroup_limits_async(user.id)
     from app.services import resource_monitor
     resource_monitor.apply_user_cgroup_limits_async(user.id)
+    from app.services import resource_monitor
+    resource_monitor.apply_user_cgroup_limits_async(user.id)
+    from app.services import resource_monitor
+    resource_monitor.apply_user_cgroup_limits_async(user.id)
 
     # Send welcome email if configured
     if user.email:
@@ -485,6 +489,12 @@ def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_c
             data["owner_role"] = owner.role
         known = storage_quota.cached_storage_used_bytes(user.id)
         limit_bytes = storage_quota.user_storage_limit_bytes(user)
+        from app.services import resource_monitor
+        data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
+        data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)
+        from app.services import resource_monitor
+        data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
+        data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)
         from app.services import resource_monitor
         data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
         data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)

@@ -1313,17 +1313,34 @@ else
         unzip -q "$archive" -d "$extract_dir"
         SOURCE_DIR="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
         [[ -n "$SOURCE_DIR" && -d "$SOURCE_DIR/backend" && -d "$SOURCE_DIR/frontend" ]] || fail "Archive does not contain backend/frontend source"
-        UPDATE_REF="v$(cat "$SOURCE_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' || echo '1.0.6')"
+        UPDATE_REF="v$(cat "$SOURCE_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' || echo '1.0.7')"
         write_update_state "updating" "$UPDATE_REF" "Updating SPanel from ${UPDATE_REF}"
       fi
       ;;
     tag)
       [[ -n "$RELEASE_TAG" ]] || fail "--tag requires a release tag"
-      UPDATE_REF="$RELEASE_TAG"
-      write_update_state "updating" "$UPDATE_REF" "Updating SPanel from ${UPDATE_REF}"
-      update_progress 15 "fetching" "Downloading release ${RELEASE_TAG}"
-      download_release_source "$RELEASE_TAG"
-      echo "Release: ${RELEASE_TAG}"
+      HEAD_SHA="$(git ls-remote "$REPO_URL" "refs/heads/${BRANCH:-main}" 2>/dev/null | awk 'NR==1 { print $1 }' || true)"
+      TAG_SHA="$(git ls-remote "$REPO_URL" "refs/tags/${RELEASE_TAG}^{}" "refs/tags/${RELEASE_TAG}" 2>/dev/null | tail -n 1 | awk '{ print $1 }' || true)"
+      if [[ -n "${SPANEL_FORCE_TAG:-}" || -z "$HEAD_SHA" || "$HEAD_SHA" == "$TAG_SHA" ]]; then
+        UPDATE_REF="$RELEASE_TAG"
+        write_update_state "updating" "$UPDATE_REF" "Updating SPanel from ${UPDATE_REF}"
+        update_progress 15 "fetching" "Downloading release ${RELEASE_TAG}"
+        download_release_source "$RELEASE_TAG"
+        echo "Release: ${RELEASE_TAG}"
+      else
+        log "Tag ${RELEASE_TAG} is behind ${BRANCH:-main}; pulling latest branch ${BRANCH:-main} from ${REPO_URL}"
+        RELEASE_WORK_DIR="$(mktemp -d /tmp/spanel-release-update.XXXXXX)"
+        archive="${RELEASE_WORK_DIR}/spanel-release.zip"
+        extract_dir="${RELEASE_WORK_DIR}/extract"
+        base="${REPO_URL%.git}"
+        curl -fL --connect-timeout 10 --max-time 300 "${base}/archive/HEAD.zip" -o "$archive"
+        mkdir -p "$extract_dir"
+        unzip -q "$archive" -d "$extract_dir"
+        SOURCE_DIR="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+        [[ -n "$SOURCE_DIR" && -d "$SOURCE_DIR/backend" && -d "$SOURCE_DIR/frontend" ]] || fail "Archive does not contain backend/frontend source"
+        UPDATE_REF="v$(cat "$SOURCE_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' || echo '1.0.7')"
+        write_update_state "updating" "$UPDATE_REF" "Updating SPanel from ${UPDATE_REF}"
+      fi
       ;;
     branch)
       if [[ "$(readlink -f "$SOURCE_DIR")" == "$(readlink -f "$APP_DIR")" ]]; then
