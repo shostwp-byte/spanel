@@ -1,7 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
+<<<<<<< Updated upstream
+import React, { useState, useEffect } from 'react';
 import {
-  ArrowLeft, Boxes, Check, CloudDownload, Cpu, FileSpreadsheet, FileText,
+  ArrowLeft, Boxes, Cpu, Globe, Pencil, Plus, RefreshCw, Save, ShieldCheck, Trash2, X
+=======
+import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import {
+  ArrowLeft, Boxes, Check, CloudDownload, Cpu, Eye, EyeOff, FileSpreadsheet, FileText,
   FolderUp, Globe, Pencil, Plus, RefreshCw, Save, Server, ShieldCheck, Sparkles, Trash2, Upload, X
+>>>>>>> Stashed changes
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
@@ -57,16 +64,9 @@ export const DEFAULT_PKG_STATE = {
   system_info: false,
   cgi_access: false,
   anonymous_ftp: false,
-  personal_dns_mode: 'none',
+  personal_dns_mode: 'off',
   share_server_ip: true,
 };
-
-function normalizePersonalDnsMode(val) {
-  const s = String(val ?? '').trim().toLowerCase();
-  if (['3_ips', 'three', '3'].includes(s)) return '3_ips';
-  if (['2_ips', 'two', '2', 'on', 'yes', 'true', '1'].includes(s)) return '2_ips';
-  return 'none';
-}
 
 function normalizePackageToForm(pkg) {
   const aliasVal = pkg.alias_limit ?? pkg.domain_pointers_limit ?? 0;
@@ -81,7 +81,6 @@ function normalizePackageToForm(pkg) {
     ftp_accounts_limit: sftpVal,
     terminal_enabled: termVal,
     ssh_access: termVal,
-    personal_dns_mode: normalizePersonalDnsMode(pkg.personal_dns_mode),
     node_apps_limit: Number(pkg.node_apps_limit || 0),
     node_app_memory_mb: Math.max(64, Number(pkg.node_app_memory_mb || 512)),
     backup_retention_days: Math.max(1, Number(pkg.backup_retention_days || 14)),
@@ -100,584 +99,6 @@ function formatCount(val) {
   return n <= 0 ? '∞' : n.toLocaleString();
 }
 
-function parseQuotaInt(val, fallback = 0, bytesToMb = false) {
-  if (val === undefined || val === null) return fallback;
-  if (typeof val === 'number') {
-    if (val < 0) return 0;
-    if (bytesToMb && val >= 1048576) return Math.max(1, Math.round(val / 1048576));
-    return Math.round(val);
-  }
-  const s = String(val).trim().toLowerCase();
-  if (!s || ['unlimited', 'unlim', 'inf', 'infinite', '∞', '-1', 'none', 'null', 'all'].includes(s)) {
-    return 0;
-  }
-  const m = s.match(/^([+-]?\d+(?:\.\d+)?)\s*([kmgt]b?)?$/i);
-  if (m) {
-    const num = parseFloat(m[1]);
-    if (num < 0) return 0;
-    const unit = (m[2] || '').toLowerCase().replace('b', '');
-    if (unit === 'g') return Math.round(num * 1024);
-    if (unit === 't') return Math.round(num * 1024 * 1024);
-    if (unit === 'k') return num > 0 ? Math.max(1, Math.round(num / 1024)) : 0;
-    const n = Math.round(num);
-    if (bytesToMb && n >= 1048576) return Math.max(1, Math.round(n / 1048576));
-    return n;
-  }
-  const numOnly = parseInt(s.replace(/[^0-9-]/g, ''), 10);
-  if (isNaN(numOnly)) return fallback;
-  if (numOnly < 0) return 0;
-  if (bytesToMb && numOnly >= 1048576) return Math.max(1, Math.round(numOnly / 1048576));
-  return numOnly;
-}
-
-function parseBoolFlag(val, fallback = true) {
-  if (val === undefined || val === null) return fallback;
-  if (typeof val === 'boolean') return val;
-  const s = String(val).trim().toLowerCase();
-  if (['on', 'yes', 'y', 'true', '1', 'enabled', 'allow', 'two', 'three'].includes(s)) return true;
-  if (['off', 'no', 'n', 'false', '0', 'disabled', 'none', 'deny', '/bin/false', '/sbin/nologin'].includes(s)) return false;
-  return fallback;
-}
-
-function mapDirectAdminRecord(name, raw, isReseller = false) {
-  const kv = {};
-  Object.entries(raw || {}).forEach(([k, v]) => {
-    kv[String(k).trim().toLowerCase()] = v;
-  });
-  const pkg = {
-    ...DEFAULT_PKG_STATE,
-    name: (name || kv.name || kv.package || 'DA_Package').trim(),
-    is_reseller_package: Boolean(isReseller),
-    reseller_user_limit: isReseller ? 25 : 0,
-    ips_limit: isReseller ? 1 : 0,
-    source_panel: 'directadmin',
-  };
-  if ('quota' in kv) pkg.storage_limit_mb = parseQuotaInt(kv.quota, 5120);
-  if ('bandwidth' in kv) pkg.bandwidth_limit_mb = parseQuotaInt(kv.bandwidth, 102400);
-  if ('vdomains' in kv) pkg.website_limit = parseQuotaInt(kv.vdomains, 5);
-  if ('nsubdomains' in kv) pkg.subdomain_limit = parseQuotaInt(kv.nsubdomains, 20);
-  if ('domainptr' in kv) {
-    const ptr = parseQuotaInt(kv.domainptr, 10);
-    pkg.alias_limit = ptr;
-    pkg.domain_pointers_limit = ptr;
-  }
-  if ('inode' in kv) pkg.inode_limit = parseQuotaInt(kv.inode, 250000);
-  if ('mysql' in kv) pkg.database_limit = parseQuotaInt(kv.mysql, 5);
-  if ('nemails' in kv) pkg.mail_accounts_limit = parseQuotaInt(kv.nemails, 10);
-  if ('nemailf' in kv) pkg.email_forwarders_limit = parseQuotaInt(kv.nemailf, 20);
-  if ('nemailr' in kv) pkg.autoresponders_limit = parseQuotaInt(kv.nemailr, 10);
-  if ('nemailml' in kv) pkg.mailing_lists_limit = parseQuotaInt(kv.nemailml, 0);
-  if ('ftp' in kv) {
-    const ftpVal = parseQuotaInt(kv.ftp, 5);
-    pkg.sftp_accounts_limit = ftpVal;
-    pkg.ftp_accounts_limit = ftpVal;
-  }
-  if ('nusers' in kv) {
-    pkg.reseller_user_limit = parseQuotaInt(kv.nusers, 25);
-    pkg.is_reseller_package = true;
-  }
-  if ('ips' in kv) pkg.ips_limit = parseQuotaInt(kv.ips, 0);
-  if ('oversell' in kv) pkg.reseller_overselling_enabled = parseBoolFlag(kv.oversell, false);
-  if ('php' in kv) pkg.php_access = parseBoolFlag(kv.php, true);
-  if ('ssl' in kv) pkg.ssl_access = parseBoolFlag(kv.ssl, true);
-  if ('ssh' in kv) {
-    const sshFlag = parseBoolFlag(kv.ssh, false);
-    pkg.terminal_enabled = sshFlag;
-    pkg.ssh_access = sshFlag;
-  }
-  if ('userssh' in kv) pkg.ssh_access_users = parseBoolFlag(kv.userssh, false);
-  if ('cron' in kv) pkg.cron_jobs = parseBoolFlag(kv.cron, true);
-  if ('dnscontrol' in kv) pkg.dns_control = parseBoolFlag(kv.dnscontrol, true);
-  if ('git' in kv) pkg.git_access = parseBoolFlag(kv.git, true);
-  if ('redis' in kv) pkg.redis_access = parseBoolFlag(kv.redis, true);
-  if ('spam' in kv) pkg.spamassassin = parseBoolFlag(kv.spam, true);
-  if ('catchall' in kv) pkg.catch_all_email = parseBoolFlag(kv.catchall, false);
-  if ('login_keys' in kv) pkg.login_keys = parseBoolFlag(kv.login_keys, true);
-  if ('sysinfo' in kv) pkg.system_info = parseBoolFlag(kv.sysinfo, false);
-  if ('cgi' in kv) pkg.cgi_access = parseBoolFlag(kv.cgi, false);
-  if ('aftp' in kv) pkg.anonymous_ftp = parseBoolFlag(kv.aftp, false);
-  if ('serverip' in kv) pkg.share_server_ip = parseBoolFlag(kv.serverip, true);
-  if ('dns' in kv) {
-    pkg.personal_dns_mode = normalizePersonalDnsMode(kv.dns);
-  }
-  if ('cpu_quota' in kv || 'lve_cpu' in kv) {
-    pkg.cpu_quota_percent = parseQuotaInt(kv.cpu_quota ?? kv.lve_cpu, 100);
-  }
-  if ('mem_max' in kv || 'lve_pmem' in kv) {
-    const mem = parseQuotaInt(kv.mem_max ?? kv.lve_pmem, 1024);
-    pkg.memory_max_mb = mem;
-    pkg.memory_high_mb = mem > 0 ? Math.max(256, Math.round(mem * 0.75)) : 0;
-  }
-  if ('tasks_max' in kv || 'lve_nproc' in kv || 'lve_ep' in kv) {
-    pkg.tasks_max = parseQuotaInt(kv.tasks_max ?? kv.lve_nproc ?? kv.lve_ep, 80);
-  }
-  return pkg;
-}
-
-function mapCpanelRecord(name, raw, isReseller = false) {
-  const kv = {};
-  Object.entries(raw || {}).forEach(([k, v]) => {
-    kv[String(k).trim().toUpperCase()] = v;
-  });
-  const pkg = {
-    ...DEFAULT_PKG_STATE,
-    name: (name || kv.NAME || kv.PACKAGE || 'cPanel_Package').trim(),
-    is_reseller_package: Boolean(isReseller),
-    reseller_user_limit: isReseller ? 25 : 0,
-    ips_limit: isReseller ? 1 : 0,
-    source_panel: 'cpanel',
-  };
-  if ('QUOTA' in kv) pkg.storage_limit_mb = parseQuotaInt(kv.QUOTA, 5120);
-  if ('BWLIMIT' in kv) pkg.bandwidth_limit_mb = parseQuotaInt(kv.BWLIMIT, 102400);
-  if ('MAXADDON' in kv) {
-    const addonRaw = String(kv.MAXADDON ?? '').trim().toLowerCase();
-    if (['unlimited', 'unlim', '∞', '-1', 'all'].includes(addonRaw)) {
-      pkg.website_limit = 0;
-    } else {
-      pkg.website_limit = 1 + parseQuotaInt(addonRaw, 0);
-    }
-  }
-  if ('MAXSUB' in kv) pkg.subdomain_limit = parseQuotaInt(kv.MAXSUB, 20);
-  if ('MAXPARK' in kv) {
-    const park = parseQuotaInt(kv.MAXPARK, 10);
-    pkg.alias_limit = park;
-    pkg.domain_pointers_limit = park;
-  }
-  if ('MAXSQL' in kv) pkg.database_limit = parseQuotaInt(kv.MAXSQL, 5);
-  if ('MAXPOP' in kv) pkg.mail_accounts_limit = parseQuotaInt(kv.MAXPOP, 10);
-  if ('MAXFTP' in kv) {
-    const ftpVal = parseQuotaInt(kv.MAXFTP, 5);
-    pkg.sftp_accounts_limit = ftpVal;
-    pkg.ftp_accounts_limit = ftpVal;
-  }
-  if ('MAXLST' in kv) pkg.mailing_lists_limit = parseQuotaInt(kv.MAXLST, 0);
-  if ('HASSHELL' in kv) {
-    const sh = parseBoolFlag(kv.HASSHELL, false);
-    pkg.terminal_enabled = sh;
-    pkg.ssh_access = sh;
-  }
-  if ('CGI' in kv) pkg.cgi_access = parseBoolFlag(kv.CGI, false);
-  if ('IP' in kv) pkg.ips_limit = parseBoolFlag(kv.IP, false) ? 1 : 0;
-  if ('MAXACCT' in kv || 'ACCT_LIMIT' in kv) {
-    pkg.reseller_user_limit = parseQuotaInt(kv.MAXACCT ?? kv.ACCT_LIMIT, 25);
-    pkg.is_reseller_package = true;
-  }
-  if ('OVERSELL' in kv) pkg.reseller_overselling_enabled = parseBoolFlag(kv.OVERSELL, false);
-  return pkg;
-}
-
-function mapPleskRecord(name, raw, isReseller = false) {
-  const kv = {};
-  Object.entries(raw || {}).forEach(([k, v]) => {
-    kv[String(k).trim().toLowerCase()] = v;
-  });
-  const pkg = {
-    ...DEFAULT_PKG_STATE,
-    name: (name || kv.name || kv.plan_name || 'Plesk_Plan').trim(),
-    is_reseller_package: Boolean(isReseller),
-    reseller_user_limit: isReseller ? 25 : 0,
-    ips_limit: isReseller ? 1 : 0,
-    source_panel: 'plesk',
-  };
-  if ('disk_space' in kv) pkg.storage_limit_mb = parseQuotaInt(kv.disk_space, 5120, true);
-  if ('max_traffic' in kv || 'traffic' in kv) {
-    pkg.bandwidth_limit_mb = parseQuotaInt(kv.max_traffic ?? kv.traffic, 102400, true);
-  }
-  if ('max_dom' in kv || 'max_site' in kv) {
-    pkg.website_limit = parseQuotaInt(kv.max_dom ?? kv.max_site, 5);
-  }
-  if ('max_subdom' in kv) pkg.subdomain_limit = parseQuotaInt(kv.max_subdom, 20);
-  if ('max_dom_aliases' in kv) {
-    const aliasVal = parseQuotaInt(kv.max_dom_aliases, 10);
-    pkg.alias_limit = aliasVal;
-    pkg.domain_pointers_limit = aliasVal;
-  }
-  if ('max_db' in kv || 'max_mysql_db' in kv) {
-    pkg.database_limit = parseQuotaInt(kv.max_db ?? kv.max_mysql_db, 5);
-  }
-  if ('max_box' in kv) pkg.mail_accounts_limit = parseQuotaInt(kv.max_box, 10);
-  if ('max_subftp_users' in kv || 'max_wu' in kv) {
-    const ftpVal = parseQuotaInt(kv.max_subftp_users ?? kv.max_wu, 5);
-    pkg.sftp_accounts_limit = ftpVal;
-    pkg.ftp_accounts_limit = ftpVal;
-  }
-  if ('max_maillists' in kv) pkg.mailing_lists_limit = parseQuotaInt(kv.max_maillists, 0);
-  if ('max_cl' in kv) {
-    pkg.reseller_user_limit = parseQuotaInt(kv.max_cl, 25);
-    pkg.is_reseller_package = true;
-  }
-  if ('oversell' in kv) pkg.reseller_overselling_enabled = parseBoolFlag(kv.oversell, false);
-  if ('allow_sh_access' in kv || 'shell' in kv) {
-    const shVal = String(kv.allow_sh_access ?? kv.shell ?? '').trim().toLowerCase();
-    const shFlag = !['false', 'off', 'no', '0', 'none', '/bin/false', '/sbin/nologin'].includes(shVal);
-    pkg.terminal_enabled = shFlag;
-    pkg.ssh_access = shFlag;
-  }
-  if ('php' in kv) pkg.php_access = parseBoolFlag(kv.php, true);
-  if ('ssl' in kv) pkg.ssl_access = parseBoolFlag(kv.ssl, true);
-  if ('manage_crontab' in kv) pkg.cron_jobs = parseBoolFlag(kv.manage_crontab, true);
-  if ('manage_dns' in kv) pkg.dns_control = parseBoolFlag(kv.manage_dns, true);
-  if ('manage_spamfilter' in kv) pkg.spamassassin = parseBoolFlag(kv.manage_spamfilter, true);
-  if ('git' in kv) pkg.git_access = parseBoolFlag(kv.git, true);
-  return pkg;
-}
-
-function parseRawPackageContent(text, defaultName, panelHint = 'directadmin', isReseller = false) {
-  const trimmed = (text || '').trim();
-  if (!trimmed) return [];
-
-  // 1. Check if XML (Plesk <service-plan> / <reseller-plan> / <domain-template>)
-  if (trimmed.startsWith('<') && (trimmed.includes('service-plan') || trimmed.includes('reseller-plan') || trimmed.includes('limits') || trimmed.includes('domain-template'))) {
-    try {
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(trimmed, 'text/xml');
-      const planNodes = Array.from(
-        doc.querySelectorAll('service-plan > get > result, reseller-plan > get > result, service-plan > add, reseller-plan > add, domain-template, plan')
-      );
-      const targets = planNodes.length > 0 ? planNodes : [doc.documentElement];
-      const parsedPlans = [];
-      targets.forEach((node, idx) => {
-        const nameNode = node.querySelector(':scope > name') || node.querySelector('name');
-        const pName = (nameNode ? nameNode.textContent : defaultName || `Plesk_Plan_${idx + 1}`).trim();
-        const flat = {};
-        node.querySelectorAll('limit').forEach(lim => {
-          const ln = lim.querySelector('name')?.textContent?.trim();
-          const lv = lim.querySelector('value')?.textContent?.trim();
-          if (ln) flat[ln] = lv;
-        });
-        node.querySelectorAll('permission').forEach(perm => {
-          const pn = perm.querySelector('name')?.textContent?.trim();
-          const pv = perm.querySelector('value')?.textContent?.trim();
-          if (pn) flat[pn] = pv;
-        });
-        if (Object.keys(flat).length > 0) {
-          parsedPlans.push(mapPleskRecord(pName, flat, isReseller));
-        }
-      });
-      if (parsedPlans.length > 0) return parsedPlans;
-    } catch (_) {
-      // Fall through to text parser
-    }
-  }
-
-  // 2. Check if JSON (WHM listpkgs, Plesk REST API, DirectAdmin JSON, or array of packages)
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      const obj = JSON.parse(trimmed);
-      const items = Array.isArray(obj)
-        ? obj
-        : (obj?.data?.pkg || obj?.pkg || obj?.packages || obj?.plans || [obj]);
-      const out = [];
-      items.forEach((it, idx) => {
-        if (!it || typeof it !== 'object') return;
-        const pName = String(it.name || it.PACKAGE || it.pkg || defaultName || `Imported_${idx + 1}`).trim();
-        if (Array.isArray(it.limits) || 'disk_space' in it || 'max_dom' in it || panelHint === 'plesk') {
-          const flat = { ...it };
-          if (Array.isArray(it.limits)) {
-            it.limits.forEach(l => { if (l?.name) flat[l.name] = l.value; });
-          }
-          if (Array.isArray(it.permissions)) {
-            it.permissions.forEach(p => { if (p?.name) flat[p.name] = p.value; });
-          }
-          out.push(mapPleskRecord(pName, flat, isReseller));
-        } else if ('QUOTA' in it || 'BWLIMIT' in it || 'MAXADDON' in it || 'MAXPOP' in it || panelHint === 'cpanel') {
-          out.push(mapCpanelRecord(pName, it, isReseller));
-        } else {
-          out.push(mapDirectAdminRecord(pName, it, isReseller));
-        }
-      });
-      if (out.length > 0) return out;
-    } catch (_) {
-      // Fall through to line/section parser
-    }
-  }
-
-  // 3. Support multi-package blocks separated by [package_name] or --- package_name ---
-  const blocks = [];
-  let currentHeader = defaultName || (panelHint === 'cpanel' ? 'cPanel_Package' : panelHint === 'plesk' ? 'Plesk_Plan' : 'DA_Package');
-  let currentLines = [];
-  for (const rawLine of trimmed.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#') || line.startsWith(';')) continue;
-    const secMatch = line.match(/^\[([^\]]+)\]$/) || line.match(/^===+\s*([^=]+?)\s*===+$/);
-    if (secMatch) {
-      if (currentLines.length > 0) {
-        blocks.push({ name: currentHeader, lines: currentLines });
-        currentLines = [];
-      }
-      currentHeader = secMatch[1].trim();
-      continue;
-    }
-    currentLines.push(line);
-  }
-  if (currentLines.length > 0) {
-    blocks.push({ name: currentHeader, lines: currentLines });
-  }
-
-  return blocks.map(blk => {
-    const kv = {};
-    blk.lines.forEach(line => {
-      // Also support URL query string on a single line: bandwidth=102400&quota=5120&vdomains=5
-      if (line.includes('&') && line.includes('=') && !line.includes(' ')) {
-        line.split('&').forEach(pair => {
-          const eqIdx = pair.indexOf('=');
-          if (eqIdx > 0) {
-            const k = decodeURIComponent(pair.slice(0, eqIdx).trim());
-            const v = decodeURIComponent(pair.slice(eqIdx + 1).trim());
-            kv[k] = v;
-          }
-        });
-        return;
-      }
-      const eqIdx = line.indexOf('=');
-      const colonIdx = line.indexOf(':');
-      if (eqIdx > 0) {
-        const k = line.slice(0, eqIdx).trim();
-        const v = line.slice(eqIdx + 1).trim();
-        kv[k] = v;
-      } else if (colonIdx > 0) {
-        const k = line.slice(0, colonIdx).trim();
-        const v = line.slice(colonIdx + 1).trim();
-        kv[k] = v;
-      }
-    });
-
-    const pkgName = String(kv.name || kv.NAME || kv.package || kv.PACKAGE || blk.name).trim();
-    const keysUpper = Object.keys(kv).map(k => k.toUpperCase());
-    const keysLower = Object.keys(kv).map(k => k.toLowerCase());
-
-    if (keysUpper.some(k => ['BWLIMIT', 'MAXADDON', 'MAXPOP', 'MAXSQL', 'HASSHELL', 'FEATURELIST'].includes(k))) {
-      return mapCpanelRecord(pkgName, kv, isReseller);
-    }
-    if (keysLower.some(k => ['disk_space', 'max_traffic', 'max_dom', 'max_subdom', 'max_box', 'max_wu'].includes(k))) {
-      return mapPleskRecord(pkgName, kv, isReseller);
-    }
-    if (panelHint === 'cpanel') return mapCpanelRecord(pkgName, kv, isReseller);
-    if (panelHint === 'plesk') return mapPleskRecord(pkgName, kv, isReseller);
-    return mapDirectAdminRecord(pkgName, kv, isReseller);
-  });
-}
-
-function getSampleConfigText(panel, isReseller) {
-  if (panel === 'directadmin') {
-    if (isReseller) {
-      return `[DA_Reseller_Silver]
-bandwidth=512000
-quota=51200
-inode=1000000
-vdomains=unlimited
-nsubdomains=unlimited
-nemails=unlimited
-nemailf=unlimited
-nemailr=unlimited
-mysql=unlimited
-domainptr=unlimited
-ftp=unlimited
-nusers=30
-ips=1
-oversell=ON
-php=ON
-ssl=ON
-ssh=OFF
-userssh=ON
-dnscontrol=ON
-cron=ON
-sysinfo=ON
-login_keys=ON
-dns=TWO
-serverip=ON
-
-[DA_Reseller_Gold]
-bandwidth=unlimited
-quota=153600
-inode=3000000
-vdomains=unlimited
-nsubdomains=unlimited
-nemails=unlimited
-mysql=unlimited
-ftp=unlimited
-nusers=100
-ips=2
-oversell=ON
-php=ON
-ssl=ON
-ssh=ON
-userssh=ON
-dnscontrol=ON
-cron=ON
-dns=TWO
-serverip=ON`;
-    }
-    return `[DA_Starter_Basic]
-bandwidth=51200
-quota=5120
-inode=150000
-vdomains=2
-nsubdomains=10
-nemails=10
-nemailf=20
-nemailr=5
-nemailml=0
-mysql=2
-domainptr=5
-ftp=2
-aftp=OFF
-cgi=OFF
-php=ON
-spam=ON
-catchall=OFF
-ssl=ON
-ssh=OFF
-cron=ON
-sysinfo=OFF
-login_keys=ON
-dnscontrol=ON
-git=ON
-redis=ON
-
-[DA_Business_Pro]
-bandwidth=unlimited
-quota=25600
-inode=500000
-vdomains=15
-nsubdomains=unlimited
-nemails=unlimited
-nemailf=unlimited
-mysql=20
-domainptr=20
-ftp=10
-php=ON
-spam=ON
-catchall=ON
-ssl=ON
-ssh=ON
-cron=ON
-login_keys=ON
-dnscontrol=ON
-git=ON
-redis=ON`;
-  }
-
-  if (panel === 'cpanel') {
-    if (isReseller) {
-      return `[cPanel_Reseller_Starter]
-QUOTA=51200
-BWLIMIT=512000
-MAXACCT=25
-OVERSELL=y
-MAXADDON=unlimited
-MAXSUB=unlimited
-MAXPARK=unlimited
-MAXSQL=unlimited
-MAXPOP=unlimited
-MAXFTP=unlimited
-HASSHELL=n
-CGI=y
-IP=y
-
-[cPanel_Reseller_Enterprise]
-QUOTA=204800
-BWLIMIT=unlimited
-MAXACCT=100
-OVERSELL=y
-MAXADDON=unlimited
-MAXSUB=unlimited
-MAXPARK=unlimited
-MAXSQL=unlimited
-MAXPOP=unlimited
-MAXFTP=unlimited
-HASSHELL=y
-CGI=y
-IP=y`;
-    }
-    return `[cPanel_WP_Standard]
-QUOTA=10240
-BWLIMIT=102400
-MAXADDON=4
-MAXSUB=25
-MAXPARK=10
-MAXSQL=10
-MAXPOP=25
-MAXFTP=5
-MAXLST=0
-HASSHELL=n
-CGI=n
-IP=n
-FEATURELIST=default
-
-[cPanel_Ecommerce_VIP]
-QUOTA=51200
-BWLIMIT=unlimited
-MAXADDON=19
-MAXSUB=unlimited
-MAXPARK=unlimited
-MAXSQL=50
-MAXPOP=unlimited
-MAXFTP=20
-HASSHELL=y
-CGI=y
-IP=y
-FEATURELIST=default`;
-  }
-
-  // Plesk XML / Key-Value format
-  if (isReseller) {
-    return `<?xml version="1.0" encoding="UTF-8"?>
-<packet>
-  <reseller-plan>
-    <get>
-      <result>
-        <name>Plesk Reseller Partner</name>
-        <limits>
-          <limit><name>max_cl</name><value>40</value></limit>
-          <limit><name>disk_space</name><value>107374182400</value></limit>
-          <limit><name>max_traffic</name><value>-1</value></limit>
-          <limit><name>max_dom</name><value>-1</value></limit>
-          <limit><name>max_subdom</name><value>-1</value></limit>
-          <limit><name>max_db</name><value>-1</value></limit>
-          <limit><name>max_box</name><value>-1</value></limit>
-          <limit><name>oversell</name><value>true</value></limit>
-        </limits>
-        <permissions>
-          <permission><name>allow_sh_access</name><value>true</value></permission>
-          <permission><name>manage_dns</name><value>true</value></permission>
-          <permission><name>manage_crontab</name><value>true</value></permission>
-        </permissions>
-      </result>
-    </get>
-  </reseller-plan>
-</packet>`;
-  }
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<packet>
-  <service-plan>
-    <get>
-      <result>
-        <name>Plesk Web Host Edition</name>
-        <limits>
-          <limit><name>disk_space</name><value>16106127360</value></limit>
-          <limit><name>max_traffic</name><value>214748364800</value></limit>
-          <limit><name>max_dom</name><value>10</value></limit>
-          <limit><name>max_subdom</name><value>50</value></limit>
-          <limit><name>max_dom_aliases</name><value>20</value></limit>
-          <limit><name>max_db</name><value>15</value></limit>
-          <limit><name>max_box</name><value>30</value></limit>
-          <limit><name>max_subftp_users</name><value>10</value></limit>
-        </limits>
-        <permissions>
-          <permission><name>allow_sh_access</name><value>false</value></permission>
-          <permission><name>php</name><value>true</value></permission>
-          <permission><name>ssl</name><value>true</value></permission>
-          <permission><name>manage_dns</name><value>true</value></permission>
-          <permission><name>manage_crontab</name><value>true</value></permission>
-          <permission><name>git</name><value>true</value></permission>
-        </permissions>
-      </result>
-    </get>
-  </service-plan>
-</packet>`;
-}
-
 export function PackagesPage({ mode = 'users' }) {
   const {
     packages, users, request, setNotice, setError, loading, loadPackages, loadUsers,
@@ -689,6 +110,8 @@ export function PackagesPage({ mode = 'users' }) {
   const [editingPackageId, setEditingPackageId] = useState(null);
   const [editingPackageForm, setEditingPackageForm] = useState({ ...DEFAULT_PKG_STATE });
 
+<<<<<<< Updated upstream
+=======
   // Import Modal State
   const [showImportModal, setShowImportModal] = useState(false);
   const [importPanel, setImportPanel] = useState('directadmin'); // directadmin | cpanel | plesk
@@ -703,8 +126,10 @@ export function PackagesPage({ mode = 'users' }) {
     auth_type: 'password',
     verify_ssl: false,
   });
+  const [showRemoteSecret, setShowRemoteSecret] = useState(false);
   const fileInputRef = useRef(null);
 
+>>>>>>> Stashed changes
   useEffect(() => {
     setPackageTab('list');
     setEditingPackageId(null);
@@ -731,169 +156,14 @@ export function PackagesPage({ mode = 'users' }) {
     for (const key of intFields) {
       clean[key] = Math.max(0, parseInt(clean[key], 10) || 0);
     }
-    clean.website_limit = Math.min(1000, clean.website_limit);
-    clean.storage_limit_mb = Math.min(1024 * 1024, clean.storage_limit_mb);
-    clean.database_limit = Math.min(10000, clean.database_limit);
-    clean.alias_limit = Math.min(1000, clean.alias_limit);
     clean.domain_pointers_limit = clean.alias_limit;
-    clean.sftp_accounts_limit = Math.min(100, clean.sftp_accounts_limit);
     clean.ftp_accounts_limit = clean.sftp_accounts_limit;
-    clean.mail_accounts_limit = Math.min(1000, clean.mail_accounts_limit);
-    clean.node_apps_limit = Math.min(100, clean.node_apps_limit);
-    clean.reseller_user_limit = Math.min(10000, clean.reseller_user_limit);
     clean.ssh_access = Boolean(clean.terminal_enabled);
     clean.terminal_enabled = Boolean(clean.terminal_enabled);
     clean.node_app_memory_mb = Math.min(16384, Math.max(64, clean.node_app_memory_mb || 512));
     clean.backup_retention_days = Math.min(365, Math.max(1, clean.backup_retention_days || 14));
-    clean.personal_dns_mode = normalizePersonalDnsMode(clean.personal_dns_mode);
     clean.is_reseller_package = mode === 'resellers';
-    delete clean._selected;
-    delete clean._id;
-    delete clean.source_panel;
     return clean;
-  }
-
-  function openImportModal(defaultPanel = 'directadmin') {
-    setImportPanel(defaultPanel);
-    setImportMethod('file');
-    setShowImportModal(true);
-  }
-
-  async function handleFileSelect(e) {
-    const files = Array.from(e.target.files || []);
-    if (files.length === 0) return;
-    const isResellerMode = mode === 'resellers';
-    const newlyParsed = [];
-    for (const file of files) {
-      try {
-        const content = await file.text();
-        const baseName = file.name.replace(/\.(pkg|conf|txt|json|xml|plan)$/i, '').trim() || file.name;
-        const items = parseRawPackageContent(content, baseName, importPanel, isResellerMode);
-        items.forEach(it => {
-          newlyParsed.push({
-            ...it,
-            is_reseller_package: isResellerMode,
-            _selected: true,
-            _id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          });
-        });
-      } catch (err) {
-        setError(`${t('Failed to read file')}: ${file.name}`);
-      }
-    }
-    if (newlyParsed.length > 0) {
-      setParsedPackages(prev => [...prev, ...newlyParsed]);
-      setNotice(t('Parsed {count} package(s) from uploaded file(s).', { count: newlyParsed.length }));
-    } else {
-      setError(t('Could not detect any valid package configuration in the selected file(s).'));
-    }
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  }
-
-  function handleParseRawText(customText) {
-    const textToParse = typeof customText === 'string' ? customText : rawImportText;
-    if (!textToParse.trim()) {
-      setError(t('Please paste package configuration content or load a sample template first.'));
-      return;
-    }
-    const isResellerMode = mode === 'resellers';
-    const items = parseRawPackageContent(textToParse, '', importPanel, isResellerMode);
-    if (items.length === 0) {
-      setError(t('Could not detect any valid package configuration.'));
-      return;
-    }
-    const decorated = items.map(it => ({
-      ...it,
-      is_reseller_package: isResellerMode,
-      _selected: true,
-      _id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    }));
-    setParsedPackages(decorated);
-  }
-
-  function handleLoadSample() {
-    const sample = getSampleConfigText(importPanel, mode === 'resellers');
-    setRawImportText(sample);
-    handleParseRawText(sample);
-  }
-
-  async function handleFetchRemotePackages(e) {
-    if (e && e.preventDefault) e.preventDefault();
-    if (!remoteForm.host_url.trim() || !remoteForm.secret.trim()) {
-      setError(t('Please enter the remote Panel URL and Password / API Token.'));
-      return;
-    }
-    const res = await request('/packages/fetch-remote', {
-      method: 'POST',
-      body: JSON.stringify({
-        panel_type: importPanel,
-        host_url: remoteForm.host_url.trim(),
-        username: remoteForm.username.trim() || 'admin',
-        secret: remoteForm.secret,
-        auth_type: remoteForm.auth_type,
-        is_reseller_package: mode === 'resellers',
-        verify_ssl: Boolean(remoteForm.verify_ssl),
-      }),
-    }, t('Connecting to remote panel and fetching packages...'));
-    if (res && Array.isArray(res.packages)) {
-      if (res.packages.length === 0) {
-        setError(t('Connected successfully, but no packages were found on the remote panel.'));
-        return;
-      }
-      const isResellerMode = mode === 'resellers';
-      const decorated = res.packages.map(it => ({
-        ...DEFAULT_PKG_STATE,
-        ...it,
-        is_reseller_package: isResellerMode,
-        source_panel: importPanel,
-        _selected: true,
-        _id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      }));
-      setParsedPackages(decorated);
-      setNotice(t('Fetched {count} package(s) from remote panel.', { count: decorated.length }));
-    }
-  }
-
-  function handleLoadSingleIntoEditor(pkg) {
-    const normalized = normalizePackageToForm(pkg);
-    setEditingPackageId(null);
-    setNewPackage({
-      ...normalized,
-      is_reseller_package: mode === 'resellers',
-    });
-    setShowImportModal(false);
-    setPackageTab('create');
-    setNotice(t('Loaded package "{name}" into the editor. Review and click Create Package to save.', { name: normalized.name }));
-  }
-
-  async function handleBatchImportSubmit() {
-    const selected = parsedPackages.filter(p => p._selected && p.name && p.name.trim());
-    if (selected.length === 0) {
-      setError(t('Please select at least one package with a valid name to import.'));
-      return;
-    }
-    const sanitizedList = selected.map(p => sanitizePayload(p));
-    const res = await request('/packages/import', {
-      method: 'POST',
-      body: JSON.stringify({
-        packages: sanitizedList,
-        conflict_mode: conflictMode,
-        source_panel: importPanel,
-      }),
-    }, t('Importing packages...'));
-    if (res && res.ok) {
-      await loadPackages();
-      setShowImportModal(false);
-      setParsedPackages([]);
-      setRawImportText('');
-      setNotice(
-        t('Import completed: {created} created, {updated} updated, {skipped} skipped.', {
-          created: res.created ?? 0,
-          updated: res.updated ?? 0,
-          skipped: res.skipped ?? 0,
-        })
-      );
-    }
   }
 
   async function createPackage(e) {
@@ -1038,8 +308,6 @@ export function PackagesPage({ mode = 'users' }) {
     return matchMode && matchSearch;
   });
 
-  const selectedImportCount = parsedPackages.filter(p => p._selected).length;
-
   return (
     <div className="section">
       <div className="section-title" style={{ marginBottom: '16px', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1066,14 +334,6 @@ export function PackagesPage({ mode = 'users' }) {
               <RefreshCw size={14} /> {t('Refresh')}
             </button>
             <button
-              type="button"
-              className="secondary-light"
-              onClick={() => openImportModal('directadmin')}
-              title={t('Import packages from DirectAdmin, cPanel/WHM, or Plesk')}
-            >
-              <Upload size={14} /> {t('Import Packages')}
-            </button>
-            <button
               onClick={() => {
                 setEditingPackageId(null);
                 setNewPackage({ ...DEFAULT_PKG_STATE });
@@ -1084,18 +344,9 @@ export function PackagesPage({ mode = 'users' }) {
             </button>
           </div>
         ) : (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              className="secondary-light"
-              onClick={() => openImportModal('directadmin')}
-            >
-              <Upload size={14} /> {t('Import from DA / cPanel / Plesk')}
-            </button>
-            <button className="secondary-light" onClick={cancelEditingPackage}>
-              <ArrowLeft size={14} /> {t('Back to Package List')}
-            </button>
-          </div>
+          <button className="secondary-light" onClick={cancelEditingPackage}>
+            <ArrowLeft size={14} /> {t('Back to Package List')}
+          </button>
         )}
       </div>
 
@@ -1112,11 +363,7 @@ export function PackagesPage({ mode = 'users' }) {
                   <tr>
                     <th>{t('Package Name')}</th>
                     <th>{t('Disk')} / {t('Bandwidth')}</th>
-                    <th>
-                      {mode === 'resellers'
-                        ? `${t('Max Sub-Accounts (Users)')} & IPs`
-                        : `${t('Websites')} & ${t('Databases')}`}
-                    </th>
+                    <th>{t('Websites')} & {t('Databases')}</th>
                     <th>{t('Email')} & {t('App Runtimes')}</th>
                     <th>CPU / RAM</th>
                     <th style={{ textAlign: 'right' }}>{t('Actions')}</th>
@@ -1142,21 +389,7 @@ export function PackagesPage({ mode = 'users' }) {
                           {formatMb(pkg.storage_limit_mb)} <span className="muted">/</span> {formatMb(pkg.bandwidth_limit_mb)}
                         </td>
                         <td>
-                          {mode === 'resellers' ? (
-                            <>
-                              {formatCount(pkg.reseller_user_limit)} {t('Users')} <span className="muted">·</span>{' '}
-                              {formatCount(pkg.ips_limit)} IPs
-                              {pkg.reseller_overselling_enabled && (
-                                <span className="badge ok" style={{ marginLeft: '6px', fontSize: '11px' }}>
-                                  Oversell
-                                </span>
-                              )}
-                            </>
-                          ) : (
-                            <>
-                              {formatCount(pkg.website_limit)} {t('Sites')} <span className="muted">·</span> {formatCount(pkg.database_limit)} DBs
-                            </>
-                          )}
+                          {formatCount(pkg.website_limit)} {t('Sites')} <span className="muted">·</span> {formatCount(pkg.database_limit)} DBs
                         </td>
                         <td>
                           {formatCount(pkg.mail_accounts_limit)} Mail <span className="muted">·</span>{' '}
@@ -1427,11 +660,11 @@ export function PackagesPage({ mode = 'users' }) {
                     <label className="pkg-feature-check">
                       <input
                         type="checkbox"
-                        checked={currentForm.personal_dns_mode === '2_ips' || currentForm.personal_dns_mode === '3_ips' || currentForm.personal_dns_mode === 'on'}
+                        checked={currentForm.personal_dns_mode === 'on'}
                         onChange={e =>
                           setCurrentForm(prev => ({
                             ...prev,
-                            personal_dns_mode: e.target.checked ? '2_ips' : 'none',
+                            personal_dns_mode: e.target.checked ? 'on' : 'off',
                           }))
                         }
                       />
@@ -1444,13 +677,15 @@ export function PackagesPage({ mode = 'users' }) {
           </div>
         </div>
       )}
+<<<<<<< Updated upstream
+=======
 
       {/* Modal Import Packages from DirectAdmin, cPanel/WHM, Plesk */}
-      {showImportModal && (
+      {showImportModal && typeof document !== 'undefined' && createPortal(
         <div
           className="modal-backdrop pkg-import-modal-backdrop"
           onClick={() => setShowImportModal(false)}
-          style={{ zIndex: 1200 }}
+          style={{ zIndex: 9999 }}
         >
           <div
             className="modal-card pkg-import-modal-card"
@@ -1618,79 +853,104 @@ export function PackagesPage({ mode = 'users' }) {
               {importMethod === 'remote' && (
                 <form
                   onSubmit={handleFetchRemotePackages}
-                  style={{
-                    padding: '14px 16px',
-                    borderRadius: '10px',
-                    border: '1px solid var(--border)',
-                    background: 'var(--surface-alt)',
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
-                    gap: '12px',
-                    alignItems: 'end',
-                  }}
+                  className="pkg-remote-form-card"
                 >
-                  <div>
-                    <label style={{ fontSize: '12px', fontWeight: 600, display: 'block', marginBottom: '4px' }}>
-                      {t('Remote Panel URL')}
-                    </label>
-                    <input
-                      type="text"
-                      placeholder={
-                        importPanel === 'directadmin'
-                          ? 'https://da.example.com:2222'
-                          : importPanel === 'cpanel'
-                          ? 'https://whm.example.com:2087'
-                          : 'https://plesk.example.com:8443'
-                      }
-                      value={remoteForm.host_url}
-                      onChange={e => setRemoteForm(prev => ({ ...prev, host_url: e.target.value }))}
-                      style={{ margin: 0, height: '36px' }}
-                    />
+                  <div className="pkg-remote-form-grid">
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {t('Remote Panel URL')}
+                      </label>
+                      <input
+                        type="text"
+                        placeholder={
+                          importPanel === 'directadmin'
+                            ? 'https://da.example.com:2222'
+                            : importPanel === 'cpanel'
+                            ? 'https://whm.example.com:2087'
+                            : 'https://plesk.example.com:8443'
+                        }
+                        value={remoteForm.host_url}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, host_url: e.target.value }))}
+                        style={{ margin: 0, height: '38px', width: '100%' }}
+                      />
+                    </div>
+
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {t('Admin / Reseller Username')}
+                      </label>
+                      <input
+                        type="text"
+                        placeholder={importPanel === 'cpanel' ? 'root' : 'admin'}
+                        value={remoteForm.username}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, username: e.target.value }))}
+                        style={{ margin: 0, height: '38px', width: '100%' }}
+                      />
+                    </div>
+
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {t('Authentication Method')}
+                      </label>
+                      <select
+                        value={remoteForm.auth_type}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, auth_type: e.target.value }))}
+                        style={{ margin: 0, height: '38px', width: '100%' }}
+                      >
+                        <option value="password">{t('Password / Login Key')}</option>
+                        <option value="token">{t('API Token / API Key')}</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {remoteForm.auth_type === 'token' ? t('API Token / Key') : t('Password / Login Key')}
+                      </label>
+                      <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                        <input
+                          type={showRemoteSecret ? 'text' : 'password'}
+                          placeholder="••••••••••••••••"
+                          value={remoteForm.secret}
+                          onChange={e => setRemoteForm(prev => ({ ...prev, secret: e.target.value }))}
+                          style={{ margin: 0, height: '38px', width: '100%', paddingRight: '38px' }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowRemoteSecret(prev => !prev)}
+                          title={showRemoteSecret ? t('Hide password') : t('Show password')}
+                          style={{
+                            position: 'absolute',
+                            right: '6px',
+                            background: 'transparent',
+                            border: 'none',
+                            padding: '4px 6px',
+                            minHeight: 'auto',
+                            height: '28px',
+                            color: 'var(--text-secondary)',
+                            boxShadow: 'none',
+                          }}
+                        >
+                          {showRemoteSecret ? <EyeOff size={15} /> : <Eye size={15} />}
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
-                  <div>
-                    <label style={{ fontSize: '12px', fontWeight: 600, display: 'block', marginBottom: '4px' }}>
-                      {t('Admin / Reseller Username')}
+                  <div className="pkg-remote-action-bar">
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '12.5px', color: 'var(--text-secondary)', cursor: 'pointer', margin: 0 }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(remoteForm.verify_ssl)}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, verify_ssl: e.target.checked }))}
+                        style={{ width: '15px', height: '15px', margin: 0 }}
+                      />
+                      <span>
+                        {t('Verify SSL Certificate (uncheck for self-signed SSL or IP:port)')}
+                      </span>
                     </label>
-                    <input
-                      type="text"
-                      placeholder={importPanel === 'cpanel' ? 'root' : 'admin'}
-                      value={remoteForm.username}
-                      onChange={e => setRemoteForm(prev => ({ ...prev, username: e.target.value }))}
-                      style={{ margin: 0, height: '36px' }}
-                    />
-                  </div>
 
-                  <div>
-                    <label style={{ fontSize: '12px', fontWeight: 600, display: 'block', marginBottom: '4px' }}>
-                      {t('Authentication Method')}
-                    </label>
-                    <select
-                      value={remoteForm.auth_type}
-                      onChange={e => setRemoteForm(prev => ({ ...prev, auth_type: e.target.value }))}
-                      style={{ margin: 0, height: '36px' }}
-                    >
-                      <option value="password">{t('Password / Login Key')}</option>
-                      <option value="token">{t('API Token / API Key')}</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label style={{ fontSize: '12px', fontWeight: 600, display: 'block', marginBottom: '4px' }}>
-                      {remoteForm.auth_type === 'token' ? t('API Token / Key') : t('Password / Login Key')}
-                    </label>
-                    <input
-                      type="password"
-                      placeholder="••••••••••••••••"
-                      value={remoteForm.secret}
-                      onChange={e => setRemoteForm(prev => ({ ...prev, secret: e.target.value }))}
-                      style={{ margin: 0, height: '36px' }}
-                    />
-                  </div>
-
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <button type="submit" disabled={!!loading} style={{ height: '36px', width: '100%' }}>
-                      <CloudDownload size={14} /> {t('Fetch Remote Packages')}
+                    <button type="submit" disabled={!!loading} style={{ height: '38px', padding: '0 18px' }}>
+                      <CloudDownload size={15} /> {t('Fetch Remote Packages')}
                     </button>
                   </div>
                 </form>
@@ -1868,8 +1128,10 @@ export function PackagesPage({ mode = 'users' }) {
               </div>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
+>>>>>>> Stashed changes
     </div>
   );
 }
