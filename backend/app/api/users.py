@@ -375,11 +375,14 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
     resource_monitor.apply_user_cgroup_limits_async(user.id)
     from app.services import resource_monitor
     resource_monitor.apply_user_cgroup_limits_async(user.id)
-<<<<<<< Updated upstream
     from app.services import resource_monitor
     resource_monitor.apply_user_cgroup_limits_async(user.id)
-=======
->>>>>>> Stashed changes
+    from app.services import resource_monitor
+    resource_monitor.apply_user_cgroup_limits_async(user.id)
+    from app.services import resource_monitor
+    resource_monitor.apply_user_cgroup_limits_async(user.id)
+    from app.services import resource_monitor
+    resource_monitor.apply_user_cgroup_limits_async(user.id)
 
     # Send welcome email if configured
     if user.email:
@@ -592,12 +595,18 @@ def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_c
         from app.services import resource_monitor
         data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
         data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)
-<<<<<<< Updated upstream
         from app.services import resource_monitor
         data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
         data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)
-=======
->>>>>>> Stashed changes
+        from app.services import resource_monitor
+        data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
+        data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)
+        from app.services import resource_monitor
+        data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
+        data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)
+        from app.services import resource_monitor
+        data["mysql_used_bytes"] = resource_monitor.cached_user_mysql_bytes(user.id)
+        data["bandwidth_used_bytes"] = resource_monitor.cached_user_bandwidth_bytes(user.id)
         data["storage_limit_bytes"] = limit_bytes
         if known is None:
             # -1, not 0: nobody has "used nothing", and a zero would draw an
