@@ -1039,6 +1039,138 @@ def dashboard_summary(db: Session = Depends(get_db), current_user: User = Depend
         }
 
     summary["tenants"] = _safe(_tenants_summary, {})
+    own_sites = [site for site in sites if site.owner_id == current_user.id]
+    own_unsecured = sorted(site.domain for site in own_sites if not site.ssl_enabled)
+    summary["own_websites"] = {
+        "total": len(own_sites),
+        "suspended": sum(1 for site in own_sites if site.status == "suspended"),
+        "waf_on": sum(1 for site in own_sites if site.waf_enabled),
+    }
+    summary["own_ssl"] = {
+        "total": len(own_sites),
+        "secured": len(own_sites) - len(own_unsecured),
+        "unsecured": own_unsecured[:UNSECURED_SHOWN],
+        "unsecured_count": len(own_unsecured),
+    }
+
+    def _tenants_summary() -> dict[str, Any]:
+        from app.services import resource_monitor, storage_quota
+
+        all_dbs = db_query.all()
+        locked_dbs = [d.db_name for d in all_dbs if getattr(d, "write_locked", False)]
+        own_locked_dbs = [
+            d.db_name
+            for d in all_dbs
+            if d.owner_id == current_user.id and getattr(d, "write_locked", False)
+        ]
+        if admin:
+            managed_users = db.query(User).filter(User.id != current_user.id).all()
+        elif normalize_role(current_user.role) == Role.reseller:
+            managed_users = db.query(User).filter(User.reseller_id == current_user.id).all()
+        else:
+            managed_users = []
+
+        suspended_users = sum(1 for u in managed_users if not u.is_active)
+        under_attack_users = []
+        over_quota_users = []
+        for u in managed_users:
+            atk = resource_monitor.cached_user_attack_state(u.id)
+            if atk.get("under_attack"):
+                under_attack_users.append(u.username)
+            limit_mb = int(getattr(u, "storage_limit_mb", 0) or 0)
+            if limit_mb > 0:
+                used_b = int(storage_quota.cached_storage_used_bytes(u.id) or 0)
+                if used_b >= limit_mb * 1024 * 1024 * 0.9:
+                    over_quota_users.append(u.username)
+
+        own_atk = resource_monitor.cached_user_attack_state(current_user.id)
+        reseller_user_limit = 0
+        if current_user.reseller_package and getattr(current_user.reseller_package, "user_limit", 0):
+            reseller_user_limit = int(current_user.reseller_package.user_limit)
+        elif current_user.package and getattr(current_user.package, "reseller_user_limit", 0):
+            reseller_user_limit = int(current_user.package.reseller_user_limit)
+
+        return {
+            "managed_users_total": len(managed_users),
+            "reseller_user_limit": reseller_user_limit,
+            "suspended_users": suspended_users,
+            "under_attack_users": under_attack_users[:5],
+            "under_attack_count": len(under_attack_users),
+            "over_quota_users": over_quota_users[:5],
+            "over_quota_count": len(over_quota_users),
+            "locked_databases": locked_dbs[:5],
+            "locked_databases_count": len(locked_dbs),
+            "own_locked_databases_count": len(own_locked_dbs),
+            "own_under_attack": bool(own_atk.get("under_attack")),
+        }
+
+    summary["tenants"] = _safe(_tenants_summary, {})
+    own_sites = [site for site in sites if site.owner_id == current_user.id]
+    own_unsecured = sorted(site.domain for site in own_sites if not site.ssl_enabled)
+    summary["own_websites"] = {
+        "total": len(own_sites),
+        "suspended": sum(1 for site in own_sites if site.status == "suspended"),
+        "waf_on": sum(1 for site in own_sites if site.waf_enabled),
+    }
+    summary["own_ssl"] = {
+        "total": len(own_sites),
+        "secured": len(own_sites) - len(own_unsecured),
+        "unsecured": own_unsecured[:UNSECURED_SHOWN],
+        "unsecured_count": len(own_unsecured),
+    }
+
+    def _tenants_summary() -> dict[str, Any]:
+        from app.services import resource_monitor, storage_quota
+
+        all_dbs = db_query.all()
+        locked_dbs = [d.db_name for d in all_dbs if getattr(d, "write_locked", False)]
+        own_locked_dbs = [
+            d.db_name
+            for d in all_dbs
+            if d.owner_id == current_user.id and getattr(d, "write_locked", False)
+        ]
+        if admin:
+            managed_users = db.query(User).filter(User.id != current_user.id).all()
+        elif normalize_role(current_user.role) == Role.reseller:
+            managed_users = db.query(User).filter(User.reseller_id == current_user.id).all()
+        else:
+            managed_users = []
+
+        suspended_users = sum(1 for u in managed_users if not u.is_active)
+        under_attack_users = []
+        over_quota_users = []
+        for u in managed_users:
+            atk = resource_monitor.cached_user_attack_state(u.id)
+            if atk.get("under_attack"):
+                under_attack_users.append(u.username)
+            limit_mb = int(getattr(u, "storage_limit_mb", 0) or 0)
+            if limit_mb > 0:
+                used_b = int(storage_quota.cached_storage_used_bytes(u.id) or 0)
+                if used_b >= limit_mb * 1024 * 1024 * 0.9:
+                    over_quota_users.append(u.username)
+
+        own_atk = resource_monitor.cached_user_attack_state(current_user.id)
+        reseller_user_limit = 0
+        if current_user.reseller_package and getattr(current_user.reseller_package, "user_limit", 0):
+            reseller_user_limit = int(current_user.reseller_package.user_limit)
+        elif current_user.package and getattr(current_user.package, "reseller_user_limit", 0):
+            reseller_user_limit = int(current_user.package.reseller_user_limit)
+
+        return {
+            "managed_users_total": len(managed_users),
+            "reseller_user_limit": reseller_user_limit,
+            "suspended_users": suspended_users,
+            "under_attack_users": under_attack_users[:5],
+            "under_attack_count": len(under_attack_users),
+            "over_quota_users": over_quota_users[:5],
+            "over_quota_count": len(over_quota_users),
+            "locked_databases": locked_dbs[:5],
+            "locked_databases_count": len(locked_dbs),
+            "own_locked_databases_count": len(own_locked_dbs),
+            "own_under_attack": bool(own_atk.get("under_attack")),
+        }
+
+    summary["tenants"] = _safe(_tenants_summary, {})
     if admin:
         summary["firewall"] = {"enabled": _safe(firewall.is_enabled)}
         summary["waf"] = {"engine": _safe(_waf_engine, "unknown")}

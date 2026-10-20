@@ -26,7 +26,7 @@ Tài liệu này hướng dẫn chi tiết quy trình triển khai **SPanel** tr
 Đăng nhập SSH vào VPS với quyền `root` và chạy lệnh:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh -o /tmp/spanel-install.sh && sudo bash /tmp/spanel-install.sh
+curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" -o /tmp/spanel-install.sh && sudo env npm_config_legacy_peer_deps=true bash /tmp/spanel-install.sh
 ```
 
 Trong quá trình chạy, trình cài đặt sẽ cho phép bạn thiết lập:
@@ -38,7 +38,7 @@ Trong quá trình chạy, trình cài đặt sẽ cho phép bạn thiết lập:
 Phù hợp khi tích hợp vào Cloud-Init, User-Data hoặc script triển khai hàng loạt:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh | sudo bash -s -- \
+curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" | sudo env npm_config_legacy_peer_deps=true bash -s -- \
   --admin-user admin \
   --admin-pass 'MatKhauManh@2026!' \
   --admin-email admin@yourdomain.com \
@@ -53,7 +53,7 @@ export PANEL_URL="https://panel.yourdomain.com:2222"
 export ENABLE_SSL="yes"
 export SSL_EMAIL="admin@yourdomain.com"
 export SPANEL_ADMIN_PASSWORD="MatKhauManh@2026!"
-curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh | sudo bash
+curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" | sudo env npm_config_legacy_peer_deps=true bash
 ```
 
 ---

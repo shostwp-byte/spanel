@@ -65,13 +65,13 @@ Toàn bộ tài liệu kỹ thuật, hướng dẫn cài đặt, vận hành và
 Đăng nhập SSH vào máy chủ Ubuntu 24.04 LTS với quyền `root` và chạy lệnh:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh -o /tmp/spanel-install.sh && sudo bash /tmp/spanel-install.sh
+curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" -o /tmp/spanel-install.sh && sudo env npm_config_legacy_peer_deps=true bash /tmp/spanel-install.sh
 ```
 
 Hoặc cài đặt tự động không cần tương tác (Unattended):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh | sudo bash -s -- \
+curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" | sudo env npm_config_legacy_peer_deps=true bash -s -- \
   --admin-user admin \
   --admin-pass 'MatKhauManh@2026!' \
   --php-default 8.4

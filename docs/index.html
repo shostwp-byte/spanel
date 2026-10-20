@@ -226,7 +226,7 @@
         <code>spanel-helper</code>, tích hợp WHMCS và tối ưu hoàn hảo trên di động.
       </p>
       <div class="install-box">
-        <code id="installCmd">curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh -o /tmp/spanel-install.sh &amp;&amp; sudo bash /tmp/spanel-install.sh</code>
+        <code id="installCmd">curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" -o /tmp/spanel-install.sh &amp;&amp; sudo env npm_config_legacy_peer_deps=true bash /tmp/spanel-install.sh</code>
         <button class="btn btn-primary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('installCmd').innerText); this.innerText='Đã sao chép!'; setTimeout(()=>this.innerText='Sao chép lệnh', 2000);">Sao chép lệnh</button>
       </div>
     </section>
@@ -317,7 +317,7 @@
       <div class="card">
         <h3>🚀 Cài đặt Tự động (Unattended)</h3>
         <p>Chạy bằng quyền <code>root</code> trên máy chủ Ubuntu 24.04 LTS mới:</p>
-        <pre style="margin-top:10px;padding:12px;background:var(--code-bg);color:#e2e8f0;border-radius:8px;overflow-x:auto;font-size:12.5px;">curl -fsSL https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh | sudo bash -s -- \
+        <pre style="margin-top:10px;padding:12px;background:var(--code-bg);color:#e2e8f0;border-radius:8px;overflow-x:auto;font-size:12.5px;">curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" | sudo env npm_config_legacy_peer_deps=true bash -s -- \
   --admin-user admin \
   --admin-pass 'MatKhauManh@2026!' \
   --php-default 8.4</pre>
