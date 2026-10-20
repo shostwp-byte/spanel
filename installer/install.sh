@@ -1061,6 +1061,7 @@ SERVICE
   rm -f /etc/systemd/system/spanel-auto-update.service /etc/systemd/system/spanel-auto-update.timer
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable --now spanel-api
+  systemctl restart spanel-api || true
   systemctl enable --now spanel-backup-scheduler.timer
   systemctl enable --now spanel-malware-scheduler.timer
   systemctl enable --now spanel-notify.timer

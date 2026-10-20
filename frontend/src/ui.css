@@ -1972,14 +1972,32 @@ table.table {
 }
 
 /* Package Import Modal (DirectAdmin / cPanel / Plesk) */
+.pkg-import-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  overflow-y: auto;
+}
+
 .pkg-import-modal-card {
   width: min(980px, 96vw) !important;
   max-width: 980px !important;
   max-height: 90vh;
+  margin: auto;
   display: flex;
   flex-direction: column;
   padding: 0 !important;
   overflow: hidden;
+  background: var(--surface-solid, var(--surface));
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.28);
 }
 
 .pkg-import-header {
