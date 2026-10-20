@@ -1,6 +1,14 @@
+<<<<<<< Updated upstream
 import React, { useState, useEffect } from 'react';
 import {
   ArrowLeft, Boxes, Cpu, Globe, Pencil, Plus, RefreshCw, Save, ShieldCheck, Trash2, X
+=======
+import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import {
+  ArrowLeft, Boxes, Check, CloudDownload, Cpu, Eye, EyeOff, FileSpreadsheet, FileText,
+  FolderUp, Globe, Pencil, Plus, RefreshCw, Save, Server, ShieldCheck, Sparkles, Trash2, Upload, X
+>>>>>>> Stashed changes
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
@@ -102,6 +110,26 @@ export function PackagesPage({ mode = 'users' }) {
   const [editingPackageId, setEditingPackageId] = useState(null);
   const [editingPackageForm, setEditingPackageForm] = useState({ ...DEFAULT_PKG_STATE });
 
+<<<<<<< Updated upstream
+=======
+  // Import Modal State
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importPanel, setImportPanel] = useState('directadmin'); // directadmin | cpanel | plesk
+  const [importMethod, setImportMethod] = useState('file'); // file | remote
+  const [rawImportText, setRawImportText] = useState('');
+  const [parsedPackages, setParsedPackages] = useState([]);
+  const [conflictMode, setConflictMode] = useState('overwrite'); // overwrite | skip | rename
+  const [remoteForm, setRemoteForm] = useState({
+    host_url: '',
+    username: 'admin',
+    secret: '',
+    auth_type: 'password',
+    verify_ssl: false,
+  });
+  const [showRemoteSecret, setShowRemoteSecret] = useState(false);
+  const fileInputRef = useRef(null);
+
+>>>>>>> Stashed changes
   useEffect(() => {
     setPackageTab('list');
     setEditingPackageId(null);
@@ -649,6 +677,461 @@ export function PackagesPage({ mode = 'users' }) {
           </div>
         </div>
       )}
+<<<<<<< Updated upstream
+=======
+
+      {/* Modal Import Packages from DirectAdmin, cPanel/WHM, Plesk */}
+      {showImportModal && typeof document !== 'undefined' && createPortal(
+        <div
+          className="modal-backdrop pkg-import-modal-backdrop"
+          onClick={() => setShowImportModal(false)}
+          style={{ zIndex: 9999 }}
+        >
+          <div
+            className="modal-card pkg-import-modal-card"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="pkg-import-header">
+              <div>
+                <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px', fontSize: '16px' }}>
+                  <Upload size={18} style={{ color: 'var(--primary)' }} />
+                  {mode === 'resellers'
+                    ? t('Import Reseller Packages (DirectAdmin / cPanel / Plesk)')
+                    : t('Import User Packages (DirectAdmin / cPanel / Plesk)')}
+                </h3>
+                <p className="muted" style={{ margin: '4px 0 0', fontSize: '12.5px' }}>
+                  {t('Automatically map quotas, domains, databases, email limits, and permissions into SPanel packages.')}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="secondary-light mini"
+                onClick={() => setShowImportModal(false)}
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            <div className="pkg-import-body">
+              {/* Step 1: Select Source Panel */}
+              <div>
+                <label style={{ display: 'block', fontSize: '12.5px', fontWeight: 700, marginBottom: '8px', color: 'var(--text)' }}>
+                  1. {t('Select Source Control Panel')}
+                </label>
+                <div className="pkg-panel-cards">
+                  <div
+                    className={`pkg-panel-card ${importPanel === 'directadmin' ? 'active' : ''}`}
+                    onClick={() => setImportPanel('directadmin')}
+                  >
+                    <div className="pkg-panel-card-title">
+                      <Server size={15} style={{ color: '#2563eb' }} /> DirectAdmin
+                    </div>
+                    <div className="pkg-panel-card-desc">
+                      {t('Supports .pkg files (/usr/local/directadmin/data/users/*/packages/*.pkg) & DirectAdmin API :2222')}
+                    </div>
+                  </div>
+
+                  <div
+                    className={`pkg-panel-card ${importPanel === 'cpanel' ? 'active' : ''}`}
+                    onClick={() => setImportPanel('cpanel')}
+                  >
+                    <div className="pkg-panel-card-title">
+                      <FileSpreadsheet size={15} style={{ color: '#ea580c' }} /> cPanel / WHM
+                    </div>
+                    <div className="pkg-panel-card-desc">
+                      {t('Supports /var/cpanel/packages/* files, WHM listpkgs JSON & WHM API :2087')}
+                    </div>
+                  </div>
+
+                  <div
+                    className={`pkg-panel-card ${importPanel === 'plesk' ? 'active' : ''}`}
+                    onClick={() => setImportPanel('plesk')}
+                  >
+                    <div className="pkg-panel-card-title">
+                      <Globe size={15} style={{ color: '#0891b2' }} /> Plesk Obsidian
+                    </div>
+                    <div className="pkg-panel-card-desc">
+                      {t('Supports Plesk Service/Reseller Plan XML, REST JSON (/api/v2/serviceplans) & API :8443')}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Step 2: Select Import Method */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
+                <div className="pkg-import-method-tabs">
+                  <button
+                    type="button"
+                    className={`pkg-import-method-tab ${importMethod === 'file' ? 'active' : ''}`}
+                    onClick={() => setImportMethod('file')}
+                  >
+                    <FolderUp size={14} /> {t('Upload Files / Paste Config')}
+                  </button>
+                  <button
+                    type="button"
+                    className={`pkg-import-method-tab ${importMethod === 'remote' ? 'active' : ''}`}
+                    onClick={() => setImportMethod('remote')}
+                  >
+                    <CloudDownload size={14} /> {t('Connect Remote Panel API')}
+                  </button>
+                </div>
+
+                {importMethod === 'file' && (
+                  <button
+                    type="button"
+                    className="secondary-light mini"
+                    onClick={handleLoadSample}
+                  >
+                    <Sparkles size={13} /> {t('Load Sample Template')} ({importPanel === 'directadmin' ? 'DirectAdmin' : importPanel === 'cpanel' ? 'cPanel/WHM' : 'Plesk'})
+                  </button>
+                )}
+              </div>
+
+              {/* Method A: Upload Files or Paste Raw Configuration */}
+              {importMethod === 'file' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <div className="pkg-upload-dropzone">
+                    <div>
+                      <strong style={{ fontSize: '13.5px', display: 'block', color: 'var(--text)' }}>
+                        {t('Select one or multiple package files from your computer')}
+                      </strong>
+                      <span className="muted" style={{ fontSize: '12px' }}>
+                        {importPanel === 'directadmin' && t('DirectAdmin path: /usr/local/directadmin/data/users/admin/packages/*.pkg')}
+                        {importPanel === 'cpanel' && t('cPanel path: /var/cpanel/packages/<package_name> or WHM JSON')}
+                        {importPanel === 'plesk' && t('Plesk format: XML <service-plan> / <reseller-plan> or REST JSON')}
+                      </span>
+                    </div>
+                    <div>
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        accept=".pkg,.conf,.txt,.json,.xml,.plan,*"
+                        style={{ display: 'none' }}
+                        onChange={handleFileSelect}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                      >
+                        <FolderUp size={14} /> {t('Choose Package Files...')}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                        {t('Or paste package configuration content (.pkg / key=value / JSON / XML):')}
+                      </label>
+                      <button
+                        type="button"
+                        className="secondary-light mini"
+                        onClick={() => handleParseRawText()}
+                      >
+                        <FileText size={13} /> {t('Parse Configuration')}
+                      </button>
+                    </div>
+                    <textarea
+                      rows={5}
+                      value={rawImportText}
+                      onChange={e => setRawImportText(e.target.value)}
+                      placeholder={
+                        importPanel === 'directadmin'
+                          ? '[Business_Pkg]\nquota=10240\nbandwidth=102400\nvdomains=5\nnsubdomains=20\nmysql=10\nnemails=20\nphp=ON\nssl=ON\nssh=OFF'
+                          : importPanel === 'cpanel'
+                          ? '[cPanel_Gold]\nQUOTA=10240\nBWLIMIT=102400\nMAXADDON=4\nMAXSUB=20\nMAXSQL=10\nMAXPOP=20\nHASSHELL=n'
+                          : '<packet><service-plan><get><result><name>Plesk_Pro</name><limits><limit><name>disk_space</name><value>10737418240</value></limit></limits></result></get></service-plan></packet>'
+                      }
+                      style={{ width: '100%', fontFamily: 'monospace', fontSize: '12.5px', margin: 0 }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Method B: Remote Panel API Connection */}
+              {importMethod === 'remote' && (
+                <form
+                  onSubmit={handleFetchRemotePackages}
+                  className="pkg-remote-form-card"
+                >
+                  <div className="pkg-remote-form-grid">
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {t('Remote Panel URL')}
+                      </label>
+                      <input
+                        type="text"
+                        placeholder={
+                          importPanel === 'directadmin'
+                            ? 'https://da.example.com:2222'
+                            : importPanel === 'cpanel'
+                            ? 'https://whm.example.com:2087'
+                            : 'https://plesk.example.com:8443'
+                        }
+                        value={remoteForm.host_url}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, host_url: e.target.value }))}
+                        style={{ margin: 0, height: '38px', width: '100%' }}
+                      />
+                    </div>
+
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {t('Admin / Reseller Username')}
+                      </label>
+                      <input
+                        type="text"
+                        placeholder={importPanel === 'cpanel' ? 'root' : 'admin'}
+                        value={remoteForm.username}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, username: e.target.value }))}
+                        style={{ margin: 0, height: '38px', width: '100%' }}
+                      />
+                    </div>
+
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {t('Authentication Method')}
+                      </label>
+                      <select
+                        value={remoteForm.auth_type}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, auth_type: e.target.value }))}
+                        style={{ margin: 0, height: '38px', width: '100%' }}
+                      >
+                        <option value="password">{t('Password / Login Key')}</option>
+                        <option value="token">{t('API Token / API Key')}</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label style={{ fontSize: '12.5px', fontWeight: 600, display: 'block', marginBottom: '5px', color: 'var(--text)' }}>
+                        {remoteForm.auth_type === 'token' ? t('API Token / Key') : t('Password / Login Key')}
+                      </label>
+                      <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                        <input
+                          type={showRemoteSecret ? 'text' : 'password'}
+                          placeholder="••••••••••••••••"
+                          value={remoteForm.secret}
+                          onChange={e => setRemoteForm(prev => ({ ...prev, secret: e.target.value }))}
+                          style={{ margin: 0, height: '38px', width: '100%', paddingRight: '38px' }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowRemoteSecret(prev => !prev)}
+                          title={showRemoteSecret ? t('Hide password') : t('Show password')}
+                          style={{
+                            position: 'absolute',
+                            right: '6px',
+                            background: 'transparent',
+                            border: 'none',
+                            padding: '4px 6px',
+                            minHeight: 'auto',
+                            height: '28px',
+                            color: 'var(--text-secondary)',
+                            boxShadow: 'none',
+                          }}
+                        >
+                          {showRemoteSecret ? <EyeOff size={15} /> : <Eye size={15} />}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="pkg-remote-action-bar">
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '12.5px', color: 'var(--text-secondary)', cursor: 'pointer', margin: 0 }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(remoteForm.verify_ssl)}
+                        onChange={e => setRemoteForm(prev => ({ ...prev, verify_ssl: e.target.checked }))}
+                        style={{ width: '15px', height: '15px', margin: 0 }}
+                      />
+                      <span>
+                        {t('Verify SSL Certificate (uncheck for self-signed SSL or IP:port)')}
+                      </span>
+                    </label>
+
+                    <button type="submit" disabled={!!loading} style={{ height: '38px', padding: '0 18px' }}>
+                      <CloudDownload size={15} /> {t('Fetch Remote Packages')}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* Step 3: Interactive Preview & Mapping Table */}
+              {parsedPackages.length > 0 && (
+                <div className="pkg-preview-box">
+                  <div className="pkg-preview-toolbar">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 700, cursor: 'pointer' }}>
+                        <input
+                          type="checkbox"
+                          checked={selectedImportCount === parsedPackages.length && parsedPackages.length > 0}
+                          onChange={e => {
+                            const checked = e.target.checked;
+                            setParsedPackages(prev => prev.map(p => ({ ...p, _selected: checked })));
+                          }}
+                          style={{ width: '15px', height: '15px', margin: 0 }}
+                        />
+                        {t('Preview Parsed Packages')} ({selectedImportCount}/{parsedPackages.length})
+                      </label>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '12px', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                        {t('If package name exists:')}
+                      </span>
+                      <select
+                        value={conflictMode}
+                        onChange={e => setConflictMode(e.target.value)}
+                        style={{ width: 'auto', height: '30px', minHeight: '30px', padding: '2px 8px', fontSize: '12px', margin: 0 }}
+                      >
+                        <option value="overwrite">{t('Overwrite existing package')}</option>
+                        <option value="skip">{t('Skip duplicate package')}</option>
+                        <option value="rename">{t('Auto-rename (append _imported)')}</option>
+                      </select>
+                      <button
+                        type="button"
+                        className="secondary-light mini"
+                        onClick={() => setParsedPackages([])}
+                      >
+                        <Trash2 size={12} /> {t('Clear List')}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style={{ overflowX: 'auto', maxHeight: '280px' }}>
+                    <table className="pkg-clean-table">
+                      <thead>
+                        <tr>
+                          <th style={{ width: '36px' }}></th>
+                          <th>{t('Package Name')}</th>
+                          <th>{t('Source')}</th>
+                          <th>{t('Disk')} / {t('Bandwidth')}</th>
+                          <th>
+                            {mode === 'resellers'
+                              ? `${t('Max Sub-Accounts (Users)')} / IPs`
+                              : `${t('Websites')} / ${t('Subdomains')} / DBs`}
+                          </th>
+                          <th>{t('Email')} / FTP</th>
+                          <th>{t('Features')}</th>
+                          <th style={{ textAlign: 'right' }}>{t('Actions')}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {parsedPackages.map((pkg, idx) => (
+                          <tr key={pkg._id || idx}>
+                            <td>
+                              <input
+                                type="checkbox"
+                                checked={Boolean(pkg._selected)}
+                                onChange={e => {
+                                  const checked = e.target.checked;
+                                  setParsedPackages(prev =>
+                                    prev.map((item, i) => (i === idx ? { ...item, _selected: checked } : item))
+                                  );
+                                }}
+                                style={{ width: '15px', height: '15px', margin: 0 }}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="text"
+                                value={pkg.name}
+                                onChange={e => {
+                                  const val = e.target.value;
+                                  setParsedPackages(prev =>
+                                    prev.map((item, i) => (i === idx ? { ...item, name: val } : item))
+                                  );
+                                }}
+                                style={{ height: '30px', minHeight: '30px', padding: '4px 8px', fontSize: '13px', width: '175px', margin: 0 }}
+                              />
+                            </td>
+                            <td>
+                              <span className="badge" style={{ fontSize: '11px', textTransform: 'uppercase' }}>
+                                {pkg.source_panel || importPanel}
+                              </span>
+                            </td>
+                            <td>
+                              {formatMb(pkg.storage_limit_mb)} <span className="muted">/</span> {formatMb(pkg.bandwidth_limit_mb)}
+                            </td>
+                            <td>
+                              {mode === 'resellers' ? (
+                                <>
+                                  {formatCount(pkg.reseller_user_limit)} {t('Users')} · {formatCount(pkg.ips_limit)} IPs
+                                </>
+                              ) : (
+                                <>
+                                  {formatCount(pkg.website_limit)} Web · {formatCount(pkg.subdomain_limit)} Sub · {formatCount(pkg.database_limit)} DB
+                                </>
+                              )}
+                            </td>
+                            <td>
+                              {formatCount(pkg.mail_accounts_limit)} Mail · {formatCount(pkg.sftp_accounts_limit)} FTP
+                            </td>
+                            <td>
+                              <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap' }}>
+                                {pkg.php_access && <span className="badge ok" style={{ fontSize: '10.5px' }}>PHP</span>}
+                                {pkg.ssl_access && <span className="badge ok" style={{ fontSize: '10.5px' }}>SSL</span>}
+                                {pkg.terminal_enabled && <span className="badge warn" style={{ fontSize: '10.5px' }}>SSH</span>}
+                                {pkg.dns_control && <span className="badge" style={{ fontSize: '10.5px' }}>DNS</span>}
+                                {mode === 'resellers' && pkg.reseller_overselling_enabled && (
+                                  <span className="badge ok" style={{ fontSize: '10.5px' }}>Oversell</span>
+                                )}
+                              </div>
+                            </td>
+                            <td style={{ textAlign: 'right' }}>
+                              <div style={{ display: 'inline-flex', gap: '6px' }}>
+                                <button
+                                  type="button"
+                                  className="secondary-light mini"
+                                  onClick={() => handleLoadSingleIntoEditor(pkg)}
+                                  title={t('Load into Package Editor to customize all parameters before saving')}
+                                >
+                                  <Pencil size={12} /> {t('Load to Editor')}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="danger mini"
+                                  onClick={() => setParsedPackages(prev => prev.filter((_, i) => i !== idx))}
+                                >
+                                  <Trash2 size={12} />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="pkg-import-footer">
+              <div className="muted" style={{ fontSize: '12px' }}>
+                {t('Tip: Click "Load to Editor" on any row to customize Cgroups v2 & App Runtime limits before saving.')}
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="secondary-light"
+                  onClick={() => setShowImportModal(false)}
+                >
+                  <X size={14} /> {t('Cancel')}
+                </button>
+                <button
+                  type="button"
+                  disabled={!!loading || selectedImportCount === 0}
+                  onClick={handleBatchImportSubmit}
+                >
+                  <Check size={14} /> {t('Import Selected')} ({selectedImportCount})
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+>>>>>>> Stashed changes
     </div>
   );
 }

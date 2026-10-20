@@ -1867,6 +1867,18 @@ export const vi = {
   "Tasks Max": "Số tiến trình tối đa (Tasks Max)",
   "Read-Only (Quota Exceeded)": "Chỉ đọc (Vượt hạn mức)",
   "Resource Monitor": "Giám sát Tài nguyên User",
+<<<<<<< Updated upstream
+=======
+  "Connected successfully, but no packages were found on the remote panel.": "Đã kết nối thành công nhưng không tìm thấy gói nào trên máy chủ từ xa.",
+  "Please enter the remote Panel URL and Password / API Token.": "Vui lòng nhập URL máy chủ Panel và Mật khẩu / API Token.",
+  "Authentication failed on remote panel: Invalid username, password, or Login Key.": "Xác thực thất bại trên máy chủ Panel từ xa: Sai tài khoản, mật khẩu hoặc Login Key.",
+  "Verify SSL Certificate (uncheck for self-signed SSL or IP:port)": "Xác thực chứng chỉ SSL (bỏ chọn nếu dùng SSL tự ký hoặc IP:port)",
+  "Show password": "Hiện mật khẩu",
+  "Hide password": "Ẩn mật khẩu",
+  "Connected successfully, but no packages were found on the remote panel.": "Đã kết nối thành công nhưng không tìm thấy gói nào trên máy chủ từ xa.",
+  "Please enter the remote Panel URL and Password / API Token.": "Vui lòng nhập URL máy chủ Panel và Mật khẩu / API Token.",
+  "Authentication failed on remote panel: Invalid username, password, or Login Key.": "Xác thực thất bại trên máy chủ Panel từ xa: Sai tài khoản, mật khẩu hoặc Login Key.",
+>>>>>>> Stashed changes
   "Updates Online & Rollback Center": "Cập nhật Trực tuyến & Trung tâm Khôi phục (Rollback)",
   "Automatically detect new releases from your designated update server with pre-update snapshots and instant auto-rollback protection.": "Tự động phát hiện phiên bản mới từ máy chủ cập nhật chỉ định, kèm cơ chế chụp Snapshot dự phòng và tự động Rollback tức thì khi có sự cố.",
   "Check for Updates": "Kiểm tra Phiên bản mới",

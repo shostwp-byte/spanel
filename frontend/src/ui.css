@@ -1971,6 +1971,230 @@ table.table {
   }
 }
 
+<<<<<<< Updated upstream
+=======
+/* Package Import Modal (DirectAdmin / cPanel / Plesk) */
+.section {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  transform: none !important;
+}
+.section:hover {
+  transform: none !important;
+}
+
+.pkg-import-modal-backdrop {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 9999 !important;
+  background: rgba(15, 23, 42, 0.68) !important;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 20px !important;
+  box-sizing: border-box !important;
+}
+
+.pkg-import-modal-card {
+  width: min(880px, 95vw) !important;
+  max-width: 880px !important;
+  max-height: calc(100vh - 40px) !important;
+  margin: auto !important;
+  display: flex !important;
+  flex-direction: column !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  background: var(--surface-solid, #ffffff) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 14px !important;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.4) !important;
+}
+
+:root[data-theme="dark"] .pkg-import-modal-card {
+  background: var(--bg-elevated, #1e293b) !important;
+}
+
+.pkg-import-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 22px;
+  background: var(--surface-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+.pkg-import-body {
+  flex: 1 1 auto;
+  padding: 18px 22px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.pkg-import-footer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 22px;
+  background: var(--surface-alt);
+  border-top: 1px solid var(--border);
+}
+
+.pkg-remote-form-card {
+  padding: 16px 18px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.pkg-remote-form-grid {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 14px 16px;
+  align-items: end;
+}
+
+.pkg-remote-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.pkg-panel-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.pkg-panel-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 11px 14px;
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.16s ease;
+}
+
+.pkg-panel-card:hover {
+  border-color: var(--primary);
+  background: var(--surface-alt);
+}
+
+.pkg-panel-card.active {
+  border-color: var(--primary);
+  background: var(--primary-subtle, rgba(37, 99, 235, 0.08));
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+.pkg-panel-card-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pkg-panel-card-desc {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.pkg-import-method-tabs {
+  display: inline-flex;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 4px;
+  align-self: flex-start;
+}
+
+.pkg-import-method-tab {
+  border: none !important;
+  background: transparent !important;
+  color: var(--text-secondary) !important;
+  font-size: 12.5px !important;
+  font-weight: 600 !important;
+  padding: 6px 14px !important;
+  min-height: 30px !important;
+  border-radius: 6px !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  box-shadow: none !important;
+}
+
+.pkg-import-method-tab.active {
+  background: var(--primary) !important;
+  color: #ffffff !important;
+}
+
+.pkg-upload-dropzone {
+  border: 1.5px dashed var(--border-strong, var(--border));
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: var(--surface-alt);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.pkg-preview-box {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.pkg-preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--surface-alt);
+  border-bottom: 1px solid var(--border);
+}
+
+@media (max-width: 720px) {
+  .pkg-panel-cards,
+  .pkg-remote-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+>>>>>>> Stashed changes
 
 /* ---------- Mobile & Multi-Device UX/UI Polish ---------- */
 @media (max-width: 950px) {

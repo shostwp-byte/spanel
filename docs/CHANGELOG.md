@@ -23,6 +23,18 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 - **Tối ưu hoá Giao diện Đa thiết bị & Di động (`frontend/src/ui.css`, `frontend/src/pages/Websites.jsx`):**
   - Tự động tinh gọn các cột phụ trên màn hình điện thoại (`<= 640px`) trong bảng Domains và Subdomains.
   - Bổ sung hệ thống Media Queries cho Tablet (`<= 950px`), Mobile (`<= 768px`) và màn hình nhỏ (`<= 480px`), cố định khung chuông thông báo trong khung nhìn di động và hỗ trợ cuộn mượt cho bảng/hộp thoại Modal.
+<<<<<<< Updated upstream
+=======
+- **Tích hợp Nút Donate & Hộp thoại Mã QR VietQR (`frontend/src/App.jsx`):**
+  - Bố trí nút `❤️ Donate` nhỏ gọn, nổi bật ngay trên thanh Header và chân trang Sidebar, tích hợp sẵn mã QR chuẩn VietQR Napas247 (Ngân hàng **MB Bank**, STK **978579798888**, Chủ tài khoản **Tran Quang Quoc Dung**, Nội dung **Donate Spanel**) kèm nút sao chép nhanh từng trường thông tin.
+- **Tính năng Import Gói Dịch vụ (User & Reseller Packages) từ DirectAdmin, cPanel/WHM và Plesk (`frontend/src/pages/Packages.jsx`, `backend/app/api/packages.py`):**
+  - Hỗ trợ nhập gói dịch vụ cho cả **Manage User Packages** và **Manage Reseller Packages** từ 3 nền tảng Hosting Panel phổ biến nhất: **DirectAdmin** (`.pkg`, API cổng `2222`), **cPanel / WHM** (`/var/cpanel/packages/*`, JSON `listpkgs`, WHM API cổng `2087`) và **Plesk Obsidian** (XML `<service-plan>` / `<reseller-plan>`, REST JSON `/api/v2/serviceplans`, API cổng `8443`).
+  - Hỗ trợ 2 phương thức nhập linh hoạt: **Tải lên nhiều tệp / Dán cấu hình trực tiếp (kèm mẫu thử có sẵn)** hoặc **Kết nối trực tiếp API máy chủ Panel từ xa**.
+  - **Tự động nhận diện quyền tài khoản DirectAdmin API (`Admin` & `Reseller`) và hỗ trợ cả Basic Auth lẫn Session Login:** Hỗ trợ chuẩn hoá URL tự động, gửi `Referer`/`Origin` chuẩn cho DirectAdmin (`check_referer=1`), ưu tiên gọi `CMD_API_PACKAGES_USER` trước khi tài khoản đăng nhập không phải `admin` (tránh bị chặn ở `CMD_API_PACKAGES_RESELLER` trả về HTTP 401/403), và tự động fallback sang cơ chế đăng nhập phiên (`POST /api/login` & `POST /CMD_LOGIN` kèm Cookie + `CMD_PACKAGES_USER?json=yes`) khi máy chủ DirectAdmin giới hạn HTTP Basic Auth đối với mật khẩu thường.
+  - **Cố định khung hiển thị Modal Import Packages qua React Portal (`createPortal(..., document.body)`) & Bố cục Form 2 cột (`frontend/src/pages/Packages.jsx`, `frontend/src/ui.css`):** Đưa hộp thoại Import Packages ra ngoài `.section` (vốn có `backdrop-filter`/`transform` tạo CSS containing block làm cắt cụt khung modal), thiết kế lại biểu mẫu **Connect Remote Panel API** dạng lưới 2 cột rộng rãi (không bị cắt URL dài, có nút Ẩn/Hiện mật khẩu và tuỳ chọn xác thực SSL), đồng thời tự động `systemctl restart spanel-api` khi chạy lại bộ cài đặt hoặc cập nhật.
+  - **Đồng bộ chuẩn hoá trường `personal_dns_mode` (`none` / `2_ips` / `3_ips`) (`frontend/src/pages/Packages.jsx`, `backend/app/schemas/schemas.py`, `backend/app/api/packages.py`):** Khắc phục triệt để lỗi xác thực Pydantic (`Input should be 'none', '2_ips' or '3_ips'`) khi tạo hoặc nhập gói dịch vụ Reseller / User.
+  - Cung cấp bảng **Preview & Chuyển đổi thông số tự động** (Disk, Bandwidth, Websites, Subdomains, Domain Aliases, MySQL Databases, Email Accounts, Forwarders, FTP/SFTP, Max Users, Dedicated IPs, Overselling, SSH/SSL/DNS/Cron/Git) với tuỳ chọn xử lý trùng tên (`Ghi đè`, `Bỏ qua`, `Tự động đổi tên`) hoặc nạp từng gói vào biểu mẫu chỉnh sửa chi tiết trước khi lưu.
+>>>>>>> Stashed changes
 - **Phân loại Thông báo theo Vai trò (`Admin` / `Reseller` / `End User`):**
   - Phân luồng thông báo độc lập cho từng cấp độ người dùng kèm thanh lọc danh mục (`Tất cả`, `Chưa đọc`, `Hệ thống`, `Bảo mật`, `Sao lưu`, `Tài nguyên`).
 - **Tự động Đồng bộ Menu End User theo Trạng thái Add-ons:**
