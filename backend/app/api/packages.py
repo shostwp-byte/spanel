@@ -161,7 +161,7 @@ def _default_package_dict(name: str, is_reseller: bool = False) -> dict:
         "system_info": False,
         "cgi_access": False,
         "anonymous_ftp": False,
-        "personal_dns_mode": "off",
+        "personal_dns_mode": "none",
         "share_server_ip": True,
     }
 
@@ -238,7 +238,12 @@ def _map_da_dict_to_package(name: str, raw: dict, is_reseller: bool = False) -> 
         pkg["share_server_ip"] = _parse_bool_flag(kv.get("serverip"), True)
     if "dns" in kv:
         dns_mode = str(kv.get("dns", "OFF")).strip().upper()
-        pkg["personal_dns_mode"] = "on" if dns_mode in {"ON", "TWO", "THREE", "1", "TRUE"} else "off"
+        if dns_mode in {"THREE", "3", "3_IPS"}:
+            pkg["personal_dns_mode"] = "3_ips"
+        elif dns_mode in {"ON", "TWO", "2", "2_IPS", "1", "TRUE", "YES"}:
+            pkg["personal_dns_mode"] = "2_ips"
+        else:
+            pkg["personal_dns_mode"] = "none"
     if "cpu_quota" in kv or "lve_cpu" in kv:
         pkg["cpu_quota_percent"] = _parse_int_quota(kv.get("cpu_quota") or kv.get("lve_cpu"), 100)
     if "mem_max" in kv or "lve_pmem" in kv:

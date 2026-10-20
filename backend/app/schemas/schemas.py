@@ -36,6 +36,17 @@ def _validate_linux_login_password(value: str) -> str:
     return value
 
 
+def _normalize_personal_dns_mode(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in {"3_ips", "three", "3"}:
+        return "3_ips"
+    if s in {"2_ips", "two", "2", "on", "yes", "true", "1"}:
+        return "2_ips"
+    return "none"
+
+
 def _validate_php_version(value: Optional[str]) -> Optional[str]:
     if value is None:
         return value
@@ -230,6 +241,11 @@ class UserPackageCreate(BaseModel):
     mysql_storage_limit_mb: int = Field(default=0, ge=0, le=1048576)
     mysql_max_db_size_mb: int = Field(default=0, ge=0, le=1048576)
 
+    @field_validator("personal_dns_mode", mode="before")
+    @classmethod
+    def validate_personal_dns_mode(cls, value: Optional[str]) -> str:
+        return _normalize_personal_dns_mode(value) or "none"
+
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str) -> str:
@@ -296,6 +312,11 @@ class UserPackageUpdate(BaseModel):
     tasks_max: Optional[int] = Field(default=None, ge=0, le=1000000)
     mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
     mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
+
+    @field_validator("personal_dns_mode", mode="before")
+    @classmethod
+    def validate_personal_dns_mode(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_personal_dns_mode(value)
 
     @field_validator("name")
     @classmethod
@@ -387,6 +408,11 @@ class UserPackageOut(BaseModel):
 
     owner_id: Optional[int] = None
     created_at: Optional[datetime] = None
+
+    @field_validator("personal_dns_mode", mode="before")
+    @classmethod
+    def validate_personal_dns_mode(cls, value: Optional[str]) -> str:
+        return _normalize_personal_dns_mode(value) or "none"
 
     class Config:
         from_attributes = True

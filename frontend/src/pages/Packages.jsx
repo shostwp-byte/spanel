@@ -57,9 +57,16 @@ export const DEFAULT_PKG_STATE = {
   system_info: false,
   cgi_access: false,
   anonymous_ftp: false,
-  personal_dns_mode: 'off',
+  personal_dns_mode: 'none',
   share_server_ip: true,
 };
+
+function normalizePersonalDnsMode(val) {
+  const s = String(val ?? '').trim().toLowerCase();
+  if (['3_ips', 'three', '3'].includes(s)) return '3_ips';
+  if (['2_ips', 'two', '2', 'on', 'yes', 'true', '1'].includes(s)) return '2_ips';
+  return 'none';
+}
 
 function normalizePackageToForm(pkg) {
   const aliasVal = pkg.alias_limit ?? pkg.domain_pointers_limit ?? 0;
@@ -74,6 +81,7 @@ function normalizePackageToForm(pkg) {
     ftp_accounts_limit: sftpVal,
     terminal_enabled: termVal,
     ssh_access: termVal,
+    personal_dns_mode: normalizePersonalDnsMode(pkg.personal_dns_mode),
     node_apps_limit: Number(pkg.node_apps_limit || 0),
     node_app_memory_mb: Math.max(64, Number(pkg.node_app_memory_mb || 512)),
     backup_retention_days: Math.max(1, Number(pkg.backup_retention_days || 14)),
@@ -190,8 +198,7 @@ function mapDirectAdminRecord(name, raw, isReseller = false) {
   if ('aftp' in kv) pkg.anonymous_ftp = parseBoolFlag(kv.aftp, false);
   if ('serverip' in kv) pkg.share_server_ip = parseBoolFlag(kv.serverip, true);
   if ('dns' in kv) {
-    const dMode = String(kv.dns || '').trim().toUpperCase();
-    pkg.personal_dns_mode = ['ON', 'TWO', 'THREE', '1', 'TRUE'].includes(dMode) ? 'on' : 'off';
+    pkg.personal_dns_mode = normalizePersonalDnsMode(kv.dns);
   }
   if ('cpu_quota' in kv || 'lve_cpu' in kv) {
     pkg.cpu_quota_percent = parseQuotaInt(kv.cpu_quota ?? kv.lve_cpu, 100);
@@ -724,12 +731,21 @@ export function PackagesPage({ mode = 'users' }) {
     for (const key of intFields) {
       clean[key] = Math.max(0, parseInt(clean[key], 10) || 0);
     }
+    clean.website_limit = Math.min(1000, clean.website_limit);
+    clean.storage_limit_mb = Math.min(1024 * 1024, clean.storage_limit_mb);
+    clean.database_limit = Math.min(10000, clean.database_limit);
+    clean.alias_limit = Math.min(1000, clean.alias_limit);
     clean.domain_pointers_limit = clean.alias_limit;
+    clean.sftp_accounts_limit = Math.min(100, clean.sftp_accounts_limit);
     clean.ftp_accounts_limit = clean.sftp_accounts_limit;
+    clean.mail_accounts_limit = Math.min(1000, clean.mail_accounts_limit);
+    clean.node_apps_limit = Math.min(100, clean.node_apps_limit);
+    clean.reseller_user_limit = Math.min(10000, clean.reseller_user_limit);
     clean.ssh_access = Boolean(clean.terminal_enabled);
     clean.terminal_enabled = Boolean(clean.terminal_enabled);
     clean.node_app_memory_mb = Math.min(16384, Math.max(64, clean.node_app_memory_mb || 512));
     clean.backup_retention_days = Math.min(365, Math.max(1, clean.backup_retention_days || 14));
+    clean.personal_dns_mode = normalizePersonalDnsMode(clean.personal_dns_mode);
     clean.is_reseller_package = mode === 'resellers';
     delete clean._selected;
     delete clean._id;
@@ -1411,11 +1427,11 @@ export function PackagesPage({ mode = 'users' }) {
                     <label className="pkg-feature-check">
                       <input
                         type="checkbox"
-                        checked={currentForm.personal_dns_mode === 'on'}
+                        checked={currentForm.personal_dns_mode === '2_ips' || currentForm.personal_dns_mode === '3_ips' || currentForm.personal_dns_mode === 'on'}
                         onChange={e =>
                           setCurrentForm(prev => ({
                             ...prev,
-                            personal_dns_mode: e.target.checked ? 'on' : 'off',
+                            personal_dns_mode: e.target.checked ? '2_ips' : 'none',
                           }))
                         }
                       />
