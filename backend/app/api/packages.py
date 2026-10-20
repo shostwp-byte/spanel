@@ -1,6 +1,17 @@
-from typing import List
+import base64
+import ipaddress
+import json
+import re
+import socket
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -11,6 +22,22 @@ from app.schemas.schemas import UserPackageCreate, UserPackageOut, UserPackageUp
 from app.services.audit import log_action
 
 router = APIRouter(prefix="/packages", tags=["packages"])
+
+
+class PackageBatchImportIn(BaseModel):
+    packages: List[UserPackageCreate] = Field(default_factory=list)
+    conflict_mode: str = Field(default="overwrite")  # overwrite | skip | rename
+    source_panel: str = Field(default="directadmin")
+
+
+class RemotePanelFetchIn(BaseModel):
+    panel_type: str = Field(default="directadmin")  # directadmin | cpanel | plesk
+    host_url: str
+    username: str = Field(default="admin")
+    secret: str
+    auth_type: str = Field(default="password")  # password | token
+    is_reseller_package: bool = Field(default=False)
+    verify_ssl: bool = Field(default=False)
 
 
 def _package_by_id(db: Session, package_id: int) -> UserPackage:
@@ -28,8 +55,6 @@ def _ensure_unique_name(db: Session, name: str, package_id: int | None = None) -
         raise HTTPException(status_code=409, detail="Package name already exists")
 
 
-<<<<<<< Updated upstream
-=======
 def _parse_int_quota(val: Any, default: int = 0, bytes_to_mb: bool = False) -> int:
     if val is None:
         return default
@@ -633,7 +658,6 @@ def _da_fetch_cmd_packages(
     return items, None
 
 
->>>>>>> Stashed changes
 @router.get("", response_model=List[UserPackageOut])
 def list_packages(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
@@ -657,8 +681,6 @@ def _reseller_can_grant_terminal(reseller: User) -> bool:
     return False
 
 
-<<<<<<< Updated upstream
-=======
 @router.post("/fetch-remote")
 def fetch_remote_packages(
     payload: RemotePanelFetchIn,
@@ -994,7 +1016,6 @@ def batch_import_packages(
     }
 
 
->>>>>>> Stashed changes
 @router.post("", response_model=UserPackageOut)
 def create_package(
     payload: UserPackageCreate,
@@ -1079,7 +1100,7 @@ def create_package(
     return package
 
 
-@router.patch("/{package_id}", response_model=UserPackageOut)
+@router.patch("/{package_id:int}", response_model=UserPackageOut)
 def update_package(
     package_id: int,
     payload: UserPackageUpdate,
@@ -1196,7 +1217,7 @@ def update_package(
     return package
 
 
-@router.delete("/{package_id}")
+@router.delete("/{package_id:int}")
 def delete_package(
     package_id: int,
     request: Request,
@@ -1207,7 +1228,7 @@ def delete_package(
     package = _package_by_id(db, package_id)
     if current_user.role == Role.reseller and package.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Cannot delete a package you do not own")
-    if db.query(User).filter(User.package_id == package.id).first():
+    if db.query(User).filter((User.package_id == package.id) | (User.reseller_package_id == package.id)).first():
         raise HTTPException(status_code=400, detail="Package is in use")
     name = package.name
     db.delete(package)
