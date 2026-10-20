@@ -1292,13 +1292,18 @@ else
     release)
       log "Checking latest release from ${REPO_URL}"
       RELEASE_TAG="$(latest_release_tag || true)"
+      HEAD_SHA="$(git ls-remote "$REPO_URL" "refs/heads/${BRANCH:-main}" 2>/dev/null | awk 'NR==1 { print $1 }' || true)"
+      TAG_SHA=""
       if [[ -n "$RELEASE_TAG" ]]; then
+        TAG_SHA="$(git ls-remote "$REPO_URL" "refs/tags/${RELEASE_TAG}^{}" "refs/tags/${RELEASE_TAG}" 2>/dev/null | tail -n 1 | awk '{ print $1 }' || true)"
+      fi
+      if [[ -n "$RELEASE_TAG" && ( -z "$HEAD_SHA" || "$HEAD_SHA" == "$TAG_SHA" ) ]]; then
         UPDATE_REF="$RELEASE_TAG"
         write_update_state "updating" "$UPDATE_REF" "Updating SPanel from ${UPDATE_REF}"
         download_release_source "$RELEASE_TAG"
         echo "Release: ${RELEASE_TAG}"
       else
-        log "No release tag found; pulling latest branch ${BRANCH:-main} from ${REPO_URL}"
+        log "Pulling latest branch ${BRANCH:-main} from ${REPO_URL}"
         RELEASE_WORK_DIR="$(mktemp -d /tmp/spanel-release-update.XXXXXX)"
         archive="${RELEASE_WORK_DIR}/spanel-release.zip"
         extract_dir="${RELEASE_WORK_DIR}/extract"

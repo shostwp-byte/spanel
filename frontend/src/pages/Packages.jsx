@@ -1432,7 +1432,7 @@ export function PackagesPage({ mode = 'users' }) {
       {/* Modal Import Packages from DirectAdmin, cPanel/WHM, Plesk */}
       {showImportModal && (
         <div
-          className="modal-backdrop"
+          className="modal-backdrop pkg-import-modal-backdrop"
           onClick={() => setShowImportModal(false)}
           style={{ zIndex: 1200 }}
         >

@@ -347,8 +347,8 @@ def _map_plesk_dict_to_package(name: str, raw: dict, is_reseller: bool = False) 
     return pkg
 
 
-def _validate_remote_url(raw_url: str) -> str:
-    url = raw_url.strip().rstrip("/")
+def _validate_remote_url(raw_url: str, panel: str = "directadmin") -> str:
+    url = raw_url.strip().strip("'\"").rstrip("/")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     parsed = urllib.parse.urlparse(url)
@@ -357,8 +357,16 @@ def _validate_remote_url(raw_url: str) -> str:
     host = parsed.hostname.strip().lower()
     if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "169.254.169.254"}:
         raise HTTPException(status_code=400, detail="Remote panel URL cannot point to loopback or metadata addresses")
+    port = parsed.port
+    if not port:
+        if panel == "directadmin":
+            port = 2222
+        elif panel == "cpanel":
+            port = 2087
+        elif panel == "plesk":
+            port = 8443
     try:
-        infos = socket.getaddrinfo(host, parsed.port or 443)
+        infos = socket.getaddrinfo(host, port or 443)
         for info in infos:
             ip_str = info[4][0]
             ip_obj = ipaddress.ip_address(ip_str)
@@ -366,24 +374,139 @@ def _validate_remote_url(raw_url: str) -> str:
                 raise HTTPException(status_code=400, detail="Remote panel host resolves to a restricted address")
     except socket.gaierror as exc:
         raise HTTPException(status_code=400, detail=f"Cannot resolve hostname '{host}': {exc}")
-    return url
+    host_fmt = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{parsed.scheme}://{host_fmt}:{port}" if port else f"{parsed.scheme}://{host_fmt}"
 
 
 def _http_fetch(url: str, headers: dict, data: bytes | None = None, verify_ssl: bool = False) -> str:
     ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": "SPanel-Package-Importer/1.0", **headers})
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "User-Agent": "SPanel-Package-Importer/1.0",
+            "Accept": "application/json, text/plain, */*",
+            **headers,
+        },
+    )
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=14) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body_preview = ""
         try:
-            body_preview = exc.read().decode("utf-8", errors="replace")[:250]
+            body_preview = exc.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             pass
+        if exc.code in (401, 403) or "Not logged in" in body_preview:
+            raise HTTPException(
+                status_code=400,
+                detail="Authentication failed on remote panel: Invalid username, password, or Login Key.",
+            )
         raise HTTPException(status_code=400, detail=f"Remote panel returned HTTP {exc.code}: {body_preview or exc.reason}")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to connect to remote panel: {exc}")
+
+
+def _da_parse_response_kv(raw_text: str) -> dict[str, Any]:
+    text = (raw_text or "").strip()
+    if not text:
+        return {}
+    if text.startswith("{"):
+        try:
+            j = json.loads(text)
+            if isinstance(j, dict):
+                return j
+        except Exception:
+            pass
+    qs = urllib.parse.parse_qs(text, keep_blank_values=True)
+    if qs and ("=" in text):
+        return {k: (v[0] if isinstance(v, list) and len(v) == 1 else v) for k, v in qs.items()}
+    kv: dict[str, Any] = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            kv[k.strip()] = urllib.parse.unquote_plus(v.strip())
+    return kv
+
+
+def _da_fetch_cmd_packages(
+    base_url: str,
+    headers: dict[str, str],
+    list_cmd: str,
+    show_cmd: str,
+    is_reseller_pkg: bool,
+    verify_ssl: bool,
+) -> tuple[list[dict] | None, str | None]:
+    raw_list = _http_fetch(f"{base_url}/{list_cmd}", headers, verify_ssl=verify_ssl)
+    stripped = (raw_list or "").strip()
+    lower_head = stripped[:400].lower()
+    if "<html" in lower_head or "<!doctype" in lower_head or "cmd_login" in lower_head:
+        return None, "Authentication failed on DirectAdmin: Invalid password/Login Key, or 2FA requires a Login Key."
+
+    pkg_names: list[str] = []
+    parsed_json = None
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed_json = json.loads(stripped)
+        except Exception:
+            parsed_json = None
+
+    if isinstance(parsed_json, list):
+        pkg_names = [str(x).strip() for x in parsed_json if isinstance(x, (str, int)) and str(x).strip()]
+    elif isinstance(parsed_json, dict):
+        err_flag = parsed_json.get("error")
+        if err_flag and str(err_flag) not in ("0", "false", "False"):
+            err_msg = str(parsed_json.get("result") or parsed_json.get("text") or parsed_json.get("details") or err_flag)
+            return None, err_msg
+        lst = parsed_json.get("list") or parsed_json.get("packages")
+        if isinstance(lst, list):
+            pkg_names = [str(x).strip() for x in lst if isinstance(x, (str, int)) and str(x).strip()]
+        elif isinstance(lst, dict):
+            pkg_names = [str(v).strip() for v in lst.values() if isinstance(v, (str, int)) and str(v).strip()]
+        else:
+            for k, v in parsed_json.items():
+                if k not in ("error", "text", "details", "result") and isinstance(v, (str, int)) and str(v).strip():
+                    pkg_names.append(str(v).strip())
+    else:
+        parsed_qs = urllib.parse.parse_qs(stripped, keep_blank_values=True)
+        err_vals = parsed_qs.get("error")
+        if err_vals and str(err_vals[0]).strip() not in ("0", "", "false", "False"):
+            text_part = (parsed_qs.get("text") or [""])[0]
+            detail_part = (parsed_qs.get("details") or [""])[0]
+            err_msg = f"{text_part}: {detail_part}".strip(": ") or "DirectAdmin API returned error=1"
+            return None, err_msg
+        raw_items = parsed_qs.get("list[]") or parsed_qs.get("list") or []
+        if raw_items:
+            pkg_names = [str(x).strip() for x in raw_items if str(x).strip()]
+        else:
+            for k, v in parsed_qs.items():
+                if (k.isdigit() or k.startswith("list[")) and v:
+                    for item in v:
+                        if str(item).strip():
+                            pkg_names.append(str(item).strip())
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_names: list[str] = []
+    for name in pkg_names:
+        if name and name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+
+    items: list[dict] = []
+    for pkg_name in unique_names[:60]:
+        q_name = urllib.parse.quote(pkg_name)
+        detail_raw = _http_fetch(
+            f"{base_url}/{show_cmd}?package={q_name}", headers, verify_ssl=verify_ssl
+        )
+        kv = _da_parse_response_kv(detail_raw)
+        if str(kv.get("error", "0")) not in ("0", "", "false", "False"):
+            continue
+        flat_kv = {k: (v[0] if isinstance(v, list) and v else v) for k, v in kv.items()}
+        items.append(_map_da_dict_to_package(pkg_name, flat_kv, is_reseller=is_reseller_pkg))
+
+    return items, None
 
 
 @router.get("", response_model=List[UserPackageOut])
@@ -417,7 +540,7 @@ def fetch_remote_packages(
     ensure_role(current_user.role, Role.reseller)
     is_reseller_pkg = bool(payload.is_reseller_package) if current_user.role == Role.admin else False
     panel = (payload.panel_type or "directadmin").strip().lower()
-    base_url = _validate_remote_url(payload.host_url)
+    base_url = _validate_remote_url(payload.host_url, panel=panel)
     user = (payload.username or "admin").strip()
     secret = (payload.secret or "").strip()
     if not secret:
@@ -428,47 +551,31 @@ def fetch_remote_packages(
 
     if panel == "directadmin":
         headers = {"Authorization": f"Basic {basic_token}"}
-        list_cmd = "CMD_API_PACKAGES_RESELLER" if is_reseller_pkg else "CMD_API_PACKAGES_USER"
-        show_cmd = "CMD_API_SHOW_RESELLER_PACKAGE" if is_reseller_pkg else "CMD_API_SHOW_USER_PACKAGE"
-        raw_list = _http_fetch(f"{base_url}/{list_cmd}?json=yes", headers, verify_ssl=payload.verify_ssl)
-        pkg_names: list[str] = []
-        try:
-            j = json.loads(raw_list)
-            if isinstance(j, list):
-                pkg_names = [str(x) for x in j if x]
-            elif isinstance(j, dict):
-                lst = j.get("list") or j.get("packages") or list(j.values())
-                if isinstance(lst, list):
-                    pkg_names = [str(x) for x in lst if x]
-        except Exception:
-            parsed_qs = urllib.parse.parse_qs(raw_list)
-            pkg_names = parsed_qs.get("list[]") or parsed_qs.get("list") or []
-            if not pkg_names:
-                for line in raw_list.splitlines():
-                    if "=" in line:
-                        _, v = line.split("=", 1)
-                        v = urllib.parse.unquote_plus(v.strip())
-                        if v:
-                            pkg_names.append(v)
+        primary_list = "CMD_API_PACKAGES_RESELLER" if is_reseller_pkg else "CMD_API_PACKAGES_USER"
+        primary_show = "CMD_API_SHOW_RESELLER_PACKAGE" if is_reseller_pkg else "CMD_API_SHOW_USER_PACKAGE"
+        fallback_list = "CMD_API_PACKAGES_USER" if is_reseller_pkg else "CMD_API_PACKAGES_RESELLER"
+        fallback_show = "CMD_API_SHOW_USER_PACKAGE" if is_reseller_pkg else "CMD_API_SHOW_RESELLER_PACKAGE"
 
-        for pkg_name in pkg_names[:50]:
-            q_name = urllib.parse.quote(pkg_name)
-            detail_raw = _http_fetch(
-                f"{base_url}/{show_cmd}?package={q_name}", headers, verify_ssl=payload.verify_ssl
+        pkgs, err1 = _da_fetch_cmd_packages(
+            base_url, headers, primary_list, primary_show, is_reseller_pkg, payload.verify_ssl
+        )
+        if pkgs is None or len(pkgs) == 0:
+            # If a DirectAdmin Reseller account (e.g. dareseller) is used or no packages exist in primary scope,
+            # automatically try the secondary scope (CMD_API_PACKAGES_USER <-> CMD_API_PACKAGES_RESELLER).
+            pkgs_fb, err2 = _da_fetch_cmd_packages(
+                base_url, headers, fallback_list, fallback_show, is_reseller_pkg, payload.verify_ssl
             )
-            kv: dict[str, Any] = {}
-            try:
-                kv = json.loads(detail_raw)
-            except Exception:
-                qs = urllib.parse.parse_qs(detail_raw, keep_blank_values=True)
-                if qs:
-                    kv = {k: v[0] if isinstance(v, list) and v else "" for k, v in qs.items()}
-                else:
-                    for line in detail_raw.splitlines():
-                        if "=" in line:
-                            k, v = line.split("=", 1)
-                            kv[k.strip()] = v.strip()
-            results.append(_map_da_dict_to_package(pkg_name, kv, is_reseller=is_reseller_pkg))
+            if pkgs_fb is not None and len(pkgs_fb) > 0:
+                results = pkgs_fb
+            elif pkgs is not None and pkgs_fb is not None:
+                results = []
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"DirectAdmin API error: {err1 or err2 or 'Unable to fetch packages'}",
+                )
+        else:
+            results = pkgs
 
     elif panel == "cpanel":
         if payload.auth_type == "token":
@@ -801,7 +908,7 @@ def create_package(
     return package
 
 
-@router.patch("/{package_id}", response_model=UserPackageOut)
+@router.patch("/{package_id:int}", response_model=UserPackageOut)
 def update_package(
     package_id: int,
     payload: UserPackageUpdate,
@@ -918,7 +1025,7 @@ def update_package(
     return package
 
 
-@router.delete("/{package_id}")
+@router.delete("/{package_id:int}")
 def delete_package(
     package_id: int,
     request: Request,
