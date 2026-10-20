@@ -31,12 +31,14 @@ else
 fi
 
 if ! curl -fsSL "$archive_url" -o "$tmp_dir/source.tar.gz" 2>/dev/null; then
-  echo "==> Downloading latest HEAD archive from ${SPANEL_GITHUB}"
-  curl -fsSL "${SPANEL_GITHUB}/archive/HEAD.tar.gz" -o "$tmp_dir/source.tar.gz"
+  if ! curl -fsSL "${SPANEL_GITHUB}/archive/refs/heads/1.0.6.tar.gz" -o "$tmp_dir/source.tar.gz" 2>/dev/null; then
+    echo "==> Downloading latest HEAD archive from ${SPANEL_GITHUB}"
+    curl -fsSL "${SPANEL_GITHUB}/archive/HEAD.tar.gz" -o "$tmp_dir/source.tar.gz"
+  fi
 fi
 
 tar -xzf "$tmp_dir/source.tar.gz" -C "$tmp_dir"
-source_dir="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d -name 'spanel-*' | head -n 1)"
+source_dir="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 [[ -n "$source_dir" && -d "$source_dir" ]] || {
   echo "ERROR: Could not extract SPanel source archive." >&2
   exit 1

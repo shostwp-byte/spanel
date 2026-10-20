@@ -1,6 +1,6 @@
 from pathlib import Path
 
-APP_VERSION_FALLBACK = "1.0.60"
+APP_VERSION_FALLBACK = "1.0.6"
 
 
 def _read_app_version() -> str:

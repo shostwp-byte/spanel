@@ -1,9 +1,9 @@
 # SPanel — Nền tảng Quản trị Web Hosting Đa tầng Thế hệ mới
 
-**SPanel (`v1.0.60`)** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, gọn nhẹ, bảo mật cao dành cho **Ubuntu 24.04 LTS**. Hệ thống hỗ trợ kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)**, giao diện quản lý tên miền & subdomain trực quan theo phong cách DirectAdmin, tối ưu hiển thị trên cả máy tính lẫn thiết bị di động (Mobile Responsive), hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh** cùng chế độ **Sáng / Tối (Light / Dark Mode)**.
+**SPanel (`v1.0.6`)** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, gọn nhẹ, bảo mật cao dành cho **Ubuntu 24.04 LTS**. Hệ thống hỗ trợ kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)**, giao diện quản lý tên miền & subdomain trực quan theo phong cách DirectAdmin, tối ưu hiển thị trên cả máy tính lẫn thiết bị di động (Mobile Responsive), hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh** cùng chế độ **Sáng / Tối (Light / Dark Mode)**.
 
 - **Kho mã nguồn chính thức:** [https://github.com/shostwp-byte/spanel](https://github.com/shostwp-byte/spanel)
-- **Phiên bản hiện tại:** `v1.0.60`
+- **Phiên bản hiện tại:** `v1.0.6`
 - **Giấy phép:** GNU AGPLv3 ([LICENSE](LICENSE))
 
 ---
@@ -107,7 +107,7 @@ spanel/
 ├── tools/i18n/       # Công cụ quản lý từ điển đa ngôn ngữ (Tiếng Việt / Tiếng Anh)
 ├── docs/             # Bộ tài liệu kỹ thuật & cổng thông tin GitHub Pages của SPanel
 ├── install.sh        # Script bootstrap cài đặt nhanh từ GitHub
-└── VERSION           # Phiên bản phát hành chuẩn SemVer (1.0.60)
+└── VERSION           # Phiên bản phát hành chuẩn SemVer (1.0.6)
 ```
 
 ---

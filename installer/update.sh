@@ -1308,7 +1308,7 @@ else
         unzip -q "$archive" -d "$extract_dir"
         SOURCE_DIR="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
         [[ -n "$SOURCE_DIR" && -d "$SOURCE_DIR/backend" && -d "$SOURCE_DIR/frontend" ]] || fail "Archive does not contain backend/frontend source"
-        UPDATE_REF="v$(cat "$SOURCE_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' || echo '1.0.60')"
+        UPDATE_REF="v$(cat "$SOURCE_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' || echo '1.0.6')"
         write_update_state "updating" "$UPDATE_REF" "Updating SPanel from ${UPDATE_REF}"
       fi
       ;;

@@ -64,6 +64,8 @@ def run_migrations() -> None:
     if _has_legacy_schema():
         command.stamp(cfg, "0001_initial")
     command.upgrade(cfg, "head")
+    import app.models.entities  # noqa: F401
+    Base.metadata.create_all(bind=engine)
     _ensure_resource_limit_columns()
 
 

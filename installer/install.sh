@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SPANEL_INSTALLER_VERSION="${SPANEL_INSTALLER_VERSION:-v1.0.60}"
+SPANEL_INSTALLER_VERSION="${SPANEL_INSTALLER_VERSION:-v1.0.6}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Please run this installer as root"
@@ -488,12 +488,12 @@ write_waf_default_rules() {
   cat >/etc/nginx/modsec/spanel-default.conf <<'RULES'
 # SPanel default WAF rules: lightweight WordPress, Laravel, and PHP probes only.
 SecRule REQUEST_URI "@rx (?i)(?:/\.env(?:\.|$)|/\.user\.ini(?:\.|$)|/\.git/|/composer\.(?:json|lock)(?:$|[?])|/(?:phpinfo|info)\.php(?:$|[?])|/(?:config|database|db)\.php\.(?:bak|old|save|txt)(?:$|[?]))" "id:1001301,phase:1,deny,status:403,log,msg:'SPanel blocked PHP sensitive file probe'"
-SecRule REQUEST_URI|ARGS "@rx (?i)(?:\.\./|\.\.\\|%2e%2e%2f|%252e%252e%252f)" "id:1001302,phase:2,deny,status:403,log,msg:'SPanel blocked PHP path traversal'"
+SecRule REQUEST_URI|ARGS "@rx (?i)(?:\.\./|\.\.\\|%2e%2e%2f|%252e%252e%252f)" "id:1001302,phase:1,deny,status:403,log,msg:'SPanel blocked PHP path traversal'"
 SecRule REQUEST_URI "@rx (?i)(?:/(?:c99|r57|shell|cmd|wso)\.php(?:$|[?])|/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin\.php(?:$|[?]))" "id:1001303,phase:1,deny,status:403,log,msg:'SPanel blocked PHP runtime probe'"
 SecRule REQUEST_URI "@rx (?i)(?:/\.env(?:\.|$)|/artisan(?:$|[?])|/server\.php(?:$|[?])|/storage/logs/[^?]*\.log(?:$|[?])|/bootstrap/cache/[^?]*\.php(?:$|[?]))" "id:1001201,phase:1,deny,status:403,log,msg:'SPanel blocked Laravel sensitive path'"
 SecRule REQUEST_URI "@rx (?i)(?:/_ignition/execute-solution(?:$|[?]))" "id:1001202,phase:1,deny,status:403,log,msg:'SPanel blocked Laravel Ignition RCE probe'"
 SecRule REQUEST_URI "@rx (?i)(?:/wp-config\.php(?:\.|$|[?])|/wp-content/(?:uploads|cache|upgrade)/[^?]*\.php(?:$|[?])|/wp-admin/includes/[^?]*\.php(?:$|[?])|/wp-includes/[^?]*\.php(?:$|[?]))" "id:1001101,phase:1,deny,status:403,log,msg:'SPanel blocked WordPress sensitive path'"
-SecRule ARGS:author "@rx ^[0-9]+$" "id:1001103,phase:2,deny,status:403,log,msg:'SPanel blocked WordPress author enumeration'"
+SecRule ARGS:author "@rx ^[0-9]+$" "id:1001103,phase:1,deny,status:403,log,msg:'SPanel blocked WordPress author enumeration'"
 SecRule REQUEST_URI "@rx (?i)(?:/wp-admin/install\.php(?:$|[?])|/wp-admin/setup-config\.php(?:$|[?]))" "id:1001104,phase:1,deny,status:403,log,msg:'SPanel blocked WordPress installer probe'"
 RULES
 }
@@ -544,7 +544,7 @@ copy_sources() {
 build_frontend() {
   cd "${APP_DIR}/frontend"
   rm -rf node_modules package-lock.json dist .vite
-  npm install
+  npm install --no-audit --no-fund --legacy-peer-deps || npm install --no-audit --no-fund --force
   VITE_API_URL=/api npm run build
   if [[ ! -f dist/index.html ]]; then
     fail "Frontend build failed: ${APP_DIR}/frontend/dist/index.html is missing"
@@ -1420,7 +1420,7 @@ source_version() {
 write_update_state() {
   local version now
   version="$(source_version)"
-  version="${version:-1.0.60}"
+  version="${version:-1.0.6}"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   install -d -o spanel -g spanel -m 0750 /var/lib/spanel /var/lib/spanel/geoip
   cat >/var/lib/spanel/update-status.json <<STATE
