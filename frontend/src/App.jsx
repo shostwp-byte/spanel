@@ -13,7 +13,7 @@ import 'ace-builds/src-noconflict/mode-text';
 import 'ace-builds/src-noconflict/mode-yaml';
 import 'ace-builds/src-noconflict/theme-textmate';
 import 'ace-builds/src-noconflict/theme-tomorrow_night';
-import { Sparkles, UserPlus, ArrowRightLeft, Wrench, PenTool as Tool, BarChart, MessageSquare, Key, AlertTriangle, LayoutTemplate, Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
+import { Sparkles, UserPlus, ArrowRightLeft, Wrench, PenTool as Tool, BarChart, MessageSquare, Key, AlertTriangle, LayoutTemplate, Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Heart, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
 import { Terminal } from './components/Terminal';
 import { AIAssistant } from './components/AIAssistant.jsx';
 import { LANGUAGES, t, useLanguage } from './i18n.js';
@@ -1164,6 +1164,8 @@ function AppContent() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [donateModalOpen, setDonateModalOpen] = useState(false);
+  const [donateCopiedField, setDonateCopiedField] = useState("");
   const notificationsRef = useRef();
   const userMenuRef = useRef(null);
   // Set while signing out on purpose. Requests already in flight come back
@@ -4212,7 +4214,21 @@ function AppContent() {
             })}
           </div>)}
         </nav>
-        {appVersion && <div className="sidebar-version">v{appVersion}</div>}
+        <div className="sidebar-footer-row">
+          {appVersion && <div className="sidebar-version">v{appVersion}</div>}
+          <button
+            type="button"
+            className="sidebar-donate-btn"
+            onClick={() => {
+              setMobileMenuOpen(false);
+              setDonateModalOpen(true);
+            }}
+            title={t('Donate to SPanel')}
+          >
+            <Heart size={13} fill="currentColor" />
+            <span>{t('Donate')}</span>
+          </button>
+        </div>
       </aside>
       <div className="content">
         {effectiveRole !== actualRole && (
@@ -4225,24 +4241,38 @@ function AppContent() {
           </div>
         )}
         <section className="topbar">
-          <button className="mobile-nav-toggle" onClick={() => setMobileMenuOpen(o => !o)} aria-expanded={mobileMenuOpen} aria-label={t('Toggle navigation')}>
-            <Menu size={20} /><span><ActiveIcon size={17} />{t(pageItem?.[1] || 'Menu')}</span>
-          </button>
-          <div className="page-title">
-            <h1>{pageItem?.[1] ? t(pageItem[1]) : (panelSettings.app_name || 'spanel')}</h1>
+          <div className="topbar-left">
+            <button className="mobile-nav-toggle" onClick={() => setMobileMenuOpen(o => !o)} aria-expanded={mobileMenuOpen} aria-label={t('Toggle navigation')}>
+              <Menu size={20} /><span><ActiveIcon size={17} />{t(pageItem?.[1] || 'Menu')}</span>
+            </button>
+            <div className="page-title">
+              <h1>{pageItem?.[1] ? t(pageItem[1]) : (panelSettings.app_name || 'spanel')}</h1>
+            </div>
           </div>
           {/* The page title, then one account menu - profile, account security
               and sign out live in it, as they do in OPanel. */}
           <div className="top-actions">
             {(canSwitchToAdmin || canSwitchToReseller) && (
-              <div className="segmented" style={{ marginRight: '8px' }} aria-label="Access Level">
+              <div className="segmented role-switcher-seg" aria-label="Access Level">
                 {canSwitchToAdmin && <button className={effectiveRole === 'admin' ? 'active' : ''} onClick={() => { setViewLevel('admin'); navigateToPage('dashboard'); }}>Admin</button>}
                 {canSwitchToReseller && <button className={effectiveRole === 'reseller' ? 'active' : ''} onClick={() => { setViewLevel('reseller'); navigateToPage('dashboard'); }}>Reseller</button>}
                 <button className={effectiveRole === 'user' ? 'active' : ''} onClick={() => { setViewLevel('user'); navigateToPage('dashboard'); }}>User</button>
               </div>
             )}
 
-            <div className="user-menu" ref={notificationsRef} style={{ marginRight: '8px' }}>
+            <div className="top-utility-group">
+              <button
+                type="button"
+                className="donate-trigger-btn"
+                onClick={() => setDonateModalOpen(true)}
+                title={t('Donate to SPanel')}
+                aria-label={t('Donate to SPanel')}
+              >
+                <Heart size={14} fill="currentColor" className="donate-heart-icon" />
+                <span className="donate-trigger-label">{t('Donate')}</span>
+              </button>
+
+              <div className="user-menu" ref={notificationsRef}>
               <a href="#" className="theme-toggle" onClick={(e) => { e.preventDefault(); setNotificationsOpen(!notificationsOpen); }} title={t('Notifications')} style={{ position: 'relative' }}>
                 <Bell size={16} />
                 {systemNotifications.length > 0 && (
@@ -4464,6 +4494,7 @@ function AppContent() {
                 <button type="button" role="menuitem" className="user-menu-logout" onClick={() => { setUserMenuOpen(false); logout(); }}><LogOut size={15} />{t('Logout')}</button>
               </div>}
             </div>
+            </div>
           </div>
         </section>
         {currentUser?.demo && <div className="demo-strip" role="status"><Eye size={15} /><span>{t('This is a demo: you can look at everything, but changes are not saved.')}</span></div>}
@@ -4473,6 +4504,306 @@ function AppContent() {
         </div>
       </div>
     </section>
+
+    {donateModalOpen && (
+      <div
+        className="modal-backdrop donate-modal-backdrop"
+        onClick={() => setDonateModalOpen(false)}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          zIndex: 1200,
+          background: 'rgba(15, 23, 42, 0.62)',
+          backdropFilter: 'blur(5px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '14px',
+        }}
+      >
+        <div
+          className="modal donate-modal-card"
+          onClick={e => e.stopPropagation()}
+          style={{
+            width: '100%',
+            maxWidth: '430px',
+            borderRadius: '18px',
+            background: 'var(--bg-elevated, var(--surface))',
+            border: '1px solid var(--border-strong, var(--border))',
+            boxShadow: '0 24px 48px rgba(15, 23, 42, 0.28)',
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            className="modal-header"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '12px',
+              padding: '16px 20px',
+              borderBottom: '1px solid var(--border)',
+              background: 'linear-gradient(135deg, rgba(225, 29, 72, 0.08) 0%, rgba(244, 63, 94, 0.03) 100%)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+              <div
+                style={{
+                  width: '36px',
+                  height: '36px',
+                  borderRadius: '10px',
+                  background: 'rgba(225, 29, 72, 0.14)',
+                  color: '#e11d48',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                <Heart size={18} fill="currentColor" />
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: 'var(--text)' }}>
+                  {t('Donate to SPanel')}
+                </h3>
+                <small style={{ display: 'block', fontSize: '12px', color: 'var(--text-muted)', marginTop: '1px' }}>
+                  {t('Support SPanel open-source development')}
+                </small>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="secondary-light"
+              onClick={() => setDonateModalOpen(false)}
+              style={{ width: '32px', minWidth: '32px', height: '32px', minHeight: '32px', padding: 0, borderRadius: '8px' }}
+              aria-label={t('Close')}
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          <div
+            className="modal-body"
+            style={{
+              padding: '18px 20px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '14px',
+            }}
+          >
+            {/* VietQR Frame */}
+            <div
+              style={{
+                background: '#ffffff',
+                border: '1px solid #e2e8f0',
+                borderRadius: '14px',
+                padding: '14px 16px 12px',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                boxShadow: '0 4px 14px rgba(15, 23, 42, 0.05)',
+              }}
+            >
+              <div
+                style={{
+                  width: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  marginBottom: '10px',
+                  paddingBottom: '8px',
+                  borderBottom: '1px dashed #e2e8f0',
+                }}
+              >
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    fontSize: '12.5px',
+                    fontWeight: 800,
+                    color: '#1e3a8a',
+                    letterSpacing: '0.02em',
+                  }}
+                >
+                  <span
+                    style={{
+                      display: 'inline-block',
+                      width: '8px',
+                      height: '8px',
+                      borderRadius: '999px',
+                      background: '#dc2626',
+                    }}
+                  />
+                  MB BANK
+                </span>
+                <span
+                  style={{
+                    fontSize: '11px',
+                    fontWeight: 700,
+                    color: '#0284c7',
+                    background: '#f0f9ff',
+                    border: '1px solid #bae6fd',
+                    padding: '2px 8px',
+                    borderRadius: '999px',
+                  }}
+                >
+                  VietQR • Napas247
+                </span>
+              </div>
+
+              <div
+                style={{
+                  width: '204px',
+                  height: '204px',
+                  padding: '6px',
+                  background: '#ffffff',
+                  borderRadius: '10px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <svg
+                  viewBox="-1 -1 39 39"
+                  width="192"
+                  height="192"
+                  shapeRendering="crispEdges"
+                  role="img"
+                  aria-label="VietQR MB Bank 978579798888 Tran Quang Quoc Dung"
+                  style={{ width: '100%', height: '100%', display: 'block' }}
+                >
+                  <rect x="-1" y="-1" width="39" height="39" fill="#ffffff" />
+                  <path d="M0 0h7v1h-7zM10 0h3v1h-3zM15 0h1v1h-1zM21 0h1v1h-1zM25 0h1v1h-1zM28 0h1v1h-1zM30 0h7v1h-7zM0 1h1v1h-1zM6 1h1v1h-1zM10 1h2v1h-2zM20 1h3v1h-3zM24 1h1v1h-1zM26 1h1v1h-1zM30 1h1v1h-1zM36 1h1v1h-1zM0 2h1v1h-1zM2 2h3v1h-3zM6 2h1v1h-1zM8 2h1v1h-1zM10 2h3v1h-3zM14 2h2v1h-2zM17 2h1v1h-1zM24 2h1v1h-1zM26 2h1v1h-1zM30 2h1v1h-1zM32 2h3v1h-3zM36 2h1v1h-1zM0 3h1v1h-1zM2 3h3v1h-3zM6 3h1v1h-1zM8 3h1v1h-1zM12 3h2v1h-2zM15 3h1v1h-1zM18 3h1v1h-1zM20 3h1v1h-1zM23 3h1v1h-1zM25 3h3v1h-3zM30 3h1v1h-1zM32 3h3v1h-3zM36 3h1v1h-1zM0 4h1v1h-1zM2 4h3v1h-3zM6 4h1v1h-1zM8 4h2v1h-2zM12 4h6v1h-6zM19 4h1v1h-1zM21 4h1v1h-1zM23 4h1v1h-1zM25 4h2v1h-2zM30 4h1v1h-1zM32 4h3v1h-3zM36 4h1v1h-1zM0 5h1v1h-1zM6 5h1v1h-1zM8 5h5v1h-5zM14 5h1v1h-1zM16 5h2v1h-2zM19 5h1v1h-1zM21 5h1v1h-1zM23 5h2v1h-2zM27 5h1v1h-1zM30 5h1v1h-1zM36 5h1v1h-1zM0 6h7v1h-7zM8 6h1v1h-1zM10 6h1v1h-1zM12 6h1v1h-1zM14 6h1v1h-1zM16 6h1v1h-1zM18 6h1v1h-1zM20 6h1v1h-1zM22 6h1v1h-1zM24 6h1v1h-1zM26 6h1v1h-1zM28 6h1v1h-1zM30 6h7v1h-7zM8 7h1v1h-1zM10 7h1v1h-1zM12 7h1v1h-1zM15 7h5v1h-5zM24 7h2v1h-2zM27 7h1v1h-1zM0 8h1v1h-1zM2 8h5v1h-5zM9 8h4v1h-4zM15 8h2v1h-2zM21 8h1v1h-1zM26 8h2v1h-2zM30 8h5v1h-5zM1 9h1v1h-1zM7 9h3v1h-3zM12 9h1v1h-1zM14 9h2v1h-2zM17 9h2v1h-2zM20 9h2v1h-2zM27 9h2v1h-2zM30 9h2v1h-2zM33 9h2v1h-2zM0 10h7v1h-7zM8 10h2v1h-2zM12 10h1v1h-1zM15 10h5v1h-5zM21 10h4v1h-4zM30 10h1v1h-1zM33 10h1v1h-1zM36 10h1v1h-1zM1 11h1v1h-1zM3 11h2v1h-2zM8 11h2v1h-2zM13 11h1v1h-1zM15 11h1v1h-1zM17 11h5v1h-5zM23 11h2v1h-2zM27 11h7v1h-7zM35 11h1v1h-1zM3 12h1v1h-1zM6 12h2v1h-2zM10 12h1v1h-1zM14 12h7v1h-7zM23 12h1v1h-1zM25 12h1v1h-1zM30 12h2v1h-2zM33 12h1v1h-1zM36 12h1v1h-1zM0 13h2v1h-2zM5 13h1v1h-1zM8 13h4v1h-4zM14 13h1v1h-1zM18 13h1v1h-1zM21 13h3v1h-3zM25 13h3v1h-3zM30 13h2v1h-2zM36 13h1v1h-1zM0 14h3v1h-3zM5 14h3v1h-3zM9 14h3v1h-3zM14 14h1v1h-1zM18 14h1v1h-1zM20 14h1v1h-1zM24 14h2v1h-2zM27 14h1v1h-1zM30 14h1v1h-1zM33 14h1v1h-1zM0 15h4v1h-4zM5 15h1v1h-1zM8 15h5v1h-5zM14 15h3v1h-3zM21 15h1v1h-1zM24 15h1v1h-1zM27 15h1v1h-1zM29 15h2v1h-2zM33 15h1v1h-1zM36 15h1v1h-1zM0 16h4v1h-4zM6 16h1v1h-1zM8 16h3v1h-3zM12 16h4v1h-4zM18 16h1v1h-1zM24 16h1v1h-1zM26 16h3v1h-3zM32 16h2v1h-2zM36 16h1v1h-1zM0 17h1v1h-1zM4 17h1v1h-1zM7 17h4v1h-4zM12 17h1v1h-1zM14 17h4v1h-4zM27 17h2v1h-2zM31 17h1v1h-1zM36 17h1v1h-1zM2 18h6v1h-6zM14 18h1v1h-1zM20 18h6v1h-6zM30 18h3v1h-3zM36 18h1v1h-1zM0 19h1v1h-1zM2 19h4v1h-4zM7 19h2v1h-2zM10 19h1v1h-1zM12 19h1v1h-1zM16 19h1v1h-1zM18 19h2v1h-2zM21 19h1v1h-1zM28 19h1v1h-1zM30 19h1v1h-1zM32 19h1v1h-1zM36 19h1v1h-1zM0 20h1v1h-1zM5 20h2v1h-2zM8 20h1v1h-1zM10 20h1v1h-1zM12 20h1v1h-1zM14 20h1v1h-1zM18 20h1v1h-1zM22 20h2v1h-2zM26 20h1v1h-1zM29 20h2v1h-2zM32 20h3v1h-3zM36 20h1v1h-1zM0 21h2v1h-2zM3 21h2v1h-2zM7 21h1v1h-1zM17 21h2v1h-2zM21 21h3v1h-3zM26 21h2v1h-2zM30 21h2v1h-2zM33 21h2v1h-2zM36 21h1v1h-1zM1 22h1v1h-1zM4 22h1v1h-1zM6 22h3v1h-3zM10 22h3v1h-3zM15 22h1v1h-1zM17 22h1v1h-1zM19 22h1v1h-1zM27 22h1v1h-1zM31 22h1v1h-1zM33 22h4v1h-4zM0 23h1v1h-1zM2 23h4v1h-4zM8 23h1v1h-1zM10 23h1v1h-1zM12 23h7v1h-7zM21 23h1v1h-1zM23 23h3v1h-3zM27 23h2v1h-2zM30 23h1v1h-1zM32 23h2v1h-2zM35 23h2v1h-2zM1 24h1v1h-1zM5 24h7v1h-7zM14 24h1v1h-1zM16 24h1v1h-1zM21 24h1v1h-1zM25 24h1v1h-1zM28 24h1v1h-1zM30 24h2v1h-2zM34 24h1v1h-1zM0 25h1v1h-1zM4 25h1v1h-1zM7 25h2v1h-2zM11 25h3v1h-3zM15 25h1v1h-1zM17 25h2v1h-2zM25 25h1v1h-1zM27 25h4v1h-4zM32 25h2v1h-2zM36 25h1v1h-1zM0 26h1v1h-1zM2 26h2v1h-2zM6 26h1v1h-1zM13 26h1v1h-1zM15 26h5v1h-5zM23 26h2v1h-2zM33 26h2v1h-2zM36 26h1v1h-1zM0 27h1v1h-1zM2 27h1v1h-1zM4 27h2v1h-2zM8 27h2v1h-2zM11 27h2v1h-2zM14 27h2v1h-2zM18 27h2v1h-2zM21 27h4v1h-4zM27 27h1v1h-1zM32 27h5v1h-5zM0 28h1v1h-1zM2 28h1v1h-1zM6 28h1v1h-1zM9 28h1v1h-1zM11 28h1v1h-1zM13 28h1v1h-1zM15 28h2v1h-2zM22 28h1v1h-1zM24 28h1v1h-1zM28 28h6v1h-6zM35 28h2v1h-2zM8 29h1v1h-1zM11 29h1v1h-1zM13 29h4v1h-4zM18 29h2v1h-2zM21 29h2v1h-2zM24 29h1v1h-1zM26 29h3v1h-3zM32 29h1v1h-1zM35 29h1v1h-1zM0 30h7v1h-7zM9 30h3v1h-3zM13 30h3v1h-3zM18 30h1v1h-1zM20 30h2v1h-2zM24 30h3v1h-3zM28 30h1v1h-1zM30 30h1v1h-1zM32 30h1v1h-1zM36 30h1v1h-1zM0 31h1v1h-1zM6 31h1v1h-1zM8 31h1v1h-1zM10 31h1v1h-1zM14 31h2v1h-2zM20 31h3v1h-3zM25 31h1v1h-1zM27 31h2v1h-2zM32 31h2v1h-2zM35 31h2v1h-2zM0 32h1v1h-1zM2 32h3v1h-3zM6 32h1v1h-1zM8 32h4v1h-4zM15 32h1v1h-1zM18 32h1v1h-1zM20 32h2v1h-2zM23 32h4v1h-4zM28 32h5v1h-5zM0 33h1v1h-1zM2 33h3v1h-3zM6 33h1v1h-1zM8 33h5v1h-5zM15 33h2v1h-2zM27 33h1v1h-1zM30 33h2v1h-2zM36 33h1v1h-1zM0 34h1v1h-1zM2 34h3v1h-3zM6 34h1v1h-1zM8 34h3v1h-3zM12 34h1v1h-1zM14 34h1v1h-1zM17 34h1v1h-1zM21 34h1v1h-1zM23 34h2v1h-2zM27 34h1v1h-1zM29 34h2v1h-2zM33 34h1v1h-1zM36 34h1v1h-1zM0 35h1v1h-1zM6 35h1v1h-1zM9 35h1v1h-1zM13 35h1v1h-1zM16 35h1v1h-1zM18 35h2v1h-2zM21 35h1v1h-1zM24 35h1v1h-1zM26 35h2v1h-2zM33 35h1v1h-1zM35 35h2v1h-2zM0 36h7v1h-7zM8 36h2v1h-2zM12 36h1v1h-1zM17 36h3v1h-3zM21 36h1v1h-1zM24 36h5v1h-5zM32 36h2v1h-2zM36 36h1v1h-1z" fill="#0f172a" />
+                </svg>
+              </div>
+
+              <div
+                style={{
+                  marginTop: '8px',
+                  fontSize: '11.5px',
+                  fontWeight: 500,
+                  color: '#64748b',
+                  textAlign: 'center',
+                }}
+              >
+                {t('Scan QR with any Banking or E-Wallet app')}
+              </div>
+            </div>
+
+            {/* Bank Account Details List */}
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px',
+                background: 'var(--surface-alt)',
+                border: '1px solid var(--border)',
+                borderRadius: '12px',
+                padding: '12px 14px',
+              }}
+            >
+              {[
+                { key: 'bank', label: t('Bank'), value: 'MB Bank', mono: false },
+                { key: 'stk', label: t('Account Number'), value: '978579798888', mono: true, highlight: true },
+                { key: 'holder', label: t('Account Holder'), value: 'Tran Quang Quoc Dung', mono: false },
+                { key: 'msg', label: t('Transfer Message'), value: 'Donate Spanel', mono: true, badge: true },
+              ].map(row => (
+                <div
+                  key={row.key}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '10px',
+                    padding: '4px 0',
+                    borderBottom: row.key !== 'msg' ? '1px dashed var(--border)' : 'none',
+                  }}
+                >
+                  <div style={{ minWidth: 0, flex: '1 1 auto' }}>
+                    <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', fontWeight: 500 }}>
+                      {row.label}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: row.highlight ? '15px' : '13.5px',
+                        fontWeight: 700,
+                        color: row.highlight ? 'var(--primary)' : 'var(--text)',
+                        fontFamily: row.mono ? 'var(--font-mono)' : 'inherit',
+                        letterSpacing: row.highlight ? '0.03em' : 'normal',
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {row.value}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary-light mini"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(row.value);
+                      setDonateCopiedField(row.key);
+                      setTimeout(() => setDonateCopiedField(''), 2000);
+                    }}
+                    style={{
+                      width: 'auto',
+                      minWidth: '78px',
+                      height: '28px',
+                      minHeight: '28px',
+                      padding: '0 10px',
+                      fontSize: '11.5px',
+                      fontWeight: 600,
+                      borderRadius: '7px',
+                      flexShrink: 0,
+                      color: donateCopiedField === row.key ? '#16a34a' : 'var(--text-secondary)',
+                      borderColor: donateCopiedField === row.key ? 'rgba(22, 163, 74, 0.4)' : 'var(--border)',
+                    }}
+                  >
+                    {donateCopiedField === row.key ? (
+                      <>
+                        <Check size={13} />
+                        <span>{t('Copied')}</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy size={12} />
+                        <span>{t('Copy')}</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div
+            className="modal-footer"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '10px',
+              padding: '12px 20px',
+              borderTop: '1px solid var(--border)',
+              background: 'var(--surface-alt)',
+            }}
+          >
+            <span style={{ fontSize: '12px', color: 'var(--text-muted)', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
+              <Heart size={13} fill="#e11d48" color="#e11d48" />
+              {t('Thank you for supporting SPanel!')}
+            </span>
+            <button
+              type="button"
+              className="secondary-light"
+              onClick={() => setDonateModalOpen(false)}
+              style={{ height: '34px', minHeight: '34px', padding: '0 16px', width: 'auto' }}
+            >
+              {t('Close')}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
     {renderNotifications()}
   </main></AppContext.Provider>;
 }

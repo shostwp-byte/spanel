@@ -2430,6 +2430,15 @@ export const vi = {
   "Please enter a new domain name.": "Vui lòng nhập tên miền mới.",
   "Renaming domain to {domain}...": "Đang đổi tên miền thành {domain}...",
   "Renamed domain to {domain}.": "Đã đổi tên miền thành {domain}.",
+  "Donate": "Donate",
+  "Donate to SPanel": "Ủng hộ dự án SPanel",
+  "Support SPanel open-source development": "Tiếp thêm động lực phát triển mã nguồn mở SPanel",
+  "Scan QR with any Banking or E-Wallet app": "Quét mã QR bằng ứng dụng Ngân hàng hoặc Ví điện tử",
+  "Bank": "Ngân hàng",
+  "Account Number": "Số tài khoản",
+  "Account Holder": "Chủ tài khoản",
+  "Transfer Message": "Nội dung chuyển khoản",
+  "Thank you for supporting SPanel!": "Cảm ơn bạn đã đồng hành cùng SPanel!",
 };
 
 /* Said in English by the people who run these servers. Translating them
