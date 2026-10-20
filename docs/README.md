@@ -1,9 +1,9 @@
-# Tài liệu Kỹ thuật & Hướng dẫn Sử dụng SPanel (`v1.0.60`)
+# Tài liệu Kỹ thuật & Hướng dẫn Sử dụng SPanel (`v1.0.6`)
 
 Chào mừng bạn đến với bộ tài liệu chính thức của **SPanel** — nền tảng quản trị máy chủ và web hosting đa tầng dành cho **Ubuntu 24.04 LTS**.
 
 - **Kho lưu trữ GitHub:** [https://github.com/shostwp-byte/spanel](https://github.com/shostwp-byte/spanel)
-- **Phiên bản tài liệu:** `v1.0.60`
+- **Phiên bản tài liệu:** `v1.0.6`
 
 ---
 

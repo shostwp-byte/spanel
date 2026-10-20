@@ -1,4 +1,4 @@
-# Danh mục Tính năng Chi tiết của SPanel (`v1.0.60`)
+# Danh mục Tính năng Chi tiết của SPanel (`v1.0.6`)
 
 Tài liệu này mô tả chi tiết các nhóm tính năng của **SPanel** được phân chia theo 3 vai trò người dùng (**Admin**, **Reseller**, **End User**) cùng cơ chế quản lý tiện ích mở rộng (**Add-ons**).
 

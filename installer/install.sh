@@ -544,6 +544,8 @@ copy_sources() {
 build_frontend() {
   cd "${APP_DIR}/frontend"
   rm -rf node_modules package-lock.json dist .vite
+  export npm_config_legacy_peer_deps=true
+  export NPM_CONFIG_LEGACY_PEER_DEPS=true
   npm install --no-audit --no-fund --legacy-peer-deps || npm install --no-audit --no-fund --force
   VITE_API_URL=/api npm run build
   if [[ ! -f dist/index.html ]]; then

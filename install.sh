@@ -6,27 +6,15 @@ SPANEL_REPO_SLUG="${SPANEL_GITHUB#*github.com/}"
 SPANEL_REPO_SLUG="${SPANEL_REPO_SLUG%.git}"
 INSTALLER_REL_PATH="${INSTALLER_REL_PATH:-installer/install.sh}"
 
-latest_tag="$(
-  if [[ -n "${SPANEL_VERSION:-}" ]]; then
-    printf '%s\n' "${SPANEL_VERSION}"
-  else
-    curl -fsSL "https://api.github.com/repos/${SPANEL_REPO_SLUG}/tags?per_page=100" 2>/dev/null \
-      | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(v[^"]*\)".*/\1/p' \
-      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -V \
-      | tail -n 1 || true
-  fi
-)"
-
 tmp_dir="$(mktemp -d)"
 trap 'cd /; rm -rf "$tmp_dir"' EXIT
 
-if [[ -n "$latest_tag" ]]; then
-  echo "==> Installing SPanel ${latest_tag} from ${SPANEL_GITHUB}"
-  archive_url="${SPANEL_GITHUB}/archive/refs/tags/${latest_tag}.tar.gz"
+if [[ -n "${SPANEL_VERSION:-}" ]]; then
+  echo "==> Installing SPanel ${SPANEL_VERSION} from ${SPANEL_GITHUB}"
+  archive_url="${SPANEL_GITHUB}/archive/refs/tags/${SPANEL_VERSION}.tar.gz"
 else
   branch="${SPANEL_BRANCH:-main}"
-  echo "==> Installing SPanel (${branch}) from ${SPANEL_GITHUB}"
+  echo "==> Installing SPanel (v1.0.6 - branch ${branch}) from ${SPANEL_GITHUB}"
   archive_url="${SPANEL_GITHUB}/archive/refs/heads/${branch}.tar.gz"
 fi
 
@@ -44,5 +32,9 @@ source_dir="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   exit 1
 }
 cd "$source_dir"
+export npm_config_legacy_peer_deps=true
+export NPM_CONFIG_LEGACY_PEER_DEPS=true
+export npm_config_audit=false
+export npm_config_fund=false
 chmod +x "$INSTALLER_REL_PATH" installer/update.sh installer/rescue-firewall.sh
-bash "$INSTALLER_REL_PATH"
+bash "$INSTALLER_REL_PATH" "$@"

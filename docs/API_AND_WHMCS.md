@@ -1,4 +1,4 @@
-# Tài liệu Provisioning API, Module WHMCS & Trợ lý AI MCP (`v1.0.60`)
+# Tài liệu Provisioning API, Module WHMCS & Trợ lý AI MCP (`v1.0.6`)
 
 Tài liệu này hướng dẫn các nhà cung cấp dịch vụ hosting tích hợp **SPanel** vào hệ thống quản lý khách hàng & thanh toán tự động **WHMCS**, sử dụng REST API cấp phát tài khoản và kết nối trợ lý AI qua giao thức **MCP (Model Context Protocol)**.
 

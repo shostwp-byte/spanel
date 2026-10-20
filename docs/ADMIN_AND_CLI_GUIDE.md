@@ -1,4 +1,4 @@
-# Cẩm nang Quản trị Hệ thống, Bảo mật & Lệnh CLI (`v1.0.60`)
+# Cẩm nang Quản trị Hệ thống, Bảo mật & Lệnh CLI (`v1.0.6`)
 
 Tài liệu này cung cấp kiến thức chuyên sâu về mô hình bảo mật của **SPanel**, bộ công cụ dòng lệnh cứu hộ qua SSH, cơ chế tường lửa và quy trình di chuyển dữ liệu (Migration) từ các bảng điều khiển khác.
 

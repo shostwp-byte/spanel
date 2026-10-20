@@ -1,4 +1,4 @@
-# Hướng dẫn Cài đặt & Cập nhật Trực tuyến SPanel (`v1.0.60`)
+# Hướng dẫn Cài đặt & Cập nhật Trực tuyến SPanel (`v1.0.6`)
 
 Tài liệu này hướng dẫn chi tiết quy trình triển khai **SPanel** trên máy chủ VPS mới hoàn toàn cũng như quy trình cập nhật phiên bản mới trực tuyến.
 
@@ -121,7 +121,7 @@ sudo spanel-update
 
 # Hoặc chỉ định rõ chế độ cập nhật qua update.sh:
 sudo bash /opt/spanel/installer/update.sh --release
-sudo bash /opt/spanel/installer/update.sh --tag v1.0.60
+sudo bash /opt/spanel/installer/update.sh --tag v1.0.6
 sudo bash /opt/spanel/installer/update.sh --branch main
 ```
 
