@@ -988,9 +988,12 @@ def _merge_certbot_ssl_config(new_content: str, existing_content: str) -> str:
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
     listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
+<<<<<<< Updated upstream
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
     listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
+=======
+>>>>>>> Stashed changes
     ssl_lines = []
     seen_ssl_lines = set()
     for line in existing_content.splitlines():
@@ -1083,9 +1086,12 @@ def apply_manual_ssl_config(new_content: str, cert_path: str, key_path: str, ca_
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
     listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
+<<<<<<< Updated upstream
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
     listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
+=======
+>>>>>>> Stashed changes
     ssl_lines = [
         f"    ssl_certificate {fullchain if ca else cert};",
         f"    ssl_certificate_key {key};",

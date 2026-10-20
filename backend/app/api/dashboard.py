@@ -1105,6 +1105,7 @@ def dashboard_summary(db: Session = Depends(get_db), current_user: User = Depend
         }
 
     summary["tenants"] = _safe(_tenants_summary, {})
+<<<<<<< Updated upstream
     own_sites = [site for site in sites if site.owner_id == current_user.id]
     own_unsecured = sorted(site.domain for site in own_sites if not site.ssl_enabled)
     summary["own_websites"] = {
@@ -1171,6 +1172,8 @@ def dashboard_summary(db: Session = Depends(get_db), current_user: User = Depend
         }
 
     summary["tenants"] = _safe(_tenants_summary, {})
+=======
+>>>>>>> Stashed changes
     if admin:
         summary["firewall"] = {"enabled": _safe(firewall.is_enabled)}
         summary["waf"] = {"engine": _safe(_waf_engine, "unknown")}
