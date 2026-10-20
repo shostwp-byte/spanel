@@ -133,7 +133,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-if [[ -z "${SPANEL_UPDATE_STABLE_COPY:-}" ]]; then
+if [[ -z "${SPANEL_UPDATE_STABLE_COPY:-}" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   _original_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   _stable_copy="$(mktemp /tmp/spanel-update.XXXXXX.sh)"
   cp "$_original_script" "$_stable_copy"
@@ -155,8 +155,12 @@ DEFAULT_SOURCE_DIR="/opt/spanel-source"           # Dev/branch checkout dir only
 # Resolve where THIS script lives. If it's inside a real git checkout we use
 # that. Otherwise we fall back to /opt/spanel-source so users running the
 # script from the deploy dir still get a usable workflow.
-_SCRIPT_SOURCE="${SPANEL_UPDATE_ORIGINAL_SCRIPT:-${BASH_SOURCE[0]}}"
-_SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_SOURCE")/.." && pwd)"
+_SCRIPT_SOURCE="${SPANEL_UPDATE_ORIGINAL_SCRIPT:-${BASH_SOURCE[0]:-}}"
+if [[ -n "$_SCRIPT_SOURCE" && -f "$_SCRIPT_SOURCE" ]]; then
+  _SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_SOURCE")/.." && pwd)"
+else
+  _SCRIPT_DIR="$DEFAULT_SOURCE_DIR"
+fi
 if [[ -d "$_SCRIPT_DIR/.git" ]]; then
   SOURCE_DIR="${SOURCE_DIR:-$_SCRIPT_DIR}"
 else
