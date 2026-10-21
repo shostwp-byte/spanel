@@ -758,19 +758,10 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-main)' }}>
                   Trung tâm Sao lưu & Khôi phục (Backup & Restore)
                 </h3>
-                {isManager && (
-                  <span style={{
-                    padding: '2px 9px', borderRadius: '999px', fontSize: '0.73rem', fontWeight: 700,
-                    background: 'rgba(13, 148, 136, 0.12)', border: '1px solid rgba(13, 148, 136, 0.25)',
-                    color: 'var(--accent-primary)',
-                  }}>
-                    Chuẩn Multi-Server: {serverHostname}/&lt;user&gt;/&lt;file&gt;.tar.gz
-                  </span>
-                )}
               </div>
               <p style={{ margin: '3px 0 0', fontSize: '0.84rem', color: 'var(--text-muted)' }}>
                 {isManager
-                  ? 'Quản lý sao lưu phân cấp theo Hostname/User trên Local, S3 Object Storage và SFTP/FTP dành cho Admin/Reseller.'
+                  ? 'Quản lý sao lưu và khôi phục tài khoản trên Local, S3 Object Storage và SFTP/FTP dành cho Admin/Reseller.'
                   : 'Sao lưu toàn bộ tài khoản hoặc từng Website và tự cấu hình lưu trữ từ xa (SFTP / S3) về tài khoản riêng của bạn.'}
               </p>
             </div>
@@ -861,15 +852,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   Tạo bản sao lưu toàn bộ tài khoản (Full User Backup)
                 </h4>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  {isManager ? (
-                    <>
-                      Lưu trữ chuẩn phân cấp Multi-Server: <code>{serverHostname}/&lt;username&gt;/user-&lt;username&gt;-&lt;timestamp&gt;.tar.gz</code> trên cả Local, S3 và SFTP.
-                    </>
-                  ) : (
-                    <>
-                      Đóng gói trọn vẹn Website, Database MariaDB và Hộp thư Email của bạn vào 1 file <code>.tar.gz</code> để lưu tại chỗ hoặc đẩy về kho SFTP/S3 cá nhân.
-                    </>
-                  )}
+                  Đóng gói trọn vẹn Website, Database MariaDB và Hộp thư Email của tài khoản vào gói <code>.tar.gz</code> để lưu tại chỗ hoặc đẩy lên SFTP / S3.
                 </p>
               </div>
               <button type="button" className="secondary-light" onClick={loadUserBackups} disabled={loading}>
@@ -912,9 +895,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 </span>
                 <select value={selectedUserBackupTargetId} onChange={(e) => setSelectedUserBackupTargetId(e.target.value)}>
                   <option value="">
-                    {isManager
-                      ? `Lưu tại máy chủ này (${serverHostname}/<user>/...)`
-                      : 'Lưu trên máy chủ hiện tại'}
+                    Lưu tại máy chủ này (Local)
                   </option>
                   {sftpTargets.map((target) => (
                     <option key={target.id} value={target.id}>
@@ -967,13 +948,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 <h4 style={{ margin: 0, fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-main)' }}>
                   Danh sách bản sao lưu User ({filteredUserBackups.length})
                 </h4>
-                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                  {isManager ? (
-                    <>Cấu trúc lưu trữ: <code>{serverHostname}/&lt;username&gt;/&lt;file&gt;.tar.gz</code></>
-                  ) : (
-                    <>Danh sách các bản sao lưu toàn bộ tài khoản của bạn</>
-                  )}
-                </span>
               </div>
               <div style={{ position: 'relative', minWidth: '260px' }}>
                 <Search size={15} style={{ position: 'absolute', left: '11px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
@@ -1135,11 +1109,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   Sao lưu & Khôi phục từng Website (Mã nguồn + Database)
                 </h4>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  {isManager ? (
-                    <>Định dạng chuẩn khi đẩy lên S3/SFTP: <code>{serverHostname}/&lt;user&gt;/&lt;user&gt;-&lt;domain&gt;.tar.gz</code></>
-                  ) : (
-                    <>Đóng gói thư mục gốc của Website và tự động xuất file SQL Database đi kèm vào gói <code>.tar.gz</code>.</>
-                  )}
+                  Đóng gói thư mục gốc của Website và tự động xuất file SQL Database đi kèm vào gói <code>.tar.gz</code>.
                 </p>
               </div>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
@@ -1302,7 +1272,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   {editingScheduleId ? `Chỉnh sửa lịch sao lưu #${editingScheduleId}` : 'Thiết lập lịch sao lưu tự động mới (Scheduled Backup)'}
                 </h4>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  Tự động tạo Full User Backup định kỳ theo cấu trúc chuẩn <code>{serverHostname}/&lt;username&gt;/&lt;file&gt;.tar.gz</code>.
+                  Thiết lập tiến trình Cron tự động sao lưu định kỳ các tài khoản User vào máy chủ Local hoặc đẩy lên SFTP / S3.
                 </p>
               </div>
               {editingScheduleId && (
@@ -1491,24 +1461,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         ))}
                       </select>
                     </label>
-                    <div style={{ marginTop: '10px', fontSize: '0.77rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
-                      Đường dẫn lưu mẫu:<br />
-                      <code style={{ color: 'var(--accent-primary)' }}>
-                        {scheduleForm.backup_mode === 'incremental' ? (
-                          <>
-                            {serverHostname}/demous/user-demous-2026-10-21.tar.gz (Full Base)<br />
-                            {serverHostname}/demous/user-demous-2026-10-22_020000-inc.tar.gz (Inc)
-                          </>
-                        ) : (
-                          <>
-                            {scheduleForm.name_suffix === 'none' && `${serverHostname}/demous/user-demous.tar.gz`}
-                            {scheduleForm.name_suffix === 'day_of_week' && `${serverHostname}/demous/user-demous-Wed.tar.gz`}
-                            {scheduleForm.name_suffix === 'week_of_month' && `${serverHostname}/demous/user-demous-W3.tar.gz`}
-                            {scheduleForm.name_suffix === 'full_date' && `${serverHostname}/demous/user-demous-2026-10-21.tar.gz`}
-                          </>
-                        )}
-                      </code>
-                    </div>
                   </div>
 
                   <button type="submit" disabled={loading} style={{ width: '100%', justifyContent: 'center', height: '40px', fontWeight: 600 }}>
@@ -1710,7 +1662,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                     Trình thuật sĩ Khôi phục Tài khoản (4-Step Account Restore Wizard)
                   </h4>
                   <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                    Tự động nhận diện cấu trúc phân cấp <code>&lt;hostname&gt;/&lt;username&gt;/&lt;file&gt;.tar.gz</code> trên Local, S3, SFTP và FTP/FTPS để tránh nhầm lẫn giữa các máy chủ.
+                    Khôi phục một hoặc nhiều tài khoản User từ bản sao lưu lưu trữ trên máy chủ này, kho SFTP/S3 hoặc máy chủ từ xa.
                   </p>
                 </div>
 
@@ -2107,15 +2059,9 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                       : 'Cấu hình Kho lưu trữ Sao lưu cá nhân (My Personal SFTP / S3 Storage)'}
                   </h4>
                   <p style={{ margin: '3px 0 0', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                    {isManager ? (
-                      <>
-                        Tự động phân tách thư mục theo chuẩn Multi-Server: <code>&lt;Prefix/RemotePath&gt;/{serverHostname}/&lt;username&gt;/&lt;file&gt;.tar.gz</code>.
-                      </>
-                    ) : (
-                      <>
-                        Kết nối máy chủ SFTP hoặc S3 Object Storage riêng của bạn để đẩy các bản sao lưu Website/User về tài khoản lưu trữ cá nhân.
-                      </>
-                    )}
+                    {isManager
+                      ? 'Kết nối máy chủ SFTP hoặc S3 Object Storage để lưu trữ các bản sao lưu tự động và thủ công ngoài máy chủ.'
+                      : 'Kết nối máy chủ SFTP hoặc S3 Object Storage riêng của bạn để đẩy các bản sao lưu Website/User về tài khoản lưu trữ cá nhân.'}
                   </p>
                 </div>
                 <button
