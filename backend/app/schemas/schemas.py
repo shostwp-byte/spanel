@@ -186,31 +186,31 @@ class TwoFactorDisableRequest(BaseModel):
 class UserPackageCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     slug: Optional[str] = Field(default=None, max_length=100)
-    website_limit: int = Field(default=5, ge=0, le=1000)
-    storage_limit_mb: int = Field(default=1024, ge=0, le=1024 * 1024)
-    database_limit: int = Field(default=5, ge=0, le=10000)
-    alias_limit: int = Field(default=0, ge=0, le=1000)
+    website_limit: int = Field(default=5, ge=-1, le=1000)
+    storage_limit_mb: int = Field(default=1024, ge=-1, le=1024 * 1024)
+    database_limit: int = Field(default=5, ge=-1, le=10000)
+    alias_limit: int = Field(default=0, ge=-1, le=1000)
     backup_retention_days: int = Field(default=7, ge=0, le=365)
     terminal_enabled: bool = False
     waf_enabled: bool = True
     wordpress_enabled: bool = True
-    node_apps_limit: int = Field(default=0, ge=0, le=100)
+    node_apps_limit: int = Field(default=0, ge=-1, le=100)
     node_app_memory_mb: int = Field(default=512, ge=64, le=16384)
-    sftp_accounts_limit: int = Field(default=3, ge=0, le=100)
-    mail_accounts_limit: int = Field(default=10, ge=0, le=1000)
+    sftp_accounts_limit: int = Field(default=3, ge=-1, le=100)
+    mail_accounts_limit: int = Field(default=10, ge=-1, le=1000)
     is_reseller_package: bool = False
-    reseller_user_limit: int = Field(default=0, ge=0, le=10000)
+    reseller_user_limit: int = Field(default=0, ge=-1, le=10000)
     reseller_overselling_enabled: bool = False
 
-    bandwidth_limit_mb: int = Field(default=0, ge=0)
-    inode_limit: int = Field(default=0, ge=0)
-    subdomain_limit: int = Field(default=0, ge=0)
-    email_forwarders_limit: int = Field(default=0, ge=0)
-    mailing_lists_limit: int = Field(default=0, ge=0)
-    autoresponders_limit: int = Field(default=0, ge=0)
-    domain_pointers_limit: int = Field(default=0, ge=0)
-    ftp_accounts_limit: int = Field(default=0, ge=0)
-    ips_limit: int = Field(default=0, ge=0)
+    bandwidth_limit_mb: int = Field(default=0, ge=-1)
+    inode_limit: int = Field(default=0, ge=-1)
+    subdomain_limit: int = Field(default=0, ge=-1)
+    email_forwarders_limit: int = Field(default=0, ge=-1)
+    mailing_lists_limit: int = Field(default=0, ge=-1)
+    autoresponders_limit: int = Field(default=0, ge=-1)
+    domain_pointers_limit: int = Field(default=0, ge=-1)
+    ftp_accounts_limit: int = Field(default=0, ge=-1)
+    ips_limit: int = Field(default=0, ge=-1)
     
     anonymous_ftp: bool = False
     cgi_access: bool = True
@@ -230,16 +230,16 @@ class UserPackageCreate(BaseModel):
     personal_dns_mode: Literal["none", "2_ips", "3_ips"] = "none"
     share_server_ip: bool = True
 
-    cpu_quota_percent: int = Field(default=100, ge=0, le=6400)
-    io_read_mbps: int = Field(default=0, ge=0, le=100000)
-    io_write_mbps: int = Field(default=0, ge=0, le=100000)
-    iops_read_max: int = Field(default=0, ge=0, le=10000000)
-    iops_write_max: int = Field(default=0, ge=0, le=10000000)
-    memory_high_mb: int = Field(default=1024, ge=0, le=1048576)
-    memory_max_mb: int = Field(default=2048, ge=0, le=1048576)
-    tasks_max: int = Field(default=512, ge=0, le=1000000)
-    mysql_storage_limit_mb: int = Field(default=0, ge=0, le=1048576)
-    mysql_max_db_size_mb: int = Field(default=0, ge=0, le=1048576)
+    cpu_quota_percent: int = Field(default=100, ge=-1, le=6400)
+    io_read_mbps: int = Field(default=0, ge=-1, le=100000)
+    io_write_mbps: int = Field(default=0, ge=-1, le=100000)
+    iops_read_max: int = Field(default=0, ge=-1, le=10000000)
+    iops_write_max: int = Field(default=0, ge=-1, le=10000000)
+    memory_high_mb: int = Field(default=1024, ge=-1, le=1048576)
+    memory_max_mb: int = Field(default=2048, ge=-1, le=1048576)
+    tasks_max: int = Field(default=512, ge=-1, le=1000000)
+    mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
+    mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
 
     @field_validator("personal_dns_mode", mode="before")
     @classmethod
@@ -258,31 +258,31 @@ class UserPackageCreate(BaseModel):
 class UserPackageUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     slug: Optional[str] = Field(default=None, max_length=100)
-    website_limit: Optional[int] = Field(default=None, ge=0, le=1000)
-    storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1024 * 1024)
-    database_limit: Optional[int] = Field(default=None, ge=0, le=10000)
-    alias_limit: Optional[int] = Field(default=None, ge=0, le=1000)
+    website_limit: Optional[int] = Field(default=None, ge=-1, le=1000)
+    storage_limit_mb: Optional[int] = Field(default=None, ge=-1, le=1024 * 1024)
+    database_limit: Optional[int] = Field(default=None, ge=-1, le=10000)
+    alias_limit: Optional[int] = Field(default=None, ge=-1, le=1000)
     backup_retention_days: Optional[int] = Field(default=None, ge=0, le=365)
     terminal_enabled: Optional[bool] = None
     waf_enabled: Optional[bool] = None
     wordpress_enabled: Optional[bool] = None
-    node_apps_limit: Optional[int] = Field(default=None, ge=0, le=100)
+    node_apps_limit: Optional[int] = Field(default=None, ge=-1, le=100)
     node_app_memory_mb: Optional[int] = Field(default=None, ge=64, le=16384)
-    sftp_accounts_limit: Optional[int] = Field(default=None, ge=0, le=100)
-    mail_accounts_limit: Optional[int] = Field(default=None, ge=0, le=1000)
+    sftp_accounts_limit: Optional[int] = Field(default=None, ge=-1, le=100)
+    mail_accounts_limit: Optional[int] = Field(default=None, ge=-1, le=1000)
     is_reseller_package: Optional[bool] = None
-    reseller_user_limit: Optional[int] = Field(default=None, ge=0, le=10000)
+    reseller_user_limit: Optional[int] = Field(default=None, ge=-1, le=10000)
     reseller_overselling_enabled: Optional[bool] = None
 
-    bandwidth_limit_mb: Optional[int] = Field(default=None, ge=0)
-    inode_limit: Optional[int] = Field(default=None, ge=0)
-    subdomain_limit: Optional[int] = Field(default=None, ge=0)
-    email_forwarders_limit: Optional[int] = Field(default=None, ge=0)
-    mailing_lists_limit: Optional[int] = Field(default=None, ge=0)
-    autoresponders_limit: Optional[int] = Field(default=None, ge=0)
-    domain_pointers_limit: Optional[int] = Field(default=None, ge=0)
-    ftp_accounts_limit: Optional[int] = Field(default=None, ge=0)
-    ips_limit: Optional[int] = Field(default=None, ge=0)
+    bandwidth_limit_mb: Optional[int] = Field(default=None, ge=-1)
+    inode_limit: Optional[int] = Field(default=None, ge=-1)
+    subdomain_limit: Optional[int] = Field(default=None, ge=-1)
+    email_forwarders_limit: Optional[int] = Field(default=None, ge=-1)
+    mailing_lists_limit: Optional[int] = Field(default=None, ge=-1)
+    autoresponders_limit: Optional[int] = Field(default=None, ge=-1)
+    domain_pointers_limit: Optional[int] = Field(default=None, ge=-1)
+    ftp_accounts_limit: Optional[int] = Field(default=None, ge=-1)
+    ips_limit: Optional[int] = Field(default=None, ge=-1)
     
     anonymous_ftp: Optional[bool] = None
     cgi_access: Optional[bool] = None
@@ -302,16 +302,16 @@ class UserPackageUpdate(BaseModel):
     personal_dns_mode: Optional[Literal["none", "2_ips", "3_ips"]] = None
     share_server_ip: Optional[bool] = None
 
-    cpu_quota_percent: Optional[int] = Field(default=None, ge=0, le=6400)
-    io_read_mbps: Optional[int] = Field(default=None, ge=0, le=100000)
-    io_write_mbps: Optional[int] = Field(default=None, ge=0, le=100000)
-    iops_read_max: Optional[int] = Field(default=None, ge=0, le=10000000)
-    iops_write_max: Optional[int] = Field(default=None, ge=0, le=10000000)
-    memory_high_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
-    memory_max_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
-    tasks_max: Optional[int] = Field(default=None, ge=0, le=1000000)
-    mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
-    mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
+    cpu_quota_percent: Optional[int] = Field(default=None, ge=-1, le=6400)
+    io_read_mbps: Optional[int] = Field(default=None, ge=-1, le=100000)
+    io_write_mbps: Optional[int] = Field(default=None, ge=-1, le=100000)
+    iops_read_max: Optional[int] = Field(default=None, ge=-1, le=10000000)
+    iops_write_max: Optional[int] = Field(default=None, ge=-1, le=10000000)
+    memory_high_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
+    memory_max_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
+    tasks_max: Optional[int] = Field(default=None, ge=-1, le=1000000)
+    mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
+    mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
 
     @field_validator("personal_dns_mode", mode="before")
     @classmethod
@@ -367,15 +367,15 @@ class UserPackageOut(BaseModel):
     reseller_user_limit: int = 0
     reseller_overselling_enabled: bool = False
 
-    bandwidth_limit_mb: int = Field(default=0, ge=0)
-    inode_limit: int = Field(default=0, ge=0)
-    subdomain_limit: int = Field(default=0, ge=0)
-    email_forwarders_limit: int = Field(default=0, ge=0)
-    mailing_lists_limit: int = Field(default=0, ge=0)
-    autoresponders_limit: int = Field(default=0, ge=0)
-    domain_pointers_limit: int = Field(default=0, ge=0)
-    ftp_accounts_limit: int = Field(default=0, ge=0)
-    ips_limit: int = Field(default=0, ge=0)
+    bandwidth_limit_mb: int = Field(default=0, ge=-1)
+    inode_limit: int = Field(default=0, ge=-1)
+    subdomain_limit: int = Field(default=0, ge=-1)
+    email_forwarders_limit: int = Field(default=0, ge=-1)
+    mailing_lists_limit: int = Field(default=0, ge=-1)
+    autoresponders_limit: int = Field(default=0, ge=-1)
+    domain_pointers_limit: int = Field(default=0, ge=-1)
+    ftp_accounts_limit: int = Field(default=0, ge=-1)
+    ips_limit: int = Field(default=0, ge=-1)
     
     anonymous_ftp: bool = False
     cgi_access: bool = True
@@ -425,23 +425,23 @@ class UserCreate(BaseModel):
     role: Literal["admin", "reseller", "end_user"] = "end_user"
     package_id: Optional[int] = Field(default=None, ge=1)
     reseller_package_id: Optional[int] = Field(default=None, ge=1)
-    website_limit: int = Field(default=5, ge=0, le=1000)
-    storage_limit_mb: int = Field(default=1024, ge=0, le=1024 * 1024)
-    sftp_accounts_limit: int = Field(default=3, ge=0, le=100)
-    mail_accounts_limit: int = Field(default=10, ge=0, le=1000)
-    bandwidth_limit_mb: int = Field(default=0, ge=0, le=104857600)
-    inode_limit: int = Field(default=0, ge=0, le=100000000)
-    database_limit: int = Field(default=5, ge=0, le=10000)
-    cpu_quota_percent: int = Field(default=100, ge=0, le=6400)
-    io_read_mbps: int = Field(default=0, ge=0, le=100000)
-    io_write_mbps: int = Field(default=0, ge=0, le=100000)
-    iops_read_max: int = Field(default=0, ge=0, le=10000000)
-    iops_write_max: int = Field(default=0, ge=0, le=10000000)
-    memory_high_mb: int = Field(default=1024, ge=0, le=1048576)
-    memory_max_mb: int = Field(default=2048, ge=0, le=1048576)
-    tasks_max: int = Field(default=512, ge=0, le=1000000)
-    mysql_storage_limit_mb: int = Field(default=0, ge=0, le=1048576)
-    mysql_max_db_size_mb: int = Field(default=0, ge=0, le=1048576)
+    website_limit: int = Field(default=5, ge=-1, le=1000)
+    storage_limit_mb: int = Field(default=1024, ge=-1, le=1024 * 1024)
+    sftp_accounts_limit: int = Field(default=3, ge=-1, le=100)
+    mail_accounts_limit: int = Field(default=10, ge=-1, le=1000)
+    bandwidth_limit_mb: int = Field(default=0, ge=-1, le=104857600)
+    inode_limit: int = Field(default=0, ge=-1, le=100000000)
+    database_limit: int = Field(default=5, ge=-1, le=10000)
+    cpu_quota_percent: int = Field(default=100, ge=-1, le=6400)
+    io_read_mbps: int = Field(default=0, ge=-1, le=100000)
+    io_write_mbps: int = Field(default=0, ge=-1, le=100000)
+    iops_read_max: int = Field(default=0, ge=-1, le=10000000)
+    iops_write_max: int = Field(default=0, ge=-1, le=10000000)
+    memory_high_mb: int = Field(default=1024, ge=-1, le=1048576)
+    memory_max_mb: int = Field(default=2048, ge=-1, le=1048576)
+    tasks_max: int = Field(default=512, ge=-1, le=1000000)
+    mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
+    mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
     terminal_enabled: Optional[bool] = None
 
     @field_validator("role", mode="before")
@@ -468,27 +468,27 @@ class UserUpdate(BaseModel):
     is_active: Optional[bool] = None
     package_id: Optional[int] = Field(default=None, ge=1)
     reseller_package_id: Optional[int] = Field(default=None, ge=1)
-    website_limit: Optional[int] = Field(default=None, ge=0, le=1000)
-    storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1024 * 1024)
+    website_limit: Optional[int] = Field(default=None, ge=-1, le=1000)
+    storage_limit_mb: Optional[int] = Field(default=None, ge=-1, le=1024 * 1024)
     # Grantable per user as well as per package, like the two above. Without
     # this the column existed, the API read it to refuse requests, and nothing
     # anywhere could raise it above zero.
-    sftp_accounts_limit: Optional[int] = Field(default=None, ge=0, le=100)
-    mail_accounts_limit: Optional[int] = Field(default=None, ge=0, le=1000)
+    sftp_accounts_limit: Optional[int] = Field(default=None, ge=-1, le=100)
+    mail_accounts_limit: Optional[int] = Field(default=None, ge=-1, le=1000)
     terminal_enabled: Optional[bool] = None
     is_reseller_package: Optional[bool] = None
-    reseller_user_limit: Optional[int] = Field(default=None, ge=0, le=10000)
+    reseller_user_limit: Optional[int] = Field(default=None, ge=-1, le=10000)
     reseller_overselling_enabled: Optional[bool] = None
 
-    bandwidth_limit_mb: Optional[int] = Field(default=None, ge=0)
-    inode_limit: Optional[int] = Field(default=None, ge=0)
-    subdomain_limit: Optional[int] = Field(default=None, ge=0)
-    email_forwarders_limit: Optional[int] = Field(default=None, ge=0)
-    mailing_lists_limit: Optional[int] = Field(default=None, ge=0)
-    autoresponders_limit: Optional[int] = Field(default=None, ge=0)
-    domain_pointers_limit: Optional[int] = Field(default=None, ge=0)
-    ftp_accounts_limit: Optional[int] = Field(default=None, ge=0)
-    ips_limit: Optional[int] = Field(default=None, ge=0)
+    bandwidth_limit_mb: Optional[int] = Field(default=None, ge=-1)
+    inode_limit: Optional[int] = Field(default=None, ge=-1)
+    subdomain_limit: Optional[int] = Field(default=None, ge=-1)
+    email_forwarders_limit: Optional[int] = Field(default=None, ge=-1)
+    mailing_lists_limit: Optional[int] = Field(default=None, ge=-1)
+    autoresponders_limit: Optional[int] = Field(default=None, ge=-1)
+    domain_pointers_limit: Optional[int] = Field(default=None, ge=-1)
+    ftp_accounts_limit: Optional[int] = Field(default=None, ge=-1)
+    ips_limit: Optional[int] = Field(default=None, ge=-1)
     
     anonymous_ftp: Optional[bool] = None
     cgi_access: Optional[bool] = None
@@ -507,17 +507,17 @@ class UserUpdate(BaseModel):
     
     personal_dns_mode: Optional[Literal["none", "2_ips", "3_ips"]] = None
     share_server_ip: Optional[bool] = None
-    database_limit: Optional[int] = Field(default=None, ge=0, le=10000)
-    cpu_quota_percent: Optional[int] = Field(default=None, ge=0, le=6400)
-    io_read_mbps: Optional[int] = Field(default=None, ge=0, le=100000)
-    io_write_mbps: Optional[int] = Field(default=None, ge=0, le=100000)
-    iops_read_max: Optional[int] = Field(default=None, ge=0, le=10000000)
-    iops_write_max: Optional[int] = Field(default=None, ge=0, le=10000000)
-    memory_high_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
-    memory_max_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
-    tasks_max: Optional[int] = Field(default=None, ge=0, le=1000000)
-    mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
-    mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
+    database_limit: Optional[int] = Field(default=None, ge=-1, le=10000)
+    cpu_quota_percent: Optional[int] = Field(default=None, ge=-1, le=6400)
+    io_read_mbps: Optional[int] = Field(default=None, ge=-1, le=100000)
+    io_write_mbps: Optional[int] = Field(default=None, ge=-1, le=100000)
+    iops_read_max: Optional[int] = Field(default=None, ge=-1, le=10000000)
+    iops_write_max: Optional[int] = Field(default=None, ge=-1, le=10000000)
+    memory_high_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
+    memory_max_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
+    tasks_max: Optional[int] = Field(default=None, ge=-1, le=1000000)
+    mysql_storage_limit_mb: Optional[int] = Field(default=0, ge=-1, le=1048576)
+    mysql_max_db_size_mb: Optional[int] = Field(default=0, ge=-1, le=1048576)
 
 
 class UserPasswordUpdate(BaseModel):

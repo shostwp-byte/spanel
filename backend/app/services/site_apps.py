@@ -186,7 +186,10 @@ def allocate_port(db: Session, preferred: int | None = None, exclude_app_id: int
 
 def app_limit_for(user: User) -> int:
     package = getattr(user, "package", None)
-    return int(getattr(package, "node_apps_limit", 0) or 0) if package else 0
+    if not package:
+        return 0
+    raw = getattr(package, "node_apps_limit", None)
+    return int(0 if raw is None else raw)
 
 
 def memory_ceiling_for(user: User) -> int:
@@ -203,9 +206,9 @@ def ensure_app_quota(db: Session, user: User, is_admin: bool = False) -> None:
     if is_admin:
         return
     limit = app_limit_for(user)
-    if limit <= 0:
+    if limit == 0:
         raise ValueError("Application hosting is not enabled for this package")
-    if count_apps_for_owner(db, user.id) >= limit:
+    if limit > 0 and count_apps_for_owner(db, user.id) >= limit:
         raise ValueError(f"This package allows at most {limit} application(s)")
 
 

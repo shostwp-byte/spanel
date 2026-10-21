@@ -394,12 +394,14 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
     )
     existing_root_domains_count = len(existing_domains) - existing_subdomains_count
     if is_subdomain_create:
-        eff_subdomain_limit = int((owner.package.subdomain_limit if getattr(owner, "package", None) else 0) or 0)
-        if not is_admin_role(owner.role) and eff_subdomain_limit > 0 and existing_subdomains_count >= eff_subdomain_limit:
+        raw_sub_lim = getattr(owner.package, "subdomain_limit", None) if getattr(owner, "package", None) else None
+        eff_subdomain_limit = int(-1 if raw_sub_lim is None else raw_sub_lim)
+        if not is_admin_role(owner.role) and eff_subdomain_limit >= 0 and existing_subdomains_count >= eff_subdomain_limit:
             raise HTTPException(status_code=403, detail="Subdomain limit reached")
     else:
-        eff_site_limit = int(owner.website_limit if owner.website_limit is not None else (owner.package.website_limit if getattr(owner, "package", None) else 0) or 0)
-        if not is_admin_role(owner.role) and eff_site_limit != 0 and existing_root_domains_count >= eff_site_limit:
+        raw_site_lim = owner.website_limit if owner.website_limit is not None else (getattr(owner.package, "website_limit", None) if getattr(owner, "package", None) else None)
+        eff_site_limit = int(-1 if raw_site_lim is None else raw_site_lim)
+        if not is_admin_role(owner.role) and eff_site_limit >= 0 and existing_root_domains_count >= eff_site_limit:
             raise HTTPException(status_code=403, detail="Website limit reached")
 
     install_wp = payload.install_wordpress and payload.app_type == "wordpress"

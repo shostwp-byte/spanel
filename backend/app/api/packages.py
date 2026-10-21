@@ -60,6 +60,7 @@ def _parse_int_quota(
     default: int = 0,
     bytes_to_mb: bool = False,
     auto_bytes_threshold: int | None = None,
+    unlimited_val: int = -1,
 ) -> int:
     if val is None:
         return default
@@ -68,30 +69,34 @@ def _parse_int_quota(
     if isinstance(val, (int, float)):
         n = int(val)
         if n < 0:
-            return 0
+            return unlimited_val
         if bytes_to_mb and n >= 1048576:
             return max(1, round(n / 1048576))
         if auto_bytes_threshold is not None and n >= auto_bytes_threshold:
             return max(1, round(n / 1048576))
         return n
     s = str(val).strip().lower().replace(",", "")
-    if not s or s in {"unlimited", "unlim", "inf", "infinite", "∞", "-1", "none", "null", "all"}:
+    if s in {"0", "none", "no", "off", "disabled"}:
         return 0
+    if not s or s in {"unlimited", "unlim", "inf", "infinite", "∞", "-1", "null", "all"}:
+        return unlimited_val
     m = re.match(r"^([+-]?\d+(?:\.\d+)?)\s*(bytes?|b|[kmgt]i?b?)?$", s)
     if m:
         num = float(m.group(1))
         raw_unit = (m.group(2) or "").strip()
         if num < 0:
+            return unlimited_val
+        if num == 0:
             return 0
         if raw_unit in {"b", "byte", "bytes"}:
-            return max(1, int(round(num / 1048576))) if num > 0 else 0
+            return max(1, int(round(num / 1048576)))
         unit = raw_unit.rstrip("b").rstrip("i")
         if unit == "g":
             return int(round(num * 1024))
         if unit == "t":
             return int(round(num * 1024 * 1024))
         if unit == "k":
-            return max(1, int(round(num / 1024))) if num > 0 else 0
+            return max(1, int(round(num / 1024)))
         n = int(round(num))
         if unit == "" and bytes_to_mb and n >= 1048576:
             return max(1, round(n / 1048576))
@@ -103,7 +108,7 @@ def _parse_int_quota(
         return default
     n = int(digits)
     if n < 0:
-        return 0
+        return unlimited_val
     if bytes_to_mb and n >= 1048576:
         return max(1, round(n / 1048576))
     if auto_bytes_threshold is not None and n >= auto_bytes_threshold:
@@ -314,10 +319,10 @@ def _map_cpanel_dict_to_package(name: str, raw: dict, is_reseller: bool = False)
     if "MAXADDON" in kv:
         addon_raw = str(kv.get("MAXADDON", "")).strip().lower()
         if addon_raw in {"unlimited", "unlim", "∞", "-1", "all"}:
-            pkg["website_limit"] = 0
+            pkg["website_limit"] = -1
         else:
             addons = _parse_int_quota(addon_raw, 0)
-            pkg["website_limit"] = 1 + addons
+            pkg["website_limit"] = 1 + max(0, addons)
     if "MAXSUB" in kv:
         pkg["subdomain_limit"] = _parse_int_quota(kv.get("MAXSUB"), 20)
     if "MAXPARK" in kv:
@@ -748,7 +753,7 @@ def _da_flatten_dict(j: dict[str, Any]) -> dict[str, Any]:
                 continue
 
             if v.get("type") == "checkbox" or ("checked" in v and "unlimited" not in v):
-                chk_raw = v.get("checked")
+                chk_raw = v.get("checked") if "checked" in v else v.get("value")
                 is_checked = (
                     chk_raw is True
                     or str(chk_raw or "").strip().lower() in {"checked", "yes", "on", "true", "1"}

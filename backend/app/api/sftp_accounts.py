@@ -79,10 +79,12 @@ def _sftp_host() -> str:
 
 
 def _limit_for(user: User) -> int:
-    val = int(getattr(user, "sftp_accounts_limit", 0) or 0)
-    if val == 0 and getattr(user, "package", None) is not None:
-        val = int(getattr(user.package, "sftp_accounts_limit", 0) or getattr(user.package, "ftp_accounts_limit", 0) or 0)
-    return val
+    val = getattr(user, "sftp_accounts_limit", None)
+    if val is None and getattr(user, "package", None) is not None:
+        val = getattr(user.package, "sftp_accounts_limit", None)
+        if val is None:
+            val = getattr(user.package, "ftp_accounts_limit", None)
+    return int(0 if val is None else val)
 
 
 def _owned_website(db: Session, website_id: int, current_user: User) -> Website:
@@ -156,6 +158,11 @@ def create_account(
 
     if not is_admin_role(current_user.role):
         limit = _limit_for(current_user)
+        if limit == 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Your hosting package does not include SFTP accounts — ask your administrator to raise the limit on your package or account.",
+            )
         used = db.query(SftpAccount).filter(SftpAccount.owner_id == owner_id).count()
         if limit > 0 and used >= limit:
             raise HTTPException(

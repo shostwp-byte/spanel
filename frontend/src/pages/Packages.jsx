@@ -83,22 +83,22 @@ function normalizePackageToForm(pkg) {
     terminal_enabled: termVal,
     ssh_access: termVal,
     personal_dns_mode: normalizePersonalDnsMode(pkg.personal_dns_mode),
-    node_apps_limit: Number(pkg.node_apps_limit || 0),
+    node_apps_limit: Number(pkg.node_apps_limit ?? 0),
     node_app_memory_mb: Math.max(64, Number(pkg.node_app_memory_mb || 512)),
     backup_retention_days: Math.max(1, Number(pkg.backup_retention_days || 14)),
   };
 }
 
 function formatMb(val) {
-  const n = Number(val || 0);
+  const n = Number(val ?? 0);
   if (n <= 0) return t('Unlimited');
   if (n >= 1024 && n % 1024 === 0) return `${n / 1024} GB`;
   return `${n.toLocaleString()} MB`;
 }
 
 function formatCount(val) {
-  const n = Number(val || 0);
-  return n <= 0 ? '∞' : n.toLocaleString();
+  const n = Number(val ?? 0);
+  return n < 0 ? '∞' : n.toLocaleString();
 }
 
 export function PackagesPage({ mode = 'users' }) {
@@ -152,18 +152,19 @@ export function PackagesPage({ mode = 'users' }) {
       'io_read_mbps', 'io_write_mbps', 'iops_read_max', 'iops_write_max',
     ];
     for (const key of intFields) {
-      clean[key] = Math.max(0, parseInt(clean[key], 10) || 0);
+      const parsed = parseInt(clean[key], 10);
+      clean[key] = Number.isNaN(parsed) ? 0 : (parsed < 0 ? -1 : parsed);
     }
-    clean.website_limit = Math.min(1000, clean.website_limit);
-    clean.storage_limit_mb = Math.min(1024 * 1024, clean.storage_limit_mb);
-    clean.database_limit = Math.min(10000, clean.database_limit);
-    clean.alias_limit = Math.min(1000, clean.alias_limit);
+    if (clean.website_limit > 0) clean.website_limit = Math.min(1000, clean.website_limit);
+    if (clean.storage_limit_mb > 0) clean.storage_limit_mb = Math.min(1024 * 1024, clean.storage_limit_mb);
+    if (clean.database_limit > 0) clean.database_limit = Math.min(10000, clean.database_limit);
+    if (clean.alias_limit > 0) clean.alias_limit = Math.min(1000, clean.alias_limit);
     clean.domain_pointers_limit = clean.alias_limit;
-    clean.sftp_accounts_limit = Math.min(100, clean.sftp_accounts_limit);
+    if (clean.sftp_accounts_limit > 0) clean.sftp_accounts_limit = Math.min(100, clean.sftp_accounts_limit);
     clean.ftp_accounts_limit = clean.sftp_accounts_limit;
-    clean.mail_accounts_limit = Math.min(1000, clean.mail_accounts_limit);
-    clean.node_apps_limit = Math.min(100, clean.node_apps_limit);
-    clean.reseller_user_limit = Math.min(10000, clean.reseller_user_limit);
+    if (clean.mail_accounts_limit > 0) clean.mail_accounts_limit = Math.min(1000, clean.mail_accounts_limit);
+    if (clean.node_apps_limit > 0) clean.node_apps_limit = Math.min(100, clean.node_apps_limit);
+    if (clean.reseller_user_limit > 0) clean.reseller_user_limit = Math.min(10000, clean.reseller_user_limit);
     clean.ssh_access = Boolean(clean.terminal_enabled);
     clean.terminal_enabled = Boolean(clean.terminal_enabled);
     clean.node_app_memory_mb = Math.min(16384, Math.max(64, clean.node_app_memory_mb || 512));
@@ -365,10 +366,12 @@ export function PackagesPage({ mode = 'users' }) {
     min = 0,
     max = undefined,
     allowUnlimited = true,
+    zeroIsUnlimited = false,
     zeroLabel = t('Unlimited'),
   }) {
     const rawVal = Number(currentForm[field] ?? 0);
-    const isZeroChecked = allowUnlimited && rawVal === 0;
+    const isUnlimitedChecked = allowUnlimited && (zeroIsUnlimited ? rawVal <= 0 : rawVal < 0);
+    const effectiveMin = zeroIsUnlimited ? 1 : min;
 
     return (
       <div className="pkg-field-row" key={field}>
@@ -376,13 +379,18 @@ export function PackagesPage({ mode = 'users' }) {
         <div className="pkg-input-unit-wrap">
           <input
             type="number"
-            min={allowUnlimited ? (isZeroChecked ? 0 : 1) : min}
+            min={isUnlimitedChecked ? 0 : effectiveMin}
             max={max}
-            disabled={isZeroChecked}
-            value={isZeroChecked ? '' : rawVal}
-            placeholder={isZeroChecked ? zeroLabel : String(defaultFallback)}
+            disabled={isUnlimitedChecked}
+            value={isUnlimitedChecked ? '' : rawVal}
+            placeholder={isUnlimitedChecked ? zeroLabel : String(defaultFallback)}
             onChange={e => {
-              const v = e.target.value === '' ? (allowUnlimited ? 0 : min) : Math.max(min, parseInt(e.target.value, 10) || 0);
+              if (e.target.value === '') {
+                setCurrentForm(prev => ({ ...prev, [field]: zeroIsUnlimited ? -1 : 0 }));
+                return;
+              }
+              const parsed = parseInt(e.target.value, 10);
+              const v = Number.isNaN(parsed) ? effectiveMin : Math.max(effectiveMin, parsed);
               setCurrentForm(prev => ({ ...prev, [field]: max ? Math.min(max, v) : v }));
             }}
           />
@@ -392,11 +400,11 @@ export function PackagesPage({ mode = 'users' }) {
           <label className="pkg-unlim-check">
             <input
               type="checkbox"
-              checked={isZeroChecked}
+              checked={isUnlimitedChecked}
               onChange={e => {
                 setCurrentForm(prev => ({
                   ...prev,
-                  [field]: e.target.checked ? 0 : defaultFallback,
+                  [field]: e.target.checked ? -1 : defaultFallback,
                 }));
               }}
             />
@@ -534,7 +542,7 @@ export function PackagesPage({ mode = 'users' }) {
                     const assignedCount = (users || []).filter(
                       u => u.package_id === pkg.id || u.reseller_package_id === pkg.id
                     ).length;
-                    const nodeApps = Number(pkg.node_apps_limit || 0);
+                    const nodeApps = Number(pkg.node_apps_limit ?? 0);
                     const nodeMem = Number(pkg.node_app_memory_mb || 512);
 
                     return (
@@ -567,7 +575,11 @@ export function PackagesPage({ mode = 'users' }) {
                         </td>
                         <td>
                           {formatCount(pkg.mail_accounts_limit)} Mail <span className="muted">·</span>{' '}
-                          {nodeApps > 0 ? (
+                          {nodeApps < 0 ? (
+                            <span className="badge ok" style={{ fontSize: '11.5px' }}>
+                              ∞ Apps ({nodeMem} MB)
+                            </span>
+                          ) : nodeApps > 0 ? (
                             <span className="badge ok" style={{ fontSize: '11.5px' }}>
                               {nodeApps} Apps ({nodeMem} MB)
                             </span>
@@ -662,12 +674,14 @@ export function PackagesPage({ mode = 'users' }) {
                   field: 'storage_limit_mb',
                   unit: 'MB',
                   defaultFallback: 5120,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Monthly Bandwidth'),
                   field: 'bandwidth_limit_mb',
                   unit: 'MB',
                   defaultFallback: 102400,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Hosted Websites (Domains)'),
@@ -698,6 +712,7 @@ export function PackagesPage({ mode = 'users' }) {
                   field: 'mysql_storage_limit_mb',
                   unit: 'MB',
                   defaultFallback: 2048,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Email Accounts (Mailboxes)'),
@@ -710,6 +725,18 @@ export function PackagesPage({ mode = 'users' }) {
                   field: 'email_forwarders_limit',
                   unit: 'Fwd',
                   defaultFallback: 20,
+                })}
+                {renderQuotaRow({
+                  label: t('Autoresponders'),
+                  field: 'autoresponders_limit',
+                  unit: 'Auto',
+                  defaultFallback: 10,
+                })}
+                {renderQuotaRow({
+                  label: t('Mailing Lists'),
+                  field: 'mailing_lists_limit',
+                  unit: 'Lists',
+                  defaultFallback: 0,
                 })}
                 {renderQuotaRow({
                   label: t('SFTP / FTP Sub-Accounts'),
@@ -732,9 +759,8 @@ export function PackagesPage({ mode = 'users' }) {
                   label: t('Max Applications (node_apps_limit)'),
                   field: 'node_apps_limit',
                   unit: 'Apps',
-                  defaultFallback: 3,
+                  defaultFallback: 0,
                   allowUnlimited: true,
-                  zeroLabel: t('Disabled (0)'),
                 })}
                 {renderQuotaRow({
                   label: t('Memory Limit per App (node_app_memory_mb)'),
@@ -750,42 +776,49 @@ export function PackagesPage({ mode = 'users' }) {
                   field: 'cpu_quota_percent',
                   unit: '%',
                   defaultFallback: 100,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('RAM Hard Limit (memory.max)'),
                   field: 'memory_max_mb',
                   unit: 'MB',
                   defaultFallback: 1024,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('RAM Soft Limit (memory.high)'),
                   field: 'memory_high_mb',
                   unit: 'MB',
                   defaultFallback: 768,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Max Processes / Tasks (tasks.max)'),
                   field: 'tasks_max',
                   unit: 'PIDs',
                   defaultFallback: 80,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Disk Read Bandwidth'),
                   field: 'io_read_mbps',
                   unit: 'MB/s',
                   defaultFallback: 100,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Disk Write Bandwidth'),
                   field: 'io_write_mbps',
                   unit: 'MB/s',
                   defaultFallback: 100,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Inodes Limit'),
                   field: 'inode_limit',
                   unit: 'Files',
                   defaultFallback: 250000,
+                  zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({
                   label: t('Backup Retention Period'),

@@ -557,13 +557,16 @@ def owner_mailbox_count(db: Session, owner_id: int) -> int:
 
 
 def _limit(user: User) -> int | None:
-    """A customer's mailbox limit; None for an administrator or Unlimited (0)."""
+    """A customer's mailbox limit; None for an administrator or Unlimited (-1)."""
     if _is_admin(user):
         return None
-    val = int(getattr(user, "mail_accounts_limit", 0) or 0)
-    if val == 0 and getattr(user, "package", None) is not None:
-        val = int(getattr(user.package, "mail_accounts_limit", 0) or 0)
-    return val if val > 0 else None
+    val = getattr(user, "mail_accounts_limit", None)
+    if val is None and getattr(user, "package", None) is not None:
+        val = getattr(user.package, "mail_accounts_limit", None)
+    if val is None:
+        return None
+    val_int = int(val)
+    return None if val_int < 0 else val_int
 
 
 def create_account(db: Session, actor: User, domain_id: int, local_part: str, password: str, quota_mb=None) -> MailAccount:
@@ -707,7 +710,10 @@ def create_forwarder(db: Session, actor: User, domain_id: int, local_part: str, 
     _require_active()
     domain = get_domain(db, actor, domain_id)
     if not _is_admin(actor) and getattr(actor, "package", None) is not None:
-        fwd_limit = int(getattr(actor.package, "email_forwarders_limit", 0) or 0)
+        raw_fwd = getattr(actor.package, "email_forwarders_limit", None)
+        fwd_limit = int(-1 if raw_fwd is None else raw_fwd)
+        if fwd_limit == 0:
+            raise MailError("Email forwarders are disabled for your hosting package (limit: 0).", status=403)
         if fwd_limit > 0:
             my_domains = [d.domain for d in db.query(MailDomain).filter(MailDomain.owner_id == domain.owner_id).all()]
             used_fwd = db.query(MailForwarder).filter(MailForwarder.domain.in_(my_domains or [""])).count()
@@ -1927,7 +1933,10 @@ def create_autoresponder(db: Session, actor: User, domain_id: int, local_part: s
     _require_active()
     domain = get_domain(db, actor, domain_id)
     if not _is_admin(actor) and getattr(actor, "package", None) is not None:
-        ar_limit = int(getattr(actor.package, "autoresponders_limit", 0) or 0)
+        raw_ar = getattr(actor.package, "autoresponders_limit", None)
+        ar_limit = int(-1 if raw_ar is None else raw_ar)
+        if ar_limit == 0:
+            raise MailError("Autoresponders are disabled for your hosting package (limit: 0).", status=403)
         if ar_limit > 0:
             my_domains = [d.domain for d in db.query(MailDomain).filter(MailDomain.owner_id == domain.owner_id).all()]
             used_ar = db.query(MailAutoresponder).filter(MailAutoresponder.domain.in_(my_domains or [""])).count()

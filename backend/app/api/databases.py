@@ -76,7 +76,12 @@ def list_databases(
 @router.post("", response_model=DatabaseCreatedOut)
 def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if not is_admin_role(current_user.role):
-        db_limit = int(getattr(current_user, "database_limit", 0) or (current_user.package.database_limit if current_user.package else 0))
+        raw_db_lim = getattr(current_user, "database_limit", None)
+        if raw_db_lim is None and current_user.package is not None:
+            raw_db_lim = getattr(current_user.package, "database_limit", None)
+        db_limit = int(-1 if raw_db_lim is None else raw_db_lim)
+        if db_limit == 0:
+            raise HTTPException(status_code=403, detail="Database creation is disabled for your hosting package (limit: 0).")
         if db_limit > 0:
             current_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == current_user.id).count()
             if current_count >= db_limit:
