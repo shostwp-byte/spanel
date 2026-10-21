@@ -54,7 +54,7 @@ RESERVED_USERS = {
 }
 
 ARCHIVE_SUFFIXES = (
-    ".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar",
+    ".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar", ".zip",
 )
 SQL_SUFFIXES = (".sql", ".sql.gz", ".sql.bz2", ".sql.zst")
 
@@ -199,11 +199,17 @@ def safe_upload_name(filename: str) -> str:
     return name
 
 
+ALLOWED_MIGRATION_DIRS = (
+    Path("/var/backups/spanel/migrations"),
+    Path(tempfile.gettempdir()) / "spanel-migrations",
+)
+
+
 def resolve_backup_path(archive_path: str) -> Path:
-    """Resolve a caller-supplied archive path inside ``DA_BACKUP_DIR``.
+    """Resolve a caller-supplied archive path inside ``DA_BACKUP_DIR`` or migration staging dirs.
 
     Scan, import and delete all take a path from the request body; confining it
-    to the upload directory keeps the endpoints from reading or deleting
+    to the upload/migration directories keeps the endpoints from reading or deleting
     arbitrary files on the host.
     """
     raw = (archive_path or "").strip()
@@ -212,11 +218,14 @@ def resolve_backup_path(archive_path: str) -> Path:
     root = DA_BACKUP_DIR.resolve()
     candidate = Path(raw)
     resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"Backup must be inside {root}") from exc
-    return resolved
+    allowed_roots = [root] + [d.resolve() for d in ALLOWED_MIGRATION_DIRS]
+    for allowed in allowed_roots:
+        try:
+            resolved.relative_to(allowed)
+            return resolved
+        except ValueError:
+            continue
+    raise ValueError(f"Backup must be inside {root}")
 
 
 def _strip_archive_suffix(name: str) -> str:
@@ -1329,6 +1338,160 @@ def _enable_ssl_when_dns_matches(db, website, item_summary: dict) -> None:
         )
 
 
+def _discover_da_emails(root: Path, domains: list[str]) -> dict[str, list[dict]]:
+    """Discover email accounts and forwarders per domain in a DirectAdmin backup."""
+    found: dict[str, list[dict]] = {}
+    for domain in domains:
+        mailboxes: dict[str, dict] = {}
+        # 1. Read backup/<domain>/email/passwd
+        passwd_candidates = [
+            root / "backup" / domain / "email" / "passwd",
+            root / "domains" / domain / ".htpasswd",
+        ]
+        quota_map: dict[str, int] = {}
+        quota_file = root / "backup" / domain / "email" / "quota"
+        if quota_file.is_file():
+            for raw in quota_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw.strip()
+                if ":" in line and not line.startswith("#"):
+                    local, _, q_raw = line.partition(":")
+                    try:
+                        q_bytes = int(q_raw.strip())
+                        quota_map[local.strip().lower()] = max(0, q_bytes // (1024 * 1024)) if q_bytes > 0 else 1024
+                    except ValueError:
+                        pass
+
+        for pfile in passwd_candidates:
+            if not pfile.is_file():
+                continue
+            for raw in pfile.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or ":" not in line:
+                    continue
+                parts = line.split(":")
+                local = parts[0].strip().lower()
+                pw_hash = parts[1].strip() if len(parts) > 1 else ""
+                if not local:
+                    continue
+                mailboxes[local] = {
+                    "local_part": local,
+                    "domain": domain,
+                    "address": f"{local}@{domain}",
+                    "password_hash": pw_hash,
+                    "quota_mb": quota_map.get(local, 1024),
+                    "maildir": None,
+                }
+
+        # 2. Check imap/<domain>/<local>/Maildir or backup/<domain>/email/data/imap/<local>/Maildir
+        imap_dirs = [
+            root / "imap" / domain,
+            root / "backup" / domain / "email" / "data" / "imap",
+        ]
+        for imap_base in imap_dirs:
+            if not imap_base.is_dir():
+                continue
+            for entry in sorted(imap_base.iterdir()):
+                if not entry.is_dir():
+                    continue
+                local = entry.name.strip().lower()
+                maildir = entry / "Maildir" if (entry / "Maildir").is_dir() else entry
+                if local not in mailboxes:
+                    mailboxes[local] = {
+                        "local_part": local,
+                        "domain": domain,
+                        "address": f"{local}@{domain}",
+                        "password_hash": "",
+                        "quota_mb": quota_map.get(local, 1024),
+                        "maildir": maildir,
+                    }
+                elif mailboxes[local]["maildir"] is None:
+                    mailboxes[local]["maildir"] = maildir
+
+        if mailboxes:
+            found[domain] = list(mailboxes.values())
+    return found
+
+
+def _import_da_emails(
+    db,
+    user: User,
+    root: Path,
+    domains: list[str],
+    credentials: list[str],
+    item_summary: dict,
+) -> list[str]:
+    """Import discovered DirectAdmin mailboxes and Maildir data into SPanel mail."""
+    from passlib.hash import sha512_crypt
+    from app.services import mail as mail_service
+
+    discovered = _discover_da_emails(root, domains)
+    if not discovered:
+        return []
+
+    mail_section: dict = {"domains": [], "mailboxes": [], "forwarders": []}
+    maildir_lookup: dict[tuple[str, str], Optional[Path]] = {}
+
+    for domain, boxes in discovered.items():
+        mail_section["domains"].append({"domain": domain, "catch_all": "", "relay": ""})
+        for box in boxes:
+            local = box["local_part"]
+            raw_hash = str(box.get("password_hash") or "").strip()
+            if raw_hash.startswith("{SHA512-CRYPT}$6$"):
+                final_hash = raw_hash
+            elif raw_hash.startswith("$6$"):
+                final_hash = f"{{SHA512-CRYPT}}{raw_hash}"
+            else:
+                gen_pass = secrets.token_urlsafe(14)
+                final_hash = "{SHA512-CRYPT}" + sha512_crypt.using(rounds=5000).hash(gen_pass)
+                credentials.append(f"mailbox address={local}@{domain} password={gen_pass}")
+
+            if not mail_service.SHA512_RE.fullmatch(final_hash):
+                gen_pass = secrets.token_urlsafe(14)
+                final_hash = "{SHA512-CRYPT}" + sha512_crypt.using(rounds=5000).hash(gen_pass)
+                credentials.append(f"mailbox address={local}@{domain} password={gen_pass}")
+
+            mail_section["mailboxes"].append({
+                "local_part": local,
+                "domain": domain,
+                "password_hash": final_hash,
+                "quota_mb": int(box.get("quota_mb") or 1024),
+                "enabled": True,
+            })
+            maildir_lookup[(domain, local)] = box.get("maildir")
+
+        # Forwarders from backup/<domain>/email/aliases
+        aliases_file = root / "backup" / domain / "email" / "aliases"
+        if aliases_file.is_file():
+            for raw in aliases_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or ":" not in line:
+                    continue
+                local, _, dest_raw = line.partition(":")
+                local = local.strip().lower()
+                dests = [d.strip() for d in dest_raw.split(",") if "@" in d]
+                if local and dests:
+                    mail_section["forwarders"].append({
+                        "local_part": local,
+                        "domain": domain,
+                        "destinations": dests,
+                    })
+
+    def stage_mail(domain: str, local: str) -> Optional[Path]:
+        mdir = maildir_lookup.get((domain, local))
+        if mdir and mdir.is_dir():
+            return mdir
+        return None
+
+    try:
+        restored = mail_service.restore_manifest(db, user, mail_section, stage_mail)
+        mail_service.sync_quietly(db)
+        item_summary.setdefault("mailboxes", []).extend(restored)
+        return restored
+    except Exception as exc:
+        item_summary["warnings"].append(f"Email import warning: {exc}")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Public API — Scan
 # ---------------------------------------------------------------------------
@@ -1350,7 +1513,7 @@ def list_da_backups() -> list[dict]:
 
 
 def scan_da_backup(archive_path: str) -> dict:
-    """Extract a DA backup into a staging dir, discover users/domains/databases."""
+    """Extract a DA backup into a staging dir, discover users/domains/databases/emails."""
     path = resolve_backup_path(archive_path)
     if not path.exists():
         raise FileNotFoundError(f"Backup not found: {path.name}")
@@ -1361,6 +1524,7 @@ def scan_da_backup(archive_path: str) -> dict:
         "filename": path.name,
         "size": path.stat().st_size,
         "archive_path": str(path),
+        "panel_type": "directadmin",
         "users": [],
         "errors": [],
     }
@@ -1381,6 +1545,7 @@ def scan_da_backup(archive_path: str) -> dict:
         username, email = _discover_username(root, path.name)
         domains = _discover_domains(root)
         sql_files = _discover_sql_files(root)
+        discovered_emails = _discover_da_emails(root, domains)
 
         # DirectAdmin subdomains (sub.example.com nested under example.com) come
         # in as their own websites; list them alongside the parent domains.
@@ -1394,11 +1559,14 @@ def scan_da_backup(archive_path: str) -> dict:
                 src = (parent_public / label) if parent_public else None
                 subdomains.append((fqdn, src if src and src.is_dir() else None))
 
+        all_mailboxes = [box["address"] for boxes in discovered_emails.values() for box in boxes]
+
         user_entry: dict = {
             "username": username,
             "email": email,
             "domains": [],
             "databases": [],
+            "mailboxes": all_mailboxes,
         }
 
         scan_targets = [(d, _source_for_domain(root, d)) for d in domains] + subdomains
@@ -1415,6 +1583,7 @@ def scan_da_backup(archive_path: str) -> dict:
                 "db_name": app_config.get("DB_NAME") or matched_key or "",
                 "db_user": app_config.get("DB_USER") or "",
                 "has_sql_dump": matched_sql is not None,
+                "email_count": len(discovered_emails.get(domain, [])),
                 "aliases": [
                     {"domain": name, "mode": mode}
                     for name, mode in _discover_domain_pointers(root, domain)
@@ -1444,10 +1613,17 @@ def scan_da_backup(archive_path: str) -> dict:
 # Public API — Import
 # ---------------------------------------------------------------------------
 
-def import_da_backup(archive_path: str, force: bool = False) -> dict:
+def import_da_backup(
+    archive_path: str,
+    force: bool = False,
+    *,
+    import_websites: bool = True,
+    import_databases: bool = True,
+    import_emails: bool = True,
+) -> dict:
     """Import a DA backup archive into spanel.
 
-    Creates panel users, websites, nginx vhosts, MariaDB databases, and
+    Creates panel users, websites, nginx vhosts, MariaDB databases, emails, and
     optionally SSL certificates.
 
     ``force`` is required to overwrite anything that already exists: without
@@ -1463,6 +1639,7 @@ def import_da_backup(archive_path: str, force: bool = False) -> dict:
         raise ValueError("Not a supported archive format")
 
     stamp = _utc_stamp()
+    STAGE_BASE.mkdir(parents=True, exist_ok=True)
     stage_dir = STAGE_BASE / f"web-{stamp}-{secrets.token_hex(4)}"
     stage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1492,14 +1669,15 @@ def import_da_backup(archive_path: str, force: bool = False) -> dict:
             "domains": all_domains,
             "imported_domains": [],
             "databases": [],
+            "mailboxes": [],
             "aliases": [],
             "ssl_enabled_domains": [],
             "ssl_imported_domains": [],
             "warnings": [],
         }
 
-        if not all_domains:
-            item_summary["warnings"].append("No domains found")
+        if not all_domains and not _discover_sql_files(root):
+            item_summary["warnings"].append("No domains or databases found")
             summary.append(item_summary)
             return {"summary": summary, "credentials": credentials, "errors": ["No domains found"]}
 
@@ -1512,9 +1690,10 @@ def import_da_backup(archive_path: str, force: bool = False) -> dict:
                 conflicts = []
                 if db.query(User).filter(User.username == username).first():
                     conflicts.append(f"panel user '{username}'")
-                for domain in all_domains:
-                    if db.query(Website).filter(Website.domain == domain).first():
-                        conflicts.append(f"website '{domain}'")
+                if import_websites:
+                    for domain in all_domains:
+                        if db.query(Website).filter(Website.domain == domain).first():
+                            conflicts.append(f"website '{domain}'")
                 if conflicts:
                     message = (
                         "Already exists: " + ", ".join(conflicts)
@@ -1524,11 +1703,17 @@ def import_da_backup(archive_path: str, force: bool = False) -> dict:
                     summary.append(item_summary)
                     return {"summary": summary, "credentials": credentials, "errors": [message]}
 
-            for domain in all_domains:
-                _delete_existing_domain(db, domain)
-            _delete_existing_user(db, username)
+            if force:
+                if import_websites:
+                    for domain in all_domains:
+                        _delete_existing_domain(db, domain)
+                _delete_existing_user(db, username)
 
-            user, _created = _ensure_panel_user_record(db, username, email, all_domains, credentials)
+            existing_user = db.query(User).filter(User.username == username).first()
+            if existing_user:
+                user = existing_user
+            else:
+                user, _created = _ensure_panel_user_record(db, username, email, all_domains, credentials)
 
             sql_files = _discover_sql_files(root)
             imported_sql_keys: set[str] = set()
@@ -1536,167 +1721,161 @@ def import_da_backup(archive_path: str, force: bool = False) -> dict:
 
             import_targets = [(d, _source_for_domain(root, d)) for d in domains]
             import_targets += [(fqdn, src) for fqdn, src in subdomain_sources.items()]
-            for domain, source in import_targets:
-                app_type = _detect_app_type(source)
-                app_config = _parse_app_db_config(source) if source else {}
+            if import_websites:
+                for domain, source in import_targets:
+                    app_type = _detect_app_type(source)
+                    app_config = _parse_app_db_config(source) if source else {}
 
-                _log(f"Importing domain {domain} for user {username} ...")
+                    _log(f"Importing domain {domain} for user {username} ...")
 
-                root_path = site_users.site_root_for_panel_user(user.username, domain)
-                linux_user = site_users.ensure_site_runtime(
-                    domain, root_path,
-                    DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
-                    user.username,
-                )
-                public = site_users.document_root(root_path)
-                if source is not None:
-                    # The site dir belongs to its Linux user; copy the extracted
-                    # files in through the helper (as root), from a panel-owned
-                    # staging tree laid out like the site root.
-                    staged = stage_dir / "payload" / domain
-                    _copy_site_files(source, staged / "public_html")
-                    site_users.import_site_files(root_path, linux_user, str(staged))
-                else:
-                    _log(f"  {domain}: backup carried no files, importing empty")
-
-                selected_rules = [rule["id"] for rule in waf.DEFAULT_RULES]
-                waf_enabled = True
-                # Imported sites arrive with crs_enabled off like any new site.
-                waf_result = waf.sync_site_rules(domain, selected_rules, "", crs_mode="off")
-                if waf_result.returncode != 0:
-                    waf_enabled = False
-                    _log(f"  warning: WAF rules failed for {domain}")
-
-                php_socket = site_users.site_php_fpm_socket(
-                    linux_user, root_path,
-                    DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
-                )
-                rewrite_mode = "front_controller" if app_type == "wordpress" else "none"
-                pointers = _discover_domain_pointers(root, domain)
-                # Pointers can only be added to the vhost once we know which of
-                # them this import is allowed to claim, so start without them.
-                try:
-                    nginx.write_vhost(
+                    root_path = site_users.site_root_for_panel_user(user.username, domain)
+                    linux_user = site_users.ensure_site_runtime(
                         domain, root_path,
-                        app_type=app_type,
-                        php_version=DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
-                        php_fpm_socket_override=php_socket,
-                        waf_enabled=waf_enabled,
-                        rewrite_mode=rewrite_mode,
+                        DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
+                        user.username,
                     )
-                except RuntimeError:
-                    if not waf_enabled:
-                        raise
-                    waf_enabled = False
-                    _log(f"  warning: nginx rejected WAF for {domain}; retrying with WAF disabled")
-                    nginx.write_vhost(
-                        domain, root_path,
-                        app_type=app_type,
-                        php_version=DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
-                        php_fpm_socket_override=php_socket,
-                        waf_enabled=False,
-                        rewrite_mode=rewrite_mode,
-                    )
+                    public = site_users.document_root(root_path)
+                    if source is not None:
+                        staged = stage_dir / "payload" / domain
+                        _copy_site_files(source, staged / "public_html")
+                        site_users.import_site_files(root_path, linux_user, str(staged))
+                    else:
+                        _log(f"  {domain}: backup carried no files, importing empty")
 
-                website = db.query(Website).filter(Website.domain == domain).first()
-                if website is None:
-                    website = Website(
-                        domain=domain,
-                        owner_id=user.id,
-                        root_path=root_path,
-                        linux_user=linux_user,
-                        php_version=DEFAULT_PHP_VERSION,
-                        app_type=app_type,
-                        status="active",
-                        waf_enabled=waf_enabled,
-                        nginx_rewrite_mode=rewrite_mode,
-                    )
-                    db.add(website)
-                else:
-                    website.owner_id = user.id
-                    website.root_path = root_path
-                    website.linux_user = linux_user
-                    website.php_version = DEFAULT_PHP_VERSION
-                    website.app_type = app_type
-                    website.waf_enabled = waf_enabled
-                    website.nginx_rewrite_mode = rewrite_mode
-                db.commit()
-                db.refresh(website)
+                    selected_rules = [rule["id"] for rule in waf.DEFAULT_RULES]
+                    waf_enabled = True
+                    waf_result = waf.sync_site_rules(domain, selected_rules, "", crs_mode="off")
+                    if waf_result.returncode != 0:
+                        waf_enabled = False
+                        _log(f"  warning: WAF rules failed for {domain}")
 
-                # DirectAdmin domain pointers become spanel website aliases.
-                applied_pointers = _sync_website_aliases(db, website, pointers, item_summary)
-                if applied_pointers:
-                    alias_domains = [name for name, mode in applied_pointers if mode == "alias"]
-                    redirect_domains = [name for name, mode in applied_pointers if mode == "redirect"]
+                    php_socket = site_users.site_php_fpm_socket(
+                        linux_user, root_path,
+                        DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
+                    )
+                    rewrite_mode = "front_controller" if app_type == "wordpress" else "none"
+                    pointers = _discover_domain_pointers(root, domain)
                     try:
-                        nginx.rewrite_vhost(
+                        nginx.write_vhost(
                             domain, root_path,
                             app_type=app_type,
                             php_version=DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
                             php_fpm_socket_override=php_socket,
                             waf_enabled=waf_enabled,
                             rewrite_mode=rewrite_mode,
-                            aliases=alias_domains,
-                            redirects=redirect_domains,
                         )
-                        item_summary.setdefault("aliases", []).extend(
-                            f"{name} ({mode})" for name, mode in applied_pointers
-                        )
-                        _log(f"  imported {len(applied_pointers)} pointer(s) for {domain}")
-                    except RuntimeError as exc:
-                        item_summary["warnings"].append(
-                            f"Pointers for {domain} not applied to Nginx: {exc}"
+                    except RuntimeError:
+                        if not waf_enabled:
+                            raise
+                        waf_enabled = False
+                        _log(f"  warning: nginx rejected WAF for {domain}; retrying with WAF disabled")
+                        nginx.write_vhost(
+                            domain, root_path,
+                            app_type=app_type,
+                            php_version=DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
+                            php_fpm_socket_override=php_socket,
+                            waf_enabled=False,
+                            rewrite_mode=rewrite_mode,
                         )
 
-                site_users.fix_site_permissions(root_path, linux_user)
-                websites.append(website)
-                item_summary["imported_domains"].append(domain)
+                    website = db.query(Website).filter(Website.domain == domain).first()
+                    if website is None:
+                        website = Website(
+                            domain=domain,
+                            owner_id=user.id,
+                            root_path=root_path,
+                            linux_user=linux_user,
+                            php_version=DEFAULT_PHP_VERSION,
+                            app_type=app_type,
+                            status="active",
+                            waf_enabled=waf_enabled,
+                            nginx_rewrite_mode=rewrite_mode,
+                        )
+                        db.add(website)
+                    else:
+                        website.owner_id = user.id
+                        website.root_path = root_path
+                        website.linux_user = linux_user
+                        website.php_version = DEFAULT_PHP_VERSION
+                        website.app_type = app_type
+                        website.waf_enabled = waf_enabled
+                        website.nginx_rewrite_mode = rewrite_mode
+                    db.commit()
+                    db.refresh(website)
 
-                # Database import
-                public = site_users.document_root(website.root_path)
-                app_config = app_config or _parse_app_db_config(public)
-                matched_key, matched_sql = _matched_sql_for_config(
-                    app_config, sql_files, len(import_targets) == 1
-                )
-                if matched_sql:
-                    da_creds = _da_db_credentials(matched_sql, root)
-                    db_name, db_user, db_password, reused = _create_panel_database(
-                        db, user, website,
-                        app_config.get("DB_NAME") or matched_key,
-                        app_config.get("DB_USER"),
-                        matched_sql, credentials,
-                        app_config=app_config, da_credentials=da_creds,
+                    applied_pointers = _sync_website_aliases(db, website, pointers, item_summary)
+                    if applied_pointers:
+                        alias_domains = [name for name, mode in applied_pointers if mode == "alias"]
+                        redirect_domains = [name for name, mode in applied_pointers if mode == "redirect"]
+                        try:
+                            nginx.rewrite_vhost(
+                                domain, root_path,
+                                app_type=app_type,
+                                php_version=DEFAULT_PHP_VERSION if app_type in {"wordpress", "php"} else None,
+                                php_fpm_socket_override=php_socket,
+                                waf_enabled=waf_enabled,
+                                rewrite_mode=rewrite_mode,
+                                aliases=alias_domains,
+                                redirects=redirect_domains,
+                            )
+                            item_summary.setdefault("aliases", []).extend(
+                                f"{name} ({mode})" for name, mode in applied_pointers
+                            )
+                            _log(f"  imported {len(applied_pointers)} pointer(s) for {domain}")
+                        except RuntimeError as exc:
+                            item_summary["warnings"].append(
+                                f"Pointers for {domain} not applied to Nginx: {exc}"
+                            )
+
+                    site_users.fix_site_permissions(root_path, linux_user)
+                    websites.append(website)
+                    item_summary["imported_domains"].append(domain)
+
+                    # Database import paired with website
+                    if import_databases:
+                        public = site_users.document_root(website.root_path)
+                        app_config = app_config or _parse_app_db_config(public)
+                        matched_key, matched_sql = _matched_sql_for_config(
+                            app_config, sql_files, len(import_targets) == 1
+                        )
+                        if matched_sql:
+                            da_creds = _da_db_credentials(matched_sql, root)
+                            db_name, db_user, db_password, reused = _create_panel_database(
+                                db, user, website,
+                                app_config.get("DB_NAME") or matched_key,
+                                app_config.get("DB_USER"),
+                                matched_sql, credentials,
+                                app_config=app_config, da_credentials=da_creds,
+                            )
+                            imported_sql_keys.add(matched_key)
+                            if not reused:
+                                _update_app_db_config(public, db_name, db_user, db_password)
+                            site_users.fix_site_permissions(website.root_path, website.linux_user)
+                            item_summary["databases"].append({
+                                "domain": domain, "source": str(matched_sql), "db_name": db_name,
+                            })
+
+            # Import unassigned databases (or all databases when import_websites=False)
+            if import_databases:
+                for key, sql_path in sql_files.items():
+                    if key in imported_sql_keys:
+                        continue
+                    if db.query(DatabaseAccount).filter(DatabaseAccount.db_name == key).first() and not force:
+                        continue
+                    _log(f"Importing database {key} for user {username} ...")
+                    db_name, db_user, _db_password, _reused = _create_panel_database(
+                        db, user, None, key, key, sql_path, credentials,
+                        da_credentials=_da_db_credentials(sql_path, root),
                     )
-                    imported_sql_keys.add(matched_key)
-                    # When the site's own config already carries the working
-                    # secret (reused), leave it alone; only rewrite when the
-                    # panel changed the password.
-                    if not reused:
-                        _update_app_db_config(public, db_name, db_user, db_password)
-                    site_users.fix_site_permissions(website.root_path, website.linux_user)
                     item_summary["databases"].append({
-                        "domain": domain, "source": str(matched_sql), "db_name": db_name,
+                        "domain": None, "source": str(sql_path), "db_name": db_name, "db_user": db_user,
                     })
 
-            # Import unassigned databases
-            for key, sql_path in sql_files.items():
-                if key in imported_sql_keys:
-                    continue
-                if db.query(DatabaseAccount).filter(DatabaseAccount.db_name == key).first() and not force:
-                    continue
-                _log(f"Importing unassigned database {key} for user {username} ...")
-                db_name, db_user, _db_password, _reused = _create_panel_database(
-                    db, user, None, key, key, sql_path, credentials,
-                    da_credentials=_da_db_credentials(sql_path, root),
-                )
-                item_summary["databases"].append({
-                    "domain": None, "source": str(sql_path), "db_name": db_name, "db_user": db_user,
-                })
+            # Import emails
+            if import_emails:
+                _import_da_emails(db, user, root, domains, credentials, item_summary)
 
-            # SSL: a fresh Let's Encrypt certificate is better when DNS already
-            # points here, because it renews itself. When it does not - the
-            # normal case mid-migration - fall back to the certificate the old
-            # host was serving, which is in the archive and usually still valid.
+            # SSL
             for website in websites:
                 _enable_ssl_when_dns_matches(db, website, item_summary)
                 if not website.ssl_enabled:
@@ -1736,5 +1915,19 @@ def delete_da_backup(archive_path: str) -> str:
     return name
 
 
-def restore_to_user(archive_path: str, user_id: int, import_websites: bool, import_databases: bool, import_emails: bool):
-    pass
+def restore_to_user(
+    archive_path: str,
+    user_id: int,
+    import_websites: bool = True,
+    import_databases: bool = True,
+    import_emails: bool = True,
+    force: bool = True,
+) -> dict:
+    """Entry point used by Unified Migration to restore a DirectAdmin backup."""
+    return import_da_backup(
+        archive_path,
+        force=force,
+        import_websites=import_websites,
+        import_databases=import_databases,
+        import_emails=import_emails,
+    )

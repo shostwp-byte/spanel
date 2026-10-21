@@ -1980,3 +1980,102 @@ def delete_da_backup(body: dict, db: Session = Depends(get_db), current_user: Us
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     log_action(db, current_user.id, "da_backup_delete", name)
     return {"deleted": name}
+
+
+# ---------------------------------------------------------------------------
+# cPanel & Plesk Import (Scan & Import)
+# ---------------------------------------------------------------------------
+
+@router.post("/cpanel-import/scan")
+def scan_cpanel_backup_endpoint(body: dict, current_user: User = Depends(get_current_user)):
+    """Scan a cPanel backup archive (cpmove-*.tar.gz / backup-*.tar.gz) to preview users/domains/databases/emails."""
+    ensure_role(current_user.role, Role.admin)
+    from app.services import cpanel_import
+
+    archive_path = body.get("archive_path", "")
+    if not archive_path:
+        raise HTTPException(status_code=400, detail="archive_path is required")
+    try:
+        return cpanel_import.scan_cpanel_backup(archive_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/cpanel-import/import")
+def import_cpanel_backup_endpoint(body: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Import a cPanel backup archive."""
+    ensure_role(current_user.role, Role.admin)
+    from app.services import cpanel_import
+
+    archive_path = body.get("archive_path", "")
+    force = bool(body.get("force", False))
+    if not archive_path:
+        raise HTTPException(status_code=400, detail="archive_path is required")
+    try:
+        result = cpanel_import.import_cpanel_backup(
+            archive_path,
+            force=force,
+            import_websites=bool(body.get("import_websites", True)),
+            import_databases=bool(body.get("import_databases", True)),
+            import_emails=bool(body.get("import_emails", True)),
+        )
+        log_action(db, current_user.id, "cpanel_backup_import", Path(archive_path).name)
+        return result
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/plesk-import/scan")
+def scan_plesk_backup_endpoint(body: dict, current_user: User = Depends(get_current_user)):
+    """Scan a Plesk backup archive (.tar / .tar.gz / .zip) to preview users/domains/databases/emails."""
+    ensure_role(current_user.role, Role.admin)
+    from app.services import plesk_import
+
+    archive_path = body.get("archive_path", "")
+    if not archive_path:
+        raise HTTPException(status_code=400, detail="archive_path is required")
+    try:
+        return plesk_import.scan_plesk_backup(archive_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/plesk-import/import")
+def import_plesk_backup_endpoint(body: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Import a Plesk backup archive."""
+    ensure_role(current_user.role, Role.admin)
+    from app.services import plesk_import
+
+    archive_path = body.get("archive_path", "")
+    force = bool(body.get("force", False))
+    if not archive_path:
+        raise HTTPException(status_code=400, detail="archive_path is required")
+    try:
+        result = plesk_import.import_plesk_backup(
+            archive_path,
+            force=force,
+            import_websites=bool(body.get("import_websites", True)),
+            import_databases=bool(body.get("import_databases", True)),
+            import_emails=bool(body.get("import_emails", True)),
+        )
+        log_action(db, current_user.id, "plesk_backup_import", Path(archive_path).name)
+        return result
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
