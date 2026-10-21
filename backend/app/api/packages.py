@@ -770,17 +770,44 @@ def fetch_remote_packages(
             )
 
     elif panel == "cpanel":
-        if payload.auth_type == "token":
-            headers = {"Authorization": f"whm {user}:{secret}"}
-        else:
-            headers = {"Authorization": f"Basic {basic_token}"}
-        raw_json = _http_fetch(
-            f"{base_url}/json-api/listpkgs?api.version=1", headers, verify_ssl=payload.verify_ssl
+        auth_headers_list = (
+            [{"Authorization": f"whm {user}:{secret}"}, {"Authorization": f"Basic {basic_token}"}]
+            if payload.auth_type == "token"
+            else [{"Authorization": f"Basic {basic_token}"}, {"Authorization": f"whm {user}:{secret}"}]
         )
-        try:
-            data = json.loads(raw_json)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON from WHM API: {exc}")
+        data = None
+        last_cp_err = None
+        for hdrs in auth_headers_list:
+            try:
+                raw_json = _http_fetch(
+                    f"{base_url}/json-api/listpkgs?api.version=1", hdrs, verify_ssl=payload.verify_ssl
+                )
+                stripped_cp = (raw_json or "").strip()
+                if stripped_cp[:200].lower().startswith(("<!doctype", "<html")):
+                    last_cp_err = "Authentication failed on WHM: Invalid username, password, or WHM API Token."
+                    continue
+                parsed_cp = json.loads(stripped_cp)
+                if isinstance(parsed_cp, dict):
+                    cpanel_res = parsed_cp.get("cpanelresult")
+                    if isinstance(cpanel_res, dict) and cpanel_res.get("error"):
+                        last_cp_err = str(cpanel_res.get("error"))
+                        continue
+                    meta = parsed_cp.get("metadata")
+                    if isinstance(meta, dict) and str(meta.get("result", "1")) == "0":
+                        last_cp_err = str(meta.get("reason") or "WHM API returned result=0")
+                        continue
+                    data = parsed_cp
+                    break
+            except HTTPException as exc:
+                last_cp_err = str(exc.detail)
+            except Exception as exc:
+                last_cp_err = str(exc)
+
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=last_cp_err or "Authentication failed on WHM: Invalid username, password, or WHM API Token.",
+            )
         pkgs_raw = (
             (data.get("data") or {}).get("pkg")
             or data.get("pkg")
@@ -788,75 +815,126 @@ def fetch_remote_packages(
             or []
         )
         if not isinstance(pkgs_raw, list):
-            raise HTTPException(status_code=400, detail="No packages returned from WHM listpkgs API")
-        for item in pkgs_raw[:80]:
+            pkgs_raw = []
+        for item in pkgs_raw[:100]:
             if not isinstance(item, dict):
                 continue
             pkg_name = str(item.get("name") or item.get("PACKAGE") or "cpanel_pkg").strip()
             results.append(_map_cpanel_dict_to_package(pkg_name, item, is_reseller=is_reseller_pkg))
 
     elif panel == "plesk":
-        headers = {"Accept": "application/json"}
-        if payload.auth_type == "token":
-            headers["X-API-Key"] = secret
-        else:
-            headers["Authorization"] = f"Basic {basic_token}"
-        # Try REST API /api/v2/serviceplans first, fallback to XML-RPC agent.php
-        try:
-            raw_rest = _http_fetch(f"{base_url}/api/v2/serviceplans", headers, verify_ssl=payload.verify_ssl)
-            plans = json.loads(raw_rest)
-            if isinstance(plans, list):
-                for p in plans[:80]:
-                    if not isinstance(p, dict):
-                        continue
-                    p_name = str(p.get("name") or "plesk_plan").strip()
-                    flat: dict[str, Any] = {}
-                    for lim in p.get("limits", []) if isinstance(p.get("limits"), list) else []:
-                        if isinstance(lim, dict) and "name" in lim:
-                            flat[lim["name"]] = lim.get("value")
-                    for perm in p.get("permissions", []) if isinstance(p.get("permissions"), list) else []:
-                        if isinstance(perm, dict) and "name" in perm:
-                            flat[perm["name"]] = perm.get("value")
-                    flat.update({k: v for k, v in p.items() if not isinstance(v, (list, dict))})
-                    results.append(_map_plesk_dict_to_package(p_name, flat, is_reseller=is_reseller_pkg))
-        except Exception:
-            xml_tag = "reseller-plan" if is_reseller_pkg else "service-plan"
+        rest_headers_list = (
+            [
+                {"Accept": "application/json", "X-API-Key": secret},
+                {"Accept": "application/json", "Authorization": f"Basic {basic_token}"},
+            ]
+            if payload.auth_type == "token"
+            else [
+                {"Accept": "application/json", "Authorization": f"Basic {basic_token}"},
+                {"Accept": "application/json", "X-API-Key": secret},
+            ]
+        )
+        xml_headers_list = (
+            [
+                {"Content-Type": "text/xml", "HTTP_PRETTY_PRINT": "TRUE", "KEY": secret},
+                {"Content-Type": "text/xml", "HTTP_PRETTY_PRINT": "TRUE", "HTTP_AUTH_LOGIN": user, "HTTP_AUTH_PASSWD": secret},
+            ]
+            if payload.auth_type == "token"
+            else [
+                {"Content-Type": "text/xml", "HTTP_PRETTY_PRINT": "TRUE", "HTTP_AUTH_LOGIN": user, "HTTP_AUTH_PASSWD": secret},
+                {"Content-Type": "text/xml", "HTTP_PRETTY_PRINT": "TRUE", "KEY": secret},
+            ]
+        )
+        last_plesk_err = None
+
+        def _try_plesk_rest() -> bool:
+            nonlocal last_plesk_err
+            for r_hdrs in rest_headers_list:
+                try:
+                    raw_rest = _http_fetch(f"{base_url}/api/v2/serviceplans", r_hdrs, verify_ssl=payload.verify_ssl)
+                    plans = json.loads(raw_rest)
+                    if isinstance(plans, list):
+                        for p in plans[:100]:
+                            if not isinstance(p, dict):
+                                continue
+                            p_name = str(p.get("name") or "plesk_plan").strip()
+                            flat: dict[str, Any] = {}
+                            for lim in p.get("limits", []) if isinstance(p.get("limits"), list) else []:
+                                if isinstance(lim, dict) and "name" in lim:
+                                    flat[lim["name"]] = lim.get("value")
+                            for perm in p.get("permissions", []) if isinstance(p.get("permissions"), list) else []:
+                                if isinstance(perm, dict) and "name" in perm:
+                                    flat[perm["name"]] = perm.get("value")
+                            flat.update({k: v for k, v in p.items() if not isinstance(v, (list, dict))})
+                            results.append(_map_plesk_dict_to_package(p_name, flat, is_reseller=is_reseller_pkg))
+                        return True
+                except HTTPException as exc:
+                    last_plesk_err = str(exc.detail)
+                except Exception as exc:
+                    last_plesk_err = str(exc)
+            return False
+
+        def _try_plesk_xml(xml_tag: str) -> bool:
+            nonlocal last_plesk_err
             xml_body = (
                 f'<?xml version="1.0" encoding="UTF-8"?>'
-                f'<packet><{xml_tag}><get><filter/></get></{xml_tag}></packet>'
+                f'<{ "packet" }><{xml_tag}><get><filter/></get></{xml_tag}></{ "packet" }>'
             ).encode("utf-8")
-            xml_headers = {"Content-Type": "text/xml", "HTTP_PRETTY_PRINT": "TRUE"}
-            if payload.auth_type == "token":
-                xml_headers["KEY"] = secret
-            else:
-                xml_headers["HTTP_AUTH_LOGIN"] = user
-                xml_headers["HTTP_AUTH_PASSWD"] = secret
-            raw_xml = _http_fetch(
-                f"{base_url}/enterprise/control/agent.php",
-                xml_headers,
-                data=xml_body,
-                verify_ssl=payload.verify_ssl,
-            )
-            try:
-                root = ET.fromstring(raw_xml)
-                for res_node in root.findall(f".//{xml_tag}/get/result"):
-                    p_name = (res_node.findtext("name") or "plesk_plan").strip()
-                    if not p_name or res_node.findtext("status") == "error":
+            for x_hdrs in xml_headers_list:
+                try:
+                    raw_xml = _http_fetch(
+                        f"{base_url}/enterprise/control/agent.php",
+                        x_hdrs,
+                        data=xml_body,
+                        verify_ssl=payload.verify_ssl,
+                    )
+                    root = ET.fromstring(raw_xml)
+                    sys_err = root.findtext(".//system/errtext")
+                    if sys_err:
+                        last_plesk_err = f"Plesk API: {sys_err}"
                         continue
-                    flat_xml: dict[str, Any] = {}
-                    for lim_node in res_node.findall(".//limits/limit"):
-                        ln = lim_node.findtext("name")
-                        lv = lim_node.findtext("value")
-                        if ln:
-                            flat_xml[ln] = lv
-                    for perm_node in res_node.findall(".//permissions/permission"):
-                        pn = perm_node.findtext("name")
-                        pv = perm_node.findtext("value")
-                        if pn:
-                            flat_xml[pn] = pv
-                    results.append(_map_plesk_dict_to_package(p_name, flat_xml, is_reseller=is_reseller_pkg))
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=f"Failed to parse Plesk XML response: {exc}")
+                    for res_node in root.findall(f".//{xml_tag}/get/result"):
+                        if res_node.findtext("status") == "error":
+                            err_txt = res_node.findtext("errtext")
+                            if err_txt:
+                                last_plesk_err = f"Plesk API: {err_txt}"
+                            continue
+                        p_name = (res_node.findtext("name") or "plesk_plan").strip()
+                        if not p_name:
+                            continue
+                        flat_xml: dict[str, Any] = {}
+                        for lim_node in res_node.findall(".//limits/limit"):
+                            ln = lim_node.findtext("name")
+                            lv = lim_node.findtext("value")
+                            if ln:
+                                flat_xml[ln] = lv
+                        for perm_node in res_node.findall(".//permissions/permission"):
+                            pn = perm_node.findtext("name")
+                            pv = perm_node.findtext("value")
+                            if pn:
+                                flat_xml[pn] = pv
+                        results.append(_map_plesk_dict_to_package(p_name, flat_xml, is_reseller=is_reseller_pkg))
+                    return True
+                except HTTPException as exc:
+                    last_plesk_err = str(exc.detail)
+                except Exception as exc:
+                    last_plesk_err = str(exc)
+            return False
+
+        if is_reseller_pkg:
+            ok = _try_plesk_xml("reseller-plan")
+            if not results:
+                ok = _try_plesk_rest() or _try_plesk_xml("service-plan") or ok
+        else:
+            ok = _try_plesk_rest()
+            if not results:
+                ok = _try_plesk_xml("service-plan") or ok
+
+        if not ok and not results:
+            raise HTTPException(
+                status_code=400,
+                detail=last_plesk_err or "Authentication failed on Plesk: Invalid username, password, or API Key.",
+            )
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported panel_type: {panel}")
 
