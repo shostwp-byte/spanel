@@ -61,9 +61,10 @@ def _iso(timestamp: float | int | None) -> str:
     return datetime.fromtimestamp(timestamp, UTC).isoformat() if timestamp else ""
 
 
-def _row(name: str, key: str, size, modified: str, username: str = "") -> dict:
+def _row(name: str, key: str, size, modified: str, username: str = "", hostname: str = "") -> dict:
     return {"name": name, "key": key, "size": int(size or 0), "modified": modified or "",
-            "username": username or backup.username_from_archive_name(name)}
+            "username": username or backup.username_from_archive_name(name),
+            "hostname": hostname or ""}
 
 
 def _newest_first(rows: list[dict]) -> list[dict]:
@@ -96,23 +97,36 @@ def list_local() -> list[dict]:
                 continue
             info = path.stat()
             rows.append(_row(path.name, f"{folder.name}/{path.name}", info.st_size, _iso(info.st_mtime), owner))
+        # Also scan 2-level hierarchy: users/<hostname>/<username>/*.tar.gz
+        for sub in sorted(p for p in folder.iterdir() if p.is_dir() and not p.is_symlink()):
+            for path in sub.glob("*.tar.gz"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                info = path.stat()
+                rows.append(_row(
+                    path.name,
+                    f"{folder.name}/{sub.name}/{path.name}",
+                    info.st_size,
+                    _iso(info.st_mtime),
+                    sub.name,
+                    folder.name,
+                ))
     return _newest_first(rows)
 
 
 def local_path(key: str) -> str:
-    """The archive a local key names: <folder>/<file>.tar.gz under users/,
-    nothing else."""
+    """The archive a local key names: <folder>/<file>.tar.gz or <hostname>/<user>/<file>.tar.gz under users/."""
     parts = (key or "").split("/")
-    if (len(parts) != 2 or any(part in {"", ".", ".."} or _CONTROL.search(part) for part in parts)
-            or not parts[1].endswith(".tar.gz")):
+    if (len(parts) not in (2, 3) or any(part in {"", ".", ".."} or _CONTROL.search(part) for part in parts)
+            or not parts[-1].endswith(".tar.gz")):
         raise RestoreSourceError("Not a backup in the panel's backup folder")
-    path = users_dir() / parts[0] / parts[1]
+    path = users_dir().joinpath(*parts)
     if path.is_symlink():
         raise RestoreSourceError("Not a backup in the panel's backup folder")
     try:
         return str(backup.user_backup_path(str(path)))
     except FileNotFoundError as exc:
-        raise RestoreSourceError(f"{parts[1]} is no longer in the backup folder") from exc
+        raise RestoreSourceError(f"{parts[-1]} is no longer in the backup folder") from exc
 
 
 # --- SFTP -----------------------------------------------------------------------
@@ -168,9 +182,40 @@ def _sftp_list(client: paramiko.SFTPClient, folder: str) -> list[dict]:
         entries = client.listdir_attr(folder)
     except OSError:
         raise RestoreSourceError(f"No folder {folder} on the server, or it cannot be read") from None
-    return [_row(entry.filename, posixpath.join(folder, entry.filename), entry.st_size, _iso(entry.st_mtime))
-            for entry in entries
-            if entry.filename.endswith(".tar.gz") and statmode.S_ISREG(entry.st_mode or 0)]
+    rows = []
+    for entry in entries:
+        mode = entry.st_mode or 0
+        entry_path = posixpath.join(folder, entry.filename)
+        if entry.filename.endswith(".tar.gz") and statmode.S_ISREG(mode):
+            rows.append(_row(entry.filename, entry_path, entry.st_size, _iso(entry.st_mtime)))
+        elif statmode.S_ISDIR(mode) and not entry.filename.startswith("."):
+            # Level 1 subfolder: could be <username> or <hostname>
+            try:
+                sub_entries = client.listdir_attr(entry_path)
+            except OSError:
+                continue
+            for sub in sub_entries:
+                sub_mode = sub.st_mode or 0
+                sub_path = posixpath.join(entry_path, sub.filename)
+                if sub.filename.endswith(".tar.gz") and statmode.S_ISREG(sub_mode):
+                    rows.append(_row(sub.filename, sub_path, sub.st_size, _iso(sub.st_mtime), username=entry.filename))
+                elif statmode.S_ISDIR(sub_mode) and not sub.filename.startswith("."):
+                    # Level 2 subfolder: <hostname>/<username>/*.tar.gz
+                    try:
+                        leaf_entries = client.listdir_attr(sub_path)
+                    except OSError:
+                        continue
+                    for leaf in leaf_entries:
+                        if leaf.filename.endswith(".tar.gz") and statmode.S_ISREG(leaf.st_mode or 0):
+                            rows.append(_row(
+                                leaf.filename,
+                                posixpath.join(sub_path, leaf.filename),
+                                leaf.st_size,
+                                _iso(leaf.st_mtime),
+                                username=sub.filename,
+                                hostname=entry.filename,
+                            ))
+    return rows
 
 
 def _target_sftp(target: SftpBackupTarget):
@@ -281,11 +326,22 @@ def list_source(source: dict, db) -> dict:
     if kind == "target":
         target = _target(db, source.get("target_id"))
         if (target.kind or "sftp") == "s3":
+            prefix = (target.prefix or "").strip("/")
             try:
-                rows = [_row(row["name"], row["key"], row["size"], row["modified"]) for row in backup_s3.listing(target)]
+                rows = []
+                for row in backup_s3.listing(target):
+                    rel_key = row["key"]
+                    if prefix and rel_key.startswith(prefix + "/"):
+                        rel_key = rel_key[len(prefix) + 1:]
+                    parts = [p for p in rel_key.split("/") if p]
+                    inferred_host = parts[-3] if len(parts) >= 3 else ""
+                    inferred_user = parts[-2] if len(parts) >= 2 else ""
+                    rows.append(_row(
+                        row["name"], row["key"], row["size"], row["modified"],
+                        username=inferred_user, hostname=inferred_host,
+                    ))
             except backup_s3.S3Error as exc:
                 raise RestoreSourceError(str(exc)) from None
-            prefix = (target.prefix or "").strip("/")
             return {"items": _newest_first(rows), "location": f"s3://{target.bucket}/{prefix}".rstrip("/"),
                     "host_key": None}
         folder = remote_folder(target.remote_path)
@@ -363,15 +419,18 @@ def _sftp_put(client: paramiko.SFTPClient, local_file: str, folder: str, name: s
 
 def check_key(source: dict, key: str) -> str:
     """Refuse a key this source could not have listed; return its file name."""
-    if _CONTROL.search(key or ""):
+    if _CONTROL.search(key or "") or ".." in (key or "").split("/"):
         raise RestoreSourceError("Not a backup file")
     if source["kind"] == "local":
         return Path(local_path(key)).name
     name = posixpath.basename(key)
     if not name.endswith(".tar.gz") or name != name.strip():
         raise RestoreSourceError("Not a backup file")
-    if source["kind"] == "remote" and posixpath.dirname(key) != remote_folder(source.get("path")):
-        raise RestoreSourceError("That file is not in the folder that was listed")
+    if source["kind"] == "remote":
+        base_folder = remote_folder(source.get("path")).rstrip("/")
+        norm_dir = posixpath.normpath(posixpath.dirname(key)).rstrip("/")
+        if norm_dir != base_folder and not norm_dir.startswith((base_folder + "/") if base_folder else "/"):
+            raise RestoreSourceError("That file is not in the folder that was listed")
     return name
 
 

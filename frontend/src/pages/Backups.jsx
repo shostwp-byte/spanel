@@ -23,12 +23,14 @@ const S3_PRESETS = [
 export function BackupsPage({ request, isAdmin, isReseller, API }) {
   const {
     loading, setLoading, setError, setNotice, users, selectedWebsiteId, setSelectedWebsiteId, websites,
-    formatApiError, loadUsers, loadDatabases, refreshAll,
+    loadUsers, loadDatabases, refreshAll,
   } = useAppContext();
 
-  const [backupTab, setBackupTab] = useState(isAdmin ? 'user' : 'website');
+  const isManager = Boolean(isAdmin || isReseller);
+  const [backupTab, setBackupTab] = useState(isManager ? 'user' : 'website');
+  const [serverHostname, setServerHostname] = useState(window.location.hostname || 'spanel-server');
 
-  // Restore Wizard state
+  // Restore Wizard state (Admin)
   const [restoreSource, setRestoreSource] = useState({ kind: 'local', target_id: '' });
   const [restoreRemote, setRestoreRemote] = useState({
     protocol: 'sftp', host: '', port: '22', username: 'root', password: '', path: '/var/backups/spanel/users',
@@ -69,7 +71,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   const [sftpTargetForm, setSftpTargetForm] = useState({
     name: '', kind: 'sftp',
     host: '', port: 22, username: '', password: '', private_key: '', remote_path: '/backups/spanel',
-    endpoint: '', region: 'us-east-1', bucket: '', access_key: '', secret_key: '', prefix: 'spanel', secure: true,
+    endpoint: '', region: 'us-east-1', bucket: '', access_key: '', secret_key: '', prefix: '', secure: true,
   });
 
   const backupUsers = users.filter((item) => item.is_active);
@@ -81,8 +83,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     }
     loadBackupJobs({ silent: true });
     loadUserBackups();
+    loadSftpTargets();
     if (isAdmin) {
-      loadSftpTargets();
       loadBackupSchedules();
     }
   }, [selectedWebsiteId, isAdmin]);
@@ -129,6 +131,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     try {
       const data = await request(`/maintenance/backups/${websiteId}`);
       setBackups(data.items || []);
+      if (data.server_hostname) setServerHostname(data.server_hostname);
     } catch (_err) {
       setBackups([]);
     }
@@ -138,6 +141,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     try {
       const data = await request('/maintenance/user-backups');
       setUserBackups(data.items || []);
+      if (data.server_hostname) setServerHostname(data.server_hostname);
     } catch (_err) {
       setUserBackups([]);
     }
@@ -157,10 +161,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   }
 
   async function loadSftpTargets() {
-    if (!isAdmin) {
-      setSftpTargets([]);
-      return;
-    }
     try {
       const data = await request('/maintenance/sftp-targets');
       setSftpTargets(data || []);
@@ -226,7 +226,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   }
 
   async function createUserBackup() {
-    const targetUserId = isAdmin ? Number(selectedBackupUserId) : Number(users[0]?.id || 0);
+    const targetUserId = isManager ? Number(selectedBackupUserId) : Number(users[0]?.id || 0);
     if (!targetUserId) {
       setError(t('selectUserForBackup'));
       return;
@@ -238,7 +238,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         method: 'POST',
         body: JSON.stringify({
           user_id: targetUserId,
-          target_id: isAdmin && selectedUserBackupTargetId ? Number(selectedUserBackupTargetId) : null,
+          target_id: selectedUserBackupTargetId ? Number(selectedUserBackupTargetId) : null,
         }),
       });
       queueBackupJob(
@@ -586,7 +586,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
       setSftpTargetForm({
         name: '', kind: 'sftp',
         host: '', port: 22, username: '', password: '', private_key: '', remote_path: '/backups/spanel',
-        endpoint: '', region: 'us-east-1', bucket: '', access_key: '', secret_key: '', prefix: 'spanel', secure: true,
+        endpoint: '', region: 'us-east-1', bucket: '', access_key: '', secret_key: '', prefix: '', secure: true,
       });
       setShowDestinationForm(false);
       await loadSftpTargets();
@@ -711,12 +711,16 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     return ids.map((id) => users.find((user) => user.id === Number(id))?.username || `#${id}`).join(', ');
   }
 
-  const activeBackupTab = !isAdmin && ['schedule', 'restore'].includes(backupTab) ? 'website' : backupTab;
+  const activeBackupTab = !isAdmin && backupTab === 'schedule' ? 'website' : backupTab;
   const localUserBackupFiles = userBackups.filter((item) => item.location !== 'restore');
   const filteredUserBackups = localUserBackupFiles.filter((item) => {
     if (!userBackupFilter.trim()) return true;
     const q = userBackupFilter.toLowerCase();
-    return (item.username || '').toLowerCase().includes(q) || (item.filename || '').toLowerCase().includes(q);
+    return (
+      (item.username || '').toLowerCase().includes(q)
+      || (item.filename || '').toLowerCase().includes(q)
+      || (item.relative_path || '').toLowerCase().includes(q)
+    );
   });
 
   const activeJobsList = backupJobs.filter((job) => job.status === 'queued' || job.status === 'running');
@@ -735,16 +739,29 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
               <Archive size={22} />
             </div>
             <div>
-              <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-main)' }}>
-                Trung tâm Sao lưu & Khôi phục (Backup & Restore)
-              </h3>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, color: 'var(--text-main)' }}>
+                  Trung tâm Sao lưu & Khôi phục (Backup & Restore)
+                </h3>
+                {isManager && (
+                  <span style={{
+                    padding: '2px 9px', borderRadius: '999px', fontSize: '0.73rem', fontWeight: 700,
+                    background: 'rgba(13, 148, 136, 0.12)', border: '1px solid rgba(13, 148, 136, 0.25)',
+                    color: 'var(--accent-primary)',
+                  }}>
+                    Chuẩn Multi-Server: {serverHostname}/&lt;user&gt;/&lt;file&gt;.tar.gz
+                  </span>
+                )}
+              </div>
               <p style={{ margin: '3px 0 0', fontSize: '0.84rem', color: 'var(--text-muted)' }}>
-                Quản lý sao lưu toàn bộ tài khoản (Full User), từng Website, lập lịch tự động và lưu trữ từ xa (SFTP / S3).
+                {isManager
+                  ? 'Quản lý sao lưu phân cấp theo Hostname/User trên Local, S3 Object Storage và SFTP/FTP dành cho Admin/Reseller.'
+                  : 'Sao lưu toàn bộ tài khoản hoặc từng Website và tự cấu hình lưu trữ từ xa (SFTP / S3) về tài khoản riêng của bạn.'}
               </p>
             </div>
           </div>
 
-          {/* 4-Tab Modern Pill Bar */}
+          {/* Modern Pill Tab Bar */}
           <div style={{
             display: 'inline-flex', background: 'var(--surface-2)', padding: '4px',
             borderRadius: '10px', border: '1px solid var(--border-subtle)', gap: '4px', flexWrap: 'wrap',
@@ -754,8 +771,13 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
               { id: 'website', label: 'Website Backups', icon: Globe, badge: backups.length },
               ...(isAdmin ? [
                 { id: 'schedule', label: 'Scheduled Backups', icon: Clock, badge: backupSchedules.length },
-                { id: 'restore', label: 'Restore & Destinations', icon: ArchiveRestore, badge: sftpTargets.length },
               ] : []),
+              {
+                id: 'restore',
+                label: isAdmin ? 'Restore & Destinations' : 'My Backup Storage (SFTP / S3)',
+                icon: isAdmin ? ArchiveRestore : Cloud,
+                badge: sftpTargets.length,
+              },
             ].map((tab) => {
               const Icon = tab.icon;
               const isActive = activeBackupTab === tab.id;
@@ -765,7 +787,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   type="button"
                   onClick={() => {
                     setBackupTab(tab.id);
-                    if (tab.id === 'restore' && !restoreListing && restoreSource.kind === 'local') {
+                    if (isAdmin && tab.id === 'restore' && !restoreListing && restoreSource.kind === 'local') {
                       loadRestoreListing({ kind: 'local' });
                     }
                   }}
@@ -816,7 +838,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
          ===================================================================== */}
       {activeBackupTab === 'user' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
-          {/* Create Full User Backup Card */}
           <div className="pkg-card" style={{ padding: '20px 22px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px' }}>
               <div>
@@ -825,7 +846,15 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   Tạo bản sao lưu toàn bộ tài khoản (Full User Backup)
                 </h4>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  Đóng gói trọn vẹn thông tin User, toàn bộ mã nguồn Website, tất cả Database MariaDB, cấu hình Nginx/WAF, ứng dụng Node/Docker và hộp thư Email vào 1 file <code>.tar.gz</code>.
+                  {isManager ? (
+                    <>
+                      Lưu trữ chuẩn phân cấp Multi-Server: <code>{serverHostname}/&lt;username&gt;/user-&lt;username&gt;-&lt;timestamp&gt;.tar.gz</code> trên cả Local, S3 và SFTP.
+                    </>
+                  ) : (
+                    <>
+                      Đóng gói trọn vẹn Website, Database MariaDB và Hộp thư Email của bạn vào 1 file <code>.tar.gz</code> để lưu tại chỗ hoặc đẩy về kho SFTP/S3 cá nhân.
+                    </>
+                  )}
                 </p>
               </div>
               <button type="button" className="secondary-light" onClick={loadUserBackups} disabled={loading}>
@@ -836,46 +865,44 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
             <div style={{
               marginTop: '16px', padding: '16px', borderRadius: '10px',
               background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
-              display: 'grid', gridTemplateColumns: isAdmin ? '1fr 1fr auto' : '1fr auto', gap: '14px', alignItems: 'end',
+              display: 'grid', gridTemplateColumns: isManager ? '1fr 1fr auto' : '1fr auto', gap: '14px', alignItems: 'end',
             }}>
-              {isAdmin ? (
-                <>
-                  <label style={{ margin: 0 }}>
-                    <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
-                      Tài khoản cần sao lưu (User Account)
-                    </span>
-                    <select value={selectedBackupUserId} onChange={(e) => setSelectedBackupUserId(e.target.value)}>
-                      <option value="">{t('selectUser')}</option>
-                      {backupUsers.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.username} ({item.role}) — {item.email}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label style={{ margin: 0 }}>
-                    <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
-                      Đích lưu trữ (Backup Destination)
-                    </span>
-                    <select value={selectedUserBackupTargetId} onChange={(e) => setSelectedUserBackupTargetId(e.target.value)}>
-                      <option value="">Lưu tại máy chủ này (/var/backups/spanel/users)</option>
-                      {sftpTargets.map((target) => (
-                        <option key={target.id} value={target.id}>
-                          [{String(target.kind || 'sftp').toUpperCase()}] {target.name} ({target.kind === 's3' ? target.bucket : target.host})
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </>
-              ) : (
-                <div style={{ fontSize: '0.86rem', color: 'var(--text-main)' }}>
-                  Tạo bản sao lưu đầy đủ cho tài khoản hiện tại của bạn (bao gồm tất cả Website, Database và Email).
-                </div>
+              {isManager && (
+                <label style={{ margin: 0 }}>
+                  <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
+                    Tài khoản cần sao lưu (User Account)
+                  </span>
+                  <select value={selectedBackupUserId} onChange={(e) => setSelectedBackupUserId(e.target.value)}>
+                    <option value="">{t('selectUser')}</option>
+                    {backupUsers.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.username} ({item.role}) — {item.email}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               )}
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
+                  {isManager ? 'Đích lưu trữ (Local / SFTP / S3)' : 'Đích lưu trữ của bạn (Local hoặc Kho SFTP/S3 cá nhân)'}
+                </span>
+                <select value={selectedUserBackupTargetId} onChange={(e) => setSelectedUserBackupTargetId(e.target.value)}>
+                  <option value="">
+                    {isManager
+                      ? `Lưu tại máy chủ này (${serverHostname}/<user>/...)`
+                      : 'Lưu trên máy chủ hiện tại'}
+                  </option>
+                  {sftpTargets.map((target) => (
+                    <option key={target.id} value={target.id}>
+                      [{String(target.kind || 'sftp').toUpperCase()}] {target.name} ({target.kind === 's3' ? target.bucket : target.host})
+                    </option>
+                  ))}
+                </select>
+              </label>
               <button
                 type="button"
                 onClick={createUserBackup}
-                disabled={loading || (isAdmin && !selectedBackupUserId)}
+                disabled={loading || (isManager && !selectedBackupUserId)}
                 style={{ height: '40px', padding: '0 18px', fontWeight: 600 }}
               >
                 <Archive size={16} />
@@ -912,17 +939,21 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
               <div>
                 <h4 style={{ margin: 0, fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-main)' }}>
-                  Danh sách bản sao lưu User trên máy chủ ({filteredUserBackups.length})
+                  Danh sách bản sao lưu User ({filteredUserBackups.length})
                 </h4>
                 <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                  Thư mục lưu trữ: <code>/var/backups/spanel/users/&lt;username&gt;</code>
+                  {isManager ? (
+                    <>Cấu trúc lưu trữ: <code>{serverHostname}/&lt;username&gt;/&lt;file&gt;.tar.gz</code></>
+                  ) : (
+                    <>Danh sách các bản sao lưu toàn bộ tài khoản của bạn</>
+                  )}
                 </span>
               </div>
               <div style={{ position: 'relative', minWidth: '260px' }}>
                 <Search size={15} style={{ position: 'absolute', left: '11px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
                 <input
                   type="search"
-                  placeholder="Tìm theo username hoặc tên file..."
+                  placeholder="Tìm theo username, hostname hoặc tên file..."
                   value={userBackupFilter}
                   onChange={(e) => setUserBackupFilter(e.target.value)}
                   style={{ paddingLeft: '34px', height: '36px', fontSize: '0.84rem' }}
@@ -935,7 +966,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 <thead>
                   <tr>
                     <th>Tài khoản (User)</th>
-                    <th>Tên file Backup</th>
+                    <th>{isManager ? 'Đường dẫn chuẩn (Hostname / User / File)' : 'Tên file Backup'}</th>
                     <th>Số Website</th>
                     <th>Thời gian tạo</th>
                     <th>Dung lượng</th>
@@ -944,74 +975,91 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredUserBackups.map((item) => (
-                    <tr key={item.backup_file}>
-                      <td>
-                        <strong style={{ color: 'var(--text-main)' }}>{item.username || '-'}</strong>
-                      </td>
-                      <td>
-                        <div style={{ fontWeight: 600, fontSize: '0.84rem', color: 'var(--text-main)' }}>{item.filename}</div>
-                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>{item.backup_file}</div>
-                      </td>
-                      <td>
-                        <span style={{
-                          padding: '2px 8px', borderRadius: '999px', fontSize: '0.78rem', fontWeight: 600,
-                          background: 'var(--surface-2)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)',
-                        }}>
-                          {item.websites ?? 0} site
-                        </span>
-                      </td>
-                      <td style={{ fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                        {item.generated_at ? new Date(item.generated_at).toLocaleString() : '-'}
-                      </td>
-                      <td style={{ fontWeight: 600, fontSize: '0.84rem' }}>{formatBytes(item.size)}</td>
-                      <td>
-                        <span style={{
-                          display: 'inline-flex', alignItems: 'center', gap: '5px',
-                          padding: '3px 9px', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 600,
-                          background: item.valid ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
-                          color: item.valid ? '#10b981' : '#ef4444',
-                        }}>
-                          {item.valid ? <CheckCircle size={13} /> : <AlertCircle size={13} />}
-                          {item.valid ? 'Hợp lệ' : (item.error || 'Lỗi')}
-                        </span>
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
-                          {isAdmin && (
+                  {filteredUserBackups.map((item) => {
+                    const standardizedPath = item.relative_path && item.relative_path.includes('/')
+                      ? item.relative_path
+                      : `${item.hostname || serverHostname}/${item.username || 'user'}/${item.filename}`;
+                    return (
+                      <tr key={item.backup_file}>
+                        <td>
+                          <strong style={{ color: 'var(--text-main)' }}>{item.username || '-'}</strong>
+                        </td>
+                        <td>
+                          {isManager ? (
+                            <>
+                              <div style={{ fontWeight: 600, fontSize: '0.84rem', color: 'var(--accent-primary)', fontFamily: 'monospace' }}>
+                                {standardizedPath}
+                              </div>
+                              <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+                                {item.backup_file}
+                              </div>
+                            </>
+                          ) : (
+                            <div style={{ fontWeight: 600, fontSize: '0.84rem', color: 'var(--text-main)' }}>
+                              {item.filename}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          <span style={{
+                            padding: '2px 8px', borderRadius: '999px', fontSize: '0.78rem', fontWeight: 600,
+                            background: 'var(--surface-2)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)',
+                          }}>
+                            {item.websites ?? 0} site
+                          </span>
+                        </td>
+                        <td style={{ fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                          {item.generated_at ? new Date(item.generated_at).toLocaleString() : '-'}
+                        </td>
+                        <td style={{ fontWeight: 600, fontSize: '0.84rem' }}>{formatBytes(item.size)}</td>
+                        <td>
+                          <span style={{
+                            display: 'inline-flex', alignItems: 'center', gap: '5px',
+                            padding: '3px 9px', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 600,
+                            background: item.valid ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
+                            color: item.valid ? '#10b981' : '#ef4444',
+                          }}>
+                            {item.valid ? <CheckCircle size={13} /> : <AlertCircle size={13} />}
+                            {item.valid ? 'Hợp lệ' : (item.error || 'Lỗi')}
+                          </span>
+                        </td>
+                        <td style={{ textAlign: 'right' }}>
+                          <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
+                            {isAdmin && (
+                              <button
+                                type="button"
+                                className="secondary-light"
+                                onClick={() => restoreUserBackupItem(item)}
+                                disabled={loading || !item.valid}
+                                title="Khôi phục tài khoản này"
+                              >
+                                <RotateCcw size={14} /> Khôi phục
+                              </button>
+                            )}
                             <button
                               type="button"
                               className="secondary-light"
-                              onClick={() => restoreUserBackupItem(item)}
-                              disabled={loading || !item.valid}
-                              title="Khôi phục tài khoản này"
+                              onClick={() => downloadUserBackup(item)}
+                              disabled={loading}
+                              title="Tải file .tar.gz về máy"
                             >
-                              <RotateCcw size={14} /> Khôi phục
+                              <Download size={14} /> Tải về
                             </button>
-                          )}
-                          <button
-                            type="button"
-                            className="secondary-light"
-                            onClick={() => downloadUserBackup(item)}
-                            disabled={loading}
-                            title="Tải file .tar.gz về máy"
-                          >
-                            <Download size={14} /> Tải về
-                          </button>
-                          <button
-                            type="button"
-                            className="danger"
-                            onClick={() => deleteUserBackupItem(item)}
-                            disabled={loading}
-                            title="Xóa bản sao lưu"
-                            style={{ padding: '6px 10px' }}
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                            <button
+                              type="button"
+                              className="danger"
+                              onClick={() => deleteUserBackupItem(item)}
+                              disabled={loading}
+                              title="Xóa bản sao lưu"
+                              style={{ padding: '6px 10px' }}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                   {filteredUserBackups.length === 0 && (
                     <tr>
                       <td colSpan="7">
@@ -1043,7 +1091,11 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   Sao lưu & Khôi phục từng Website (Mã nguồn + Database)
                 </h4>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  Đóng gói thư mục gốc của Website và tự động xuất file SQL Database đi kèm vào gói <code>.tar.gz</code>.
+                  {isManager ? (
+                    <>Định dạng chuẩn khi đẩy lên S3/SFTP: <code>{serverHostname}/&lt;user&gt;/&lt;user&gt;-&lt;domain&gt;.tar.gz</code></>
+                  ) : (
+                    <>Đóng gói thư mục gốc của Website và tự động xuất file SQL Database đi kèm vào gói <code>.tar.gz</code>.</>
+                  )}
                 </p>
               </div>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
@@ -1060,7 +1112,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
             <div style={{
               marginTop: '16px', padding: '16px', borderRadius: '10px',
               background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
-              display: 'grid', gridTemplateColumns: isAdmin ? '1fr 1fr auto' : '1fr', gap: '14px', alignItems: 'end',
+              display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '14px', alignItems: 'end',
             }}>
               <div>
                 <WebsiteSelect
@@ -1072,32 +1124,28 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   isReseller={isReseller}
                 />
               </div>
-              {isAdmin && (
-                <>
-                  <label style={{ margin: 0 }}>
-                    <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
-                      Đẩy bản sao lưu Website lên Cloud / SFTP
-                    </span>
-                    <select value={selectedBackupTargetId} onChange={(e) => setSelectedBackupTargetId(e.target.value)}>
-                      <option value="">-- Chọn đích lưu trữ SFTP / S3 --</option>
-                      {sftpTargets.map((target) => (
-                        <option key={target.id} value={target.id}>
-                          [{String(target.kind || 'sftp').toUpperCase()}] {target.name} ({target.kind === 's3' ? target.bucket : target.host})
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <button
-                    type="button"
-                    className="secondary-light"
-                    onClick={runSftpBackup}
-                    disabled={loading || !selectedWebsiteId || !selectedBackupTargetId}
-                    style={{ height: '40px' }}
-                  >
-                    <Cloud size={15} /> Backup & Gửi đi
-                  </button>
-                </>
-              )}
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
+                  {isManager ? 'Đẩy bản sao lưu Website lên Cloud / SFTP' : 'Đẩy về Kho SFTP / S3 cá nhân của bạn'}
+                </span>
+                <select value={selectedBackupTargetId} onChange={(e) => setSelectedBackupTargetId(e.target.value)}>
+                  <option value="">-- Chọn đích lưu trữ SFTP / S3 --</option>
+                  {sftpTargets.map((target) => (
+                    <option key={target.id} value={target.id}>
+                      [{String(target.kind || 'sftp').toUpperCase()}] {target.name} ({target.kind === 's3' ? target.bucket : target.host})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="secondary-light"
+                onClick={runSftpBackup}
+                disabled={loading || !selectedWebsiteId || !selectedBackupTargetId}
+                style={{ height: '40px' }}
+              >
+                <Cloud size={15} /> Backup & Gửi đi
+              </button>
             </div>
           </div>
 
@@ -1110,20 +1158,22 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 <thead>
                   <tr>
                     <th>Tên file sao lưu</th>
-                    <th>Đường dẫn trên máy chủ</th>
+                    <th>{isManager ? 'Đường dẫn phân cấp (Hostname / User / File)' : 'Đường dẫn'}</th>
                     <th style={{ textAlign: 'right' }}>Thao tác</th>
                   </tr>
                 </thead>
                 <tbody>
                   {backups.map((item) => {
                     const fileName = item.split('/').pop() || item;
+                    const selectedSiteObj = websites.find((w) => String(w.id) === String(selectedWebsiteId));
+                    const siteOwner = users.find((u) => u.id === selectedSiteObj?.owner_id)?.username || 'user';
                     return (
                       <tr key={item}>
                         <td>
                           <strong style={{ color: 'var(--text-main)' }}>{fileName}</strong>
                         </td>
                         <td style={{ fontFamily: 'monospace', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                          {item}
+                          {isManager ? `${serverHostname}/${siteOwner}/${fileName}` : fileName}
                         </td>
                         <td style={{ textAlign: 'right' }}>
                           <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
@@ -1180,7 +1230,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
          ===================================================================== */}
       {isAdmin && activeBackupTab === 'schedule' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
-          {/* Schedule Builder / Editor Card */}
           <div className="pkg-card" style={{ padding: '20px 22px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
               <div>
@@ -1189,7 +1238,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   {editingScheduleId ? `Chỉnh sửa lịch sao lưu #${editingScheduleId}` : 'Thiết lập lịch sao lưu tự động mới (Scheduled Backup)'}
                 </h4>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  Tự động tạo Full User Backup định kỳ theo lịch Cron, tự động xoay vòng tên file và dọn dẹp các bản cũ vượt quá số lượng giữ lại.
+                  Tự động tạo Full User Backup định kỳ theo cấu trúc chuẩn <code>{serverHostname}/&lt;username&gt;/&lt;file&gt;.tar.gz</code>.
                 </p>
               </div>
               {editingScheduleId && (
@@ -1348,13 +1397,13 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         ))}
                       </select>
                     </label>
-                    <div style={{ marginTop: '10px', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                      Tên file mẫu:{' '}
-                      <code>
-                        {scheduleForm.name_suffix === 'none' && 'user-alice.tar.gz'}
-                        {scheduleForm.name_suffix === 'day_of_week' && 'user-alice-Mon.tar.gz'}
-                        {scheduleForm.name_suffix === 'week_of_month' && 'user-alice-W3.tar.gz'}
-                        {scheduleForm.name_suffix === 'full_date' && 'user-alice-2026-10-21.tar.gz'}
+                    <div style={{ marginTop: '10px', fontSize: '0.77rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                      Đường dẫn lưu mẫu:<br />
+                      <code style={{ color: 'var(--accent-primary)' }}>
+                        {scheduleForm.name_suffix === 'none' && `${serverHostname}/demous/user-demous.tar.gz`}
+                        {scheduleForm.name_suffix === 'day_of_week' && `${serverHostname}/demous/user-demous-Wed.tar.gz`}
+                        {scheduleForm.name_suffix === 'week_of_month' && `${serverHostname}/demous/user-demous-W3.tar.gz`}
+                        {scheduleForm.name_suffix === 'full_date' && `${serverHostname}/demous/user-demous-2026-10-21.tar.gz`}
                       </code>
                     </div>
                   </div>
@@ -1415,7 +1464,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                               {String(targetObj.kind || 'sftp').toUpperCase()}: {targetObj.name}
                             </span>
                           ) : (
-                            <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>Local Server</span>
+                            <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>Local ({serverHostname})</span>
                           )}
                         </td>
                         <td>{item.retention} bản</td>
@@ -1518,14 +1567,14 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
       )}
 
       {/* =====================================================================
-          TAB 4: RESTORE CENTER & OFF-SERVER DESTINATIONS
+          TAB 4: RESTORE CENTER (ADMIN) & OFF-SERVER DESTINATIONS (ALL ROLES)
          ===================================================================== */}
-      {isAdmin && activeBackupTab === 'restore' && (() => {
+      {activeBackupTab === 'restore' && (() => {
         const byAccount = new Map();
         for (const item of restoreListing?.items || []) {
           const acct = item.username || item.name;
           if (!byAccount.has(acct)) byAccount.set(acct, []);
-          byAccount.get(acct).append ? byAccount.get(acct).push(item) : byAccount.get(acct).push(item);
+          byAccount.get(acct).push(item);
         }
         const existingSet = new Set(restoreListing?.existing || []);
         const filter = restoreFilter.trim().toLowerCase();
@@ -1538,389 +1587,405 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
 
         return (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
-            {/* 4-Step Restore Wizard Card */}
-            <div className="pkg-card" style={{ padding: '20px 22px' }}>
-              <div style={{ marginBottom: '16px' }}>
-                <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <ArchiveRestore size={18} style={{ color: 'var(--accent-primary)' }} />
-                  Trình thuật sĩ Khôi phục Tài khoản (4-Step Account Restore Wizard)
-                </h4>
-                <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  Khôi phục hàng loạt tài khoản User từ ổ cứng máy chủ hiện tại, file tải lên (Upload), kho lưu trữ S3/SFTP hoặc kéo trực tiếp từ máy chủ khác.
-                </p>
-              </div>
-
-              {/* STEP 1: Choose Source */}
-              <div style={{
-                padding: '16px', borderRadius: '10px', background: 'var(--surface-2)',
-                border: '1px solid var(--border-subtle)', marginBottom: '14px',
-              }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '12px' }}>
-                  <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
-                    Bước 1: Chọn nguồn chứa bản sao lưu (Backup Source)
-                  </div>
-                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                    <button
-                      type="button"
-                      className={restoreSource.kind === 'local' ? '' : 'secondary-light'}
-                      onClick={() => {
-                        selectRestoreSource({ kind: 'local', target_id: '' });
-                        loadRestoreListing({ kind: 'local' });
-                      }}
-                    >
-                      <HardDrive size={14} /> Máy chủ này (Local)
-                    </button>
-                    <button
-                      type="button"
-                      className={restoreSource.kind === 'target' ? '' : 'secondary-light'}
-                      onClick={() => selectRestoreSource({ kind: 'target', target_id: sftpTargets[0]?.id ? String(sftpTargets[0].id) : '' })}
-                    >
-                      <Cloud size={14} /> Đích lưu trữ (SFTP / S3)
-                    </button>
-                    <button
-                      type="button"
-                      className={restoreSource.kind === 'remote' ? '' : 'secondary-light'}
-                      onClick={() => selectRestoreSource({ kind: 'remote', target_id: '' })}
-                    >
-                      <Server size={14} /> Máy chủ khác (SFTP / FTP)
-                    </button>
-                  </div>
+            {/* 4-Step Restore Wizard Card (Admin only) */}
+            {isAdmin && (
+              <div className="pkg-card" style={{ padding: '20px 22px' }}>
+                <div style={{ marginBottom: '16px' }}>
+                  <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <ArchiveRestore size={18} style={{ color: 'var(--accent-primary)' }} />
+                    Trình thuật sĩ Khôi phục Tài khoản (4-Step Account Restore Wizard)
+                  </h4>
+                  <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                    Tự động nhận diện cấu trúc phân cấp <code>&lt;hostname&gt;/&lt;username&gt;/&lt;file&gt;.tar.gz</code> trên Local, S3, SFTP và FTP/FTPS để tránh nhầm lẫn giữa các máy chủ.
+                  </p>
                 </div>
 
-                {restoreSource.kind === 'local' && (
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
-                    <span style={{ fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                      Quét toàn bộ bản sao lưu trong <code>/var/backups/spanel/users</code> và thư mục <code>restore/</code>.
-                    </span>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <label className="button secondary-light" style={{ margin: 0, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                        <Upload size={14} /> Tải lên file User Backup (.tar.gz)
-                        <input type="file" accept=".tar.gz,application/gzip" multiple onChange={uploadToRestoreSource} hidden disabled={restoreBusy} />
-                      </label>
-                      <button type="button" onClick={() => loadRestoreListing({ kind: 'local' })} disabled={restoreBusy}>
-                        <RefreshCw size={14} className={restoreBusy ? 'spin' : ''} /> Quét danh sách Backup
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {restoreSource.kind === 'target' && (
-                  <div style={{ display: 'flex', alignItems: 'end', gap: '12px', flexWrap: 'wrap' }}>
-                    <label style={{ flex: 1, minWidth: '240px', margin: 0 }}>
-                      <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Chọn kho lưu trữ SFTP / S3</span>
-                      <select
-                        value={restoreSource.target_id}
-                        onChange={(e) => selectRestoreSource({ kind: 'target', target_id: e.target.value })}
-                      >
-                        <option value="">-- Chọn đích lưu trữ --</option>
-                        {sftpTargets.map((tg) => (
-                          <option key={tg.id} value={tg.id}>
-                            [{String(tg.kind || 'sftp').toUpperCase()}] {tg.name} — {tg.kind === 's3' ? `${tg.endpoint}/${tg.bucket}` : `${tg.host}:${tg.remote_path}`}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <button type="button" onClick={() => loadRestoreListing()} disabled={restoreBusy || !restoreSource.target_id} style={{ height: '40px' }}>
-                      <RefreshCw size={14} className={restoreBusy ? 'spin' : ''} /> Đọc danh sách từ Cloud/SFTP
-                    </button>
-                  </div>
-                )}
-
-                {restoreSource.kind === 'remote' && (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '10px' }}>
-                      <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Giao thức</span>
-                        <select
-                          value={restoreRemote.protocol}
-                          onChange={(e) => {
-                            const proto = e.target.value;
-                            setRestoreRemote((p) => ({ ...p, protocol: proto, port: proto === 'sftp' ? '22' : '21' }));
-                            setRestoreListing(null);
-                          }}
-                        >
-                          <option value="sftp">SFTP (SSH)</option>
-                          <option value="ftp">FTP</option>
-                          <option value="ftps">FTPS (TLS)</option>
-                        </select>
-                      </label>
-                      <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Máy chủ (Host / IP)</span>
-                        <input
-                          value={restoreRemote.host}
-                          onChange={(e) => setRestoreRemote((p) => ({ ...p, host: e.target.value }))}
-                          placeholder="backup.example.com"
-                        />
-                      </label>
-                      <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Cổng (Port)</span>
-                        <input
-                          type="number"
-                          value={restoreRemote.port}
-                          onChange={(e) => setRestoreRemote((p) => ({ ...p, port: e.target.value }))}
-                        />
-                      </label>
-                      <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Username</span>
-                        <input
-                          value={restoreRemote.username}
-                          onChange={(e) => setRestoreRemote((p) => ({ ...p, username: e.target.value }))}
-                        />
-                      </label>
-                      <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Password</span>
-                        <input
-                          type="password"
-                          value={restoreRemote.password}
-                          onChange={(e) => setRestoreRemote((p) => ({ ...p, password: e.target.value }))}
-                        />
-                      </label>
-                      <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Thư mục chứa Backup</span>
-                        <input
-                          value={restoreRemote.path}
-                          onChange={(e) => setRestoreRemote((p) => ({ ...p, path: e.target.value }))}
-                          placeholder="/var/backups/spanel/users"
-                        />
-                      </label>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
-                      {restoreListing?.host_key ? (
-                        <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                          SSH Host Key: <code>{restoreListing.host_key}</code>
-                        </span>
-                      ) : <span />}
-                      <button
-                        type="button"
-                        onClick={() => loadRestoreListing()}
-                        disabled={restoreBusy || !restoreRemote.host.trim() || !restoreRemote.username.trim()}
-                      >
-                        <RefreshCw size={14} className={restoreBusy ? 'spin' : ''} /> Kết nối & Liệt kê bản sao lưu
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* STEP 2 & 3: Pick Accounts and Confirm */}
-              {restoreListing && (
+                {/* STEP 1: Choose Source */}
                 <div style={{
                   padding: '16px', borderRadius: '10px', background: 'var(--surface-2)',
                   border: '1px solid var(--border-subtle)', marginBottom: '14px',
                 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '12px' }}>
-                    <div>
-                      <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
-                        Bước 2: Chọn tài khoản và phiên bản ngày sao lưu ({accounts.length} tài khoản)
-                      </div>
-                      <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                        Đã chọn <strong>{restorePicks.length}</strong> tài khoản ({formatBytes(selectedBytes)}) ·
-                        Ổ cứng máy chủ còn trống: <strong>{formatBytes(restoreListing.free_bytes || 0)}</strong>
-                      </span>
+                    <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
+                      Bước 1: Chọn nguồn chứa bản sao lưu (Backup Source)
                     </div>
-                    <div style={{ position: 'relative', minWidth: '240px' }}>
-                      <Search size={14} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                      <input
-                        type="search"
-                        placeholder="Lọc theo tên tài khoản..."
-                        value={restoreFilter}
-                        onChange={(e) => setRestoreFilter(e.target.value)}
-                        style={{ paddingLeft: '32px', height: '34px', fontSize: '0.82rem' }}
-                      />
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className={restoreSource.kind === 'local' ? '' : 'secondary-light'}
+                        onClick={() => {
+                          selectRestoreSource({ kind: 'local', target_id: '' });
+                          loadRestoreListing({ kind: 'local' });
+                        }}
+                      >
+                        <HardDrive size={14} /> Máy chủ này (Local)
+                      </button>
+                      <button
+                        type="button"
+                        className={restoreSource.kind === 'target' ? '' : 'secondary-light'}
+                        onClick={() => selectRestoreSource({ kind: 'target', target_id: sftpTargets[0]?.id ? String(sftpTargets[0].id) : '' })}
+                      >
+                        <Cloud size={14} /> Đích lưu trữ (SFTP / S3)
+                      </button>
+                      <button
+                        type="button"
+                        className={restoreSource.kind === 'remote' ? '' : 'secondary-light'}
+                        onClick={() => selectRestoreSource({ kind: 'remote', target_id: '' })}
+                      >
+                        <Server size={14} /> Máy chủ khác (SFTP / FTP)
+                      </button>
                     </div>
                   </div>
 
-                  {accounts.length === 0 ? (
-                    <EmptyState
-                      icon={FolderOpen}
-                      title="Không tìm thấy bản sao lưu hợp lệ tại nguồn này"
-                      subtitle="Hãy kiểm tra lại đường dẫn thư mục hoặc tải file .tar.gz lên."
-                    />
-                  ) : (
-                    <>
-                      <div className="pkg-table-wrap">
-                        <table className="pkg-clean-table">
-                          <thead>
-                            <tr>
-                              <th style={{ width: '40px' }}>
-                                <input
-                                  type="checkbox"
-                                  checked={allPicked}
-                                  onChange={(e) => {
-                                    const names = accounts.map(([acct]) => acct);
-                                    setRestorePicks(e.target.checked
-                                      ? Array.from(new Set([...restorePicks, ...names]))
-                                      : restorePicks.filter((a) => !names.includes(a)));
-                                  }}
-                                />
-                              </th>
-                              <th>Tài khoản (Account)</th>
-                              <th>Loại khôi phục</th>
-                              <th>Phiên bản bản sao lưu</th>
-                              <th>Số Website</th>
-                              <th>Dung lượng</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {accounts.map(([acct, versions]) => {
-                              const picked = restorePicks.includes(acct);
-                              const chosen = versions.find((v) => v.key === restoreChoice[acct]) || versions[0];
-                              const exists = existingSet.has(acct);
-                              return (
-                                <tr key={acct}>
-                                  <td>
-                                    <input
-                                      type="checkbox"
-                                      checked={picked}
-                                      onChange={(e) => setRestorePicks(
-                                        e.target.checked ? [...restorePicks, acct] : restorePicks.filter((a) => a !== acct)
-                                      )}
-                                    />
-                                  </td>
-                                  <td><strong style={{ color: 'var(--text-main)' }}>{acct}</strong></td>
-                                  <td>
-                                    <span style={{
-                                      padding: '2px 8px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 600,
-                                      background: exists ? 'rgba(245, 158, 11, 0.14)' : 'rgba(16, 185, 129, 0.14)',
-                                      color: exists ? '#f59e0b' : '#10b981',
-                                    }}>
-                                      {exists ? 'Ghi đè (Overwrite)' : 'Tạo mới (New)'}
-                                    </span>
-                                  </td>
-                                  <td>
-                                    {versions.length === 1 ? (
-                                      <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                                        {chosen.modified ? new Date(chosen.modified).toLocaleString() : chosen.name}
-                                      </span>
-                                    ) : (
-                                      <select
-                                        value={chosen.key}
-                                        onChange={(e) => setRestoreChoice({ ...restoreChoice, [acct]: e.target.value })}
-                                        style={{ height: '32px', fontSize: '0.8rem' }}
-                                      >
-                                        {versions.map((v) => (
-                                          <option key={v.key} value={v.key}>
-                                            {v.modified ? new Date(v.modified).toLocaleString() : v.name} ({formatBytes(v.size)})
-                                          </option>
-                                        ))}
-                                      </select>
-                                    )}
-                                  </td>
-                                  <td>{chosen.websites != null ? `${chosen.websites} site` : '—'}</td>
-                                  <td style={{ fontWeight: 600 }}>{formatBytes(chosen.size)}</td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      <div style={{
-                        marginTop: '14px', paddingTop: '14px', borderTop: '1px solid var(--border-subtle)',
-                        display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px',
-                      }}>
-                        <div style={{ fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                          {overwriteCount > 0 ? (
-                            <span style={{ color: '#f59e0b', fontWeight: 600 }}>
-                              Lưu ý: {overwriteCount} tài khoản đã tồn tại trên máy chủ sẽ được ghi đè dữ liệu.
-                            </span>
-                          ) : (
-                            <span>Sẵn sàng khôi phục {restorePicks.length} tài khoản đã chọn.</span>
-                          )}
-                        </div>
-                        <button
-                          type="button"
-                          onClick={runRestoreFromSource}
-                          disabled={restoreBusy || restorePicks.length === 0 || ['running', 'queued'].includes(restoreJob?.status)}
-                          style={{ height: '40px', padding: '0 20px', fontWeight: 700 }}
-                        >
-                          <ArchiveRestore size={16} />
-                          Bắt đầu Khôi phục ({restorePicks.length} tài khoản)
+                  {restoreSource.kind === 'local' && (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                      <span style={{ fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                        Quét toàn bộ bản sao lưu trong <code>/var/backups/spanel/users/{serverHostname}/&lt;user&gt;</code> và thư mục <code>restore/</code>.
+                      </span>
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <label className="button secondary-light" style={{ margin: 0, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                          <Upload size={14} /> Tải lên file User Backup (.tar.gz)
+                          <input type="file" accept=".tar.gz,application/gzip" multiple onChange={uploadToRestoreSource} hidden disabled={restoreBusy} />
+                        </label>
+                        <button type="button" onClick={() => loadRestoreListing({ kind: 'local' })} disabled={restoreBusy}>
+                          <RefreshCw size={14} className={restoreBusy ? 'spin' : ''} /> Quét danh sách Backup
                         </button>
                       </div>
-                    </>
+                    </div>
+                  )}
+
+                  {restoreSource.kind === 'target' && (
+                    <div style={{ display: 'flex', alignItems: 'end', gap: '12px', flexWrap: 'wrap' }}>
+                      <label style={{ flex: 1, minWidth: '240px', margin: 0 }}>
+                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Chọn kho lưu trữ SFTP / S3</span>
+                        <select
+                          value={restoreSource.target_id}
+                          onChange={(e) => selectRestoreSource({ kind: 'target', target_id: e.target.value })}
+                        >
+                          <option value="">-- Chọn đích lưu trữ --</option>
+                          {sftpTargets.map((tg) => (
+                            <option key={tg.id} value={tg.id}>
+                              [{String(tg.kind || 'sftp').toUpperCase()}] {tg.name} — {tg.kind === 's3' ? `${tg.endpoint}/${tg.bucket}` : `${tg.host}:${tg.remote_path}`}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button type="button" onClick={() => loadRestoreListing()} disabled={restoreBusy || !restoreSource.target_id} style={{ height: '40px' }}>
+                        <RefreshCw size={14} className={restoreBusy ? 'spin' : ''} /> Đọc danh sách từ Cloud/SFTP
+                      </button>
+                    </div>
+                  )}
+
+                  {restoreSource.kind === 'remote' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '10px' }}>
+                        <label style={{ margin: 0 }}>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Giao thức</span>
+                          <select
+                            value={restoreRemote.protocol}
+                            onChange={(e) => {
+                              const proto = e.target.value;
+                              setRestoreRemote((p) => ({ ...p, protocol: proto, port: proto === 'sftp' ? '22' : '21' }));
+                              setRestoreListing(null);
+                            }}
+                          >
+                            <option value="sftp">SFTP (SSH)</option>
+                            <option value="ftp">FTP</option>
+                            <option value="ftps">FTPS (TLS)</option>
+                          </select>
+                        </label>
+                        <label style={{ margin: 0 }}>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Máy chủ (Host / IP)</span>
+                          <input
+                            value={restoreRemote.host}
+                            onChange={(e) => setRestoreRemote((p) => ({ ...p, host: e.target.value }))}
+                            placeholder="backup.example.com"
+                          />
+                        </label>
+                        <label style={{ margin: 0 }}>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Cổng (Port)</span>
+                          <input
+                            type="number"
+                            value={restoreRemote.port}
+                            onChange={(e) => setRestoreRemote((p) => ({ ...p, port: e.target.value }))}
+                          />
+                        </label>
+                        <label style={{ margin: 0 }}>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Username</span>
+                          <input
+                            value={restoreRemote.username}
+                            onChange={(e) => setRestoreRemote((p) => ({ ...p, username: e.target.value }))}
+                          />
+                        </label>
+                        <label style={{ margin: 0 }}>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Password</span>
+                          <input
+                            type="password"
+                            value={restoreRemote.password}
+                            onChange={(e) => setRestoreRemote((p) => ({ ...p, password: e.target.value }))}
+                          />
+                        </label>
+                        <label style={{ margin: 0 }}>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Thư mục chứa Backup</span>
+                          <input
+                            value={restoreRemote.path}
+                            onChange={(e) => setRestoreRemote((p) => ({ ...p, path: e.target.value }))}
+                            placeholder="/var/backups/spanel/users"
+                          />
+                        </label>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                        {restoreListing?.host_key ? (
+                          <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                            SSH Host Key: <code>{restoreListing.host_key}</code>
+                          </span>
+                        ) : <span />}
+                        <button
+                          type="button"
+                          onClick={() => loadRestoreListing()}
+                          disabled={restoreBusy || !restoreRemote.host.trim() || !restoreRemote.username.trim()}
+                        >
+                          <RefreshCw size={14} className={restoreBusy ? 'spin' : ''} /> Kết nối & Liệt kê bản sao lưu
+                        </button>
+                      </div>
+                    </div>
                   )}
                 </div>
-              )}
 
-              {/* STEP 4: Restore Progress & Results */}
-              {restoreJob && (
-                <div style={{
-                  padding: '16px', borderRadius: '10px',
-                  background: restoreJob.status === 'error' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(13, 148, 136, 0.06)',
-                  border: `1px solid ${restoreJob.status === 'error' ? 'rgba(239, 68, 68, 0.28)' : 'rgba(13, 148, 136, 0.28)'}`,
-                }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 700, fontSize: '0.92rem', color: 'var(--text-main)' }}>
-                      {['running', 'queued'].includes(restoreJob.status) ? (
-                        <RefreshCw size={16} className="spin" style={{ color: 'var(--accent-primary)' }} />
-                      ) : restoreJob.status === 'done' ? (
-                        <CheckCircle size={16} style={{ color: '#10b981' }} />
-                      ) : (
-                        <AlertCircle size={16} style={{ color: '#ef4444' }} />
-                      )}
-                      <span>
-                        Tiến trình Khôi phục:{' '}
-                        {(restoreJob.results || []).filter((r) => r.status === 'done').length} / {(restoreJob.results || []).length} hoàn tất
+                {/* STEP 2 & 3: Pick Accounts and Confirm */}
+                {restoreListing && (
+                  <div style={{
+                    padding: '16px', borderRadius: '10px', background: 'var(--surface-2)',
+                    border: '1px solid var(--border-subtle)', marginBottom: '14px',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '12px' }}>
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
+                          Bước 2: Chọn tài khoản và phiên bản ngày sao lưu ({accounts.length} tài khoản)
+                        </div>
+                        <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                          Đã chọn <strong>{restorePicks.length}</strong> tài khoản ({formatBytes(selectedBytes)}) ·
+                          Ổ cứng máy chủ còn trống: <strong>{formatBytes(restoreListing.free_bytes || 0)}</strong>
+                        </span>
+                      </div>
+                      <div style={{ position: 'relative', minWidth: '240px' }}>
+                        <Search size={14} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+                        <input
+                          type="search"
+                          placeholder="Lọc theo tên tài khoản..."
+                          value={restoreFilter}
+                          onChange={(e) => setRestoreFilter(e.target.value)}
+                          style={{ paddingLeft: '32px', height: '34px', fontSize: '0.82rem' }}
+                        />
+                      </div>
+                    </div>
+
+                    {accounts.length === 0 ? (
+                      <EmptyState
+                        icon={FolderOpen}
+                        title="Không tìm thấy bản sao lưu hợp lệ tại nguồn này"
+                        subtitle="Hãy kiểm tra lại đường dẫn thư mục hoặc tải file .tar.gz lên."
+                      />
+                    ) : (
+                      <>
+                        <div className="pkg-table-wrap">
+                          <table className="pkg-clean-table">
+                            <thead>
+                              <tr>
+                                <th style={{ width: '40px' }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={allPicked}
+                                    onChange={(e) => {
+                                      const names = accounts.map(([acct]) => acct);
+                                      setRestorePicks(e.target.checked
+                                        ? Array.from(new Set([...restorePicks, ...names]))
+                                        : restorePicks.filter((a) => !names.includes(a)));
+                                    }}
+                                  />
+                                </th>
+                                <th>Tài khoản (Account)</th>
+                                <th>Máy chủ gốc (Hostname)</th>
+                                <th>Loại khôi phục</th>
+                                <th>Phiên bản bản sao lưu</th>
+                                <th>Dung lượng</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {accounts.map(([acct, versions]) => {
+                                const picked = restorePicks.includes(acct);
+                                const chosen = versions.find((v) => v.key === restoreChoice[acct]) || versions[0];
+                                const exists = existingSet.has(acct);
+                                return (
+                                  <tr key={acct}>
+                                    <td>
+                                      <input
+                                        type="checkbox"
+                                        checked={picked}
+                                        onChange={(e) => setRestorePicks(
+                                          e.target.checked ? [...restorePicks, acct] : restorePicks.filter((a) => a !== acct)
+                                        )}
+                                      />
+                                    </td>
+                                    <td><strong style={{ color: 'var(--text-main)' }}>{acct}</strong></td>
+                                    <td>
+                                      <code style={{ fontSize: '0.78rem', color: 'var(--accent-primary)' }}>
+                                        {chosen.hostname || serverHostname}
+                                      </code>
+                                    </td>
+                                    <td>
+                                      <span style={{
+                                        padding: '2px 8px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 600,
+                                        background: exists ? 'rgba(245, 158, 11, 0.14)' : 'rgba(16, 185, 129, 0.14)',
+                                        color: exists ? '#f59e0b' : '#10b981',
+                                      }}>
+                                        {exists ? 'Ghi đè (Overwrite)' : 'Tạo mới (New)'}
+                                      </span>
+                                    </td>
+                                    <td>
+                                      {versions.length === 1 ? (
+                                        <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                                          {chosen.modified ? new Date(chosen.modified).toLocaleString() : chosen.name}
+                                        </span>
+                                      ) : (
+                                        <select
+                                          value={chosen.key}
+                                          onChange={(e) => setRestoreChoice({ ...restoreChoice, [acct]: e.target.value })}
+                                          style={{ height: '32px', fontSize: '0.8rem' }}
+                                        >
+                                          {versions.map((v) => (
+                                            <option key={v.key} value={v.key}>
+                                              {v.hostname ? `[${v.hostname}] ` : ''}{v.modified ? new Date(v.modified).toLocaleString() : v.name} ({formatBytes(v.size)})
+                                            </option>
+                                          ))}
+                                        </select>
+                                      )}
+                                    </td>
+                                    <td style={{ fontWeight: 600 }}>{formatBytes(chosen.size)}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        <div style={{
+                          marginTop: '14px', paddingTop: '14px', borderTop: '1px solid var(--border-subtle)',
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px',
+                        }}>
+                          <div style={{ fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                            {overwriteCount > 0 ? (
+                              <span style={{ color: '#f59e0b', fontWeight: 600 }}>
+                                Lưu ý: {overwriteCount} tài khoản đã tồn tại trên máy chủ sẽ được ghi đè dữ liệu.
+                              </span>
+                            ) : (
+                              <span>Sẵn sàng khôi phục {restorePicks.length} tài khoản đã chọn.</span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={runRestoreFromSource}
+                            disabled={restoreBusy || restorePicks.length === 0 || ['running', 'queued'].includes(restoreJob?.status)}
+                            style={{ height: '40px', padding: '0 20px', fontWeight: 700 }}
+                          >
+                            <ArchiveRestore size={16} />
+                            Bắt đầu Khôi phục ({restorePicks.length} tài khoản)
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {/* STEP 4: Restore Progress & Results */}
+                {restoreJob && (
+                  <div style={{
+                    padding: '16px', borderRadius: '10px',
+                    background: restoreJob.status === 'error' ? 'rgba(239, 68, 68, 0.06)' : 'rgba(13, 148, 136, 0.06)',
+                    border: `1px solid ${restoreJob.status === 'error' ? 'rgba(239, 68, 68, 0.28)' : 'rgba(13, 148, 136, 0.28)'}`,
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 700, fontSize: '0.92rem', color: 'var(--text-main)' }}>
+                        {['running', 'queued'].includes(restoreJob.status) ? (
+                          <RefreshCw size={16} className="spin" style={{ color: 'var(--accent-primary)' }} />
+                        ) : restoreJob.status === 'done' ? (
+                          <CheckCircle size={16} style={{ color: '#10b981' }} />
+                        ) : (
+                          <AlertCircle size={16} style={{ color: '#ef4444' }} />
+                        )}
+                        <span>
+                          Tiến trình Khôi phục:{' '}
+                          {(restoreJob.results || []).filter((r) => r.status === 'done').length} / {(restoreJob.results || []).length} hoàn tất
+                        </span>
+                      </div>
+                      <span style={{
+                        padding: '2px 9px', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 700,
+                        background: restoreJob.status === 'done' ? 'rgba(16, 185, 129, 0.16)' : restoreJob.status === 'error' ? 'rgba(239, 68, 68, 0.16)' : 'rgba(13, 148, 136, 0.16)',
+                        color: restoreJob.status === 'done' ? '#10b981' : restoreJob.status === 'error' ? '#ef4444' : 'var(--accent-primary)',
+                      }}>
+                        {restoreJob.status.toUpperCase()}
                       </span>
                     </div>
-                    <span style={{
-                      padding: '2px 9px', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 700,
-                      background: restoreJob.status === 'done' ? 'rgba(16, 185, 129, 0.16)' : restoreJob.status === 'error' ? 'rgba(239, 68, 68, 0.16)' : 'rgba(13, 148, 136, 0.16)',
-                      color: restoreJob.status === 'done' ? '#10b981' : restoreJob.status === 'error' ? '#ef4444' : 'var(--accent-primary)',
-                    }}>
-                      {restoreJob.status.toUpperCase()}
-                    </span>
-                  </div>
 
-                  <div className="pkg-table-wrap">
-                    <table className="pkg-clean-table">
-                      <thead>
-                        <tr>
-                          <th>Tài khoản / File</th>
-                          <th>Trạng thái</th>
-                          <th>Chi tiết kết quả</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(restoreJob.results || []).map((row, idx) => (
-                          <tr key={`${row.name}-${idx}`}>
-                            <td><strong style={{ color: 'var(--text-main)' }}>{row.username || row.name}</strong></td>
-                            <td>
-                              <span style={{
-                                padding: '2px 8px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 600,
-                                background: row.status === 'done'
-                                  ? 'rgba(16, 185, 129, 0.14)'
-                                  : row.status === 'failed'
-                                  ? 'rgba(239, 68, 68, 0.14)'
-                                  : 'rgba(13, 148, 136, 0.14)',
-                                color: row.status === 'done' ? '#10b981' : row.status === 'failed' ? '#ef4444' : 'var(--accent-primary)',
-                              }}>
-                                {row.status}
-                              </span>
-                            </td>
-                            <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                              {row.detail || '—'}
-                            </td>
+                    <div className="pkg-table-wrap">
+                      <table className="pkg-clean-table">
+                        <thead>
+                          <tr>
+                            <th>Tài khoản / File</th>
+                            <th>Trạng thái</th>
+                            <th>Chi tiết kết quả</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody>
+                          {(restoreJob.results || []).map((row, idx) => (
+                            <tr key={`${row.name}-${idx}`}>
+                              <td><strong style={{ color: 'var(--text-main)' }}>{row.username || row.name}</strong></td>
+                              <td>
+                                <span style={{
+                                  padding: '2px 8px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 600,
+                                  background: row.status === 'done'
+                                    ? 'rgba(16, 185, 129, 0.14)'
+                                    : row.status === 'failed'
+                                    ? 'rgba(239, 68, 68, 0.14)'
+                                    : 'rgba(13, 148, 136, 0.14)',
+                                  color: row.status === 'done' ? '#10b981' : row.status === 'failed' ? '#ef4444' : 'var(--accent-primary)',
+                                }}>
+                                  {row.status}
+                                </span>
+                              </td>
+                              <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                                {row.detail || '—'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
 
-            {/* Off-Server Backup Destinations Card (SFTP & S3) */}
+            {/* Off-Server Backup Destinations Card (Admin/Reseller & Personal End-User) */}
             <div className="pkg-card" style={{ padding: '20px 22px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
                 <div>
                   <h4 style={{ margin: 0, fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <Cloud size={18} style={{ color: 'var(--accent-primary)' }} />
-                    Quản lý Đích lưu trữ từ xa (Off-Server Backup Destinations: SFTP & S3)
+                    {isManager
+                      ? 'Quản lý Đích lưu trữ từ xa (Off-Server Backup Destinations: SFTP & S3)'
+                      : 'Cấu hình Kho lưu trữ Sao lưu cá nhân (My Personal SFTP / S3 Storage)'}
                   </h4>
                   <p style={{ margin: '3px 0 0', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                    Kết nối máy chủ SFTP hoặc Object Storage chuẩn S3 (AWS S3, Cloudflare R2, Wasabi, Backblaze B2, MinIO) để lưu trữ an toàn ngoài VPS.
+                    {isManager ? (
+                      <>
+                        Tự động phân tách thư mục theo chuẩn Multi-Server: <code>&lt;Prefix/RemotePath&gt;/{serverHostname}/&lt;username&gt;/&lt;file&gt;.tar.gz</code>.
+                      </>
+                    ) : (
+                      <>
+                        Kết nối máy chủ SFTP hoặc S3 Object Storage riêng của bạn để đẩy các bản sao lưu Website/User về tài khoản lưu trữ cá nhân.
+                      </>
+                    )}
                   </p>
                 </div>
                 <button
@@ -2001,7 +2066,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                           <input value={sftpTargetForm.username} onChange={(e) => setSftpTargetForm((p) => ({ ...p, username: e.target.value }))} placeholder="backup-user" required />
                         </label>
                         <label style={{ margin: 0 }}>
-                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Remote Path</span>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Remote Path gốc</span>
                           <input value={sftpTargetForm.remote_path} onChange={(e) => setSftpTargetForm((p) => ({ ...p, remote_path: e.target.value }))} placeholder="/backups/spanel" required />
                         </label>
                         <label style={{ margin: 0 }}>
@@ -2033,8 +2098,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         <input value={sftpTargetForm.bucket} onChange={(e) => setSftpTargetForm((p) => ({ ...p, bucket: e.target.value }))} placeholder="my-spanel-backups" required />
                       </label>
                       <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Folder Prefix</span>
-                        <input value={sftpTargetForm.prefix} onChange={(e) => setSftpTargetForm((p) => ({ ...p, prefix: e.target.value }))} placeholder="spanel" />
+                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Folder Prefix (Để trống nếu lưu từ gốc)</span>
+                        <input value={sftpTargetForm.prefix} onChange={(e) => setSftpTargetForm((p) => ({ ...p, prefix: e.target.value }))} placeholder={isManager ? `Trống -> ${serverHostname}/<user>/...` : 'backups'} />
                       </label>
                       <label style={{ margin: 0 }}>
                         <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Access Key ID</span>
@@ -2047,13 +2112,29 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                     </div>
                   )}
 
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-                    <button type="button" className="secondary-light" onClick={() => setShowDestinationForm(false)}>
-                      Hủy
-                    </button>
-                    <button type="submit" disabled={loading}>
-                      <Check size={15} /> Lưu & Kiểm tra kết nối
-                    </button>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                    <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                      {isManager ? (
+                        <>
+                          Đường dẫn thực tế khi đẩy lên:{' '}
+                          <code style={{ color: 'var(--accent-primary)' }}>
+                            {sftpTargetForm.kind === 's3'
+                              ? `${sftpTargetForm.bucket || '<bucket>'}/${sftpTargetForm.prefix ? `${sftpTargetForm.prefix.replace(/^\/+|\/+$/g, '')}/` : ''}${serverHostname}/<user>/<file>.tar.gz`
+                              : `${(sftpTargetForm.remote_path || '/backups').replace(/\/+$/g, '')}/${serverHostname}/<user>/<file>.tar.gz`}
+                          </code>
+                        </>
+                      ) : (
+                        <>Dữ liệu sao lưu sẽ được đẩy trực tiếp vào đường dẫn bạn chỉ định.</>
+                      )}
+                    </span>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button type="button" className="secondary-light" onClick={() => setShowDestinationForm(false)}>
+                        Hủy
+                      </button>
+                      <button type="submit" disabled={loading}>
+                        <Check size={15} /> Lưu & Kiểm tra kết nối
+                      </button>
+                    </div>
                   </div>
                 </form>
               )}
@@ -2065,48 +2146,56 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                       <th>Tên Đích lưu trữ</th>
                       <th>Loại</th>
                       <th>Máy chủ / Bucket</th>
-                      <th>Thư mục / Prefix</th>
+                      <th>Cấu trúc đường dẫn lưu trữ</th>
                       <th>Bảo mật kết nối</th>
                       <th style={{ textAlign: 'right' }}>Thao tác</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {sftpTargets.map((target) => (
-                      <tr key={target.id}>
-                        <td><strong style={{ color: 'var(--text-main)' }}>{target.name}</strong></td>
-                        <td>
-                          <span style={{
-                            padding: '2px 8px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 700,
-                            background: target.kind === 's3' ? 'rgba(59, 130, 246, 0.14)' : 'rgba(13, 148, 136, 0.14)',
-                            color: target.kind === 's3' ? '#3b82f6' : 'var(--accent-primary)',
-                          }}>
-                            {String(target.kind || 'sftp').toUpperCase()}
-                          </span>
-                        </td>
-                        <td>
-                          {target.kind === 's3'
-                            ? <span><code>{target.endpoint}</code> · Bucket: <strong>{target.bucket}</strong></span>
-                            : <span><code>{target.username}@{target.host}:{target.port}</code></span>}
-                        </td>
-                        <td><code>{target.kind === 's3' ? (target.prefix || '/') : target.remote_path}</code></td>
-                        <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                          {target.kind === 's3'
-                            ? (target.secure ? 'HTTPS (TLS)' : 'HTTP')
-                            : (target.host_key_fingerprint ? `Pinned: ${target.host_key_fingerprint.slice(0, 22)}...` : 'Ghim SSH Key ở lần kết nối đầu')}
-                        </td>
-                        <td style={{ textAlign: 'right' }}>
-                          <button
-                            type="button"
-                            className="danger"
-                            onClick={() => deleteSftpTarget(target)}
-                            disabled={loading}
-                            style={{ padding: '6px 10px' }}
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {sftpTargets.map((target) => {
+                      const basePrefix = target.kind === 's3'
+                        ? (target.prefix || '').replace(/^\/+|\/+$/g, '')
+                        : (target.remote_path || '/').replace(/\/+$/g, '');
+                      const structurePreview = isManager
+                        ? `${basePrefix ? `${basePrefix}/` : ''}${serverHostname}/<user>/<file>.tar.gz`
+                        : `${basePrefix || '/'}/<file>.tar.gz`;
+                      return (
+                        <tr key={target.id}>
+                          <td><strong style={{ color: 'var(--text-main)' }}>{target.name}</strong></td>
+                          <td>
+                            <span style={{
+                              padding: '2px 8px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 700,
+                              background: target.kind === 's3' ? 'rgba(59, 130, 246, 0.14)' : 'rgba(13, 148, 136, 0.14)',
+                              color: target.kind === 's3' ? '#3b82f6' : 'var(--accent-primary)',
+                            }}>
+                              {String(target.kind || 'sftp').toUpperCase()}
+                            </span>
+                          </td>
+                          <td>
+                            {target.kind === 's3'
+                              ? <span><code>{target.endpoint}</code> · Bucket: <strong>{target.bucket}</strong></span>
+                              : <span><code>{target.username}@{target.host}:{target.port}</code></span>}
+                          </td>
+                          <td><code style={{ color: 'var(--accent-primary)' }}>{structurePreview}</code></td>
+                          <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                            {target.kind === 's3'
+                              ? (target.secure ? 'HTTPS (TLS)' : 'HTTP')
+                              : (target.host_key_fingerprint ? `Pinned: ${target.host_key_fingerprint.slice(0, 22)}...` : 'Ghim SSH Key ở lần kết nối đầu')}
+                          </td>
+                          <td style={{ textAlign: 'right' }}>
+                            <button
+                              type="button"
+                              className="danger"
+                              onClick={() => deleteSftpTarget(target)}
+                              disabled={loading}
+                              style={{ padding: '6px 10px' }}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                     {sftpTargets.length === 0 && (
                       <tr>
                         <td colSpan="6">

@@ -104,6 +104,9 @@ def _ensure_resource_limit_columns() -> None:
             ("write_locked", "BOOLEAN NOT NULL DEFAULT 0"),
             ("write_locked_reason", "VARCHAR(255) DEFAULT NULL"),
         ],
+        "sftp_backup_targets": [
+            ("owner_id", "INTEGER DEFAULT NULL"),
+        ],
     }
     try:
         inspector = inspect(engine)

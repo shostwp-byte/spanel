@@ -84,10 +84,10 @@ def stored_name(local_name: str, mode: str, *, when: Optional[datetime] = None) 
     return f"{stem}{suffix}.tar.gz"
 
 
-def object_key(prefix: Optional[str], name: str) -> str:
-    """Join a bucket prefix to a file name without inventing a leading slash."""
-    clean = (prefix or "").strip().strip("/")
-    return f"{clean}/{name}" if clean else name
+def object_key(prefix: Optional[str], name: str, subpath: Optional[str] = None) -> str:
+    """Join a bucket prefix and optional hierarchy subpath (<hostname>/<user>) to a file name."""
+    parts = [p.strip().strip("/") for p in (prefix, subpath, name) if p and p.strip().strip("/")]
+    return "/".join(parts) if parts else name
 
 
 def _client(target):
@@ -159,14 +159,14 @@ def check(target) -> dict:
     return {"ok": True, "bucket": target.bucket, "endpoint": target.endpoint}
 
 
-def upload(target, local_file: str, *, remote_name: Optional[str] = None) -> dict:
+def upload(target, local_file: str, *, remote_name: Optional[str] = None, subpath: Optional[str] = None) -> dict:
     """Put one archive in the bucket. Returns where it landed."""
     path = Path(local_file).resolve()
     if not path.is_file():
         raise FileNotFoundError("Local backup file not found")
 
     client = _client(target)
-    key = object_key(target.prefix, remote_name or path.name)
+    key = object_key(target.prefix, remote_name or path.name, subpath=subpath)
     try:
         client.fput_object(target.bucket, key, str(path),
                            content_type="application/gzip")

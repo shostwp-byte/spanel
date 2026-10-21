@@ -40,7 +40,7 @@ def _cron_due(schedule: str, now: datetime) -> bool:
     )
 
 
-def _upload_if_configured(db, schedule: BackupSchedule, archive: str) -> str:
+def _upload_if_configured(db, schedule: BackupSchedule, archive: str, username: str = "") -> str:
     """Send the archive wherever the schedule points, under whatever name.
 
     The name is not cosmetic. A schedule set to `none` overwrites one file per
@@ -56,9 +56,11 @@ def _upload_if_configured(db, schedule: BackupSchedule, archive: str) -> str:
         raise ValueError("Backup target not found")
 
     remote_name = backup_s3.stored_name(archive, getattr(schedule, "name_suffix", None))
+    acct = username or backup.username_from_archive_name(archive)
+    subpath = f"{backup.get_server_hostname()}/{acct}" if acct else backup.get_server_hostname()
 
     if (target.kind or "sftp") == "s3":
-        result = backup_s3.upload(target, archive, remote_name=remote_name)
+        result = backup_s3.upload(target, archive, remote_name=remote_name, subpath=subpath)
         return f"{target.name}:{result['remote_file']}"
 
     try:
@@ -76,6 +78,7 @@ def _upload_if_configured(db, schedule: BackupSchedule, archive: str) -> str:
     result = backup.upload_to_sftp(
         archive,
         remote_name=remote_name,
+        subpath=subpath,
         host=target.host,
         port=target.port,
         username=target.username,
@@ -145,7 +148,7 @@ def run_one(db, schedule: BackupSchedule, now: datetime | None = None) -> bool:
     for user in users:
         try:
             archive = backup.create_user_backup(user, db)
-            target = _upload_if_configured(db, schedule, archive)
+            target = _upload_if_configured(db, schedule, archive, username=user.username)
             if schedule.target_id:
                 # The copies live on the destination now; keeping them here
                 # too doubled the disk a destination is meant to spare. A

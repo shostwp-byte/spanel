@@ -31,6 +31,38 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024
 BACKUP_MANIFEST = "manifest.json"
 PANEL_USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 
+
+def get_server_hostname() -> str:
+    """Resolve the canonical hostname for organizing multi-server backups (<hostname>/<user>/...)."""
+    candidates: list[str] = []
+    if getattr(settings, "panel_domain", None):
+        candidates.append(str(settings.panel_domain).strip())
+    if getattr(settings, "panel_url", None):
+        try:
+            from urllib.parse import urlparse
+            parsed = (urlparse(str(settings.panel_url)).hostname or "").strip()
+            if parsed:
+                candidates.append(parsed)
+        except Exception:
+            pass
+    try:
+        import socket
+        fqdn = (socket.getfqdn() or "").strip()
+        host = (socket.gethostname() or "").strip()
+        if fqdn and "." in fqdn:
+            candidates.append(fqdn)
+        if host:
+            candidates.append(host)
+        if fqdn:
+            candidates.append(fqdn)
+    except Exception:
+        pass
+    for raw in candidates:
+        clean = re.sub(r"[^A-Za-z0-9._-]", "", raw.lower()).strip(".-")
+        if clean and clean not in {"localhost", "localhost.localdomain", "127.0.0.1", "0.0.0.0"}:
+            return clean
+    return "spanel-server"
+
 # Full-user archives spanel will restore. spanel writes "spanel_user"; "opanel_user"
 # is the same archive layout (manifest.json, sites/<domain>/site, databases/<domain>.sql)
 # written by opanel, a sibling panel, so accept it too and move accounts between the
@@ -67,7 +99,9 @@ def _hostname_conflicts(db, domain: str, exclude_website_id: int | None = None) 
 def create_backup(website: Website, db_name: Optional[str] = None) -> str:
     stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     backup_dir = Path(settings.backup_root) / website.domain
-    archive = backup_dir / f"{website.domain}-{stamp}.tar.gz"
+    owner_username = getattr(getattr(website, "owner", None), "username", "") or ""
+    prefix = f"{owner_username}-{website.domain}" if owner_username else website.domain
+    archive = backup_dir / f"{prefix}-{stamp}.tar.gz"
     sql_file = backup_dir / f"{website.domain}-{stamp}.sql"
     shell.run(["mkdir", "-p", str(backup_dir)])
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -88,9 +122,11 @@ def create_backup(website: Website, db_name: Optional[str] = None) -> str:
     return str(archive)
 
 
-def _user_backup_dir(username: str) -> Path:
+def _user_backup_dir(username: str, use_hierarchy: bool = True) -> Path:
     if not PANEL_USERNAME_RE.fullmatch(username or ""):
         raise ValueError("Invalid panel username")
+    if use_hierarchy:
+        return Path(settings.backup_root) / "users" / get_server_hostname() / username
     return Path(settings.backup_root) / "users" / username
 
 
@@ -103,27 +139,6 @@ def user_restore_dir() -> str:
 
 
 def _ensure_user_dir(path: Path) -> Path:
-    """Create a directory under <backup_root>/users, past a root-owned parent.
-
-    The panel runs as spanel and owns <backup_root>, but nothing ever created
-    <backup_root>/users, so whichever process reached it first became its
-    owner. Where that was a root one, every scheduled backup since has died on
-
-        [Errno 13] Permission denied: '/var/backups/spanel/users/<account>'
-
-    reported as a failed job with no hint that a directory mode was the whole
-    of it. The helper repairs the parent and creates the leaf as spanel, which
-    is the one thing the panel cannot do for itself.
-
-    The retry is outside the except block on purpose: if the helper could not
-    fix it either, the caller should see the same PermissionError it would
-    have seen anyway, not a second error about the helper.
-
-    0750 explicitly, so a directory the panel makes matches one the helper
-    makes. Default umask gave 0755 and left account archives world-readable
-    to anyone who could reach them - nothing can today, because the backup
-    root above is 0750, but that is one chmod away from not being true.
-    """
     try:
         path.mkdir(mode=0o750, parents=True, exist_ok=True)
         return path
@@ -138,9 +153,9 @@ def _ensure_user_dir(path: Path) -> Path:
     return path
 
 
-def create_user_backup(user: User, db) -> str:
+def create_user_backup(user: User, db, use_hierarchy: bool = True) -> str:
     stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    backup_dir = _ensure_user_dir(_user_backup_dir(user.username))
+    backup_dir = _ensure_user_dir(_user_backup_dir(user.username, use_hierarchy=use_hierarchy))
     archive = backup_dir / f"user-{user.username}-{stamp}.tar.gz"
     websites = db.query(Website).filter(Website.owner_id == user.id).order_by(Website.id.asc()).all()
 
@@ -149,6 +164,7 @@ def create_user_backup(user: User, db) -> str:
         manifest = {
             "kind": "spanel_user",
             "version": 1,
+            "hostname": get_server_hostname(),
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "user": {
                 "username": user.username,
@@ -175,9 +191,6 @@ def create_user_backup(user: User, db) -> str:
             mail_boxes.append((f"mail/{account.domain}/{account.local_part}",
                                Path(f"/home/{linux_user}/mail/{account.domain}/{account.local_part}")))
 
-        # Applications are not websites and their data is not under a website
-        # root, so without this a restore brought back the sites and quietly
-        # dropped every container's workflows and database.
         app_payloads: dict[str, Path] = {}
         for app_entry, payload in _collect_applications(user, db, tmp_dir):
             manifest["applications"].append(app_entry)
@@ -227,7 +240,6 @@ def create_user_backup(user: User, db) -> str:
                 }
             manifest["websites"].append(site_entry)
 
-        # Also export any standalone or additional databases owned by this user
         for db_item in db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).order_by(DatabaseAccount.id.asc()).all():
             if db_item.id in exported_db_ids:
                 continue
@@ -352,10 +364,23 @@ def _collect_applications(user: User, db, tmp_dir: Path) -> list[tuple[dict, Opt
 
 
 def list_user_backups(username: str) -> List[str]:
-    backup_dir = _user_backup_dir(username)
-    if settings.command_dry_run or not backup_dir.exists():
+    if settings.command_dry_run:
         return []
-    return [str(path) for path in sorted(backup_dir.glob("*.tar.gz"), reverse=True)]
+    dirs = [
+        _user_backup_dir(username, use_hierarchy=True),
+        _user_backup_dir(username, use_hierarchy=False),
+    ]
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for d in dirs:
+        if d.exists():
+            for p in d.glob("*.tar.gz"):
+                rp = p.resolve()
+                if rp not in seen and rp.is_file():
+                    seen.add(rp)
+                    paths.append(rp)
+    paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [str(p) for p in paths]
 
 
 def list_uploaded_user_backups(username: Optional[str] = None) -> List[str]:
@@ -384,9 +409,16 @@ def list_uploaded_user_backups(username: Optional[str] = None) -> List[str]:
 
 def describe_user_backup(backup_file: str) -> dict:
     path = user_backup_path(backup_file)
+    users_root = (Path(settings.backup_root) / "users").resolve()
+    try:
+        rel_path = str(path.relative_to(users_root)).replace("\\", "/")
+    except ValueError:
+        rel_path = path.name
     item = {
         "backup_file": str(path),
         "filename": path.name,
+        "relative_path": rel_path,
+        "hostname": get_server_hostname(),
         "size": path.stat().st_size,
         "username": "",
         "generated_at": "",
@@ -402,6 +434,8 @@ def describe_user_backup(backup_file: str) -> dict:
         item["valid"] = kind in RESTORABLE_BACKUP_KINDS
         item["source"] = "opanel" if kind == "opanel_user" else "spanel"
         item["username"] = (manifest.get("user") or {}).get("username") or ""
+        if manifest.get("hostname"):
+            item["hostname"] = manifest["hostname"]
         item["generated_at"] = manifest.get("generated_at") or ""
         item["websites"] = len(manifest.get("websites") or [])
         item["applications"] = len(manifest.get("applications") or [])
@@ -414,7 +448,10 @@ def describe_user_backup(backup_file: str) -> dict:
     return item
 
 
-def list_all_user_backups(username: Optional[str] = None) -> list[dict]:
+def list_all_user_backups(
+    username: Optional[str] = None,
+    allowed_usernames: Optional[set[str]] = None,
+) -> list[dict]:
     if settings.command_dry_run:
         return []
     users_root = Path(settings.backup_root) / "users"
@@ -429,19 +466,20 @@ def list_all_user_backups(username: Optional[str] = None) -> list[dict]:
                 seen.add(p)
                 paths.append(p)
     else:
-        for sub in sorted(users_root.iterdir()):
-            if not sub.is_dir():
+        for p in users_root.rglob("*.tar.gz"):
+            if p.is_symlink() or not p.is_file():
                 continue
-            for p in sorted(sub.glob("*.tar.gz"), reverse=True):
-                rp = p.resolve()
-                if rp not in seen and rp.is_file():
-                    seen.add(rp)
-                    paths.append(rp)
+            rp = p.resolve()
+            if rp not in seen:
+                seen.add(rp)
+                paths.append(rp)
     paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     results = []
     restore_dir_resolved = _user_restore_dir().resolve()
     for p in paths:
         info = describe_user_backup(str(p))
+        if allowed_usernames is not None and info.get("username") not in allowed_usernames:
+            continue
         info["location"] = "restore" if restore_dir_resolved in p.parents else "user"
         results.append(info)
     return results
@@ -838,7 +876,6 @@ def restore_user_backup(backup_file: str, db) -> dict:
             wordpress.fix_permissions(root_path, linux_user)
             restored_websites.append({"domain": domain, "created": created_site})
 
-        # Restore any additional or standalone databases from manifest["databases"]
         for extra_db in manifest.get("databases") or []:
             db_name = (extra_db.get("db_name") or "").strip()
             db_user = (extra_db.get("db_user") or "").strip()
@@ -1046,7 +1083,6 @@ def restore_backup(website: Website, backup_file: str, db=None) -> str:
                     break
 
             def safe_filter(member: tarfile.TarInfo, dest_path: str):
-                # Hard-links inside backups are uncommon and risky; refuse outright.
                 if member.islnk():
                     return None
                 if member.name.startswith("database/"):
@@ -1062,8 +1098,6 @@ def restore_backup(website: Website, backup_file: str, db=None) -> str:
             try:
                 tar.extractall(path=str(target_dir), filter=safe_filter)
             except TypeError:
-                # Older Python (<3.12) without the filter parameter — fall back to
-                # manual extraction with the existing safety check.
                 _ensure_safe_tar(archive, target_dir)
                 for member in members:
                     if member.name.startswith("database/"):
@@ -1227,23 +1261,12 @@ def upload_to_sftp(
     username: str,
     remote_path: str,
     remote_name: Optional[str] = None,
+    subpath: Optional[str] = None,
     password: Optional[str] = None,
     private_key: Optional[str] = None,
     expected_host_key_type: Optional[str] = None,
     expected_host_key_fingerprint: Optional[str] = None,
 ) -> dict:
-    """Upload ``local_file`` to ``host:port`` via SFTP.
-
-    Host key handling:
-      * If a fingerprint is pinned, the server's key is compared against it
-        before any auth bytes are sent. A mismatch raises
-        :class:`SftpHostKeyMismatch`.
-      * If no fingerprint is pinned yet (TOFU bootstrap), the server's key is
-        captured and returned. The caller must persist it.
-
-    Returns a dict ``{"remote_file": ..., "host_key_type": ...,
-    "host_key_fingerprint": ...}``.
-    """
     local_path = Path(local_file).resolve()
     if not local_path.exists() or not local_path.is_file():
         raise FileNotFoundError("Local backup file not found")
@@ -1251,9 +1274,9 @@ def upload_to_sftp(
         raise ValueError("SFTP password or private key is required")
 
     pkey = _load_private_key(private_key, password=password) if private_key else None
-    remote_dir = posixpath.normpath(remote_path.strip() or ".")
-    # The caller may want it stored under a rotating name - see
-    # backup_s3.stored_name, which both destinations share.
+    base_dir = posixpath.normpath(remote_path.strip() or ".")
+    clean_sub = (subpath or "").strip().strip("/")
+    remote_dir = posixpath.join(base_dir, clean_sub) if clean_sub else base_dir
     remote_file = posixpath.join(remote_dir, remote_name or local_path.name)
 
     captured_type: Optional[str] = expected_host_key_type

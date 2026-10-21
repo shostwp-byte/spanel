@@ -354,6 +354,7 @@ class SftpBackupTarget(Base):
     KIND_S3 = "s3"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     kind: Mapped[str] = mapped_column(String(8), default=KIND_SFTP)
 
