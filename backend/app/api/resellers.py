@@ -48,6 +48,7 @@ class WebhookEndpointOut(BaseModel):
     url: str
     events: str
     is_active: bool
+    has_secret: bool = False
 
 class ResellerStatsOut(BaseModel):
     total_users: int
@@ -200,10 +201,21 @@ def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get
     return config
 
 
+def _serialize_webhook(wh: WebhookEndpoint) -> dict:
+    return {
+        "id": wh.id,
+        "url": wh.url,
+        "events": wh.events or "*",
+        "is_active": bool(wh.is_active),
+        "has_secret": bool(wh.secret and wh.secret.strip()),
+    }
+
+
 @router.get("/webhooks", response_model=List[WebhookEndpointOut])
 def list_webhooks(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
-    return db.query(WebhookEndpoint).filter(WebhookEndpoint.user_id == current_user.id).all()
+    rows = db.query(WebhookEndpoint).filter(WebhookEndpoint.user_id == current_user.id).order_by(WebhookEndpoint.id.desc()).all()
+    return [_serialize_webhook(w) for w in rows]
 
 @router.post("/webhooks", response_model=WebhookEndpointOut)
 def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -213,14 +225,14 @@ def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db)
     webhook = WebhookEndpoint(
         user_id=current_user.id,
         url=safe_url,
-        secret=payload.secret,
-        events=payload.events,
+        secret=(payload.secret or "").strip() or None,
+        events=(payload.events or "*").strip() or "*",
         is_active=payload.is_active
     )
     db.add(webhook)
     db.commit()
     db.refresh(webhook)
-    return webhook
+    return _serialize_webhook(webhook)
 
 @router.put("/webhooks/{webhook_id}", response_model=WebhookEndpointOut)
 def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -232,16 +244,37 @@ def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session 
 
     if payload.url is not None:
         webhook.url = _validate_webhook_url(payload.url)
-    if payload.secret is not None:
-        webhook.secret = payload.secret
+    if payload.secret is not None and payload.secret.strip() != "":
+        webhook.secret = payload.secret.strip()
     if payload.events is not None:
-        webhook.events = payload.events
+        webhook.events = payload.events.strip() or "*"
     if payload.is_active is not None:
         webhook.is_active = payload.is_active
 
     db.commit()
     db.refresh(webhook)
-    return webhook
+    return _serialize_webhook(webhook)
+
+@router.post("/webhooks/{webhook_id}/test")
+def test_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.reseller)
+    webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id, WebhookEndpoint.user_id == current_user.id).first()
+    if not webhook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    from datetime import datetime, timezone
+    from app.services.webhooks import _send_webhook
+    sample_payload = {
+        "event": "webhook_test",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "target": "spanel.test",
+        "detail": "Test webhook delivery from SPanel API & Billing Integration",
+    }
+    ok, status_code, detail = _send_webhook(webhook.url, webhook.secret, sample_payload)
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"Webhook test failed ({detail})")
+    return {"ok": True, "status_code": status_code, "detail": detail}
 
 @router.delete("/webhooks/{webhook_id}")
 def delete_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

@@ -2495,6 +2495,12 @@ export const vi = {
   "Account Holder": "Chủ tài khoản",
   "Transfer Message": "Nội dung chuyển khoản",
   "Thank you for supporting SPanel!": "Cảm ơn bạn đã đồng hành cùng SPanel!",
+  "API & Billing Integration": "Tích hợp API & Billing",
+  "Customize Skin & White-Label Branding": "Tùy biến Giao diện & Thương hiệu (White-Label)",
+  "Customize the panel appearance, brand identity, logo, favicon, and login screen for your customers.": "Tùy chỉnh giao diện bảng điều khiển, bộ nhận diện thương hiệu, logo, favicon và màn hình đăng nhập dành cho khách hàng.",
+  "Presets": "Màu mẫu",
+  "Optional": "Tùy chọn",
+  "Testing webhook...": "Đang gửi thử nghiệm Webhook...",
 };
 
 /* Said in English by the people who run these servers. Translating them

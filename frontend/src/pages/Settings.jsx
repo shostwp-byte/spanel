@@ -1,35 +1,128 @@
 import React, { useState, useEffect } from 'react';
-import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
+import {
+  Check, Clock, Code2, Copy, Edit2, Globe, KeyRound, Lock, Plus,
+  RefreshCw, Send, Server, Settings as SettingsIcon, ShieldCheck,
+  Trash2, Zap, ExternalLink
+} from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
+const INTEGRATION_PLATFORMS = [
+  {
+    id: 'whmcs',
+    label: 'WHMCS',
+    defaultName: 'WHMCS Billing',
+    badge: 'Server Module',
+    guide: 'Trong WHMCS → System Settings → Servers → Add New Server: Chọn module "spanel", điền Hostname/IP, Port 2222 và dán mã Token bp_... vào ô Access Hash.',
+  },
+  {
+    id: 'hostbill',
+    label: 'HostBill / Blesta',
+    defaultName: 'HostBill Server',
+    badge: 'Provisioning Module',
+    guide: 'Trong HostBill hoặc Blesta → Settings → Apps / Server Modules: Cấu hình Hostname, Port 2222 (HTTPS) và sử dụng Token bp_... làm API Token / Access Hash.',
+  },
+  {
+    id: 'perfex',
+    label: 'Perfex CRM',
+    defaultName: 'Perfex CRM',
+    badge: 'REST API + Webhook',
+    guide: 'Perfex CRM gọi chiều vào qua Header "Authorization: Bearer bp_..." tới Base Endpoint bên dưới khi Hóa đơn/Hợp đồng hoàn tất, kết hợp cấu hình Outbound Webhook ở khung dưới để nhận sự kiện ngược lại từ SPanel.',
+  },
+  {
+    id: 'custom',
+    label: 'Custom API / n8n',
+    defaultName: 'Custom Integration',
+    badge: 'REST JSON',
+    guide: 'Sử dụng chuẩn RESTful JSON với Bearer Token bp_... để tự động hóa tạo tài khoản, khóa/mở khóa, cấp link đăng nhập SSO 1-click và lấy thống kê dung lượng.',
+  },
+];
+
+const WEBHOOK_EVENT_PRESETS = [
+  { id: 'all', label: 'Tất cả sự kiện (*)', value: '*' },
+  {
+    id: 'provisioning',
+    label: 'Chỉ sự kiện Provisioning / Billing',
+    value: 'provisioning_create,provisioning_suspend,provisioning_unsuspend,provisioning_terminate,provisioning_change_package,provisioning_change_password',
+  },
+  {
+    id: 'websites',
+    label: 'Sự kiện Website & Database',
+    value: 'create_website,delete_website,create_database,delete_database,issue_ssl',
+  },
+];
+
+const PROVISIONING_ENDPOINTS = [
+  { method: 'GET', path: '/plans', desc: 'Lấy danh sách gói Hosting (UserPackage) để đồng bộ lên hệ thống bán hàng' },
+  { method: 'POST', path: '/accounts', desc: 'Tạo tài khoản Hosting mới (+ Website, WordPress, DNS, SSL tự động)' },
+  { method: 'GET', path: '/accounts/{external_id}', desc: 'Truy vấn trạng thái & thông tin tài khoản theo ID đơn hàng/dịch vụ' },
+  { method: 'POST', path: '/accounts/{external_id}/suspend', desc: 'Tạm khóa tài khoản Hosting & toàn bộ Website trực thuộc' },
+  { method: 'POST', path: '/accounts/{external_id}/unsuspend', desc: 'Mở khóa lại tài khoản Hosting' },
+  { method: 'DELETE', path: '/accounts/{external_id}?backup=true', desc: 'Hủy dịch vụ & xóa tài khoản (tùy chọn tự sao lưu trước khi xóa)' },
+  { method: 'PATCH', path: '/accounts/{external_id}/package', desc: 'Nâng cấp / Hạ cấp gói tài nguyên (Upgrade / Downgrade Package)' },
+  { method: 'PATCH', path: '/accounts/{external_id}/password', desc: 'Đặt lại mật khẩu đăng nhập Panel & xoay vòng mật khẩu SFTP' },
+  { method: 'POST', path: '/accounts/{external_id}/login', desc: 'Tạo đường dẫn đăng nhập 1-click SSO (hiệu lực 300 giây)' },
+  { method: 'GET', path: '/accounts/usage', desc: 'Đồng bộ dung lượng ổ cứng, số lượng Website & Database của toàn bộ tài khoản' },
+];
+
 export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanelHost }) {
   const {
     loading, setLoading, setError, setNotice, currentUser, loadCurrentUser, panelSettings, setPanelSettings,
-    API, readCookie, clearSession, handleAuthExpired, formatApiError,
-    copyText, copiedField, currentPanelPort, renderDemoAccounts,
-    panelSettingsTab, setPanelSettingsTab,
+    clearSession, panelSettingsTab, setPanelSettingsTab,
   } = useAppContext();
-  const [panelSettingsForm, setPanelSettingsForm] = useState({ app_name: 'spanel', panel_hostname: '', panel_port: 2222, ssl_enabled: false, primary_color: '#4f46e5' });
+
+  const [panelSettingsForm, setPanelSettingsForm] = useState({
+    app_name: 'spanel',
+    panel_hostname: '',
+    panel_port: 2222,
+    ssl_enabled: false,
+    primary_color: '#16a34a',
+    ticket_url: '',
+  });
+
+  // API Tokens state
   const [apiTokens, setApiTokens] = useState([]);
-  const [newApiToken, setNewApiToken] = useState({ name: 'WHMCS', allowed_ips: '' });
+  const [selectedPlatform, setSelectedPlatform] = useState('whmcs');
+  const [newApiToken, setNewApiToken] = useState({
+    name: 'WHMCS Billing',
+    allowed_ips: '',
+    scopes: 'provisioning:read,provisioning:write',
+  });
   const [createdApiToken, setCreatedApiToken] = useState('');
-  const [brandAssetsForm, setBrandAssetsForm] = useState({ logo: null, favicon: null });
-  const [panelLogoFile, setPanelLogoFile] = useState(null);
-  const [panelFaviconFile, setPanelFaviconFile] = useState(null);
-  const [adminAccountForm, setAdminAccountForm] = useState({ email: '', current_password: '', password: '', confirm_password: '', code: '' });
+  const [showEndpointsRef, setShowEndpointsRef] = useState(false);
+
+  // Outbound Webhooks state
+  const [webhooks, setWebhooks] = useState([]);
+  const [showWebhookForm, setShowWebhookForm] = useState(false);
+  const [webhookForm, setWebhookForm] = useState({
+    id: null,
+    url: '',
+    secret: '',
+    events: '*',
+    is_active: true,
+  });
+
+  // Admin Account state
+  const [adminAccountForm, setAdminAccountForm] = useState({
+    email: '',
+    current_password: '',
+    password: '',
+    confirm_password: '',
+    code: '',
+  });
 
   useEffect(() => {
     if (currentUser?.email) {
-      setAdminAccountForm(prev => ({ ...prev, email: prev.email || currentUser.email }));
+      setAdminAccountForm((prev) => ({ ...prev, email: prev.email || currentUser.email }));
     }
   }, [currentUser?.email]);
 
   useEffect(() => {
     if (isAdmin) {
       loadApiTokens();
-      request('/panel-settings').then(data => {
+      loadWebhooks();
+      request('/panel-settings').then((data) => {
         if (data) setPanelSettings(data);
       });
     }
@@ -54,7 +147,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
       panel_hostname: hostname,
       panel_port: port,
       ssl_enabled: !!data.ssl_enabled,
-      primary_color: data.primary_color || '#4f46e5',
+      primary_color: data.primary_color || '#16a34a',
       ticket_url: data.ticket_url || '',
     };
   }
@@ -68,15 +161,27 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     const hostnameChanged = hostname && hostname !== currentHostname;
 
     if (wantsSsl && (!hasSsl || hostnameChanged)) {
-      const nameData = await request('/panel-settings', {
-        method: 'PATCH',
-        body: JSON.stringify({ app_name: panelSettingsForm.app_name, panel_port: port, ticket_url: panelSettingsForm.ticket_url }),
-      }, t('Saving panel settings...'));
+      const nameData = await request(
+        '/panel-settings',
+        {
+          method: 'PATCH',
+          body: JSON.stringify({
+            app_name: panelSettingsForm.app_name,
+            panel_port: port,
+            ticket_url: panelSettingsForm.ticket_url,
+          }),
+        },
+        t('Saving panel settings...')
+      );
       if (!nameData) return;
-      const sslData = await request('/panel-settings/ssl', {
-        method: 'POST',
-        body: JSON.stringify({ panel_hostname: hostname, panel_port: port }),
-      }, t('Installing panel SSL...'));
+      const sslData = await request(
+        '/panel-settings/ssl',
+        {
+          method: 'POST',
+          body: JSON.stringify({ panel_hostname: hostname, panel_port: port }),
+        },
+        t('Installing panel SSL...')
+      );
       if (sslData) {
         setPanelSettings(sslData);
         setPanelSettingsForm(formFromPanelSettings(sslData));
@@ -86,29 +191,34 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
       return;
     }
 
-    const payload = hasSsl && !wantsSsl
-      ? { app_name: panelSettingsForm.app_name, panel_url: `http://${hostname}:${port}`, ticket_url: panelSettingsForm.ticket_url }
-      : { app_name: panelSettingsForm.app_name, panel_hostname: hostname, ticket_url: panelSettingsForm.ticket_url };
-    const data = await request('/panel-settings', {
-      method: 'PATCH',
-      body: JSON.stringify(payload),
-    }, t('Saving panel settings...'));
+    const payload =
+      hasSsl && !wantsSsl
+        ? {
+            app_name: panelSettingsForm.app_name,
+            panel_url: `http://${hostname}:${port}`,
+            ticket_url: panelSettingsForm.ticket_url,
+          }
+        : {
+            app_name: panelSettingsForm.app_name,
+            panel_hostname: hostname,
+            ticket_url: panelSettingsForm.ticket_url,
+          };
+    const data = await request(
+      '/panel-settings',
+      {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      },
+      t('Saving panel settings...')
+    );
     if (data) {
       setPanelSettings(data);
       setPanelSettingsForm(formFromPanelSettings(data));
-      setNotice(hasSsl && !wantsSsl ? 'Panel SSL disabled. The panel remains reachable by IP and port over HTTP.' : 'Panel settings updated.');
-      if (loadPanelSettings) await loadPanelSettings();
-    }
-  }
-
-  async function saveBrandColor() {
-    const data = await request('/panel-settings', {
-      method: 'PATCH',
-      body: JSON.stringify({ primary_color: panelSettingsForm.primary_color }),
-    }, t('Saving brand color...'));
-    if (data) {
-      setPanelSettings(data);
-      setNotice(t('Brand color updated.'));
+      setNotice(
+        hasSsl && !wantsSsl
+          ? 'Panel SSL disabled. The panel remains reachable by IP and port over HTTP.'
+          : 'Panel settings updated.'
+      );
       if (loadPanelSettings) await loadPanelSettings();
     }
   }
@@ -119,13 +229,24 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
       setError(ipv6.detail || 'This server has no IPv6 address, so this feature cannot be used.');
       return;
     }
-    if (!confirm(t(enable
-      ? 'Enable IPv6 for every website and the panel?\n\nspanel adds listen [::] to every website\'s nginx config, checks it with nginx -t, and rolls back on any error. The panel restarts.'
-      : 'Disable IPv6?\n\nWebsites and the panel will accept IPv4 only. If a domain still has an AAAA record, visitors arriving over IPv6 will not get through.'))) return;
-    const data = await request('/panel-settings/ipv6', {
-      method: 'POST',
-      body: JSON.stringify({ enabled: enable }),
-    }, enable ? 'Enabling IPv6...' : 'Disabling IPv6...');
+    if (
+      !confirm(
+        t(
+          enable
+            ? "Enable IPv6 for every website and the panel?\n\nspanel adds listen [::] to every website's nginx config, checks it with nginx -t, and rolls back on any error. The panel restarts."
+            : 'Disable IPv6?\n\nWebsites and the panel will accept IPv4 only. If a domain still has an AAAA record, visitors arriving over IPv6 will not get through.'
+        )
+      )
+    )
+      return;
+    const data = await request(
+      '/panel-settings/ipv6',
+      {
+        method: 'POST',
+        body: JSON.stringify({ enabled: enable }),
+      },
+      enable ? 'Enabling IPv6...' : 'Disabling IPv6...'
+    );
     if (data) {
       setPanelSettings(data);
       setNotice(data.message || (enable ? 'IPv6 enabled.' : 'IPv6 disabled.'));
@@ -137,54 +258,129 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     if (data) setApiTokens(data);
   }
 
+  async function loadWebhooks() {
+    try {
+      const data = await request('/resellers/webhooks');
+      if (data) setWebhooks(data);
+    } catch {
+      setWebhooks([]);
+    }
+  }
+
+  function handleSelectPlatform(platformId) {
+    setSelectedPlatform(platformId);
+    const found = INTEGRATION_PLATFORMS.find((p) => p.id === platformId);
+    if (found) {
+      setNewApiToken((prev) => ({ ...prev, name: found.defaultName }));
+    }
+  }
+
   async function createApiToken() {
-    if (!newApiToken.name.trim()) { setError(t('Token name is required.')); return; }
-    const data = await request('/provisioning/v1/tokens', {
-      method: 'POST',
-      body: JSON.stringify({
-        name: newApiToken.name.trim(),
-        scopes: 'provisioning:read,provisioning:write',
-        allowed_ips: newApiToken.allowed_ips.trim(),
-      }),
-    }, t('Creating API token...'));
+    if (!newApiToken.name.trim()) {
+      setError(t('Token name is required.'));
+      return;
+    }
+    const data = await request(
+      '/provisioning/v1/tokens',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          name: newApiToken.name.trim(),
+          scopes: newApiToken.scopes || 'provisioning:read,provisioning:write',
+          allowed_ips: newApiToken.allowed_ips.trim(),
+        }),
+      },
+      t('Creating API token...')
+    );
     if (data) {
       setCreatedApiToken(data.token || '');
-      setNotice(t('API token created. Copy it now; it will not be shown again. Paste it into WHMCS Server Access Hash.'));
-      setNewApiToken({ name: 'WHMCS', allowed_ips: '' });
+      setNotice(
+        t('API token created. Copy it now; it will not be shown again.')
+      );
       await loadApiTokens();
     }
   }
 
-  async function copyApiToken() {
-    if (!createdApiToken) return;
+  async function copyToClipboard(value, noticeMsg) {
+    if (!value) return;
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(createdApiToken);
-      } else {
-        const input = document.getElementById('created-api-token');
-        input?.focus();
-        input?.select();
-        document.execCommand('copy');
-      }
-      setNotice(t('API token copied. Paste it into WHMCS Server Access Hash.'));
+      await navigator.clipboard.writeText(value);
+      setNotice(noticeMsg || t('Copied to clipboard.'));
     } catch {
-      const input = document.getElementById('created-api-token');
-      input?.focus();
-      input?.select();
-      setError(t('Copy failed. The token is selected; press Ctrl+C.'));
+      setError(t('Copy failed. Please select and press Ctrl+C.'));
     }
   }
 
   async function revokeApiToken(token) {
-    if (!confirm(`Revoke API token ${token.name}? WHMCS using it will stop working.`)) return;
-    const data = await request(`/provisioning/v1/tokens/${token.id}`, { method: 'DELETE' }, `Revoking ${token.name}...`);
+    if (!confirm(`Thu hồi API token "${token.name}"? Các hệ thống Billing/CRM đang dùng token này sẽ ngừng kết nối.`)) return;
+    const data = await request(
+      `/provisioning/v1/tokens/${token.id}`,
+      { method: 'DELETE' },
+      `Revoking ${token.name}...`
+    );
     if (data) {
-      setNotice(`Revoked API token ${token.name}.`);
+      setNotice(`Đã thu hồi API token ${token.name}.`);
       await loadApiTokens();
     }
   }
 
-    async function saveAdminAccount() {
+  async function saveWebhook(e) {
+    e.preventDefault();
+    setLoading(t('Saving...'));
+    try {
+      let res;
+      if (webhookForm.id) {
+        res = await request(`/resellers/webhooks/${webhookForm.id}`, {
+          method: 'PUT',
+          body: JSON.stringify(webhookForm),
+        });
+        if (res) setNotice(t('Webhook updated.'));
+      } else {
+        res = await request('/resellers/webhooks', {
+          method: 'POST',
+          body: JSON.stringify(webhookForm),
+        });
+        if (res) setNotice(t('Webhook created.'));
+      }
+      if (res) {
+        setShowWebhookForm(false);
+        await loadWebhooks();
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading('');
+  }
+
+  async function testWebhookEndpoint(wh) {
+    setLoading(t('Testing webhook...'));
+    try {
+      const res = await request(`/resellers/webhooks/${wh.id}/test`, { method: 'POST' });
+      if (res) {
+        setNotice(`Đã gửi sự kiện thử nghiệm thành công tới ${wh.url} (HTTP ${res.status_code || 200}).`);
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading('');
+  }
+
+  async function deleteWebhook(wh) {
+    if (!confirm(`Xóa kết nối Webhook tới "${wh.url}"?`)) return;
+    setLoading(t('Deleting...'));
+    try {
+      const res = await request(`/resellers/webhooks/${wh.id}`, { method: 'DELETE' });
+      if (res) {
+        setNotice(t('Webhook deleted.'));
+        await loadWebhooks();
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+    setLoading('');
+  }
+
+  async function saveAdminAccount() {
     const email = String(adminAccountForm.email || '').trim();
     const password = String(adminAccountForm.password || '');
     const confirmPassword = String(adminAccountForm.confirm_password || '');
@@ -221,141 +417,831 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
       }
     }
 
-    const data = await request('/panel-settings/admin-account', {
-      method: 'PATCH',
-      body: JSON.stringify(payload),
-    }, t('Saving admin account...'));
+    const data = await request(
+      '/panel-settings/admin-account',
+      {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      },
+      t('Saving admin account...')
+    );
     if (!data) return;
     if (data.password_changed) {
       clearSession('Password changed. Please log in again.');
       return;
     }
-    setAdminAccountForm(prev => ({ ...prev, current_password: '', password: '', confirm_password: '', code: '' }));
+    setAdminAccountForm((prev) => ({
+      ...prev,
+      current_password: '',
+      password: '',
+      confirm_password: '',
+      code: '',
+    }));
     await loadCurrentUser({ clearOnUnauthorized: false });
     setNotice(data.message || 'Admin account updated.');
   }
 
-  async function uploadPanelAsset(kind) {
-    const file = kind === 'logo' ? panelLogoFile : panelFaviconFile;
-    if (!file) return;
-    const body = new FormData();
-    body.append('file', file);
-    const data = await request(`/panel-settings/${kind}`, { method: 'POST', body }, `Uploading ${kind}...`);
-    if (data) {
-      setPanelSettings(data);
-      setPanelSettingsForm(formFromPanelSettings(data));
-      if (kind === 'logo') setPanelLogoFile(null);
-      if (kind === 'favicon') setPanelFaviconFile(null);
-      if (loadPanelSettings) await loadPanelSettings();
-    }
-  }
-
-  function renderPanelSettings() {
-    if (!isAdmin) return <div className="section"><h2>{t('Settings')}</h2><p className="hint">{t('No permission.')}</p></div>;
-    // Four tabs, one underlined row like Backups and Panel users (operator,
-    // 2026-09-27): the page had grown into four unrelated forms stacked up.
-    const tabs = [
-      ['general', 'General', SettingsIcon],
-      ['account', 'Admin account', Lock],
-      ['api', 'API Tokens', KeyRound],
-    ];
-    const activeTab = tabs.some(([id]) => id === panelSettingsTab) ? panelSettingsTab : 'general';
-    const taspanel = (id, content) => activeTab === id && <div className="backup-tab-panel" id={`panel-settings-tab-${id}`} role="tabpanel" aria-labelledby={`panel-settings-tab-button-${id}`}>{content}</div>;
-    return <div className="section panel-settings-page">
-      <div className="segmented-control backup-tabs" role="tablist" aria-label={t('Panel settings sections')}>
-        {tabs.map(([id, label, Icon]) => <button
-          key={id}
-          type="button"
-          role="tab"
-          id={`panel-settings-tab-button-${id}`}
-          aria-controls={`panel-settings-tab-${id}`}
-          aria-selected={activeTab === id}
-          className={activeTab === id ? 'active' : ''}
-          onClick={() => setPanelSettingsTab(id)}
-        ><Icon size={14}/>{t(label)}</button>)}
+  if (!isAdmin) {
+    return (
+      <div className="section">
+        <h2>{t('Settings')}</h2>
+        <p className="hint">{t('No permission.')}</p>
       </div>
-      {taspanel('general', <>
-        <div className="backup-panel-title">
-          <div><h3>{t('General')}</h3><p className="hint">{t('Panel port, hostname and the server\'s addresses.')}</p></div>
-          <button className="secondary-light" disabled={!!loading} onClick={loadPanelSettings}><RefreshCw size={14}/>{t('Refresh')}</button>
-        </div>
-        <div className="panel-settings-grid panel-settings-compact">
-            <label><span>{t('Panel hostname')}</span><input value={panelSettingsForm.panel_hostname} onChange={e => setPanelSettingsForm(prev => ({ ...prev, panel_hostname: e.target.value }))} placeholder="panel.domain.com" /></label>
-          <label><span>{t('Panel port')}</span><input type="number" min="1024" max="65535" value={panelSettingsForm.panel_port} onChange={e => setPanelSettingsForm(prev => ({ ...prev, panel_port: e.target.value }))} placeholder="2222" /></label>
-          <label><span>{t('Support Ticket URL')}</span><input value={panelSettingsForm.ticket_url} onChange={e => setPanelSettingsForm(prev => ({ ...prev, ticket_url: e.target.value }))} placeholder="https://my.shost.vn/submitticket.php" /></label>
-          <label className="check-line panel-ssl-status"><input type="checkbox" checked={!!panelSettingsForm.ssl_enabled} onChange={e => setPanelSettingsForm(prev => ({ ...prev, ssl_enabled: e.target.checked }))} />{t('Panel SSL')}</label>
-          <button disabled={!!loading || !panelSettingsForm.panel_port || !panelSettingsForm.panel_hostname} onClick={savePanelSettings}><SettingsIcon size={14}/>{t('Save settings')}</button>
-        </div>
-        <div className="panel-net-strip">
-          <div className="panel-net-row">
-            <span className="panel-net-label">IPv4</span>
-            <div className="panel-net-value">
-              {panelSettings.server_ipv4?.length > 0
-                ? panelSettings.server_ipv4.map(address => <span key={address} className="badge">{address}</span>)
-                : <span className="hint">{t('Could not read the server\'s IPv4 address.')}</span>}
-            </div>
-          </div>
-          <div className="panel-net-row">
-            <span className="panel-net-label">IPv6</span>
-            <div className="panel-net-value">
-              {panelSettings.ipv6?.addresses?.length > 0
-                ? panelSettings.ipv6.addresses.map(address => <span key={address} className="badge">{address}</span>)
-                : <span className="badge">{t('None')}</span>}
-              <span className={`badge ${panelSettings.ipv6?.enabled ? 'ok' : ''}`}>
-                {panelSettings.ipv6?.enabled ? 'On' : 'Off'}
-              </span>
-            </div>
-            {panelSettings.ipv6?.enabled
-              ? <button className="secondary-light" disabled={!!loading} onClick={() => toggleIpv6(false)}>{t('Disable IPv6')}</button>
-              : <button className="secondary-light" disabled={!!loading || !panelSettings.ipv6?.available} onClick={() => toggleIpv6(true)}>{t('Enable IPv6')}</button>}
-          </div>
-          <span className="hint">{panelSettings.ipv6?.detail}</span>
-        </div>
-      </>)}
-      {taspanel('account', <>
-        <div className="backup-panel-title">
-          <div><h3>{t('Admin account')}</h3><p className="hint">{t('A new password needs the current one, and the authenticator code when two-factor sign-in is on.')}</p></div>
-        </div>
-        <div className="panel-settings-grid admin-account-grid">
-          <label><span>{t('Email')}</span><input type="email" value={adminAccountForm.email} onChange={e => setAdminAccountForm(prev => ({ ...prev, email: e.target.value }))} placeholder="admin@domain.com" /></label>
-          <label><span>{t('Current password')}</span><input type="password" value={adminAccountForm.current_password} onChange={e => setAdminAccountForm(prev => ({ ...prev, current_password: e.target.value }))} placeholder={t('Current password')} autoComplete="current-password" /></label>
-          <label><span>{t('New password')}</span><input type="password" value={adminAccountForm.password} onChange={e => setAdminAccountForm(prev => ({ ...prev, password: e.target.value }))} placeholder={t('New password')} autoComplete="new-password" /></label>
-          <label><span>{t('Confirm password')}</span><input type="password" value={adminAccountForm.confirm_password} onChange={e => setAdminAccountForm(prev => ({ ...prev, confirm_password: e.target.value }))} placeholder={t('Repeat new password')} autoComplete="new-password" /></label>
-          <label><span>{t('Authenticator code')}</span><input value={adminAccountForm.code} onChange={e => setAdminAccountForm(prev => ({ ...prev, code: e.target.value }))} placeholder="123456" inputMode="numeric" autoComplete="one-time-code" /></label>
-          <button disabled={!!loading || !adminAccountForm.email.trim() || (!!adminAccountForm.password && adminAccountForm.password !== adminAccountForm.confirm_password)} onClick={saveAdminAccount}><Lock size={14}/>{t('Save account')}</button>
-        </div>
-      </>)}
-      {taspanel('api', <>
-        <div className="backup-panel-title">
-          <div><h3>{t('API Tokens')}</h3><p className="hint">{t('Create one token for WHMCS. Paste it into WHMCS Server → Access Hash.')}</p></div>
-          <button className="secondary-light" disabled={!!loading} onClick={loadApiTokens}><RefreshCw size={14}/>{t('Refresh')}</button>
-        </div>
-        {createdApiToken && <div className="user-create-card">
-          <label><span>{t('New token (copy now)')}</span><input id="created-api-token" readOnly value={createdApiToken} onFocus={e => e.target.select()} /></label>
-          <button className="secondary" disabled={!!loading} onClick={copyApiToken}><Copy size={14}/>{t('Copy token')}</button>
-          <button className="secondary-light" onClick={() => setCreatedApiToken('')}>{t('Hide')}</button>
-        </div>}
-        <div className="user-create-card">
-          <label><span>{t('Name')}</span><input value={newApiToken.name} onChange={e => setNewApiToken(prev => ({ ...prev, name: e.target.value }))} placeholder="WHMCS" /></label>
-          <label><span>{t('WHMCS server IP')}</span><input value={newApiToken.allowed_ips} onChange={e => setNewApiToken(prev => ({ ...prev, allowed_ips: e.target.value }))} placeholder={t('optional: 1.2.3.4 or 1.2.3.4, 5.6.7.8')} /></label>
-          <button disabled={!!loading || !newApiToken.name.trim()} onClick={createApiToken}><Plus size={14}/>{t('Create token')}</button>
-        </div>
-        <p className="hint">{t('Leave WHMCS server IP empty to allow all IPs. Multiple IPs: separate with comma.')}</p>
-        <div className="package-list">
-          {apiTokens.length === 0 && <EmptyState icon={KeyRound} message={t('No API tokens found.')} />}
-          {apiTokens.map(token => <div className="package-row" key={token.id}>
-            <div className="user-main"><strong>{token.name}</strong><small>{token.allowed_ips ? `Allowed IPs: ${token.allowed_ips}` : 'Allowed IPs: all'}</small></div>
-            <span className="user-metric"><KeyRound size={13}/>{token.is_active ? 'Active' : 'Revoked'}</span>
-            <span className="user-metric"><Clock size={13}/>{token.last_used_at ? new Date(token.last_used_at).toLocaleString() : 'Never used'}</span>
-            <div className="row-actions">
-              <button className="mini danger" disabled={!!loading || !token.is_active} onClick={() => revokeApiToken(token)}><Trash2 size={14}/>{t('Revoke')}</button>
-            </div>
-          </div>)}
-        </div>
-      </>)}
-    </div>;
+    );
   }
-  return renderPanelSettings();
+
+  const tabs = [
+    ['general', 'General', SettingsIcon],
+    ['account', 'Admin account', Lock],
+    ['api', 'API & Billing Integration', KeyRound],
+  ];
+  const activeTab = tabs.some(([id]) => id === panelSettingsTab) ? panelSettingsTab : 'general';
+  const taspanel = (id, content) =>
+    activeTab === id && (
+      <div
+        className="backup-tab-panel"
+        id={`panel-settings-tab-${id}`}
+        role="tabpanel"
+        aria-labelledby={`panel-settings-tab-button-${id}`}
+      >
+        {content}
+      </div>
+    );
+
+  const panelOrigin =
+    panelSettingsForm.panel_hostname
+      ? `${panelSettingsForm.ssl_enabled ? 'https' : 'http'}://${panelSettingsForm.panel_hostname}:${panelSettingsForm.panel_port || 2222}`
+      : window.location.origin;
+  const baseProvisioningUrl = `${panelOrigin}/api/provisioning/v1`;
+  const activePlatformInfo =
+    INTEGRATION_PLATFORMS.find((p) => p.id === selectedPlatform) || INTEGRATION_PLATFORMS[0];
+
+  return (
+    <div className="section panel-settings-page">
+      <div className="segmented-control backup-tabs" role="tablist" aria-label={t('Panel settings sections')}>
+        {tabs.map(([id, label, Icon]) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            id={`panel-settings-tab-button-${id}`}
+            aria-controls={`panel-settings-tab-${id}`}
+            aria-selected={activeTab === id}
+            className={activeTab === id ? 'active' : ''}
+            onClick={() => setPanelSettingsTab(id)}
+          >
+            <Icon size={14} />
+            {t(label)}
+          </button>
+        ))}
+      </div>
+
+      {/* TAB 1: GENERAL */}
+      {taspanel(
+        'general',
+        <>
+          <div className="backup-panel-title">
+            <div>
+              <h3>{t('General')}</h3>
+              <p className="hint">{t("Panel port, hostname and the server's addresses.")}</p>
+            </div>
+            <button className="secondary-light" disabled={!!loading} onClick={loadPanelSettings}>
+              <RefreshCw size={14} />
+              {t('Refresh')}
+            </button>
+          </div>
+          <div className="panel-settings-grid panel-settings-compact">
+            <label>
+              <span>{t('Panel hostname')}</span>
+              <input
+                value={panelSettingsForm.panel_hostname}
+                onChange={(e) => setPanelSettingsForm((prev) => ({ ...prev, panel_hostname: e.target.value }))}
+                placeholder="panel.domain.com"
+              />
+            </label>
+            <label>
+              <span>{t('Panel port')}</span>
+              <input
+                type="number"
+                min="1024"
+                max="65535"
+                value={panelSettingsForm.panel_port}
+                onChange={(e) => setPanelSettingsForm((prev) => ({ ...prev, panel_port: e.target.value }))}
+                placeholder="2222"
+              />
+            </label>
+            <label>
+              <span>{t('Support Ticket URL')}</span>
+              <input
+                value={panelSettingsForm.ticket_url}
+                onChange={(e) => setPanelSettingsForm((prev) => ({ ...prev, ticket_url: e.target.value }))}
+                placeholder="https://my.shost.vn/submitticket.php"
+              />
+            </label>
+            <label className="check-line panel-ssl-status">
+              <input
+                type="checkbox"
+                checked={!!panelSettingsForm.ssl_enabled}
+                onChange={(e) => setPanelSettingsForm((prev) => ({ ...prev, ssl_enabled: e.target.checked }))}
+              />
+              {t('Panel SSL')}
+            </label>
+            <button
+              disabled={!!loading || !panelSettingsForm.panel_port || !panelSettingsForm.panel_hostname}
+              onClick={savePanelSettings}
+            >
+              <SettingsIcon size={14} />
+              {t('Save settings')}
+            </button>
+          </div>
+          <div className="panel-net-strip">
+            <div className="panel-net-row">
+              <span className="panel-net-label">IPv4</span>
+              <div className="panel-net-value">
+                {panelSettings.server_ipv4?.length > 0 ? (
+                  panelSettings.server_ipv4.map((address) => (
+                    <span key={address} className="badge">
+                      {address}
+                    </span>
+                  ))
+                ) : (
+                  <span className="hint">{t("Could not read the server's IPv4 address.")}</span>
+                )}
+              </div>
+            </div>
+            <div className="panel-net-row">
+              <span className="panel-net-label">IPv6</span>
+              <div className="panel-net-value">
+                {panelSettings.ipv6?.addresses?.length > 0 ? (
+                  panelSettings.ipv6.addresses.map((address) => (
+                    <span key={address} className="badge">
+                      {address}
+                    </span>
+                  ))
+                ) : (
+                  <span className="badge">{t('None')}</span>
+                )}
+                <span className={`badge ${panelSettings.ipv6?.enabled ? 'ok' : ''}`}>
+                  {panelSettings.ipv6?.enabled ? 'On' : 'Off'}
+                </span>
+              </div>
+              {panelSettings.ipv6?.enabled ? (
+                <button className="secondary-light" disabled={!!loading} onClick={() => toggleIpv6(false)}>
+                  {t('Disable IPv6')}
+                </button>
+              ) : (
+                <button
+                  className="secondary-light"
+                  disabled={!!loading || !panelSettings.ipv6?.available}
+                  onClick={() => toggleIpv6(true)}
+                >
+                  {t('Enable IPv6')}
+                </button>
+              )}
+            </div>
+            <span className="hint">{panelSettings.ipv6?.detail}</span>
+          </div>
+        </>
+      )}
+
+      {/* TAB 2: ADMIN ACCOUNT */}
+      {taspanel(
+        'account',
+        <>
+          <div className="backup-panel-title">
+            <div>
+              <h3>{t('Admin account')}</h3>
+              <p className="hint">
+                {t('A new password needs the current one, and the authenticator code when two-factor sign-in is on.')}
+              </p>
+            </div>
+          </div>
+          <div className="panel-settings-grid admin-account-grid">
+            <label>
+              <span>{t('Email')}</span>
+              <input
+                type="email"
+                value={adminAccountForm.email}
+                onChange={(e) => setAdminAccountForm((prev) => ({ ...prev, email: e.target.value }))}
+                placeholder="admin@domain.com"
+              />
+            </label>
+            <label>
+              <span>{t('Current password')}</span>
+              <input
+                type="password"
+                value={adminAccountForm.current_password}
+                onChange={(e) => setAdminAccountForm((prev) => ({ ...prev, current_password: e.target.value }))}
+                placeholder={t('Current password')}
+                autoComplete="current-password"
+              />
+            </label>
+            <label>
+              <span>{t('New password')}</span>
+              <input
+                type="password"
+                value={adminAccountForm.password}
+                onChange={(e) => setAdminAccountForm((prev) => ({ ...prev, password: e.target.value }))}
+                placeholder={t('New password')}
+                autoComplete="new-password"
+              />
+            </label>
+            <label>
+              <span>{t('Confirm password')}</span>
+              <input
+                type="password"
+                value={adminAccountForm.confirm_password}
+                onChange={(e) => setAdminAccountForm((prev) => ({ ...prev, confirm_password: e.target.value }))}
+                placeholder={t('Repeat new password')}
+                autoComplete="new-password"
+              />
+            </label>
+            <label>
+              <span>{t('Authenticator code')}</span>
+              <input
+                value={adminAccountForm.code}
+                onChange={(e) => setAdminAccountForm((prev) => ({ ...prev, code: e.target.value }))}
+                placeholder="123456"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+              />
+            </label>
+            <button
+              disabled={
+                !!loading ||
+                !adminAccountForm.email.trim() ||
+                (!!adminAccountForm.password && adminAccountForm.password !== adminAccountForm.confirm_password)
+              }
+              onClick={saveAdminAccount}
+            >
+              <Lock size={14} />
+              {t('Save account')}
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* TAB 3: API & BILLING INTEGRATION (UNIFIED INBOUND TOKENS + OUTBOUND WEBHOOKS) */}
+      {taspanel(
+        'api',
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+          {/* CARD 1: INBOUND PROVISIONING API TOKENS */}
+          <div className="pkg-card" style={{ padding: '20px 22px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '14px', marginBottom: '16px' }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <KeyRound size={18} style={{ color: 'var(--accent-primary)' }} />
+                  1. Provisioning API Tokens (WHMCS, HostBill, Blesta, Perfex CRM)
+                </h3>
+                <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                  Cấp quyền cho hệ thống Billing / CRM bên ngoài gọi vào SPanel để tự động khởi tạo Hosting, khóa/mở khóa, nâng cấp gói và đăng nhập 1-click (SSO).
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="secondary-light"
+                  onClick={() => setShowEndpointsRef((v) => !v)}
+                >
+                  <Code2 size={14} />
+                  {showEndpointsRef ? 'Ẩn tài liệu API' : 'Xem tài liệu REST API'}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-light"
+                  disabled={!!loading}
+                  onClick={() => {
+                    loadApiTokens();
+                    loadWebhooks();
+                  }}
+                >
+                  <RefreshCw size={14} /> {t('Refresh')}
+                </button>
+              </div>
+            </div>
+
+            {/* Platform Selector Pills + Quick Connection Info */}
+            <div style={{
+              padding: '14px 16px', borderRadius: '10px',
+              background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
+              marginBottom: '16px', display: 'flex', flexDirection: 'column', gap: '12px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '0.79rem', fontWeight: 700, color: 'var(--text-muted)' }}>
+                    Hệ thống tích hợp:
+                  </span>
+                  {INTEGRATION_PLATFORMS.map((plat) => {
+                    const active = selectedPlatform === plat.id;
+                    return (
+                      <button
+                        key={plat.id}
+                        type="button"
+                        onClick={() => handleSelectPlatform(plat.id)}
+                        style={{
+                          padding: '5px 12px',
+                          borderRadius: '999px',
+                          fontSize: '0.8rem',
+                          fontWeight: 600,
+                          border: active ? '1px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
+                          background: active ? 'rgba(13, 148, 136, 0.14)' : 'var(--surface-1)',
+                          color: active ? 'var(--accent-primary)' : 'var(--text-main)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {plat.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Base API URL:</span>
+                  <code style={{
+                    padding: '4px 8px', borderRadius: '6px',
+                    background: 'var(--surface-1)', border: '1px solid var(--border-subtle)',
+                    fontSize: '0.78rem', color: 'var(--accent-primary)', fontWeight: 600,
+                  }}>
+                    {baseProvisioningUrl}
+                  </code>
+                  <button
+                    type="button"
+                    className="secondary-light"
+                    style={{ padding: '4px 8px', height: '28px', fontSize: '0.76rem' }}
+                    onClick={() => copyToClipboard(baseProvisioningUrl, 'Đã sao chép Base API URL.')}
+                  >
+                    <Copy size={12} /> Copy URL
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ fontSize: '0.81rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                <strong style={{ color: 'var(--text-main)' }}>Hướng dẫn ({activePlatformInfo.label}):</strong>{' '}
+                {activePlatformInfo.guide}
+              </div>
+            </div>
+
+            {/* Collapsible REST API Reference */}
+            {showEndpointsRef && (
+              <div style={{
+                padding: '14px 16px', borderRadius: '10px',
+                background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
+                marginBottom: '16px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
+                  <strong style={{ fontSize: '0.88rem', color: 'var(--text-main)' }}>
+                    Danh sách Endpoint REST API ({baseProvisioningUrl})
+                  </strong>
+                  <code style={{ fontSize: '0.77rem', color: 'var(--text-muted)' }}>
+                    Header: Authorization: Bearer bp_xxxxxxxx...
+                  </code>
+                </div>
+                <div className="pkg-table-wrap">
+                  <table className="pkg-clean-table">
+                    <thead>
+                      <tr>
+                        <th style={{ width: '90px' }}>Method</th>
+                        <th>Endpoint Path</th>
+                        <th>Chức năng nghiệp vụ</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {PROVISIONING_ENDPOINTS.map((ep) => (
+                        <tr key={`${ep.method}-${ep.path}`}>
+                          <td>
+                            <span style={{
+                              padding: '2px 7px', borderRadius: '6px', fontSize: '0.72rem', fontWeight: 700,
+                              background:
+                                ep.method === 'GET'
+                                  ? 'rgba(59, 130, 246, 0.14)'
+                                  : ep.method === 'POST'
+                                  ? 'rgba(16, 185, 129, 0.14)'
+                                  : ep.method === 'DELETE'
+                                  ? 'rgba(239, 68, 68, 0.14)'
+                                  : 'rgba(245, 158, 11, 0.14)',
+                              color:
+                                ep.method === 'GET'
+                                  ? '#3b82f6'
+                                  : ep.method === 'POST'
+                                  ? '#10b981'
+                                  : ep.method === 'DELETE'
+                                  ? '#ef4444'
+                                  : '#f59e0b',
+                            }}>
+                              {ep.method}
+                            </span>
+                          </td>
+                          <td><code>/api/provisioning/v1{ep.path}</code></td>
+                          <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{ep.desc}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Newly Created Token Banner */}
+            {createdApiToken && (
+              <div style={{
+                padding: '14px 16px', borderRadius: '10px', marginBottom: '16px',
+                background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.35)',
+                display: 'flex', flexDirection: 'column', gap: '10px',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                  <strong style={{ fontSize: '0.88rem', color: '#10b981', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <Check size={16} /> Khóa API Token mới đã được khởi tạo (Chỉ hiển thị 1 lần duy nhất):
+                  </strong>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard(createdApiToken, 'Đã sao chép API Token vào bộ nhớ tạm.')}
+                    >
+                      <Copy size={14} /> Sao chép Token
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-light"
+                      onClick={() => setCreatedApiToken('')}
+                    >
+                      Đóng
+                    </button>
+                  </div>
+                </div>
+                <input
+                  id="created-api-token"
+                  readOnly
+                  value={createdApiToken}
+                  onFocus={(e) => e.target.select()}
+                  style={{ fontFamily: 'monospace', fontWeight: 700, fontSize: '0.86rem' }}
+                />
+              </div>
+            )}
+
+            {/* Create Token Form */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(180px, 1.2fr) minmax(220px, 1.8fr) minmax(180px, 1fr) auto',
+              gap: '12px',
+              alignItems: 'end',
+              padding: '14px 16px',
+              borderRadius: '10px',
+              background: 'var(--surface-2)',
+              border: '1px solid var(--border-subtle)',
+              marginBottom: '16px',
+            }}>
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                  Tên gợi nhớ (Hệ thống kết nối)
+                </span>
+                <input
+                  value={newApiToken.name}
+                  onChange={(e) => setNewApiToken((prev) => ({ ...prev, name: e.target.value }))}
+                  placeholder="VD: WHMCS, HostBill, Perfex CRM"
+                />
+              </label>
+
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                  Giới hạn IP máy chủ gọi API (Để trống = Cho phép mọi IP)
+                </span>
+                <input
+                  value={newApiToken.allowed_ips}
+                  onChange={(e) => setNewApiToken((prev) => ({ ...prev, allowed_ips: e.target.value }))}
+                  placeholder="Tùy chọn: 103.1.2.3, 103.1.2.4"
+                />
+              </label>
+
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                  Quyền hạn (Scopes)
+                </span>
+                <select
+                  value={newApiToken.scopes}
+                  onChange={(e) => setNewApiToken((prev) => ({ ...prev, scopes: e.target.value }))}
+                >
+                  <option value="provisioning:read,provisioning:write">Toàn quyền (Đọc & Ghi Provisioning)</option>
+                  <option value="provisioning:read">Chỉ đọc (Đồng bộ Gói & Dung lượng)</option>
+                </select>
+              </label>
+
+              <button
+                type="button"
+                disabled={!!loading || !newApiToken.name.trim()}
+                onClick={createApiToken}
+                style={{ height: '40px', padding: '0 18px', fontWeight: 600 }}
+              >
+                <Plus size={15} /> Tạo API Token
+              </button>
+            </div>
+
+            {/* Tokens Table */}
+            <div className="pkg-table-wrap">
+              <table className="pkg-clean-table">
+                <thead>
+                  <tr>
+                    <th>Tên Token / Hệ thống</th>
+                    <th>Quyền hạn (Scopes)</th>
+                    <th>IP được phép (Whitelist)</th>
+                    <th>Trạng thái</th>
+                    <th>Lần gọi gần nhất</th>
+                    <th style={{ textAlign: 'right' }}>Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {apiTokens.map((token) => (
+                    <tr key={token.id}>
+                      <td>
+                        <strong style={{ color: 'var(--text-main)' }}>{token.name}</strong>
+                        {token.created_at && (
+                          <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                            Tạo lúc: {new Date(token.created_at).toLocaleString()}
+                          </div>
+                        )}
+                      </td>
+                      <td>
+                        <code style={{ fontSize: '0.76rem' }}>{token.scopes}</code>
+                      </td>
+                      <td>
+                        {token.allowed_ips ? (
+                          <code style={{ fontSize: '0.78rem', color: 'var(--accent-primary)' }}>{token.allowed_ips}</code>
+                        ) : (
+                          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Tất cả IP (All IPs)</span>
+                        )}
+                      </td>
+                      <td>
+                        <span style={{
+                          padding: '3px 9px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 700,
+                          background: token.is_active ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)',
+                          color: token.is_active ? '#10b981' : '#ef4444',
+                        }}>
+                          {token.is_active ? 'Đang hoạt động' : 'Đã thu hồi'}
+                        </span>
+                      </td>
+                      <td style={{ fontSize: '0.81rem', color: 'var(--text-muted)' }}>
+                        {token.last_used_at ? new Date(token.last_used_at).toLocaleString() : 'Chưa từng gọi'}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          type="button"
+                          className="danger"
+                          style={{ padding: '6px 12px', fontSize: '0.78rem' }}
+                          disabled={!!loading || !token.is_active}
+                          onClick={() => revokeApiToken(token)}
+                        >
+                          <Trash2 size={14} /> Thu hồi
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {apiTokens.length === 0 && (
+                    <tr>
+                      <td colSpan="6">
+                        <EmptyState
+                          icon={KeyRound}
+                          title="Chưa có API Token nào"
+                          subtitle="Tạo một API Token ở khung phía trên để kết nối WHMCS, HostBill, Blesta hoặc Perfex CRM."
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* CARD 2: OUTBOUND EVENT WEBHOOKS */}
+          <div className="pkg-card" style={{ padding: '20px 22px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '14px', marginBottom: '16px' }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Zap size={18} style={{ color: 'var(--accent-primary)' }} />
+                  2. Outbound Event Webhooks (Perfex CRM, ERP, n8n, Automation)
+                </h3>
+                <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                  Tự động đẩy thông báo JSON (kèm chữ ký bảo mật <code>X-SPanel-Signature</code> HMAC-SHA256) sang hệ thống CRM / Billing bên ngoài khi phát sinh sự kiện trên SPanel.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setWebhookForm({ id: null, url: '', secret: '', events: '*', is_active: true });
+                  setShowWebhookForm(true);
+                }}
+              >
+                <Plus size={15} /> Thêm Webhook Endpoint
+              </button>
+            </div>
+
+            {showWebhookForm && (
+              <form
+                onSubmit={saveWebhook}
+                style={{
+                  padding: '16px',
+                  borderRadius: '10px',
+                  background: 'var(--surface-2)',
+                  border: '1px solid var(--border-subtle)',
+                  marginBottom: '16px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '14px',
+                }}
+              >
+                <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
+                  {webhookForm.id ? 'Chỉnh sửa Webhook Endpoint' : 'Thêm mới Webhook Endpoint'}
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '12px' }}>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      Endpoint URL nhận sự kiện (HTTPS/HTTP)
+                    </span>
+                    <input
+                      type="url"
+                      value={webhookForm.url}
+                      onChange={(e) => setWebhookForm({ ...webhookForm, url: e.target.value })}
+                      placeholder="https://crm.yourdomain.com/api/webhooks/spanel"
+                      required
+                    />
+                  </label>
+
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      HMAC Secret (Tùy chọn — ký xác thực X-SPanel-Signature)
+                    </span>
+                    <input
+                      type="text"
+                      value={webhookForm.secret || ''}
+                      onChange={(e) => setWebhookForm({ ...webhookForm, secret: e.target.value })}
+                      placeholder={webhookForm.id ? 'Để trống nếu giữ nguyên Secret cũ' : 'Chuỗi bí mật dùng để kiểm tra chữ ký SHA-256'}
+                    />
+                  </label>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) minmax(260px, 1.5fr) auto', gap: '12px', alignItems: 'end' }}>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      Mẫu bộ lọc sự kiện nhanh
+                    </span>
+                    <select
+                      value={
+                        WEBHOOK_EVENT_PRESETS.find((p) => p.value === webhookForm.events)?.value || 'custom'
+                      }
+                      onChange={(e) => {
+                        if (e.target.value !== 'custom') {
+                          setWebhookForm({ ...webhookForm, events: e.target.value });
+                        }
+                      }}
+                    >
+                      {WEBHOOK_EVENT_PRESETS.map((p) => (
+                        <option key={p.id} value={p.value}>{p.label}</option>
+                      ))}
+                      <option value="custom">Tùy chỉnh danh sách sự kiện...</option>
+                    </select>
+                  </label>
+
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      Danh sách sự kiện đăng ký (Events)
+                    </span>
+                    <input
+                      type="text"
+                      value={webhookForm.events}
+                      onChange={(e) => setWebhookForm({ ...webhookForm, events: e.target.value })}
+                      placeholder="*, provisioning_create, provisioning_suspend..."
+                      required
+                    />
+                  </label>
+
+                  <label className="check-line" style={{ margin: 0, height: '40px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <input
+                      type="checkbox"
+                      checked={!!webhookForm.is_active}
+                      onChange={(e) => setWebhookForm({ ...webhookForm, is_active: e.target.checked })}
+                    />
+                    <span>Kích hoạt</span>
+                  </label>
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                  <button
+                    type="button"
+                    className="secondary-light"
+                    onClick={() => setShowWebhookForm(false)}
+                  >
+                    Hủy
+                  </button>
+                  <button type="submit" disabled={!!loading}>
+                    <Check size={15} /> Lưu cấu hình Webhook
+                  </button>
+                </div>
+              </form>
+            )}
+
+            <div className="pkg-table-wrap">
+              <table className="pkg-clean-table">
+                <thead>
+                  <tr>
+                    <th>Endpoint URL</th>
+                    <th>Sự kiện đăng ký (Events)</th>
+                    <th>Bảo mật HMAC</th>
+                    <th>Trạng thái</th>
+                    <th style={{ textAlign: 'right' }}>Thao tác</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {webhooks.map((wh) => (
+                    <tr key={wh.id}>
+                      <td>
+                        <code style={{ wordBreak: 'break-all', fontSize: '0.82rem', color: 'var(--text-main)' }}>
+                          {wh.url}
+                        </code>
+                      </td>
+                      <td>
+                        <code style={{ fontSize: '0.76rem', color: 'var(--accent-primary)' }}>
+                          {wh.events === '*' ? '* (Tất cả sự kiện)' : wh.events}
+                        </code>
+                      </td>
+                      <td>
+                        <span style={{
+                          padding: '2px 8px', borderRadius: '999px', fontSize: '0.73rem', fontWeight: 600,
+                          background: wh.has_secret ? 'rgba(13, 148, 136, 0.14)' : 'var(--surface-3)',
+                          color: wh.has_secret ? 'var(--accent-primary)' : 'var(--text-muted)',
+                        }}>
+                          {wh.has_secret ? 'HMAC-SHA256' : 'Không dùng Secret'}
+                        </span>
+                      </td>
+                      <td>
+                        <span style={{
+                          padding: '3px 9px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 700,
+                          background: wh.is_active ? 'rgba(16, 185, 129, 0.14)' : 'var(--surface-3)',
+                          color: wh.is_active ? '#10b981' : 'var(--text-muted)',
+                        }}>
+                          {wh.is_active ? 'Đang bật (Active)' : 'Tạm tắt (Inactive)'}
+                        </span>
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
+                          <button
+                            type="button"
+                            className="secondary-light"
+                            style={{ padding: '6px 10px', fontSize: '0.78rem' }}
+                            disabled={!!loading}
+                            onClick={() => testWebhookEndpoint(wh)}
+                            title="Gửi gói tin JSON thử nghiệm tới URL này"
+                          >
+                            <Send size={13} /> Gửi thử
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-light"
+                            style={{ padding: '6px 10px' }}
+                            disabled={!!loading}
+                            onClick={() => {
+                              setWebhookForm({
+                                id: wh.id,
+                                url: wh.url,
+                                secret: '',
+                                events: wh.events || '*',
+                                is_active: wh.is_active,
+                              });
+                              setShowWebhookForm(true);
+                            }}
+                            title="Chỉnh sửa"
+                          >
+                            <Edit2 size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className="danger"
+                            style={{ padding: '6px 10px' }}
+                            disabled={!!loading}
+                            onClick={() => deleteWebhook(wh)}
+                            title="Xóa Webhook"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {webhooks.length === 0 && (
+                    <tr>
+                      <td colSpan="5">
+                        <EmptyState
+                          icon={Zap}
+                          title="Chưa cấu hình Outbound Webhook nào"
+                          subtitle="Chỉ cần thêm Webhook nếu bạn muốn SPanel bắn sự kiện thời gian thực sang Perfex CRM, n8n hoặc hệ thống tự động hóa bên ngoài."
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
-
-
