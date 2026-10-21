@@ -125,6 +125,8 @@ export function PackagesPage({ mode = 'users' }) {
     verify_ssl: false,
   });
   const [showRemoteSecret, setShowRemoteSecret] = useState(false);
+  const [remoteAlert, setRemoteAlert] = useState(null);
+  const [fetchingRemote, setFetchingRemote] = useState(false);
 
   useEffect(() => {
     setPackageTab('list');
@@ -176,6 +178,7 @@ export function PackagesPage({ mode = 'users' }) {
 
   function selectSourcePanel(panel) {
     setImportPanel(panel);
+    setRemoteAlert(null);
     setRemoteForm(prev => {
       const currentUser = (prev.username || '').trim();
       let nextUser = prev.username;
@@ -190,44 +193,64 @@ export function PackagesPage({ mode = 'users' }) {
 
   function openImportModal(defaultPanel = 'directadmin') {
     selectSourcePanel(defaultPanel);
+    setRemoteAlert(null);
     setShowImportModal(true);
   }
 
   async function handleFetchRemotePackages(e) {
     if (e && e.preventDefault) e.preventDefault();
+    setRemoteAlert(null);
     if (!remoteForm.host_url.trim() || !remoteForm.secret.trim()) {
-      setError(t('Please enter the remote Panel URL and Password / API Token.'));
+      const msg = t('Please enter the remote Panel URL and Password / API Token.');
+      setRemoteAlert({ type: 'error', text: msg });
+      setError(msg);
       return;
     }
     const defaultUser = importPanel === 'cpanel' ? 'root' : 'admin';
-    const res = await request('/packages/fetch-remote', {
-      method: 'POST',
-      body: JSON.stringify({
-        panel_type: importPanel,
-        host_url: remoteForm.host_url.trim(),
-        username: remoteForm.username.trim() || defaultUser,
-        secret: remoteForm.secret,
-        auth_type: remoteForm.auth_type,
-        is_reseller_package: mode === 'resellers',
-        verify_ssl: Boolean(remoteForm.verify_ssl),
-      }),
-    }, t('Connecting to remote panel and fetching packages...'));
-    if (res && Array.isArray(res.packages)) {
-      if (res.packages.length === 0) {
-        setError(t('Connected successfully, but no packages were found on the remote panel.'));
+    setFetchingRemote(true);
+    try {
+      const res = await request('/packages/fetch-remote', {
+        method: 'POST',
+        body: JSON.stringify({
+          panel_type: importPanel,
+          host_url: remoteForm.host_url.trim(),
+          username: remoteForm.username.trim() || defaultUser,
+          secret: remoteForm.secret,
+          auth_type: remoteForm.auth_type,
+          is_reseller_package: mode === 'resellers',
+          verify_ssl: Boolean(remoteForm.verify_ssl),
+        }),
+      }, t('Connecting to remote panel and fetching packages...'));
+      if (!res) return;
+      if (res.ok === false || res.error) {
+        const errMsg = String(res.error || res.detail || t('Failed to connect to remote panel.'));
+        setRemoteAlert({ type: 'error', text: errMsg });
+        setError(errMsg);
         return;
       }
-      const isResellerMode = mode === 'resellers';
-      const decorated = res.packages.map(it => ({
-        ...DEFAULT_PKG_STATE,
-        ...it,
-        is_reseller_package: isResellerMode,
-        source_panel: importPanel,
-        _selected: true,
-        _id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      }));
-      setParsedPackages(decorated);
-      setNotice(t('Fetched {count} package(s) from remote panel.', { count: decorated.length }));
+      if (Array.isArray(res.packages)) {
+        if (res.packages.length === 0) {
+          const emptyMsg = t('Connected successfully, but no packages were found on the remote panel.');
+          setRemoteAlert({ type: 'error', text: emptyMsg });
+          setError(emptyMsg);
+          return;
+        }
+        const isResellerMode = mode === 'resellers';
+        const decorated = res.packages.map(it => ({
+          ...DEFAULT_PKG_STATE,
+          ...it,
+          is_reseller_package: isResellerMode,
+          source_panel: importPanel,
+          _selected: true,
+          _id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        }));
+        setParsedPackages(decorated);
+        const okMsg = t('Fetched {count} package(s) from remote panel.', { count: decorated.length });
+        setRemoteAlert({ type: 'success', text: okMsg });
+        setNotice(okMsg);
+      }
+    } finally {
+      setFetchingRemote(false);
     }
   }
 
@@ -1095,6 +1118,24 @@ export function PackagesPage({ mode = 'users' }) {
                     </div>
                   </div>
 
+                  {remoteAlert && (
+                    <div
+                      style={{
+                        padding: '10px 14px',
+                        borderRadius: '8px',
+                        fontSize: '12.5px',
+                        lineHeight: 1.45,
+                        border: remoteAlert.type === 'error' ? '1px solid rgba(239, 68, 68, 0.35)' : '1px solid rgba(34, 197, 94, 0.35)',
+                        background: remoteAlert.type === 'error' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(34, 197, 94, 0.1)',
+                        color: remoteAlert.type === 'error' ? '#dc2626' : '#16a34a',
+                        fontWeight: 600,
+                        wordBreak: 'break-word',
+                      }}
+                    >
+                      {remoteAlert.text}
+                    </div>
+                  )}
+
                   <div
                     className="pkg-remote-action-bar"
                     style={{
@@ -1119,8 +1160,8 @@ export function PackagesPage({ mode = 'users' }) {
                       </span>
                     </label>
 
-                    <button type="submit" disabled={!!loading} style={{ height: '38px', padding: '0 18px' }}>
-                      <CloudDownload size={15} /> {t('Fetch Remote Packages')}
+                    <button type="submit" disabled={fetchingRemote || !!loading} style={{ height: '38px', padding: '0 18px' }}>
+                      <CloudDownload size={15} /> {fetchingRemote ? t('Connecting to remote panel and fetching packages...') : t('Fetch Remote Packages')}
                     </button>
                   </div>
                 </form>

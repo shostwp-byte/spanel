@@ -352,17 +352,53 @@ def _map_plesk_dict_to_package(name: str, raw: dict, is_reseller: bool = False) 
     return pkg
 
 
-def _validate_remote_url(raw_url: str, panel: str = "directadmin") -> str:
-    url = raw_url.strip().strip("'\"").rstrip("/")
-    if not url.startswith(("http://", "https://")):
+def _build_ssl_context(verify_ssl: bool = False) -> ssl.SSLContext:
+    if verify_ssl:
+        return ssl.create_default_context()
+    ctx = ssl._create_unverified_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    for cipher_str in ("DEFAULT:@SECLEVEL=0", "DEFAULT:@SECLEVEL=1", "ALL:@SECLEVEL=0"):
+        try:
+            ctx.set_ciphers(cipher_str)
+            break
+        except Exception:
+            pass
+    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+    if hasattr(ssl, "TLSVersion") and hasattr(ctx, "minimum_version"):
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1
+        except Exception:
+            pass
+    return ctx
+
+
+def _validate_remote_url_candidates(raw_url: str, panel: str = "directadmin") -> list[str]:
+    url = (raw_url or "").strip().strip("'\"")
+    if not url:
+        raise ValueError("Remote panel URL is required")
+    explicit_scheme = None
+    if url.lower().startswith("https://"):
+        explicit_scheme = "https"
+    elif url.lower().startswith("http://"):
+        explicit_scheme = "http"
+    else:
         url = "https://" + url
+
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise HTTPException(status_code=400, detail="Invalid remote panel URL")
+        raise ValueError("Invalid remote panel URL")
+
     host = parsed.hostname.strip().lower()
     if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "169.254.169.254"}:
-        raise HTTPException(status_code=400, detail="Remote panel URL cannot point to loopback or metadata addresses")
-    port = parsed.port
+        raise ValueError("Remote panel URL cannot point to loopback or metadata addresses")
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
     if not port:
         if panel == "directadmin":
             port = 2222
@@ -370,58 +406,22 @@ def _validate_remote_url(raw_url: str, panel: str = "directadmin") -> str:
             port = 2087
         elif panel == "plesk":
             port = 8443
+
     try:
         infos = socket.getaddrinfo(host, port or 443)
         for info in infos:
             ip_str = info[4][0]
             ip_obj = ipaddress.ip_address(ip_str)
             if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
-                raise HTTPException(status_code=400, detail="Remote panel host resolves to a restricted address")
+                raise ValueError("Remote panel host resolves to a restricted address")
     except socket.gaierror as exc:
-        raise HTTPException(status_code=400, detail=f"Cannot resolve hostname '{host}': {exc}")
+        raise ValueError(f"Cannot resolve hostname '{host}': {exc}")
+
     host_fmt = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    return f"{parsed.scheme}://{host_fmt}:{port}" if port else f"{parsed.scheme}://{host_fmt}"
-
-
-def _http_fetch(
-    url: str,
-    headers: dict,
-    data: bytes | None = None,
-    verify_ssl: bool = False,
-    opener: Any = None,
-) -> str:
-    ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
-    parsed_u = urllib.parse.urlparse(url)
-    origin_url = f"{parsed_u.scheme}://{parsed_u.netloc}" if parsed_u.scheme and parsed_u.netloc else ""
-    req_headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
-        "Accept": "application/json, text/plain, */*",
-    }
-    if origin_url:
-        req_headers["Referer"] = f"{origin_url}/"
-        req_headers["Origin"] = origin_url
-    req_headers.update(headers or {})
-    req = urllib.request.Request(url, data=data, headers=req_headers)
-    try:
-        if opener is not None:
-            with opener.open(req, timeout=15) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        body_preview = ""
-        try:
-            body_preview = exc.read().decode("utf-8", errors="replace")[:300]
-        except Exception:
-            pass
-        if exc.code in (401, 403) or "Not logged in" in body_preview or "UNAUTHORIZED" in body_preview:
-            raise HTTPException(
-                status_code=400,
-                detail="Authentication failed on remote panel: Invalid username, password, or Login Key.",
-            )
-        raise HTTPException(status_code=400, detail=f"Remote panel returned HTTP {exc.code}: {body_preview or exc.reason}")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to connect to remote panel: {exc}")
+    netloc = f"{host_fmt}:{port}" if port else host_fmt
+    primary_scheme = explicit_scheme or "https"
+    alt_scheme = "http" if primary_scheme == "https" else "https"
+    return [f"{primary_scheme}://{netloc}", f"{alt_scheme}://{netloc}"]
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -429,82 +429,277 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _da_create_session_opener(
-    base_url: str, user: str, secret: str, verify_ssl: bool = False
-) -> Any:
-    """Authenticate against DirectAdmin via session cookies (/api/login or /CMD_LOGIN)
-    when HTTP Basic Auth is restricted for regular passwords or specific commands.
-    """
-    import http.cookiejar
+def _extract_cookies_from_headers(hdrs: Any) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    if not hdrs:
+        return cookies
+    raw_list: list[str] = []
+    if hasattr(hdrs, "get_all"):
+        raw_list = hdrs.get_all("Set-Cookie") or []
+    elif hasattr(hdrs, "getheaders"):
+        raw_list = hdrs.getheaders("Set-Cookie") or []
+    for sc in raw_list:
+        first_part = str(sc).split(";", 1)[0].strip()
+        if "=" in first_part:
+            k, v = first_part.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if k and v and v.lower() not in {"deleted", "null", "none", '""', "''"}:
+                cookies[k] = v
+    return cookies
 
-    ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
-    base_headers = {
+
+def _http_fetch(
+    url: str,
+    headers: dict,
+    data: bytes | None = None,
+    verify_ssl: bool = False,
+    include_origin: bool = False,
+    _depth: int = 0,
+) -> str:
+    if _depth > 4:
+        raise RuntimeError("Too many redirects from remote panel")
+    ctx = _build_ssl_context(verify_ssl=verify_ssl)
+    parsed_u = urllib.parse.urlparse(url)
+    origin_url = f"{parsed_u.scheme}://{parsed_u.netloc}" if parsed_u.scheme and parsed_u.netloc else ""
+    req_headers: dict[str, str] = {
         "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
-        "Referer": f"{base_url}/",
-        "Origin": base_url,
+        "Accept": "application/json, text/plain, */*",
     }
+    if include_origin and origin_url:
+        req_headers["Referer"] = f"{origin_url}/"
+        req_headers["Origin"] = origin_url
+    req_headers.update(headers or {})
 
-    # 1. Modern DirectAdmin JSON login: POST /api/login
-    cj1 = http.cookiejar.CookieJar()
-    opener1 = urllib.request.build_opener(
+    opener = urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=ctx),
-        urllib.request.HTTPCookieProcessor(cj1),
-    )
-    try:
-        login_payload = json.dumps({"username": user, "password": secret}).encode("utf-8")
-        req1 = urllib.request.Request(
-            f"{base_url}/api/login",
-            data=login_payload,
-            headers={**base_headers, "Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        with opener1.open(req1, timeout=12) as resp:
-            if resp.status in (200, 201, 204) or len(cj1) > 0:
-                return opener1
-    except Exception:
-        if len(cj1) > 0:
-            return opener1
-
-    # 2. Classic DirectAdmin form login: POST /CMD_LOGIN
-    cj2 = http.cookiejar.CookieJar()
-    opener2 = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ctx),
-        urllib.request.HTTPCookieProcessor(cj2),
         _NoRedirectHandler(),
     )
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=req_headers,
+        method="POST" if data is not None else "GET",
+    )
     try:
-        form_payload = urllib.parse.urlencode(
-            {"username": user, "password": secret, "referer": "/"}
-        ).encode("utf-8")
-        req2 = urllib.request.Request(
+        with opener.open(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if "this web server is running in ssl mode" in body[:400].lower() and url.startswith("http://"):
+                https_url = "https://" + url[len("http://"):]
+                return _http_fetch(
+                    https_url, headers, data=data, verify_ssl=verify_ssl, include_origin=include_origin, _depth=_depth + 1
+                )
+            return body
+    except urllib.error.HTTPError as exc:
+        body_preview = ""
+        try:
+            body_preview = exc.read().decode("utf-8", errors="replace")[:400]
+        except Exception:
+            pass
+
+        if "this web server is running in ssl mode" in body_preview.lower() and url.startswith("http://"):
+            https_url = "https://" + url[len("http://"):]
+            return _http_fetch(
+                https_url, headers, data=data, verify_ssl=verify_ssl, include_origin=include_origin, _depth=_depth + 1
+            )
+
+        if exc.code in (301, 302, 303, 307, 308):
+            loc = str(exc.headers.get("Location") or "").strip()
+            if loc:
+                full_loc = urllib.parse.urljoin(url, loc)
+                loc_parsed = urllib.parse.urlparse(full_loc)
+                loc_lower = full_loc.lower()
+                if "cmd_login" in loc_lower or "/login" in loc_parsed.path.lower():
+                    raise RuntimeError(
+                        "Authentication failed on remote panel: Invalid username, password, or Login Key."
+                    )
+                # If remote panel redirected IP -> force_hostname, try keeping the direct IP connection
+                # with Host/Referer/Origin set to the redirected hostname first (bypasses Cloudflare/DNS issues),
+                # then fall back to following full_loc with Authorization preserved.
+                if (
+                    loc_parsed.hostname
+                    and parsed_u.hostname
+                    and loc_parsed.hostname.lower() != parsed_u.hostname.lower()
+                    and "Host" not in req_headers
+                ):
+                    new_scheme = loc_parsed.scheme or parsed_u.scheme
+                    same_ip_url = urllib.parse.urlunparse(
+                        (new_scheme, parsed_u.netloc, parsed_u.path, parsed_u.params, parsed_u.query, "")
+                    )
+                    host_hdrs = {
+                        **headers,
+                        "Host": loc_parsed.netloc,
+                        "Referer": f"{new_scheme}://{loc_parsed.netloc}/",
+                        "Origin": f"{new_scheme}://{loc_parsed.netloc}",
+                    }
+                    try:
+                        return _http_fetch(
+                            same_ip_url,
+                            host_hdrs,
+                            data=data,
+                            verify_ssl=verify_ssl,
+                            include_origin=include_origin,
+                            _depth=_depth + 1,
+                        )
+                    except Exception:
+                        pass
+                return _http_fetch(
+                    full_loc,
+                    headers,
+                    data=data,
+                    verify_ssl=verify_ssl,
+                    include_origin=include_origin,
+                    _depth=_depth + 1,
+                )
+
+        if exc.code in (401, 403) or "not logged in" in body_preview.lower() or "unauthorized" in body_preview.lower():
+            raise RuntimeError(
+                "Authentication failed on remote panel: Invalid username, password, or Login Key."
+            )
+        raise RuntimeError(f"Remote panel returned HTTP {exc.code}: {body_preview or exc.reason}")
+    except Exception as exc:
+        err_str = str(exc)
+        if url.startswith("https://") and any(
+            k in err_str.lower() for k in ("wrong_version_number", "unknown_protocol", "ssl", "eof occurred")
+        ):
+            http_url = "http://" + url[len("https://"):]
+            try:
+                return _http_fetch(
+                    http_url, headers, data=data, verify_ssl=False, include_origin=include_origin, _depth=_depth + 1
+                )
+            except Exception:
+                pass
+        raise RuntimeError(f"Failed to connect to remote panel ({parsed_u.netloc}): {exc}")
+
+
+def _da_login_session_headers(
+    base_url: str, user: str, secret: str, verify_ssl: bool = False, _host_override: str | None = None
+) -> tuple[dict[str, str] | None, str | None]:
+    """Authenticate against DirectAdmin via /CMD_LOGIN or /api/login and return explicit Cookie/Auth headers."""
+    ctx = _build_ssl_context(verify_ssl=verify_ssl)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ctx),
+        _NoRedirectHandler(),
+    )
+    parsed_b = urllib.parse.urlparse(base_url)
+    effective_host = _host_override or parsed_b.netloc
+    effective_origin = f"{parsed_b.scheme}://{effective_host}" if parsed_b.scheme and effective_host else base_url
+    base_headers: dict[str, str] = {
+        "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
+        "Referer": f"{effective_origin}/CMD_LOGIN",
+        "Origin": effective_origin,
+    }
+    if _host_override:
+        base_headers["Host"] = _host_override
+
+    # 1. Classic & Evolution DirectAdmin form login: POST /CMD_LOGIN (with and without json=yes)
+    for extra_params in ({"referer": "/"}, {"referer": "/", "json": "yes"}):
+        form_data = urllib.parse.urlencode({"username": user, "password": secret, **extra_params}).encode("utf-8")
+        req = urllib.request.Request(
             f"{base_url}/CMD_LOGIN",
-            data=form_payload,
-            headers={
-                **base_headers,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": f"{base_url}/CMD_LOGIN",
-            },
+            data=form_data,
+            headers={**base_headers, "Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
-        with opener2.open(req2, timeout=12) as resp:
-            body = resp.read().decode("utf-8", errors="replace").lower()
-            if len(cj2) > 0 and "invalid" not in body and "cmd_login" not in body:
-                return urllib.request.build_opener(
-                    urllib.request.HTTPSHandler(context=ctx),
-                    urllib.request.HTTPCookieProcessor(cj2),
-                )
-    except urllib.error.HTTPError as exc:
-        if exc.code in (301, 302, 303, 307, 308) and len(cj2) > 0:
-            loc = str(exc.headers.get("Location") or "").lower()
-            if "error" not in loc and "login" not in loc:
-                return urllib.request.build_opener(
-                    urllib.request.HTTPSHandler(context=ctx),
-                    urllib.request.HTTPCookieProcessor(cj2),
-                )
+        cookies: dict[str, str] = {}
+        body_lower = ""
+        loc_raw = ""
+        try:
+            with opener.open(req, timeout=12) as resp:
+                cookies.update(_extract_cookies_from_headers(resp.headers))
+                body_lower = resp.read().decode("utf-8", errors="replace").lower()
+        except urllib.error.HTTPError as exc:
+            cookies.update(_extract_cookies_from_headers(exc.headers))
+            loc_raw = str(exc.headers.get("Location") or "").strip()
+            try:
+                body_lower = exc.read().decode("utf-8", errors="replace").lower()
+            except Exception:
+                pass
+            if exc.code in (301, 302, 303, 307, 308) and loc_raw and not _host_override:
+                full_loc = urllib.parse.urljoin(base_url, loc_raw)
+                loc_p = urllib.parse.urlparse(full_loc)
+                if loc_p.hostname and parsed_b.hostname and loc_p.hostname.lower() != parsed_b.hostname.lower():
+                    retry_hdrs, retry_err = _da_login_session_headers(
+                        base_url, user, secret, verify_ssl=verify_ssl, _host_override=loc_p.netloc
+                    )
+                    if retry_hdrs or retry_err:
+                        return retry_hdrs, retry_err
+        except Exception:
+            continue
+
+        loc_lower = loc_raw.lower()
+        if "twostep_auth" in body_lower or "twostep_auth" in loc_lower or "two-step" in body_lower:
+            return None, "DirectAdmin account has Two-Factor Authentication (2FA) enabled. Please create a Login Key in DirectAdmin and use it as the password."
+
+        sess_val = cookies.get("session") or cookies.get("DirectAdmin-Session") or ""
+        if len(sess_val) >= 6 and "invalid" not in body_lower and "login" not in loc_lower:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            ret_hdrs = {
+                "Cookie": cookie_str,
+                "Referer": f"{effective_origin}/",
+                "Origin": effective_origin,
+            }
+            if _host_override:
+                ret_hdrs["Host"] = _host_override
+            return ret_hdrs, None
+
+    # 2. Modern DirectAdmin JSON login: POST /api/login
+    try:
+        json_payload = json.dumps({"username": user, "password": secret}).encode("utf-8")
+        api_hdrs = {
+            "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
+            "Referer": f"{effective_origin}/",
+            "Origin": effective_origin,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if _host_override:
+            api_hdrs["Host"] = _host_override
+        req_api = urllib.request.Request(
+            f"{base_url}/api/login",
+            data=json_payload,
+            headers=api_hdrs,
+            method="POST",
+        )
+        cookies_api: dict[str, str] = {}
+        raw_api = ""
+        try:
+            with opener.open(req_api, timeout=12) as resp:
+                cookies_api.update(_extract_cookies_from_headers(resp.headers))
+                raw_api = resp.read().decode("utf-8", errors="replace").strip()
+        except urllib.error.HTTPError as exc:
+            cookies_api.update(_extract_cookies_from_headers(exc.headers))
+
+        sess_val = cookies_api.get("session") or cookies_api.get("DirectAdmin-Session") or ""
+        if len(sess_val) >= 6:
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_api.items())
+            ret_hdrs = {
+                "Cookie": cookie_str,
+                "Referer": f"{effective_origin}/",
+                "Origin": effective_origin,
+            }
+            if _host_override:
+                ret_hdrs["Host"] = _host_override
+            return ret_hdrs, None
+
+        if raw_api.startswith("{"):
+            parsed_login = json.loads(raw_api)
+            if isinstance(parsed_login, dict):
+                tok = str(parsed_login.get("token") or parsed_login.get("sessionID") or parsed_login.get("session") or "").strip()
+                if len(tok) >= 6:
+                    ret_hdrs = {
+                        "Cookie": f"session={tok}",
+                        "Authorization": f"Bearer {tok}",
+                        "Referer": f"{effective_origin}/",
+                        "Origin": effective_origin,
+                    }
+                    if _host_override:
+                        ret_hdrs["Host"] = _host_override
+                    return ret_hdrs, None
     except Exception:
         pass
 
-    return None
+    return None, None
 
 
 def _da_parse_response_kv(raw_text: str) -> dict[str, Any]:
@@ -519,10 +714,21 @@ def _da_parse_response_kv(raw_text: str) -> dict[str, Any]:
                     j = j["package"]
                 elif isinstance(j.get("data"), dict):
                     j = j["data"]
+                elif isinstance(j.get("settings"), dict):
+                    j = j["settings"]
                 flat_j: dict[str, Any] = {}
                 for k, v in j.items():
-                    if isinstance(v, dict) and "value" in v:
-                        flat_j[k] = v["value"]
+                    if isinstance(v, dict):
+                        if str(v.get("unlimited", "")).lower() in {"yes", "on", "true", "1"} or v.get("checked") is True:
+                            flat_j[k] = "unlimited"
+                        elif "value" in v:
+                            flat_j[k] = v["value"]
+                        elif "selected" in v:
+                            flat_j[k] = v["selected"]
+                        elif "text" in v:
+                            flat_j[k] = v["text"]
+                        else:
+                            flat_j[k] = v
                     elif isinstance(v, list):
                         flat_j[k] = v[0] if len(v) == 1 else v
                     else:
@@ -548,22 +754,34 @@ def _da_fetch_cmd_packages(
     show_cmd: str,
     is_reseller_pkg: bool,
     verify_ssl: bool,
-    opener: Any = None,
+    include_origin: bool = False,
 ) -> tuple[list[dict] | None, str | None]:
     try:
-        raw_list = _http_fetch(f"{base_url}/{list_cmd}", headers, verify_ssl=verify_ssl, opener=opener)
-    except HTTPException as exc:
-        return None, str(exc.detail)
+        raw_list = _http_fetch(
+            f"{base_url}/{list_cmd}", headers, verify_ssl=verify_ssl, include_origin=include_origin
+        )
     except Exception as exc:
         return None, str(exc)
 
     stripped = (raw_list or "").strip()
-    lower_head = stripped[:400].lower()
-    if "<html" in lower_head or "<!doctype" in lower_head or "cmd_login" in lower_head:
-        return None, "Authentication failed on DirectAdmin: Invalid password/Login Key, or 2FA requires a Login Key."
+    if not stripped:
+        return None, "Empty response from DirectAdmin API."
+
+    lower_all = stripped.lower()
+    if (
+        "<html" in lower_all
+        or "<!doctype" in lower_all
+        or "cmd_login" in lower_all
+        or "you cannot execute that command" in lower_all
+        or "not logged in" in lower_all
+    ):
+        if "you cannot execute that command" in lower_all:
+            return None, "DirectAdmin account or Login Key does not have permission to view packages."
+        return None, "Authentication failed on DirectAdmin: Invalid username, password, or Login Key."
 
     pkg_names: list[str] = []
     direct_items: list[dict] = []
+    recognized_response = False
     parsed_json = None
     if stripped.startswith(("{", "[")):
         try:
@@ -572,6 +790,7 @@ def _da_fetch_cmd_packages(
             parsed_json = None
 
     if isinstance(parsed_json, list):
+        recognized_response = True
         for entry in parsed_json:
             if isinstance(entry, (str, int)) and str(entry).strip():
                 pkg_names.append(str(entry).strip())
@@ -582,10 +801,14 @@ def _da_fetch_cmd_packages(
     elif isinstance(parsed_json, dict):
         err_flag = parsed_json.get("error")
         if err_flag and str(err_flag) not in ("0", "false", "False"):
-            err_msg = str(parsed_json.get("result") or parsed_json.get("text") or parsed_json.get("details") or err_flag)
-            return None, err_msg
-        lst = parsed_json.get("list") or parsed_json.get("packages")
+            err_msg = str(parsed_json.get("result") or parsed_json.get("text") or parsed_json.get("details") or parsed_json.get("message") or err_flag)
+            return None, f"DirectAdmin: {err_msg}"
+        if "message" in parsed_json and len(parsed_json) <= 3 and "list" not in parsed_json and "packages" not in parsed_json:
+            return None, f"DirectAdmin: {parsed_json.get('message')}"
+
+        lst = parsed_json.get("list") if "list" in parsed_json else parsed_json.get("packages")
         if isinstance(lst, list):
+            recognized_response = True
             for x in lst:
                 if isinstance(x, (str, int)) and str(x).strip():
                     pkg_names.append(str(x).strip())
@@ -594,6 +817,7 @@ def _da_fetch_cmd_packages(
                     if p_name:
                         direct_items.append(_map_da_dict_to_package(p_name, x, is_reseller=is_reseller_pkg))
         elif isinstance(lst, dict):
+            recognized_response = True
             for k, v in lst.items():
                 if isinstance(v, dict):
                     direct_items.append(_map_da_dict_to_package(str(k).strip(), v, is_reseller=is_reseller_pkg))
@@ -601,11 +825,22 @@ def _da_fetch_cmd_packages(
                     pkg_names.append(str(v).strip())
         else:
             for k, v in parsed_json.items():
-                if k in ("error", "text", "details", "result"):
+                if k in ("error", "text", "details", "result", "columns", "info"):
                     continue
-                if isinstance(v, dict) and any(qk in v for qk in ("quota", "bandwidth", "vdomains", "nsubdomains")):
-                    direct_items.append(_map_da_dict_to_package(str(k).strip(), v, is_reseller=is_reseller_pkg))
-                elif isinstance(v, (str, int)) and str(v).strip():
+                if isinstance(v, dict):
+                    if "package" in v or "name" in v:
+                        raw_p = v.get("package") or v.get("name")
+                        if isinstance(raw_p, dict):
+                            raw_p = raw_p.get("text") or raw_p.get("value") or ""
+                        p_str = str(raw_p or "").strip()
+                        if p_str:
+                            recognized_response = True
+                            pkg_names.append(p_str)
+                    elif any(qk in v for qk in ("quota", "bandwidth", "vdomains", "nsubdomains")):
+                        recognized_response = True
+                        direct_items.append(_map_da_dict_to_package(str(k).strip(), v, is_reseller=is_reseller_pkg))
+                elif (k.isdigit() or k.startswith("list")) and isinstance(v, (str, int)) and str(v).strip():
+                    recognized_response = True
                     pkg_names.append(str(v).strip())
     else:
         parsed_qs = urllib.parse.parse_qs(stripped, keep_blank_values=True)
@@ -615,20 +850,24 @@ def _da_fetch_cmd_packages(
             detail_part = (parsed_qs.get("details") or [""])[0]
             err_msg = f"{text_part}: {detail_part}".strip(": ") or "DirectAdmin API returned error=1"
             return None, err_msg
-        raw_items = parsed_qs.get("list[]") or parsed_qs.get("list") or []
-        if raw_items:
+        if "list[]" in parsed_qs or "list" in parsed_qs:
+            recognized_response = True
+            raw_items = parsed_qs.get("list[]") or parsed_qs.get("list") or []
             pkg_names = [str(x).strip() for x in raw_items if str(x).strip()]
         else:
             for k, v in parsed_qs.items():
                 if (k.isdigit() or k.startswith("list[")) and v:
+                    recognized_response = True
                     for item in v:
                         if str(item).strip():
                             pkg_names.append(str(item).strip())
 
+    if not recognized_response and not direct_items and not pkg_names:
+        return None, "Unrecognized response from DirectAdmin package endpoint."
+
     if direct_items and not pkg_names:
         return direct_items, None
 
-    # Deduplicate while preserving order
     seen: set[str] = set()
     unique_names: list[str] = []
     for name in pkg_names:
@@ -645,15 +884,15 @@ def _da_fetch_cmd_packages(
                 f"{base_url}/{show_cmd}{sep}package={q_name}",
                 headers,
                 verify_ssl=verify_ssl,
-                opener=opener,
+                include_origin=include_origin,
             )
+            kv = _da_parse_response_kv(detail_raw)
+            if str(kv.get("error", "0")) not in ("0", "", "false", "False"):
+                continue
+            flat_kv = {k: (v[0] if isinstance(v, list) and v else v) for k, v in kv.items()}
+            items.append(_map_da_dict_to_package(pkg_name, flat_kv, is_reseller=is_reseller_pkg))
         except Exception:
-            continue
-        kv = _da_parse_response_kv(detail_raw)
-        if str(kv.get("error", "0")) not in ("0", "", "false", "False"):
-            continue
-        flat_kv = {k: (v[0] if isinstance(v, list) and v else v) for k, v in kv.items()}
-        items.append(_map_da_dict_to_package(pkg_name, flat_kv, is_reseller=is_reseller_pkg))
+            items.append(_default_package_dict(pkg_name, is_reseller=is_reseller_pkg))
 
     return items, None
 
@@ -689,85 +928,123 @@ def fetch_remote_packages(
     ensure_role(current_user.role, Role.reseller)
     is_reseller_pkg = bool(payload.is_reseller_package) if current_user.role == Role.admin else False
     panel = (payload.panel_type or "directadmin").strip().lower()
-    base_url = _validate_remote_url(payload.host_url, panel=panel)
-    user = (payload.username or "admin").strip()
+    user = (payload.username or ("root" if panel == "cpanel" else "admin")).strip()
     secret = (payload.secret or "").strip()
     if not secret:
-        raise HTTPException(status_code=400, detail="Password or API Token is required")
+        return {"ok": False, "error": "Password or API Token is required.", "panel_type": panel, "count": 0, "packages": []}
+
+    try:
+        base_candidates = _validate_remote_url_candidates(payload.host_url, panel=panel)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "panel_type": panel, "count": 0, "packages": []}
 
     basic_token = base64.b64encode(f"{user}:{secret}".encode("utf-8")).decode("ascii")
     results: list[dict] = []
 
     if panel == "directadmin":
-        headers = {"Authorization": f"Basic {basic_token}"}
-        # Non-admin DirectAdmin accounts (e.g. dareseller) ALWAYS store their packages in CMD_API_PACKAGES_USER,
-        # while CMD_API_PACKAGES_RESELLER is strictly for the 'admin' account.
         if user.lower() != "admin":
             cmd_pairs = [
                 ("CMD_API_PACKAGES_USER", "CMD_API_SHOW_USER_PACKAGE"),
-                ("CMD_API_PACKAGES_USER?json=yes", "CMD_API_SHOW_USER_PACKAGE?json=yes"),
+                ("CMD_PACKAGES_USER?json=yes", "CMD_SHOW_USER_PACKAGE?json=yes"),
                 ("CMD_API_PACKAGES_RESELLER", "CMD_API_SHOW_RESELLER_PACKAGE"),
             ]
         elif is_reseller_pkg:
             cmd_pairs = [
                 ("CMD_API_PACKAGES_RESELLER", "CMD_API_SHOW_RESELLER_PACKAGE"),
+                ("CMD_PACKAGES_RESELLER?json=yes", "CMD_SHOW_RESELLER_PACKAGE?json=yes"),
                 ("CMD_API_PACKAGES_USER", "CMD_API_SHOW_USER_PACKAGE"),
+                ("CMD_PACKAGES_USER?json=yes", "CMD_SHOW_USER_PACKAGE?json=yes"),
             ]
         else:
             cmd_pairs = [
                 ("CMD_API_PACKAGES_USER", "CMD_API_SHOW_USER_PACKAGE"),
+                ("CMD_PACKAGES_USER?json=yes", "CMD_SHOW_USER_PACKAGE?json=yes"),
                 ("CMD_API_PACKAGES_RESELLER", "CMD_API_SHOW_RESELLER_PACKAGE"),
+                ("CMD_PACKAGES_RESELLER?json=yes", "CMD_SHOW_RESELLER_PACKAGE?json=yes"),
             ]
 
-        last_err: str | None = None
-        any_succeeded_empty = False
-        for list_cmd, show_cmd in cmd_pairs:
-            pkgs, err = _da_fetch_cmd_packages(
-                base_url, headers, list_cmd, show_cmd, is_reseller_pkg, payload.verify_ssl
-            )
-            if pkgs is not None:
-                if len(pkgs) > 0:
-                    results = pkgs
-                    break
-                any_succeeded_empty = True
-            elif err:
-                last_err = err
+        auth_header_variants = [
+            ({"Authorization": f"Basic {basic_token}"}, True),
+        ]
+        if payload.auth_type == "token":
+            auth_header_variants.append(({"Authorization": f"Bearer {secret}"}, True))
 
-        # If Basic Auth returned 401/403 (e.g. DirectAdmin server requires Session Login for regular passwords),
-        # try authenticating via /api/login or /CMD_LOGIN session cookie!
-        if not results and not any_succeeded_empty:
-            session_opener = _da_create_session_opener(base_url, user, secret, verify_ssl=payload.verify_ssl)
-            if session_opener is not None:
-                session_pairs = [
-                    ("CMD_API_PACKAGES_USER", "CMD_API_SHOW_USER_PACKAGE"),
-                    ("CMD_PACKAGES_USER?json=yes", "CMD_SHOW_USER_PACKAGE?json=yes"),
-                    ("CMD_API_PACKAGES_RESELLER", "CMD_API_SHOW_RESELLER_PACKAGE"),
-                    ("CMD_PACKAGES_RESELLER?json=yes", "CMD_SHOW_RESELLER_PACKAGE?json=yes"),
-                ]
-                if is_reseller_pkg and user.lower() == "admin":
-                    session_pairs = [
-                        ("CMD_API_PACKAGES_RESELLER", "CMD_API_SHOW_RESELLER_PACKAGE"),
-                        ("CMD_PACKAGES_RESELLER?json=yes", "CMD_SHOW_RESELLER_PACKAGE?json=yes"),
-                        ("CMD_API_PACKAGES_USER", "CMD_API_SHOW_USER_PACKAGE"),
-                        ("CMD_PACKAGES_USER?json=yes", "CMD_SHOW_USER_PACKAGE?json=yes"),
-                    ]
-                for list_cmd, show_cmd in session_pairs:
+        last_err: str | None = None
+        any_authenticated_empty = False
+
+        for base_url in base_candidates:
+            # 1. Try Basic / Bearer Auth variants
+            for hdrs, inc_origin in auth_header_variants:
+                for list_cmd, show_cmd in cmd_pairs:
+                    pkgs, err = _da_fetch_cmd_packages(
+                        base_url,
+                        hdrs,
+                        list_cmd,
+                        show_cmd,
+                        is_reseller_pkg,
+                        payload.verify_ssl,
+                        include_origin=inc_origin,
+                    )
+                    if pkgs is not None:
+                        if len(pkgs) > 0:
+                            results = pkgs
+                            break
+                        any_authenticated_empty = True
+                    elif err:
+                        last_err = err
+                        err_l = err.lower()
+                        if "authentication failed" in err_l or "failed to connect" in err_l:
+                            break
+                if results or ("failed to connect" in (last_err or "").lower()):
+                    break
+
+            if results:
+                break
+
+            if "failed to connect" in (last_err or "").lower():
+                continue
+
+            # 2. Try Session Cookie Login (/CMD_LOGIN and /api/login)
+            sess_headers, sess_err = _da_login_session_headers(
+                base_url, user, secret, verify_ssl=payload.verify_ssl
+            )
+            if sess_err:
+                last_err = sess_err
+                break
+            if sess_headers:
+                for list_cmd, show_cmd in cmd_pairs:
                     pkgs_s, err_s = _da_fetch_cmd_packages(
-                        base_url, {}, list_cmd, show_cmd, is_reseller_pkg, payload.verify_ssl, opener=session_opener
+                        base_url,
+                        sess_headers,
+                        list_cmd,
+                        show_cmd,
+                        is_reseller_pkg,
+                        payload.verify_ssl,
+                        include_origin=True,
                     )
                     if pkgs_s is not None:
                         if len(pkgs_s) > 0:
                             results = pkgs_s
                             break
-                        any_succeeded_empty = True
+                        any_authenticated_empty = True
                     elif err_s:
                         last_err = err_s
+                        if "authentication failed" in err_s.lower():
+                            break
+                if results:
+                    break
 
-        if not results and not any_succeeded_empty:
-            raise HTTPException(
-                status_code=400,
-                detail=last_err or "Authentication failed on remote panel: Invalid username, password, or Login Key.",
-            )
+            # Server responded over HTTP/HTTPS on this scheme, no need to retry alternate scheme
+            break
+
+        if not results and not any_authenticated_empty:
+            return {
+                "ok": False,
+                "error": last_err or "Authentication failed on DirectAdmin: Invalid username, password, or Login Key.",
+                "panel_type": panel,
+                "count": 0,
+                "packages": [],
+            }
 
     elif panel == "cpanel":
         auth_headers_list = (
@@ -777,40 +1054,48 @@ def fetch_remote_packages(
         )
         data = None
         last_cp_err = None
-        for hdrs in auth_headers_list:
-            try:
-                raw_json = _http_fetch(
-                    f"{base_url}/json-api/listpkgs?api.version=1", hdrs, verify_ssl=payload.verify_ssl
-                )
-                stripped_cp = (raw_json or "").strip()
-                if stripped_cp[:200].lower().startswith(("<!doctype", "<html")):
-                    last_cp_err = "Authentication failed on WHM: Invalid username, password, or WHM API Token."
-                    continue
-                parsed_cp = json.loads(stripped_cp)
-                if isinstance(parsed_cp, dict):
-                    cpanel_res = parsed_cp.get("cpanelresult")
-                    if isinstance(cpanel_res, dict) and cpanel_res.get("error"):
-                        last_cp_err = str(cpanel_res.get("error"))
-                        continue
-                    meta = parsed_cp.get("metadata")
-                    if isinstance(meta, dict) and str(meta.get("result", "1")) == "0":
-                        last_cp_err = str(meta.get("reason") or "WHM API returned result=0")
-                        continue
-                    data = parsed_cp
+        for base_url in base_candidates:
+            for hdrs in auth_headers_list:
+                for endpoint in ("/json-api/listpkgs?api.version=1", "/json-api/listpkgs"):
+                    try:
+                        raw_json = _http_fetch(
+                            f"{base_url}{endpoint}", hdrs, verify_ssl=payload.verify_ssl
+                        )
+                        stripped_cp = (raw_json or "").strip()
+                        if stripped_cp[:300].lower().startswith(("<!doctype", "<html")) or "<html" in stripped_cp[:400].lower():
+                            last_cp_err = "Authentication failed on WHM: Invalid username, password, or WHM API Token."
+                            continue
+                        parsed_cp = json.loads(stripped_cp)
+                        if isinstance(parsed_cp, dict):
+                            cpanel_res = parsed_cp.get("cpanelresult")
+                            if isinstance(cpanel_res, dict) and cpanel_res.get("error"):
+                                last_cp_err = str(cpanel_res.get("error"))
+                                continue
+                            meta = parsed_cp.get("metadata")
+                            if isinstance(meta, dict) and str(meta.get("result", "1")) == "0":
+                                last_cp_err = str(meta.get("reason") or "WHM API returned result=0")
+                                continue
+                            data = parsed_cp
+                            break
+                    except Exception as exc:
+                        last_cp_err = str(exc)
+                if data is not None:
                     break
-            except HTTPException as exc:
-                last_cp_err = str(exc.detail)
-            except Exception as exc:
-                last_cp_err = str(exc)
+            if data is not None:
+                break
 
         if not isinstance(data, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=last_cp_err or "Authentication failed on WHM: Invalid username, password, or WHM API Token.",
-            )
+            return {
+                "ok": False,
+                "error": last_cp_err or "Authentication failed on WHM: Invalid username, password, or WHM API Token.",
+                "panel_type": panel,
+                "count": 0,
+                "packages": [],
+            }
         pkgs_raw = (
             (data.get("data") or {}).get("pkg")
             or data.get("pkg")
+            or data.get("package")
             or data.get("packages")
             or []
         )
@@ -847,11 +1132,11 @@ def fetch_remote_packages(
         )
         last_plesk_err = None
 
-        def _try_plesk_rest() -> bool:
+        def _try_plesk_rest(b_url: str) -> bool:
             nonlocal last_plesk_err
             for r_hdrs in rest_headers_list:
                 try:
-                    raw_rest = _http_fetch(f"{base_url}/api/v2/serviceplans", r_hdrs, verify_ssl=payload.verify_ssl)
+                    raw_rest = _http_fetch(f"{b_url}/api/v2/serviceplans", r_hdrs, verify_ssl=payload.verify_ssl)
                     plans = json.loads(raw_rest)
                     if isinstance(plans, list):
                         for p in plans[:100]:
@@ -868,13 +1153,11 @@ def fetch_remote_packages(
                             flat.update({k: v for k, v in p.items() if not isinstance(v, (list, dict))})
                             results.append(_map_plesk_dict_to_package(p_name, flat, is_reseller=is_reseller_pkg))
                         return True
-                except HTTPException as exc:
-                    last_plesk_err = str(exc.detail)
                 except Exception as exc:
                     last_plesk_err = str(exc)
             return False
 
-        def _try_plesk_xml(xml_tag: str) -> bool:
+        def _try_plesk_xml(b_url: str, xml_tag: str) -> bool:
             nonlocal last_plesk_err
             xml_body = (
                 f'<?xml version="1.0" encoding="UTF-8"?>'
@@ -883,7 +1166,7 @@ def fetch_remote_packages(
             for x_hdrs in xml_headers_list:
                 try:
                     raw_xml = _http_fetch(
-                        f"{base_url}/enterprise/control/agent.php",
+                        f"{b_url}/enterprise/control/agent.php",
                         x_hdrs,
                         data=xml_body,
                         verify_ssl=payload.verify_ssl,
@@ -915,30 +1198,35 @@ def fetch_remote_packages(
                                 flat_xml[pn] = pv
                         results.append(_map_plesk_dict_to_package(p_name, flat_xml, is_reseller=is_reseller_pkg))
                     return True
-                except HTTPException as exc:
-                    last_plesk_err = str(exc.detail)
                 except Exception as exc:
                     last_plesk_err = str(exc)
             return False
 
-        if is_reseller_pkg:
-            ok = _try_plesk_xml("reseller-plan")
-            if not results:
-                ok = _try_plesk_rest() or _try_plesk_xml("service-plan") or ok
-        else:
-            ok = _try_plesk_rest()
-            if not results:
-                ok = _try_plesk_xml("service-plan") or ok
+        ok = False
+        for base_url in base_candidates:
+            if is_reseller_pkg:
+                ok = _try_plesk_xml(base_url, "reseller-plan")
+                if not results:
+                    ok = _try_plesk_rest(base_url) or _try_plesk_xml(base_url, "service-plan") or ok
+            else:
+                ok = _try_plesk_rest(base_url)
+                if not results:
+                    ok = _try_plesk_xml(base_url, "service-plan") or ok
+            if results or ok:
+                break
 
         if not ok and not results:
-            raise HTTPException(
-                status_code=400,
-                detail=last_plesk_err or "Authentication failed on Plesk: Invalid username, password, or API Key.",
-            )
+            return {
+                "ok": False,
+                "error": last_plesk_err or "Authentication failed on Plesk: Invalid username, password, or API Key.",
+                "panel_type": panel,
+                "count": 0,
+                "packages": [],
+            }
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported panel_type: {panel}")
+        return {"ok": False, "error": f"Unsupported panel_type: {panel}", "panel_type": panel, "count": 0, "packages": []}
 
-    return {"panel_type": panel, "count": len(results), "packages": results}
+    return {"ok": True, "panel_type": panel, "count": len(results), "packages": results}
 
 
 @router.post("/import")
