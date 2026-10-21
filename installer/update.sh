@@ -414,14 +414,12 @@ finish_update_script() {
   if [[ $rc -ne 0 ]]; then
     local cur_pct=0
     if [[ -f "$UPDATE_STATE_FILE" ]]; then
-      cur_pct="$(python3 - "$UPDATE_STATE_FILE" <<'PY' 2>/dev/null || true
-import json, sys
+      cur_pct="$(python3 -c 'import json, sys
 try:
     print(json.load(open(sys.argv[1])).get("progress_percent", 0))
 except Exception:
     print(0)
-PY
-)"
+' "$UPDATE_STATE_FILE" 2>/dev/null || true)"
     fi
     update_progress "${cur_pct:-0}" "failed" "Update failed with exit code ${rc}" || true
     write_update_state "failed" "${UPDATE_REF:-}" "Update failed with exit code ${rc}" || true

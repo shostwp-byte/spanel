@@ -19,7 +19,7 @@ cleanup_temp() {
 trap cleanup_temp EXIT
 
 sanitize_msg() {
-  printf '%s' "${1:-}" | sed -E 's#https?://[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g; s#git@[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g'
+  printf '%s' "${1:-}" | sed -E 's#https?://[^[:space:]"<>]+#[PROTECTED-UPDATE-SERVER]#g; s#git@[^[:space:]"<>]+#[PROTECTED-UPDATE-SERVER]#g'
 }
 
 log_step() {
@@ -32,9 +32,8 @@ update_state() {
   local status="$1" phase="$2" pct="$3" msg="$4"
   msg="$(sanitize_msg "$msg")"
   if command -v python3 >/dev/null 2>&1 && [[ -d "$(dirname "$STATE_FILE")" ]]; then
-    python3 - "$STATE_FILE" "$status" "$phase" "$pct" "$msg" "${ROLLBACK_SNAPSHOT_ID:-}" <<'PY' || true
-import json
-import sys
+    python3 -c '
+import json, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,7 +57,7 @@ if snap_id:
 if status in {"completed", "failed", "rolled_back"}:
     state["last_update_finished_at"] = now
 path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-PY
+' "$STATE_FILE" "$status" "$phase" "$pct" "$msg" "${ROLLBACK_SNAPSHOT_ID:-}" 2>/dev/null || true
   fi
 }
 
@@ -105,7 +104,7 @@ main() {
 
   # Read protected update source config without exposing URLs in logs
   local cfg_json
-  cfg_json="$(python3 - "$SOURCE_CONFIG_FILE" "$STATE_FILE" <<'PY' 2>/dev/null || true
+  cfg_json="$(python3 -c '
 import json, os, sys
 from pathlib import Path
 
@@ -138,8 +137,7 @@ print(json.dumps({
     "expected_sha256": expected_sha256,
     "latest_tag": latest_tag,
 }))
-PY
-)"
+' "$SOURCE_CONFIG_FILE" "$STATE_FILE" 2>/dev/null || echo '{}')"
 
   local repo_url channel auth_token download_url expected_sha256 latest_tag
   repo_url="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("server_url",""))' "$cfg_json" 2>/dev/null || echo "https://github.com/shostwp-byte/spanel.git")"
@@ -149,9 +147,11 @@ PY
   expected_sha256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("expected_sha256",""))' "$cfg_json" 2>/dev/null || echo "")"
   latest_tag="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("latest_tag",""))' "$cfg_json" 2>/dev/null || echo "")"
 
-  local branch="${BRANCH:-main}" tag="${RELEASE_TAG:-}"
+  local branch="${BRANCH:-main}"
+  local tag="${RELEASE_TAG:-}"
   local pattern="${RELEASE_PATTERN:-v[0-9]*.[0-9]*.[0-9]*}"
-  local args=("$@") ref="" url="" url_ref="" script=""
+  local args=("$@")
+  local ref="" url="" url_ref="" script=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -274,10 +274,11 @@ PY
   update_state "running" "applying" 80 "Đang áp dụng bản cập nhật ${ref} và nâng cấp dịch vụ..."
 
   local rc=0
-  if [[ "${ args[*] }" != *"--tag"* && "${ args[*] }" != *"--branch"* && "$channel" != "branch" ]]; then
-    /bin/bash "$script" --tag "$ref" "${args[@]}" 2>&1 | sed -u -E 's#https?://[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g' || rc=$?
+  local joined_args=" ${args[*]:-} "
+  if [[ "$joined_args" != *" --tag "* && "$joined_args" != *" --branch "* && "$channel" != "branch" ]]; then
+    /bin/bash "$script" --tag "$ref" "${args[@]}" 2>&1 | sed -u -E 's#https?://[^[:space:]"<>]+#[PROTECTED-UPDATE-SERVER]#g' || rc=$?
   else
-    /bin/bash "$script" --branch "${branch:-main}" "${args[@]}" 2>&1 | sed -u -E 's#https?://[^[:space:]"'''<>]+#[PROTECTED-UPDATE-SERVER]#g' || rc=$?
+    /bin/bash "$script" --branch "${branch:-main}" "${args[@]}" 2>&1 | sed -u -E 's#https?://[^[:space:]"<>]+#[PROTECTED-UPDATE-SERVER]#g' || rc=$?
   fi
 
   if [[ $rc -ne 0 ]]; then
