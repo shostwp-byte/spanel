@@ -1363,7 +1363,8 @@ else
       remote_branch="${GIT_REMOTE}/${BRANCH}"
       log "Pulling latest from ${remote_branch}"
       update_progress 15 "fetching" "Pulling latest from ${remote_branch}"
-      git fetch --prune "$GIT_REMOTE" "+refs/heads/${BRANCH}:refs/remotes/${GIT_REMOTE}/${BRANCH}" --tags
+      git fetch --force --prune "$GIT_REMOTE" "+refs/heads/${BRANCH}:refs/remotes/${GIT_REMOTE}/${BRANCH}" --tags \
+        || git fetch --force --prune "$GIT_REMOTE" "+refs/heads/${BRANCH}:refs/remotes/${GIT_REMOTE}/${BRANCH}"
       UPDATE_REF="$remote_branch"
       write_update_state "updating" "$UPDATE_REF" "Updating SPanel from ${UPDATE_REF}"
       reset_worktree_to_ref "$remote_branch" "$BRANCH"
