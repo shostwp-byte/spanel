@@ -27,7 +27,7 @@ from app.services.shell import shell
 
 logger = logging.getLogger("spanel.backup")
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 BACKUP_MANIFEST = "manifest.json"
 PANEL_USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 
@@ -160,7 +160,6 @@ def create_user_backup(user: User, db) -> str:
                 "storage_limit_mb": user.storage_limit_mb,
             },
             "websites": [],
-            "databases": [],
             "applications": [],
         }
         # Email addon: the account's mail domains, mailboxes (password hashes)
@@ -185,9 +184,6 @@ def create_user_backup(user: User, db) -> str:
                 app_payloads[app_entry["name"]] = payload
 
         sql_files: dict[str, Path] = {}
-        extra_sql_files: dict[str, Path] = {}
-        exported_db_ids: set[int] = set()
-        website_domain_by_id: dict[int, str] = {w.id: w.domain for w in websites}
         for website in websites:
             site_entry = {
                 "domain": website.domain,
@@ -206,9 +202,8 @@ def create_user_backup(user: User, db) -> str:
                 "aliases": [alias.domain for alias in getattr(website, "aliases", []) or [] if getattr(alias, "mode", "alias") == "alias"],
                 "database": None,
             }
-            db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).order_by(DatabaseAccount.id.asc()).first()
+            db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
             if db_item:
-                exported_db_ids.add(db_item.id)
                 sql_name = f"{website.domain}.sql"
                 sql_path = tmp_dir / sql_name
                 mariadb.export_database(db_item.db_name, str(sql_path))
@@ -227,30 +222,6 @@ def create_user_backup(user: User, db) -> str:
                 }
             manifest["websites"].append(site_entry)
 
-        # Also export any standalone or additional databases owned by this user
-        for db_item in db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).order_by(DatabaseAccount.id.asc()).all():
-            if db_item.id in exported_db_ids:
-                continue
-            exported_db_ids.add(db_item.id)
-            safe_db_name = re.sub(r"[^A-Za-z0-9._-]", "_", db_item.db_name)
-            sql_name = f"extra-{safe_db_name}.sql"
-            sql_path = tmp_dir / sql_name
-            mariadb.export_database(db_item.db_name, str(sql_path))
-            if settings.command_dry_run and not sql_path.exists():
-                sql_path.write_text(f"-- DRY RUN database dump for {db_item.db_name}\n", encoding="utf-8")
-            extra_sql_files[sql_name] = sql_path
-            try:
-                db_password = decrypt(db_item.db_password)
-            except RuntimeError:
-                db_password = ""
-            manifest["databases"].append({
-                "db_name": db_item.db_name,
-                "db_user": db_item.db_user,
-                "db_password": db_password,
-                "website_domain": website_domain_by_id.get(db_item.website_id) if db_item.website_id else None,
-                "sql_member": f"databases/{sql_name}",
-            })
-
         manifest_path = tmp_dir / BACKUP_MANIFEST
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding="utf-8")
         with tarfile.open(archive, "w:gz") as tar:
@@ -262,9 +233,6 @@ def create_user_backup(user: User, db) -> str:
                 sql_path = sql_files.get(website.domain)
                 if sql_path and sql_path.exists():
                     tar.add(sql_path, arcname=f"databases/{website.domain}.sql")
-            for sql_name, sql_path in extra_sql_files.items():
-                if sql_path and sql_path.exists():
-                    tar.add(sql_path, arcname=f"databases/{sql_name}")
             for name, payload in app_payloads.items():
                 if payload.exists():
                     tar.add(payload, arcname=f"applications/{name}.tar")
@@ -409,7 +377,42 @@ def describe_user_backup(backup_file: str) -> dict:
             item["error"] = "This is not a spanel or opanel user backup"
     except Exception as exc:
         item["error"] = str(exc)
+    if not item["username"]:
+        item["username"] = username_from_archive_name(path.name)
     return item
+
+
+def list_all_user_backups(username: Optional[str] = None) -> list[dict]:
+    if settings.command_dry_run:
+        return []
+    users_root = Path(settings.backup_root) / "users"
+    if not users_root.exists():
+        return []
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    if username:
+        for p_str in list_user_backups(username):
+            p = Path(p_str).resolve()
+            if p not in seen and p.is_file():
+                seen.add(p)
+                paths.append(p)
+    else:
+        for sub in sorted(users_root.iterdir()):
+            if not sub.is_dir():
+                continue
+            for p in sorted(sub.glob("*.tar.gz"), reverse=True):
+                rp = p.resolve()
+                if rp not in seen and rp.is_file():
+                    seen.add(rp)
+                    paths.append(rp)
+    paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    results = []
+    restore_dir_resolved = _user_restore_dir().resolve()
+    for p in paths:
+        info = describe_user_backup(str(p))
+        info["location"] = "restore" if restore_dir_resolved in p.parents else "user"
+        results.append(info)
+    return results
 
 
 def username_from_archive_name(name: str) -> str:
@@ -803,48 +806,6 @@ def restore_user_backup(backup_file: str, db) -> dict:
             wordpress.fix_permissions(root_path, linux_user)
             restored_websites.append({"domain": domain, "created": created_site})
 
-        # Restore any additional or standalone databases from manifest["databases"]
-        for extra_db in manifest.get("databases") or []:
-            db_name = (extra_db.get("db_name") or "").strip()
-            db_user = (extra_db.get("db_user") or "").strip()
-            if not db_name or not db_user:
-                continue
-            db_password = extra_db.get("db_password") or mariadb.random_password()
-            conflict = db.query(DatabaseAccount).filter(
-                DatabaseAccount.db_name == db_name,
-                DatabaseAccount.owner_id != user.id,
-            ).first()
-            if conflict:
-                raise ValueError(f"Database name already belongs to another user: {db_name}")
-            mariadb.create_database_credentials(
-                db_name, db_user, db_password, allow_existing_user=True
-            )
-            sql_member = extra_db.get("sql_member")
-            if sql_member:
-                sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
-                if sql_path:
-                    mariadb.import_database(db_name, str(sql_path))
-            linked_website_id = None
-            linked_domain = (extra_db.get("website_domain") or "").strip().lower()
-            if linked_domain:
-                linked_site = db.query(Website).filter(Website.domain == linked_domain, Website.owner_id == user.id).first()
-                if linked_site:
-                    linked_website_id = linked_site.id
-            db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
-            if db_account is None:
-                db.add(DatabaseAccount(
-                    owner_id=user.id,
-                    website_id=linked_website_id,
-                    db_name=db_name,
-                    db_user=db_user,
-                    db_password=encrypt(db_password),
-                ))
-            else:
-                db_account.owner_id = user.id
-                db_account.website_id = linked_website_id
-                db_account.db_user = db_user
-                db_account.db_password = encrypt(db_password)
-
         restored_apps = _restore_applications(manifest, user, db, archive, tmp_dir)
 
         from app.services import mail
@@ -996,75 +957,47 @@ def save_uploaded_user_backup(filename: str, source_file) -> str:
     return str(target)
 
 
-def restore_backup(website: Website, backup_file: str, db=None) -> str:
+def restore_backup(website: Website, backup_file: str) -> str:
     archive = backup_path(website.domain, backup_file)
     destination = Path(website.root_path).resolve()
 
-    def _extract_site_to(target_dir: Path) -> Optional[str]:
-        sql_member_found: Optional[str] = None
-        with tarfile.open(archive, "r:gz") as tar:
-            members = list(tar.getmembers())
-            has_site_prefix = any(m.name == "site" or m.name.startswith("site/") for m in members)
-            for m in members:
-                if m.isfile() and m.name.startswith("database/") and m.name.endswith(".sql"):
-                    sql_member_found = m.name
-                    break
+    # Single-pass extraction with PEP 706 data filter (Python 3.12+).
+    # The data filter rejects path traversal, absolute paths, and unsafe
+    # symlinks at the tarfile layer itself.
+    with tarfile.open(archive, "r:gz") as tar:
+        members = list(tar.getmembers())
+        has_site_prefix = any(m.name == "site" or m.name.startswith("site/") for m in members)
 
-            def safe_filter(member: tarfile.TarInfo, dest_path: str):
-                # Hard-links inside backups are uncommon and risky; refuse outright.
-                if member.islnk():
+        def safe_filter(member: tarfile.TarInfo, dest_path: str):
+            # Hard-links inside backups are uncommon and risky; refuse outright.
+            if member.islnk():
+                return None
+            if member.name.startswith("database/"):
+                return None
+            if has_site_prefix:
+                if member.name == "site":
                     return None
+                if not member.name.startswith("site/"):
+                    return None
+                member.name = member.name[len("site/"):]
+            return tarfile.data_filter(member, dest_path)
+
+        try:
+            tar.extractall(path=str(destination), filter=safe_filter)
+        except TypeError:
+            # Older Python (<3.12) without the filter parameter — fall back to
+            # manual extraction with the existing safety check.
+            _ensure_safe_tar(archive, destination)
+            for member in members:
                 if member.name.startswith("database/"):
-                    return None
+                    continue
                 if has_site_prefix:
                     if member.name == "site":
-                        return None
-                    if not member.name.startswith("site/"):
-                        return None
-                    member.name = member.name[len("site/"):]
-                return tarfile.data_filter(member, dest_path)
-
-            try:
-                tar.extractall(path=str(target_dir), filter=safe_filter)
-            except TypeError:
-                # Older Python (<3.12) without the filter parameter — fall back to
-                # manual extraction with the existing safety check.
-                _ensure_safe_tar(archive, target_dir)
-                for member in members:
-                    if member.name.startswith("database/"):
                         continue
-                    if has_site_prefix:
-                        if member.name == "site":
-                            continue
-                        if not member.name.startswith("site/"):
-                            continue
-                        member.name = member.name[len("site/"):]
-                    tar.extract(member, str(target_dir))
-        return sql_member_found
-
-    sql_member: Optional[str] = None
-    try:
-        sql_member = _extract_site_to(destination)
-    except PermissionError:
-        if not website.linux_user:
-            raise
-        site_users.IMPORT_STAGE_BASE.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="spanel-site-restore-", dir=str(site_users.IMPORT_STAGE_BASE)
-        ) as stage_tmp:
-            stage_dir = Path(stage_tmp) / "site"
-            stage_dir.mkdir(parents=True, exist_ok=True)
-            sql_member = _extract_site_to(stage_dir)
-            site_users.import_site_files(str(destination), website.linux_user, str(stage_dir))
-
-    if sql_member and db is not None:
-        db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
-        if db_item and db_item.db_name:
-            with tempfile.TemporaryDirectory(prefix="spanel-site-sql-") as sql_tmp:
-                sql_path = _extract_member_to_file(archive, sql_member, Path(sql_tmp))
-                if sql_path:
-                    mariadb.import_database(db_item.db_name, str(sql_path))
-
+                    if not member.name.startswith("site/"):
+                        continue
+                    member.name = member.name[len("site/"):]
+                tar.extract(member, str(destination))
     return str(destination)
 
 

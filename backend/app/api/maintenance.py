@@ -460,13 +460,7 @@ def get_backup_user(db: Session, current_user: User, user_id: int) -> User:
 def upload_archive_to_target(db: Session, target_id: int, archive: str) -> tuple[str, str]:
     target = db.query(SftpBackupTarget).filter(SftpBackupTarget.id == target_id).first()
     if not target or not target.is_active:
-        raise HTTPException(status_code=404, detail="Backup destination not found")
-    if (target.kind or "sftp") == "s3":
-        try:
-            result = backup_s3.upload(target, archive)
-            return target.name, result["remote_file"]
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="SFTP target not found")
     try:
         result = backup.upload_to_sftp(
             archive,
@@ -669,7 +663,6 @@ def list_backup_jobs(current_user: User = Depends(get_current_user)):
 
 
 @router.get("/backup-jobs/{job_id}")
-@router.get("/restore/jobs/{job_id}")
 def get_backup_job(job_id: str, current_user: User = Depends(get_current_user)):
     job = _get_backup_job(job_id)
     if not job:
@@ -683,7 +676,7 @@ def get_backup_job(job_id: str, current_user: User = Depends(get_current_user)):
 def restore_backup(payload: RestoreBackup, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = get_owned_website(db, current_user, payload.website_id)
     try:
-        path = backup.restore_backup(website, payload.backup_file, db=db)
+        path = backup.restore_backup(website, payload.backup_file)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if website.linux_user:
@@ -764,6 +757,26 @@ def delete_user_restore_backup(backup_file: str, request: Request, db: Session =
     return {"deleted": deleted}
 
 
+@router.get("/user-backups")
+def list_all_user_backups(current_user: User = Depends(get_current_user)):
+    username_filter = None if is_admin_role(current_user.role) else current_user.username
+    return {"items": backup.list_all_user_backups(username_filter)}
+
+
+@router.get("/user-backups-download")
+@router.get("/user-backups/download")
+def download_user_backup(backup_file: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        path = backup.user_backup_path(backup_file)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Backup not found") from exc
+    if not is_admin_role(current_user.role):
+        own_dir = (Path(settings.backup_root) / "users" / current_user.username).resolve()
+        if own_dir not in path.parents:
+            raise HTTPException(status_code=403, detail="Access denied")
+    return FileResponse(str(path), filename=path.name, media_type="application/gzip")
+
+
 @router.get("/user-backups/{user_id}")
 def list_user_backups(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     user = get_backup_user(db, current_user, user_id)
@@ -774,25 +787,16 @@ def list_user_backups(user_id: int, db: Session = Depends(get_db), current_user:
 
 
 @router.post("/user-backup")
+@router.post("/user-backups")
 def create_user_backup(payload: UserBackupCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     user = get_backup_user(db, current_user, payload.user_id)
     if payload.target_id:
         ensure_role(current_user.role, Role.admin)
         target_exists = db.query(SftpBackupTarget).filter(SftpBackupTarget.id == payload.target_id, SftpBackupTarget.is_active == True).first()  # noqa: E712
         if not target_exists:
-            raise HTTPException(status_code=404, detail="SFTP target not found")
+            raise HTTPException(status_code=404, detail="Backup destination not found")
     log_action(db, current_user.id, "queue_backup_user", user.username, request=request)
     return _queue_user_backup(current_user, user, payload.target_id)
-
-
-@router.get("/user-backups-download")
-def download_user_backup(backup_file: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    try:
-        path = backup.user_backup_path(backup_file)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Backup not found") from exc
-    return FileResponse(str(path), filename=path.name, media_type="application/gzip")
 
 
 @router.post("/user-backups/upload")
@@ -804,6 +808,7 @@ def upload_user_backup(file: UploadFile = File(...), db: Session = Depends(get_d
 
 
 @router.post("/user-restore")
+@router.post("/user-backups/restore")
 def restore_user_backup(payload: UserRestoreBackup, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
     try:
@@ -816,7 +821,14 @@ def restore_user_backup(payload: UserRestoreBackup, request: Request, db: Sessio
 
 @router.delete("/user-backups")
 def delete_user_backup(backup_file: str, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
+    try:
+        path = backup.user_backup_path(backup_file)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Backup not found") from exc
+    if not is_admin_role(current_user.role):
+        own_dir = (Path(settings.backup_root) / "users" / current_user.username).resolve()
+        if own_dir not in path.parents:
+            raise HTTPException(status_code=403, detail="Access denied")
     try:
         deleted = backup.delete_user_backup(backup_file)
     except FileNotFoundError as exc:
@@ -922,64 +934,6 @@ def _run_schedule_now_job(schedule_id: int) -> None:
             pass
     finally:
         db.close()
-
-
-@router.put("/backup-schedules/{schedule_id}", response_model=BackupScheduleOut)
-def update_backup_schedule(
-    schedule_id: int,
-    payload: BackupScheduleCreate,
-    request: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    ensure_role(current_user.role, Role.admin)
-    item = db.query(BackupSchedule).filter(BackupSchedule.id == schedule_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Backup schedule not found")
-    user_ids = [] if payload.all_users else (payload.user_ids or ([payload.user_id] if payload.user_id else []))
-    user_ids = sorted({int(user_id) for user_id in user_ids if int(user_id) > 0})
-    users = []
-    if not payload.all_users:
-        if not user_ids:
-            raise HTTPException(status_code=400, detail="Select at least one user")
-        users = db.query(User).filter(User.id.in_(user_ids)).all()
-        found_ids = {user.id for user in users}
-        missing_ids = [str(user_id) for user_id in user_ids if user_id not in found_ids]
-        if missing_ids:
-            raise HTTPException(status_code=404, detail=f"User not found: {', '.join(missing_ids)}")
-    if payload.target_id and not db.query(SftpBackupTarget).filter(SftpBackupTarget.id == payload.target_id, SftpBackupTarget.is_active == True).first():  # noqa: E712
-        raise HTTPException(status_code=404, detail="Backup destination not found")
-    item.user_id = user_ids[0] if user_ids else None
-    item.user_ids = json.dumps(user_ids)
-    item.all_users = payload.all_users
-    item.target_id = payload.target_id
-    item.schedule = payload.schedule
-    item.name_suffix = payload.name_suffix
-    item.retention = payload.retention
-    item.is_active = payload.is_active
-    db.commit()
-    db.refresh(item)
-    target = "all_users" if payload.all_users else ",".join(user.username for user in users)
-    log_action(db, current_user.id, "update_backup_schedule", target, payload.schedule, request=request)
-    return item
-
-
-@router.patch("/backup-schedules/{schedule_id}/toggle", response_model=BackupScheduleOut)
-def toggle_backup_schedule(
-    schedule_id: int,
-    request: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    ensure_role(current_user.role, Role.admin)
-    item = db.query(BackupSchedule).filter(BackupSchedule.id == schedule_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Backup schedule not found")
-    item.is_active = not bool(item.is_active)
-    db.commit()
-    db.refresh(item)
-    log_action(db, current_user.id, "toggle_backup_schedule", str(schedule_id), f"is_active={item.is_active}", request=request)
-    return item
 
 
 @router.delete("/backup-schedules/{schedule_id}")
@@ -1136,22 +1090,8 @@ def _run_restore_job(job_id: str, request_user_id: int, source: dict, items: lis
                     _set_restore_result(job_id, index, status="restoring")
                     outcome = backup.restore_user_backup(path, db)
                     username = outcome.get("username", "") if isinstance(outcome, dict) else ""
-                    sites_count = len(outcome.get("websites") or []) if isinstance(outcome, dict) else 0
-                    gen_pwd = outcome.get("generated_password", "") if isinstance(outcome, dict) else ""
-                    detail_msg = outcome.get("message", "") if isinstance(outcome, dict) else ""
-                    if not detail_msg and isinstance(outcome, dict):
-                        detail_msg = f"{sites_count} website(s) restored"
-                        if gen_pwd:
-                            detail_msg += f" · New password: {gen_pwd}"
-                    _set_restore_result(
-                        job_id,
-                        index,
-                        status="done",
-                        username=username or item.get("username", ""),
-                        detail=detail_msg,
-                        generated_password=gen_pwd,
-                        created_user=bool(outcome.get("created_user")) if isinstance(outcome, dict) else False,
-                    )
+                    _set_restore_result(job_id, index, status="done", username=username or item.get("username", ""),
+                                        detail=outcome.get("message", "") if isinstance(outcome, dict) else "")
                     restored += 1
                     if staged:
                         # The copy has done its job; 800 MB archives pile up.
