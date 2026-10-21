@@ -38,7 +38,11 @@ export const BACKUP_SCHEDULE_PRESETS = [
   ['0 2 1 * *', 'On the 1st of every month at 02:00'],
 ];
 
-export const isPresetSchedule = (presets, value) => presets.some(([preset]) => preset === value);
+export const isPresetSchedule = (presetsOrValue, maybeValue) => {
+  const list = Array.isArray(presetsOrValue) ? presetsOrValue : BACKUP_SCHEDULE_PRESETS;
+  const target = Array.isArray(presetsOrValue) ? maybeValue : presetsOrValue;
+  return list.some((entry) => (Array.isArray(entry) ? entry[0] : entry?.value) === target);
+};
 
 export const MALWARE_SCHEDULE_LABELS = {
   websites: 'Websites',

@@ -1388,16 +1388,20 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                     <label style={{ margin: 0 }}>
                       <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Mẫu thời gian</span>
                       <select
-                        value={isPresetSchedule(scheduleForm.schedule) ? scheduleForm.schedule : 'custom'}
+                        value={isPresetSchedule(BACKUP_SCHEDULE_PRESETS, scheduleForm.schedule) ? scheduleForm.schedule : 'custom'}
                         onChange={(e) => {
                           if (e.target.value !== 'custom') {
                             setScheduleForm((p) => ({ ...p, schedule: e.target.value }));
                           }
                         }}
                       >
-                        {BACKUP_SCHEDULE_PRESETS.map((preset) => (
-                          <option key={preset.value} value={preset.value}>{t(preset.labelKey)}</option>
-                        ))}
+                        {BACKUP_SCHEDULE_PRESETS.map((preset) => {
+                          const val = Array.isArray(preset) ? preset[0] : preset.value;
+                          const lbl = Array.isArray(preset) ? preset[1] : preset.labelKey;
+                          return (
+                            <option key={val} value={val}>{t(lbl)}</option>
+                          );
+                        })}
                         <option value="custom">{t('customCronSchedule')}</option>
                       </select>
                     </label>
@@ -1490,10 +1494,19 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                     <div style={{ marginTop: '10px', fontSize: '0.77rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
                       Đường dẫn lưu mẫu:<br />
                       <code style={{ color: 'var(--accent-primary)' }}>
-                        {scheduleForm.name_suffix === 'none' && `${serverHostname}/demous/user-demous.tar.gz`}
-                        {scheduleForm.name_suffix === 'day_of_week' && `${serverHostname}/demous/user-demous-Wed.tar.gz`}
-                        {scheduleForm.name_suffix === 'week_of_month' && `${serverHostname}/demous/user-demous-W3.tar.gz`}
-                        {scheduleForm.name_suffix === 'full_date' && `${serverHostname}/demous/user-demous-2026-10-21.tar.gz`}
+                        {scheduleForm.backup_mode === 'incremental' ? (
+                          <>
+                            {serverHostname}/demous/user-demous-2026-10-21.tar.gz (Full Base)<br />
+                            {serverHostname}/demous/user-demous-2026-10-22_020000-inc.tar.gz (Inc)
+                          </>
+                        ) : (
+                          <>
+                            {scheduleForm.name_suffix === 'none' && `${serverHostname}/demous/user-demous.tar.gz`}
+                            {scheduleForm.name_suffix === 'day_of_week' && `${serverHostname}/demous/user-demous-Wed.tar.gz`}
+                            {scheduleForm.name_suffix === 'week_of_month' && `${serverHostname}/demous/user-demous-W3.tar.gz`}
+                            {scheduleForm.name_suffix === 'full_date' && `${serverHostname}/demous/user-demous-2026-10-21.tar.gz`}
+                          </>
+                        )}
                       </code>
                     </div>
                   </div>
