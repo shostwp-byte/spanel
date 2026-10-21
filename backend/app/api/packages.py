@@ -55,7 +55,12 @@ def _ensure_unique_name(db: Session, name: str, package_id: int | None = None) -
         raise HTTPException(status_code=409, detail="Package name already exists")
 
 
-def _parse_int_quota(val: Any, default: int = 0, bytes_to_mb: bool = False) -> int:
+def _parse_int_quota(
+    val: Any,
+    default: int = 0,
+    bytes_to_mb: bool = False,
+    auto_bytes_threshold: int | None = None,
+) -> int:
     if val is None:
         return default
     if isinstance(val, bool):
@@ -66,16 +71,21 @@ def _parse_int_quota(val: Any, default: int = 0, bytes_to_mb: bool = False) -> i
             return 0
         if bytes_to_mb and n >= 1048576:
             return max(1, round(n / 1048576))
+        if auto_bytes_threshold is not None and n >= auto_bytes_threshold:
+            return max(1, round(n / 1048576))
         return n
-    s = str(val).strip().lower()
+    s = str(val).strip().lower().replace(",", "")
     if not s or s in {"unlimited", "unlim", "inf", "infinite", "∞", "-1", "none", "null", "all"}:
         return 0
-    m = re.match(r"^([+-]?\d+(?:\.\d+)?)\s*([kmgt]b?)?$", s)
+    m = re.match(r"^([+-]?\d+(?:\.\d+)?)\s*(bytes?|b|[kmgt]i?b?)?$", s)
     if m:
         num = float(m.group(1))
-        unit = (m.group(2) or "").rstrip("b")
+        raw_unit = (m.group(2) or "").strip()
         if num < 0:
             return 0
+        if raw_unit in {"b", "byte", "bytes"}:
+            return max(1, int(round(num / 1048576))) if num > 0 else 0
+        unit = raw_unit.rstrip("b").rstrip("i")
         if unit == "g":
             return int(round(num * 1024))
         if unit == "t":
@@ -83,7 +93,9 @@ def _parse_int_quota(val: Any, default: int = 0, bytes_to_mb: bool = False) -> i
         if unit == "k":
             return max(1, int(round(num / 1024))) if num > 0 else 0
         n = int(round(num))
-        if bytes_to_mb and n >= 1048576:
+        if unit == "" and bytes_to_mb and n >= 1048576:
+            return max(1, round(n / 1048576))
+        if unit == "" and auto_bytes_threshold is not None and n >= auto_bytes_threshold:
             return max(1, round(n / 1048576))
         return n
     digits = re.sub(r"[^0-9-]", "", s)
@@ -94,6 +106,8 @@ def _parse_int_quota(val: Any, default: int = 0, bytes_to_mb: bool = False) -> i
         return 0
     if bytes_to_mb and n >= 1048576:
         return max(1, round(n / 1048576))
+    if auto_bytes_threshold is not None and n >= auto_bytes_threshold:
+        return max(1, round(n / 1048576))
     return n
 
 
@@ -103,9 +117,9 @@ def _parse_bool_flag(val: Any, default: bool = True) -> bool:
     if isinstance(val, bool):
         return val
     s = str(val).strip().lower()
-    if s in {"on", "yes", "y", "true", "1", "enabled", "allow", "two", "three"}:
+    if s in {"on", "yes", "y", "true", "1", "enabled", "allow", "two", "three", "checked"}:
         return True
-    if s in {"off", "no", "n", "false", "0", "disabled", "none", "deny"}:
+    if s in {"off", "no", "n", "false", "0", "disabled", "none", "deny", ""}:
         return False
     return default
 
@@ -134,7 +148,7 @@ def _default_package_dict(name: str, is_reseller: bool = False) -> dict:
         "email_forwarders_limit": 20,
         "autoresponders_limit": 10,
         "mailing_lists_limit": 0,
-        "node_apps_limit": 3,
+        "node_apps_limit": 0,
         "node_app_memory_mb": 512,
         "cpu_quota_percent": 100,
         "tasks_max": 80,
@@ -169,39 +183,74 @@ def _default_package_dict(name: str, is_reseller: bool = False) -> dict:
 def _map_da_dict_to_package(name: str, raw: dict, is_reseller: bool = False) -> dict:
     kv = {str(k).strip().lower(): v for k, v in raw.items()}
     pkg = _default_package_dict(name, is_reseller=is_reseller)
-    if "quota" in kv:
-        pkg["storage_limit_mb"] = _parse_int_quota(kv.get("quota"), 5120)
-    if "bandwidth" in kv:
-        pkg["bandwidth_limit_mb"] = _parse_int_quota(kv.get("bandwidth"), 102400)
-    if "vdomains" in kv:
-        pkg["website_limit"] = _parse_int_quota(kv.get("vdomains"), 5)
-    if "nsubdomains" in kv:
-        pkg["subdomain_limit"] = _parse_int_quota(kv.get("nsubdomains"), 20)
-    if "domainptr" in kv:
-        ptr = _parse_int_quota(kv.get("domainptr"), 10)
+
+    quota_key = next((k for k in ("quota", "uquota", "disk", "disk_usage") if k in kv), None)
+    if quota_key is not None:
+        pkg["storage_limit_mb"] = _parse_int_quota(
+            kv.get(quota_key), 5120, auto_bytes_threshold=104857600
+        )
+
+    bw_key = next((k for k in ("bandwidth", "ubandwidth", "traffic") if k in kv), None)
+    if bw_key is not None:
+        pkg["bandwidth_limit_mb"] = _parse_int_quota(
+            kv.get(bw_key), 102400, auto_bytes_threshold=104857600
+        )
+
+    vdom_key = next((k for k in ("vdomains", "uvdomains", "domains") if k in kv), None)
+    if vdom_key is not None:
+        pkg["website_limit"] = _parse_int_quota(kv.get(vdom_key), 5)
+
+    sub_key = next((k for k in ("nsubdomains", "unsubdomains", "subdomains") if k in kv), None)
+    if sub_key is not None:
+        pkg["subdomain_limit"] = _parse_int_quota(kv.get(sub_key), 20)
+
+    ptr_key = next((k for k in ("domainptr", "udomainptr", "pointers") if k in kv), None)
+    if ptr_key is not None:
+        ptr = _parse_int_quota(kv.get(ptr_key), 10)
         pkg["alias_limit"] = ptr
         pkg["domain_pointers_limit"] = ptr
-    if "inode" in kv:
-        pkg["inode_limit"] = _parse_int_quota(kv.get("inode"), 250000)
-    if "mysql" in kv:
-        pkg["database_limit"] = _parse_int_quota(kv.get("mysql"), 5)
-    if "nemails" in kv:
-        pkg["mail_accounts_limit"] = _parse_int_quota(kv.get("nemails"), 10)
-    if "nemailf" in kv:
-        pkg["email_forwarders_limit"] = _parse_int_quota(kv.get("nemailf"), 20)
-    if "nemailr" in kv:
-        pkg["autoresponders_limit"] = _parse_int_quota(kv.get("nemailr"), 10)
-    if "nemailml" in kv:
-        pkg["mailing_lists_limit"] = _parse_int_quota(kv.get("nemailml"), 0)
-    if "ftp" in kv:
-        ftp_val = _parse_int_quota(kv.get("ftp"), 5)
+
+    inode_key = next((k for k in ("inode", "uinode", "inodes") if k in kv), None)
+    if inode_key is not None:
+        pkg["inode_limit"] = _parse_int_quota(kv.get(inode_key), 250000)
+
+    mysql_key = next((k for k in ("mysql", "umysql", "databases") if k in kv), None)
+    if mysql_key is not None:
+        pkg["database_limit"] = _parse_int_quota(kv.get(mysql_key), 5)
+
+    nemails_key = next((k for k in ("nemails", "unemails", "emails") if k in kv), None)
+    if nemails_key is not None:
+        pkg["mail_accounts_limit"] = _parse_int_quota(kv.get(nemails_key), 10)
+
+    nemailf_key = next((k for k in ("nemailf", "unemailf", "forwarders") if k in kv), None)
+    if nemailf_key is not None:
+        pkg["email_forwarders_limit"] = _parse_int_quota(kv.get(nemailf_key), 20)
+
+    nemailr_key = next((k for k in ("nemailr", "unemailr", "autoresponders") if k in kv), None)
+    if nemailr_key is not None:
+        pkg["autoresponders_limit"] = _parse_int_quota(kv.get(nemailr_key), 10)
+
+    nemailml_key = next((k for k in ("nemailml", "unemailml", "mailinglists") if k in kv), None)
+    if nemailml_key is not None:
+        pkg["mailing_lists_limit"] = _parse_int_quota(kv.get(nemailml_key), 0)
+
+    ftp_key = next((k for k in ("ftp", "uftp") if k in kv), None)
+    if ftp_key is not None:
+        ftp_val = _parse_int_quota(kv.get(ftp_key), 5)
         pkg["sftp_accounts_limit"] = ftp_val
         pkg["ftp_accounts_limit"] = ftp_val
-    if "nusers" in kv:
-        pkg["reseller_user_limit"] = _parse_int_quota(kv.get("nusers"), 25)
+
+    node_key = next((k for k in ("nodejs", "node_apps", "node_apps_limit") if k in kv), None)
+    if node_key is not None:
+        pkg["node_apps_limit"] = _parse_int_quota(kv.get(node_key), 0)
+
+    if "nusers" in kv or "users" in kv:
+        u_key = "nusers" if "nusers" in kv else "users"
+        pkg["reseller_user_limit"] = _parse_int_quota(kv.get(u_key), 25)
         pkg["is_reseller_package"] = True
-    if "ips" in kv:
-        pkg["ips_limit"] = _parse_int_quota(kv.get("ips"), 0)
+    if "ips" in kv or "nips" in kv:
+        ip_key = "ips" if "ips" in kv else "nips"
+        pkg["ips_limit"] = _parse_int_quota(kv.get(ip_key), 0)
     if "oversell" in kv:
         pkg["reseller_overselling_enabled"] = _parse_bool_flag(kv.get("oversell"), False)
     if "php" in kv:
@@ -464,7 +513,7 @@ def _http_fetch(
     origin_url = f"{parsed_u.scheme}://{parsed_u.netloc}" if parsed_u.scheme and parsed_u.netloc else ""
     req_headers: dict[str, str] = {
         "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "*/*",
     }
     if include_origin and origin_url:
         req_headers["Referer"] = f"{origin_url}/"
@@ -573,7 +622,7 @@ def _http_fetch(
 
 
 def _da_login_session_headers(
-    base_url: str, user: str, secret: str, verify_ssl: bool = False, _host_override: str | None = None
+    base_url: str, user: str, secret: str, verify_ssl: bool = False
 ) -> tuple[dict[str, str] | None, str | None]:
     """Authenticate against DirectAdmin via /CMD_LOGIN or /api/login and return explicit Cookie/Auth headers."""
     ctx = _build_ssl_context(verify_ssl=verify_ssl)
@@ -581,16 +630,11 @@ def _da_login_session_headers(
         urllib.request.HTTPSHandler(context=ctx),
         _NoRedirectHandler(),
     )
-    parsed_b = urllib.parse.urlparse(base_url)
-    effective_host = _host_override or parsed_b.netloc
-    effective_origin = f"{parsed_b.scheme}://{effective_host}" if parsed_b.scheme and effective_host else base_url
-    base_headers: dict[str, str] = {
+    base_headers = {
         "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
-        "Referer": f"{effective_origin}/CMD_LOGIN",
-        "Origin": effective_origin,
+        "Referer": f"{base_url}/CMD_LOGIN",
+        "Origin": base_url,
     }
-    if _host_override:
-        base_headers["Host"] = _host_override
 
     # 1. Classic & Evolution DirectAdmin form login: POST /CMD_LOGIN (with and without json=yes)
     for extra_params in ({"referer": "/"}, {"referer": "/", "json": "yes"}):
@@ -603,62 +647,46 @@ def _da_login_session_headers(
         )
         cookies: dict[str, str] = {}
         body_lower = ""
-        loc_raw = ""
+        loc_lower = ""
         try:
             with opener.open(req, timeout=12) as resp:
                 cookies.update(_extract_cookies_from_headers(resp.headers))
                 body_lower = resp.read().decode("utf-8", errors="replace").lower()
         except urllib.error.HTTPError as exc:
             cookies.update(_extract_cookies_from_headers(exc.headers))
-            loc_raw = str(exc.headers.get("Location") or "").strip()
+            loc_lower = str(exc.headers.get("Location") or "").lower()
             try:
                 body_lower = exc.read().decode("utf-8", errors="replace").lower()
             except Exception:
                 pass
-            if exc.code in (301, 302, 303, 307, 308) and loc_raw and not _host_override:
-                full_loc = urllib.parse.urljoin(base_url, loc_raw)
-                loc_p = urllib.parse.urlparse(full_loc)
-                if loc_p.hostname and parsed_b.hostname and loc_p.hostname.lower() != parsed_b.hostname.lower():
-                    retry_hdrs, retry_err = _da_login_session_headers(
-                        base_url, user, secret, verify_ssl=verify_ssl, _host_override=loc_p.netloc
-                    )
-                    if retry_hdrs or retry_err:
-                        return retry_hdrs, retry_err
         except Exception:
             continue
 
-        loc_lower = loc_raw.lower()
         if "twostep_auth" in body_lower or "twostep_auth" in loc_lower or "two-step" in body_lower:
             return None, "DirectAdmin account has Two-Factor Authentication (2FA) enabled. Please create a Login Key in DirectAdmin and use it as the password."
 
         sess_val = cookies.get("session") or cookies.get("DirectAdmin-Session") or ""
         if len(sess_val) >= 6 and "invalid" not in body_lower and "login" not in loc_lower:
             cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
-            ret_hdrs = {
+            return {
                 "Cookie": cookie_str,
-                "Referer": f"{effective_origin}/",
-                "Origin": effective_origin,
-            }
-            if _host_override:
-                ret_hdrs["Host"] = _host_override
-            return ret_hdrs, None
+                "Referer": f"{base_url}/",
+                "Origin": base_url,
+            }, None
 
     # 2. Modern DirectAdmin JSON login: POST /api/login
     try:
         json_payload = json.dumps({"username": user, "password": secret}).encode("utf-8")
-        api_hdrs = {
-            "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
-            "Referer": f"{effective_origin}/",
-            "Origin": effective_origin,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        if _host_override:
-            api_hdrs["Host"] = _host_override
         req_api = urllib.request.Request(
             f"{base_url}/api/login",
             data=json_payload,
-            headers=api_hdrs,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; SPanel-Package-Importer/1.0)",
+                "Referer": f"{base_url}/",
+                "Origin": base_url,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
             method="POST",
         )
         cookies_api: dict[str, str] = {}
@@ -673,33 +701,89 @@ def _da_login_session_headers(
         sess_val = cookies_api.get("session") or cookies_api.get("DirectAdmin-Session") or ""
         if len(sess_val) >= 6:
             cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_api.items())
-            ret_hdrs = {
+            return {
                 "Cookie": cookie_str,
-                "Referer": f"{effective_origin}/",
-                "Origin": effective_origin,
-            }
-            if _host_override:
-                ret_hdrs["Host"] = _host_override
-            return ret_hdrs, None
+                "Referer": f"{base_url}/",
+                "Origin": base_url,
+            }, None
 
         if raw_api.startswith("{"):
             parsed_login = json.loads(raw_api)
             if isinstance(parsed_login, dict):
                 tok = str(parsed_login.get("token") or parsed_login.get("sessionID") or parsed_login.get("session") or "").strip()
                 if len(tok) >= 6:
-                    ret_hdrs = {
+                    return {
                         "Cookie": f"session={tok}",
                         "Authorization": f"Bearer {tok}",
-                        "Referer": f"{effective_origin}/",
-                        "Origin": effective_origin,
-                    }
-                    if _host_override:
-                        ret_hdrs["Host"] = _host_override
-                    return ret_hdrs, None
+                        "Referer": f"{base_url}/",
+                        "Origin": base_url,
+                    }, None
     except Exception:
         pass
 
     return None, None
+
+
+def _da_flatten_dict(j: dict[str, Any]) -> dict[str, Any]:
+    for wrap_key in ("data", "settings", "result", "package"):
+        sub = j.get(wrap_key)
+        if isinstance(sub, dict) and any(
+            qk in sub for qk in ("quota", "bandwidth", "vdomains", "nsubdomains", "mysql", "nemails")
+        ):
+            j = sub
+            break
+
+    flat_j: dict[str, Any] = {}
+    for k, v in j.items():
+        if isinstance(v, dict):
+            unlim_raw = v.get("unlimited")
+            if isinstance(unlim_raw, dict):
+                unlim_raw = unlim_raw.get("checked") or unlim_raw.get("value") or ""
+            is_unlim = (
+                unlim_raw is True
+                or str(unlim_raw or "").strip().lower() in {"checked", "yes", "on", "true", "1", "unlimited"}
+            )
+            if is_unlim:
+                flat_j[k] = "unlimited"
+                continue
+
+            if v.get("type") == "checkbox" or ("checked" in v and "unlimited" not in v):
+                chk_raw = v.get("checked")
+                is_checked = (
+                    chk_raw is True
+                    or str(chk_raw or "").strip().lower() in {"checked", "yes", "on", "true", "1"}
+                )
+                flat_j[k] = "ON" if is_checked else "OFF"
+                continue
+
+            val_part = (
+                v.get("value")
+                if "value" in v
+                else (v.get("selected") if "selected" in v else v.get("text"))
+            )
+            if isinstance(val_part, dict):
+                val_part = val_part.get("value") or val_part.get("selected") or val_part.get("text") or ""
+
+            unit_raw = v.get("unit")
+            if isinstance(unit_raw, dict):
+                unit_raw = unit_raw.get("selected") or unit_raw.get("value") or unit_raw.get("text") or ""
+            unit_str = str(unit_raw or "").strip().upper()
+
+            if (
+                val_part is not None
+                and unit_str in {"KB", "K", "GB", "G", "TB", "T", "B", "BYTES"}
+                and re.match(r"^[+-]?\d+(?:\.\d+)?$", str(val_part).strip())
+            ):
+                flat_j[k] = f"{str(val_part).strip()} {unit_str}"
+            elif val_part is not None:
+                flat_j[k] = val_part
+            else:
+                flat_j[k] = v
+        elif isinstance(v, list):
+            flat_j[k] = v[0] if len(v) == 1 else v
+        else:
+            flat_j[k] = v
+    return flat_j
 
 
 def _da_parse_response_kv(raw_text: str) -> dict[str, Any]:
@@ -710,30 +794,7 @@ def _da_parse_response_kv(raw_text: str) -> dict[str, Any]:
         try:
             j = json.loads(text)
             if isinstance(j, dict):
-                if isinstance(j.get("package"), dict):
-                    j = j["package"]
-                elif isinstance(j.get("data"), dict):
-                    j = j["data"]
-                elif isinstance(j.get("settings"), dict):
-                    j = j["settings"]
-                flat_j: dict[str, Any] = {}
-                for k, v in j.items():
-                    if isinstance(v, dict):
-                        if str(v.get("unlimited", "")).lower() in {"yes", "on", "true", "1"} or v.get("checked") is True:
-                            flat_j[k] = "unlimited"
-                        elif "value" in v:
-                            flat_j[k] = v["value"]
-                        elif "selected" in v:
-                            flat_j[k] = v["selected"]
-                        elif "text" in v:
-                            flat_j[k] = v["text"]
-                        else:
-                            flat_j[k] = v
-                    elif isinstance(v, list):
-                        flat_j[k] = v[0] if len(v) == 1 else v
-                    else:
-                        flat_j[k] = v
-                return flat_j
+                return _da_flatten_dict(j)
         except Exception:
             pass
     qs = urllib.parse.parse_qs(text, keep_blank_values=True)
@@ -780,6 +841,7 @@ def _da_fetch_cmd_packages(
         return None, "Authentication failed on DirectAdmin: Invalid username, password, or Login Key."
 
     pkg_names: list[str] = []
+    row_hints: dict[str, dict[str, Any]] = {}
     direct_items: list[dict] = []
     recognized_response = False
     parsed_json = None
@@ -795,9 +857,11 @@ def _da_fetch_cmd_packages(
             if isinstance(entry, (str, int)) and str(entry).strip():
                 pkg_names.append(str(entry).strip())
             elif isinstance(entry, dict):
-                p_name = str(entry.get("name") or entry.get("package") or "").strip()
+                flat_entry = _da_flatten_dict(entry)
+                p_name = str(flat_entry.get("name") or flat_entry.get("package") or "").strip()
                 if p_name:
-                    direct_items.append(_map_da_dict_to_package(p_name, entry, is_reseller=is_reseller_pkg))
+                    row_hints[p_name] = flat_entry
+                    pkg_names.append(p_name)
     elif isinstance(parsed_json, dict):
         err_flag = parsed_json.get("error")
         if err_flag and str(err_flag) not in ("0", "false", "False"):
@@ -813,14 +877,20 @@ def _da_fetch_cmd_packages(
                 if isinstance(x, (str, int)) and str(x).strip():
                     pkg_names.append(str(x).strip())
                 elif isinstance(x, dict):
-                    p_name = str(x.get("name") or x.get("package") or "").strip()
+                    flat_x = _da_flatten_dict(x)
+                    p_name = str(flat_x.get("name") or flat_x.get("package") or "").strip()
                     if p_name:
-                        direct_items.append(_map_da_dict_to_package(p_name, x, is_reseller=is_reseller_pkg))
+                        row_hints[p_name] = flat_x
+                        pkg_names.append(p_name)
         elif isinstance(lst, dict):
             recognized_response = True
             for k, v in lst.items():
                 if isinstance(v, dict):
-                    direct_items.append(_map_da_dict_to_package(str(k).strip(), v, is_reseller=is_reseller_pkg))
+                    flat_v = _da_flatten_dict(v)
+                    p_name = str(flat_v.get("package") or flat_v.get("name") or k).strip()
+                    if p_name:
+                        row_hints[p_name] = flat_v
+                        pkg_names.append(p_name)
                 elif isinstance(v, (str, int)) and str(v).strip():
                     pkg_names.append(str(v).strip())
         else:
@@ -828,17 +898,18 @@ def _da_fetch_cmd_packages(
                 if k in ("error", "text", "details", "result", "columns", "info"):
                     continue
                 if isinstance(v, dict):
-                    if "package" in v or "name" in v:
-                        raw_p = v.get("package") or v.get("name")
-                        if isinstance(raw_p, dict):
-                            raw_p = raw_p.get("text") or raw_p.get("value") or ""
-                        p_str = str(raw_p or "").strip()
+                    flat_v = _da_flatten_dict(v)
+                    if "package" in flat_v or "name" in flat_v:
+                        p_str = str(flat_v.get("package") or flat_v.get("name") or "").strip()
                         if p_str:
                             recognized_response = True
+                            row_hints[p_str] = flat_v
                             pkg_names.append(p_str)
-                    elif any(qk in v for qk in ("quota", "bandwidth", "vdomains", "nsubdomains")):
+                    elif any(qk in flat_v for qk in ("quota", "bandwidth", "vdomains", "nsubdomains")):
                         recognized_response = True
-                        direct_items.append(_map_da_dict_to_package(str(k).strip(), v, is_reseller=is_reseller_pkg))
+                        p_str = str(k).strip()
+                        row_hints[p_str] = flat_v
+                        pkg_names.append(p_str)
                 elif (k.isdigit() or k.startswith("list")) and isinstance(v, (str, int)) and str(v).strip():
                     recognized_response = True
                     pkg_names.append(str(v).strip())
@@ -875,24 +946,35 @@ def _da_fetch_cmd_packages(
             seen.add(name)
             unique_names.append(name)
 
+    if "RESELLER" in show_cmd.upper():
+        alt_show = "CMD_SHOW_RESELLER_PACKAGE?json=yes" if "CMD_API_" in show_cmd.upper() else "CMD_API_SHOW_RESELLER_PACKAGE"
+    else:
+        alt_show = "CMD_SHOW_USER_PACKAGE?json=yes" if "CMD_API_" in show_cmd.upper() else "CMD_API_SHOW_USER_PACKAGE"
+    show_candidates = [show_cmd, alt_show]
+
     items: list[dict] = list(direct_items)
     for pkg_name in unique_names[:60]:
         q_name = urllib.parse.quote(pkg_name)
-        sep = "&" if "?" in show_cmd else "?"
-        try:
-            detail_raw = _http_fetch(
-                f"{base_url}/{show_cmd}{sep}package={q_name}",
-                headers,
-                verify_ssl=verify_ssl,
-                include_origin=include_origin,
-            )
-            kv = _da_parse_response_kv(detail_raw)
-            if str(kv.get("error", "0")) not in ("0", "", "false", "False"):
+        merged_kv: dict[str, Any] = dict(row_hints.get(pkg_name, {}))
+        for cand_cmd in show_candidates:
+            sep = "&" if "?" in cand_cmd else "?"
+            try:
+                detail_raw = _http_fetch(
+                    f"{base_url}/{cand_cmd}{sep}package={q_name}",
+                    headers,
+                    verify_ssl=verify_ssl,
+                    include_origin=include_origin,
+                )
+                kv = _da_parse_response_kv(detail_raw)
+                if str(kv.get("error", "0")) not in ("0", "", "false", "False"):
+                    continue
+                flat_kv = {k: (v[0] if isinstance(v, list) and v else v) for k, v in kv.items()}
+                if any(qk in flat_kv for qk in ("quota", "bandwidth", "vdomains", "nsubdomains", "mysql", "nemails")):
+                    merged_kv.update(flat_kv)
+                    break
+            except Exception:
                 continue
-            flat_kv = {k: (v[0] if isinstance(v, list) and v else v) for k, v in kv.items()}
-            items.append(_map_da_dict_to_package(pkg_name, flat_kv, is_reseller=is_reseller_pkg))
-        except Exception:
-            items.append(_default_package_dict(pkg_name, is_reseller=is_reseller_pkg))
+        items.append(_map_da_dict_to_package(pkg_name, merged_kv, is_reseller=is_reseller_pkg))
 
     return items, None
 
@@ -964,10 +1046,11 @@ def fetch_remote_packages(
             ]
 
         auth_header_variants = [
+            ({"Authorization": f"Basic {basic_token}"}, False),
             ({"Authorization": f"Basic {basic_token}"}, True),
         ]
         if payload.auth_type == "token":
-            auth_header_variants.append(({"Authorization": f"Bearer {secret}"}, True))
+            auth_header_variants.insert(1, ({"Authorization": f"Bearer {secret}"}, False))
 
         last_err: str | None = None
         any_authenticated_empty = False
@@ -992,17 +1075,11 @@ def fetch_remote_packages(
                         any_authenticated_empty = True
                     elif err:
                         last_err = err
-                        err_l = err.lower()
-                        if "authentication failed" in err_l or "failed to connect" in err_l:
-                            break
-                if results or ("failed to connect" in (last_err or "").lower()):
+                if results:
                     break
 
             if results:
                 break
-
-            if "failed to connect" in (last_err or "").lower():
-                continue
 
             # 2. Try Session Cookie Login (/CMD_LOGIN and /api/login)
             sess_headers, sess_err = _da_login_session_headers(
@@ -1029,13 +1106,8 @@ def fetch_remote_packages(
                         any_authenticated_empty = True
                     elif err_s:
                         last_err = err_s
-                        if "authentication failed" in err_s.lower():
-                            break
                 if results:
                     break
-
-            # Server responded over HTTP/HTTPS on this scheme, no need to retry alternate scheme
-            break
 
         if not results and not any_authenticated_empty:
             return {
