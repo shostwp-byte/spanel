@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ArrowLeft, Boxes, Check, CloudDownload, Cpu, Eye, EyeOff, FileSpreadsheet,
@@ -127,6 +127,8 @@ export function PackagesPage({ mode = 'users' }) {
   const [showRemoteSecret, setShowRemoteSecret] = useState(false);
   const [remoteAlert, setRemoteAlert] = useState(null);
   const [fetchingRemote, setFetchingRemote] = useState(false);
+  const [importingBatch, setImportingBatch] = useState(false);
+  const previewBoxRef = useRef(null);
 
   useEffect(() => {
     setPackageTab('list');
@@ -221,7 +223,7 @@ export function PackagesPage({ mode = 'users' }) {
           is_reseller_package: mode === 'resellers',
           verify_ssl: Boolean(remoteForm.verify_ssl),
         }),
-      }, t('Connecting to remote panel and fetching packages...'));
+      }, '');
       if (!res) return;
       if (res.ok === false || res.error) {
         const errMsg = String(res.error || res.detail || t('Failed to connect to remote panel.'));
@@ -249,6 +251,9 @@ export function PackagesPage({ mode = 'users' }) {
         const okMsg = t('Fetched {count} package(s) from remote panel.', { count: decorated.length });
         setRemoteAlert({ type: 'success', text: okMsg });
         setNotice(okMsg);
+        setTimeout(() => {
+          previewBoxRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }, 80);
       }
     } finally {
       setFetchingRemote(false);
@@ -274,25 +279,30 @@ export function PackagesPage({ mode = 'users' }) {
       return;
     }
     const sanitizedList = selected.map(p => sanitizePayload(p));
-    const res = await request('/packages/import', {
-      method: 'POST',
-      body: JSON.stringify({
-        packages: sanitizedList,
-        conflict_mode: conflictMode,
-        source_panel: importPanel,
-      }),
-    }, t('Importing packages...'));
-    if (res && res.ok) {
-      await loadPackages();
-      setShowImportModal(false);
-      setParsedPackages([]);
-      setNotice(
-        t('Import completed: {created} created, {updated} updated, {skipped} skipped.', {
-          created: res.created ?? 0,
-          updated: res.updated ?? 0,
-          skipped: res.skipped ?? 0,
-        })
-      );
+    setImportingBatch(true);
+    try {
+      const res = await request('/packages/import', {
+        method: 'POST',
+        body: JSON.stringify({
+          packages: sanitizedList,
+          conflict_mode: conflictMode,
+          source_panel: importPanel,
+        }),
+      }, '');
+      if (res && res.ok) {
+        await loadPackages();
+        setShowImportModal(false);
+        setParsedPackages([]);
+        setNotice(
+          t('Import completed: {created} created, {updated} updated, {skipped} skipped.', {
+            created: res.created ?? 0,
+            updated: res.updated ?? 0,
+            skipped: res.skipped ?? 0,
+          })
+        );
+      }
+    } finally {
+      setImportingBatch(false);
     }
   }
 
@@ -913,9 +923,9 @@ export function PackagesPage({ mode = 'users' }) {
             className="modal-card pkg-import-modal-card"
             onClick={e => e.stopPropagation()}
             style={{
-              width: 'min(880px, 95vw)',
-              maxWidth: '880px',
-              maxHeight: 'calc(100vh - 40px)',
+              width: 'min(1040px, 96vw)',
+              maxWidth: '1040px',
+              maxHeight: 'calc(100vh - 32px)',
               margin: 'auto',
               display: 'flex',
               flexDirection: 'column',
@@ -930,7 +940,7 @@ export function PackagesPage({ mode = 'users' }) {
             <div
               className="pkg-import-header"
               style={{
-                padding: '16px 20px',
+                padding: '14px 20px',
                 borderBottom: '1px solid var(--border)',
                 display: 'flex',
                 alignItems: 'center',
@@ -963,17 +973,15 @@ export function PackagesPage({ mode = 'users' }) {
             <div
               className="pkg-import-body"
               style={{
-                padding: '18px 20px',
+                padding: '16px 20px 24px',
                 overflowY: 'auto',
                 flex: '1 1 auto',
                 minHeight: 0,
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '16px',
+                display: 'block',
               }}
             >
               {/* Step 1: Select Source Panel */}
-              <div>
+              <div style={{ marginBottom: '14px' }}>
                 <label style={{ display: 'block', fontSize: '12.5px', fontWeight: 700, marginBottom: '8px', color: 'var(--text)' }}>
                   1. {t('Select Source Control Panel')}
                 </label>
@@ -991,12 +999,12 @@ export function PackagesPage({ mode = 'users' }) {
                     style={{
                       border: importPanel === 'directadmin' ? '2px solid var(--primary)' : '1.5px solid var(--border)',
                       borderRadius: '10px',
-                      padding: '12px 14px',
+                      padding: '10px 14px',
                       background: importPanel === 'directadmin' ? 'var(--primary-subtle, rgba(37, 99, 235, 0.08))' : 'var(--bg-elevated, var(--surface))',
                       cursor: 'pointer',
                     }}
                   >
-                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '3px' }}>
                       <Server size={15} style={{ color: '#2563eb' }} /> DirectAdmin
                     </div>
                     <div className="pkg-panel-card-desc" style={{ fontSize: '11.5px', color: 'var(--text-secondary)', lineHeight: 1.35 }}>
@@ -1010,12 +1018,12 @@ export function PackagesPage({ mode = 'users' }) {
                     style={{
                       border: importPanel === 'cpanel' ? '2px solid var(--primary)' : '1.5px solid var(--border)',
                       borderRadius: '10px',
-                      padding: '12px 14px',
+                      padding: '10px 14px',
                       background: importPanel === 'cpanel' ? 'var(--primary-subtle, rgba(37, 99, 235, 0.08))' : 'var(--bg-elevated, var(--surface))',
                       cursor: 'pointer',
                     }}
                   >
-                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '3px' }}>
                       <FileSpreadsheet size={15} style={{ color: '#ea580c' }} /> cPanel / WHM
                     </div>
                     <div className="pkg-panel-card-desc" style={{ fontSize: '11.5px', color: 'var(--text-secondary)', lineHeight: 1.35 }}>
@@ -1029,12 +1037,12 @@ export function PackagesPage({ mode = 'users' }) {
                     style={{
                       border: importPanel === 'plesk' ? '2px solid var(--primary)' : '1.5px solid var(--border)',
                       borderRadius: '10px',
-                      padding: '12px 14px',
+                      padding: '10px 14px',
                       background: importPanel === 'plesk' ? 'var(--primary-subtle, rgba(37, 99, 235, 0.08))' : 'var(--bg-elevated, var(--surface))',
                       cursor: 'pointer',
                     }}
                   >
-                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                    <div className="pkg-panel-card-title" style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)', display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '3px' }}>
                       <Globe size={15} style={{ color: '#0891b2' }} /> Plesk Obsidian
                     </div>
                     <div className="pkg-panel-card-desc" style={{ fontSize: '11.5px', color: 'var(--text-secondary)', lineHeight: 1.35 }}>
@@ -1045,7 +1053,7 @@ export function PackagesPage({ mode = 'users' }) {
               </div>
 
               {/* Step 2: Remote Panel API Connection */}
-              <div>
+              <div style={{ marginBottom: parsedPackages.length > 0 ? '16px' : 0 }}>
                 <label style={{ display: 'block', fontSize: '12.5px', fontWeight: 700, marginBottom: '8px', color: 'var(--text)' }}>
                   2. {t('Connect Remote Panel API')}
                 </label>
@@ -1056,10 +1064,10 @@ export function PackagesPage({ mode = 'users' }) {
                     background: 'var(--surface-alt)',
                     border: '1px solid var(--border)',
                     borderRadius: '10px',
-                    padding: '16px',
+                    padding: '14px 16px',
                     display: 'flex',
                     flexDirection: 'column',
-                    gap: '14px',
+                    gap: '12px',
                   }}
                 >
                   <div
@@ -1067,7 +1075,7 @@ export function PackagesPage({ mode = 'users' }) {
                     style={{
                       display: 'grid',
                       gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-                      gap: '14px',
+                      gap: '12px 14px',
                       alignItems: 'end',
                     }}
                   >
@@ -1193,8 +1201,50 @@ export function PackagesPage({ mode = 'users' }) {
                       </span>
                     </label>
 
-                    <button type="submit" disabled={fetchingRemote || !!loading} style={{ height: '38px', padding: '0 18px' }}>
-                      <CloudDownload size={15} /> {fetchingRemote ? t('Connecting to remote panel and fetching packages...') : t('Fetch Remote Packages')}
+                    <button
+                      type="submit"
+                      disabled={fetchingRemote || importingBatch}
+                      style={{
+                        height: '38px',
+                        padding: '0 18px',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: '8px',
+                        ...(fetchingRemote
+                          ? {
+                              background: 'var(--primary-light, rgba(22, 163, 74, 0.12))',
+                              color: 'var(--primary-text, var(--primary))',
+                              border: '1px solid var(--primary-border, var(--primary))',
+                              fontWeight: 700,
+                              opacity: 1,
+                              cursor: 'wait',
+                            }
+                          : {}),
+                      }}
+                    >
+                      {fetchingRemote ? (
+                        <>
+                          <span
+                            style={{
+                              width: '15px',
+                              height: '15px',
+                              borderRadius: '999px',
+                              border: '2.5px solid var(--primary-border, rgba(22, 163, 74, 0.3))',
+                              borderTopColor: 'var(--primary)',
+                              display: 'inline-block',
+                              animation: 'spin 0.8s linear infinite',
+                              flexShrink: 0,
+                            }}
+                          />
+                          <span>{t('Connecting to remote panel and fetching packages...')}</span>
+                        </>
+                      ) : (
+                        <>
+                          <CloudDownload size={15} />
+                          <span>{t('Fetch Remote Packages')}</span>
+                        </>
+                      )}
                     </button>
                   </div>
                 </form>
@@ -1202,7 +1252,17 @@ export function PackagesPage({ mode = 'users' }) {
 
               {/* Step 3: Interactive Preview & Mapping Table */}
               {parsedPackages.length > 0 && (
-                <div className="pkg-preview-box">
+                <div
+                  ref={previewBoxRef}
+                  className="pkg-preview-box"
+                  style={{
+                    border: '1px solid var(--border)',
+                    borderRadius: '10px',
+                    background: 'var(--surface)',
+                    overflow: 'hidden',
+                    flexShrink: 0,
+                  }}
+                >
                   <div className="pkg-preview-toolbar">
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                       <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 700, cursor: 'pointer' }}>
@@ -1242,28 +1302,28 @@ export function PackagesPage({ mode = 'users' }) {
                     </div>
                   </div>
 
-                  <div style={{ overflowX: 'auto', maxHeight: '280px' }}>
+                  <div className="pkg-preview-table-wrap" style={{ overflowX: 'auto', width: '100%', paddingBottom: '4px' }}>
                     <table className="pkg-clean-table">
                       <thead>
                         <tr>
-                          <th style={{ width: '36px' }}></th>
-                          <th>{t('Package Name')}</th>
-                          <th>{t('Source')}</th>
-                          <th>{t('Disk')} / {t('Bandwidth')}</th>
-                          <th>
+                          <th style={{ width: '36px', padding: '10px 12px' }}></th>
+                          <th style={{ padding: '10px 12px' }}>{t('Package Name')}</th>
+                          <th style={{ padding: '10px 12px' }}>{t('Source')}</th>
+                          <th style={{ padding: '10px 12px' }}>{t('Disk')} / {t('Bandwidth')}</th>
+                          <th style={{ padding: '10px 12px' }}>
                             {mode === 'resellers'
                               ? `${t('Max Sub-Accounts (Users)')} / IPs`
                               : `${t('Websites')} / ${t('Subdomains')} / DBs`}
                           </th>
-                          <th>{t('Email')} / FTP</th>
-                          <th>{t('Features')}</th>
-                          <th style={{ textAlign: 'right' }}>{t('Actions')}</th>
+                          <th style={{ padding: '10px 12px' }}>{t('Email')} / FTP</th>
+                          <th style={{ padding: '10px 12px' }}>{t('Features')}</th>
+                          <th style={{ textAlign: 'right', padding: '10px 12px' }}>{t('Actions')}</th>
                         </tr>
                       </thead>
                       <tbody>
                         {parsedPackages.map((pkg, idx) => (
                           <tr key={pkg._id || idx}>
-                            <td>
+                            <td style={{ padding: '10px 12px' }}>
                               <input
                                 type="checkbox"
                                 checked={Boolean(pkg._selected)}
@@ -1276,7 +1336,7 @@ export function PackagesPage({ mode = 'users' }) {
                                 style={{ width: '15px', height: '15px', margin: 0 }}
                               />
                             </td>
-                            <td>
+                            <td style={{ padding: '10px 12px' }}>
                               <input
                                 type="text"
                                 value={pkg.name}
@@ -1286,18 +1346,18 @@ export function PackagesPage({ mode = 'users' }) {
                                     prev.map((item, i) => (i === idx ? { ...item, name: val } : item))
                                   );
                                 }}
-                                style={{ height: '30px', minHeight: '30px', padding: '4px 8px', fontSize: '13px', width: '175px', margin: 0 }}
+                                style={{ height: '30px', minHeight: '30px', padding: '4px 8px', fontSize: '13px', width: '150px', margin: 0 }}
                               />
                             </td>
-                            <td>
+                            <td style={{ padding: '10px 12px' }}>
                               <span className="badge" style={{ fontSize: '11px', textTransform: 'uppercase' }}>
                                 {pkg.source_panel || importPanel}
                               </span>
                             </td>
-                            <td>
+                            <td style={{ padding: '10px 12px' }}>
                               {formatMb(pkg.storage_limit_mb)} <span className="muted">/</span> {formatMb(pkg.bandwidth_limit_mb)}
                             </td>
-                            <td>
+                            <td style={{ padding: '10px 12px' }}>
                               {mode === 'resellers' ? (
                                 <>
                                   {formatCount(pkg.reseller_user_limit)} {t('Users')} · {formatCount(pkg.ips_limit)} IPs
@@ -1308,10 +1368,10 @@ export function PackagesPage({ mode = 'users' }) {
                                 </>
                               )}
                             </td>
-                            <td>
+                            <td style={{ padding: '10px 12px' }}>
                               {formatCount(pkg.mail_accounts_limit)} Mail · {formatCount(pkg.sftp_accounts_limit)} FTP
                             </td>
-                            <td>
+                            <td style={{ padding: '10px 12px' }}>
                               <div style={{ display: 'inline-flex', gap: '4px', flexWrap: 'wrap' }}>
                                 {pkg.php_access && <span className="badge ok" style={{ fontSize: '10.5px' }}>PHP</span>}
                                 {pkg.ssl_access && <span className="badge ok" style={{ fontSize: '10.5px' }}>SSL</span>}
@@ -1322,7 +1382,7 @@ export function PackagesPage({ mode = 'users' }) {
                                 )}
                               </div>
                             </td>
-                            <td style={{ textAlign: 'right' }}>
+                            <td style={{ textAlign: 'right', padding: '10px 12px' }}>
                               <div style={{ display: 'inline-flex', gap: '6px' }}>
                                 <button
                                   type="button"
@@ -1371,16 +1431,53 @@ export function PackagesPage({ mode = 'users' }) {
                 <button
                   type="button"
                   className="secondary-light"
+                  disabled={importingBatch}
                   onClick={() => setShowImportModal(false)}
                 >
                   <X size={14} /> {t('Cancel')}
                 </button>
                 <button
                   type="button"
-                  disabled={!!loading || selectedImportCount === 0}
+                  disabled={importingBatch || fetchingRemote || selectedImportCount === 0}
                   onClick={handleBatchImportSubmit}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    ...(importingBatch
+                      ? {
+                          background: 'var(--primary-light, rgba(22, 163, 74, 0.12))',
+                          color: 'var(--primary-text, var(--primary))',
+                          border: '1px solid var(--primary-border, var(--primary))',
+                          fontWeight: 700,
+                          opacity: 1,
+                          cursor: 'wait',
+                        }
+                      : {}),
+                  }}
                 >
-                  <Check size={14} /> {t('Import Selected')} ({selectedImportCount})
+                  {importingBatch ? (
+                    <>
+                      <span
+                        style={{
+                          width: '14px',
+                          height: '14px',
+                          borderRadius: '999px',
+                          border: '2.5px solid var(--primary-border, rgba(22, 163, 74, 0.3))',
+                          borderTopColor: 'var(--primary)',
+                          display: 'inline-block',
+                          animation: 'spin 0.8s linear infinite',
+                          flexShrink: 0,
+                        }}
+                      />
+                      <span>{t('Importing packages...')}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Check size={14} />
+                      <span>{t('Import Selected')} ({selectedImportCount})</span>
+                    </>
+                  )}
                 </button>
               </div>
             </div>

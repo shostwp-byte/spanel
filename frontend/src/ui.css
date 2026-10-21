@@ -2002,9 +2002,9 @@ table.table {
 }
 
 .pkg-import-modal-card {
-  width: min(880px, 95vw) !important;
-  max-width: 880px !important;
-  max-height: calc(100vh - 40px) !important;
+  width: min(1040px, 96vw) !important;
+  max-width: 1040px !important;
+  max-height: calc(100vh - 32px) !important;
   margin: auto !important;
   display: flex !important;
   flex-direction: column !important;
@@ -2026,18 +2026,17 @@ table.table {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 16px 22px;
+  padding: 14px 20px;
   background: var(--surface-alt);
   border-bottom: 1px solid var(--border);
 }
 
 .pkg-import-body {
   flex: 1 1 auto;
-  padding: 18px 22px;
+  min-height: 0;
+  padding: 16px 20px 24px;
   overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+  display: block;
 }
 
 .pkg-import-footer {
@@ -2173,6 +2172,7 @@ table.table {
   border-radius: 10px;
   overflow: hidden;
   background: var(--surface);
+  flex-shrink: 0;
 }
 
 .pkg-preview-toolbar {
