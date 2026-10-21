@@ -519,7 +519,7 @@ def upload_archive_to_target(
     return target.name, result["remote_file"]
 
 
-def _run_site_backup_job(job_id: str, request_user_id: int, website_id: int) -> None:
+def _run_site_backup_job(job_id: str, request_user_id: int, website_id: int, backup_mode: str = "full") -> None:
     _set_backup_job(job_id, status="running", started_at=_now_iso(), message="Creating website backup")
     db = SessionLocal()
     try:
@@ -528,8 +528,8 @@ def _run_site_backup_job(job_id: str, request_user_id: int, website_id: int) -> 
             raise ValueError("User not found")
         website = get_owned_website(db, user, website_id)
         db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
-        archive = backup.create_backup(website, db_item.db_name if db_item else None)
-        log_action(db, user.id, "backup", website.domain, archive)
+        archive = backup.create_backup(website, db_item.db_name if db_item else None, backup_mode=backup_mode)
+        log_action(db, user.id, "backup", website.domain, f"{archive} ({backup_mode})")
         _set_backup_job(
             job_id,
             status="done",
@@ -545,7 +545,13 @@ def _run_site_backup_job(job_id: str, request_user_id: int, website_id: int) -> 
         db.close()
 
 
-def _run_user_backup_job(job_id: str, request_user_id: int, target_user_id: int, target_id: int | None) -> None:
+def _run_user_backup_job(
+    job_id: str,
+    request_user_id: int,
+    target_user_id: int,
+    target_id: int | None,
+    backup_mode: str = "full",
+) -> None:
     _set_backup_job(job_id, status="running", started_at=_now_iso(), message="Creating full user backup")
     db = SessionLocal()
     try:
@@ -554,7 +560,13 @@ def _run_user_backup_job(job_id: str, request_user_id: int, target_user_id: int,
             raise ValueError("User not found")
         user = get_backup_user(db, request_user, target_user_id)
         use_hierarchy = _is_manager_role(request_user.role)
-        archive = backup.create_user_backup(user, db, use_hierarchy=use_hierarchy)
+        archive = backup.create_user_backup(
+            user,
+            db,
+            use_hierarchy=use_hierarchy,
+            backup_mode=backup_mode,
+            target_id=target_id,
+        )
         remote_file = ""
         target_name = ""
         if target_id:
@@ -587,7 +599,13 @@ def _run_user_backup_job(job_id: str, request_user_id: int, target_user_id: int,
         db.close()
 
 
-def _run_sftp_backup_job(job_id: str, request_user_id: int, website_id: int, target_id: int) -> None:
+def _run_sftp_backup_job(
+    job_id: str,
+    request_user_id: int,
+    website_id: int,
+    target_id: int,
+    backup_mode: str = "full",
+) -> None:
     _set_backup_job(job_id, status="running", started_at=_now_iso(), message="Creating and uploading remote backup")
     db = SessionLocal()
     try:
@@ -597,7 +615,12 @@ def _run_sftp_backup_job(job_id: str, request_user_id: int, website_id: int, tar
         _get_accessible_sftp_target(db, request_user, target_id)
         website = get_owned_website(db, request_user, website_id)
         db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
-        archive = backup.create_backup(website, db_item.db_name if db_item else None)
+        archive = backup.create_backup(
+            website,
+            db_item.db_name if db_item else None,
+            backup_mode=backup_mode,
+            target_id=target_id,
+        )
         owner_username = getattr(getattr(website, "owner", None), "username", "") or request_user.username
         use_hierarchy = _is_manager_role(request_user.role)
         target_name, remote_file = upload_archive_to_target(
@@ -626,13 +649,13 @@ def _run_sftp_backup_job(job_id: str, request_user_id: int, website_id: int, tar
         db.close()
 
 
-def _queue_site_backup(current_user: User, website: Website) -> dict:
+def _queue_site_backup(current_user: User, website: Website, backup_mode: str = "full") -> dict:
     job = _queue_backup_job(current_user, "site_backup", "Website backup queued", website_id=website.id)
-    _backup_job_executor.submit(_run_site_backup_job, job["job_id"], current_user.id, website.id)
+    _backup_job_executor.submit(_run_site_backup_job, job["job_id"], current_user.id, website.id, backup_mode)
     return job
 
 
-def _queue_user_backup(current_user: User, user: User, target_id: int | None) -> dict:
+def _queue_user_backup(current_user: User, user: User, target_id: int | None, backup_mode: str = "full") -> dict:
     job = _queue_backup_job(
         current_user,
         "user_backup",
@@ -640,11 +663,11 @@ def _queue_user_backup(current_user: User, user: User, target_id: int | None) ->
         target_user_id=user.id,
         target_id=target_id,
     )
-    _backup_job_executor.submit(_run_user_backup_job, job["job_id"], current_user.id, user.id, target_id)
+    _backup_job_executor.submit(_run_user_backup_job, job["job_id"], current_user.id, user.id, target_id, backup_mode)
     return job
 
 
-def _queue_sftp_backup(current_user: User, website: Website, target_id: int) -> dict:
+def _queue_sftp_backup(current_user: User, website: Website, target_id: int, backup_mode: str = "full") -> dict:
     job = _queue_backup_job(
         current_user,
         "sftp_backup",
@@ -652,7 +675,7 @@ def _queue_sftp_backup(current_user: User, website: Website, target_id: int) -> 
         website_id=website.id,
         target_id=target_id,
     )
-    _backup_job_executor.submit(_run_sftp_backup_job, job["job_id"], current_user.id, website.id, target_id)
+    _backup_job_executor.submit(_run_sftp_backup_job, job["job_id"], current_user.id, website.id, target_id, backup_mode)
     return job
 
 
@@ -703,7 +726,7 @@ def _quota_check_for_website(db: Session, website: Website):
 @router.post("/backup")
 def create_backup(payload: BackupCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = get_owned_website(db, current_user, payload.website_id)
-    return _queue_site_backup(current_user, website)
+    return _queue_site_backup(current_user, website, backup_mode=payload.backup_mode)
 
 
 @router.get("/backup-jobs")
@@ -860,8 +883,8 @@ def create_user_backup(payload: UserBackupCreate, request: Request, db: Session 
     user = get_backup_user(db, current_user, payload.user_id)
     if payload.target_id:
         _get_accessible_sftp_target(db, current_user, payload.target_id)
-    log_action(db, current_user.id, "queue_backup_user", user.username, request=request)
-    return _queue_user_backup(current_user, user, payload.target_id)
+    log_action(db, current_user.id, "queue_backup_user", user.username, payload.backup_mode, request=request)
+    return _queue_user_backup(current_user, user, payload.target_id, backup_mode=payload.backup_mode)
 
 
 @router.post("/user-backups/upload")
@@ -932,6 +955,8 @@ def create_backup_schedule(payload: BackupScheduleCreate, request: Request, db: 
         target_id=payload.target_id,
         schedule=payload.schedule,
         name_suffix=payload.name_suffix,
+        backup_mode=payload.backup_mode,
+        full_every_n=payload.full_every_n,
         retention=payload.retention,
         is_active=payload.is_active,
         last_status="pending",
@@ -1018,6 +1043,8 @@ def update_backup_schedule(
     item.target_id = payload.target_id
     item.schedule = payload.schedule
     item.name_suffix = payload.name_suffix
+    item.backup_mode = payload.backup_mode
+    item.full_every_n = payload.full_every_n
     item.retention = payload.retention
     item.is_active = payload.is_active
     db.commit()
@@ -1180,13 +1207,18 @@ def _run_restore_job(job_id: str, request_user_id: int, source: dict, items: lis
         restored = 0
         try:
             for index, item in enumerate(items):
-                staged = ""
+                cleanup_paths: list[str] = []
                 try:
                     _set_restore_result(job_id, index, status="fetching" if source["kind"] != "local" else "restoring")
-                    path, is_copy = restore_sources.fetch(source, item["key"], item.get("size") or 0, db)
-                    staged = path if is_copy else ""
+                    path, chain_paths, cleanup_paths = restore_sources.fetch_chain(
+                        source, item["key"], item.get("size") or 0, db
+                    )
                     _set_restore_result(job_id, index, status="restoring")
-                    outcome = backup.restore_user_backup(path, db)
+                    outcome = backup.restore_user_backup(
+                        path,
+                        db,
+                        chain_files=chain_paths if chain_paths else None,
+                    )
                     username = outcome.get("username", "") if isinstance(outcome, dict) else ""
                     sites_count = len(outcome.get("websites") or []) if isinstance(outcome, dict) else 0
                     gen_pwd = outcome.get("generated_password", "") if isinstance(outcome, dict) else ""
@@ -1205,12 +1237,13 @@ def _run_restore_job(job_id: str, request_user_id: int, source: dict, items: lis
                         created_user=bool(outcome.get("created_user")) if isinstance(outcome, dict) else False,
                     )
                     restored += 1
-                    if staged:
-                        Path(staged).unlink(missing_ok=True)
                 except Exception as exc:  # noqa: BLE001
                     db.rollback()
                     logger.warning("restore %s failed: %s", item.get("key"), exc)
                     _set_restore_result(job_id, index, status="failed", detail=str(exc)[:500])
+                finally:
+                    for cp in cleanup_paths:
+                        Path(cp).unlink(missing_ok=True)
             total = len(items)
             if restored == total:
                 _set_backup_job(job_id, status="done", message=f"Restored {restored} of {total}",
@@ -1273,8 +1306,8 @@ def create_sftp_backup(
 ):
     website = get_owned_website(db, current_user, payload.website_id)
     target = _get_accessible_sftp_target(db, current_user, payload.target_id)
-    log_action(db, current_user.id, "queue_backup_sftp", website.domain, target.name, request=request)
-    return _queue_sftp_backup(current_user, website, target.id)
+    log_action(db, current_user.id, "queue_backup_sftp", website.domain, f"{target.name} ({payload.backup_mode})", request=request)
+    return _queue_sftp_backup(current_user, website, target.id, backup_mode=payload.backup_mode)
 
 
 @router.get("/php-config")

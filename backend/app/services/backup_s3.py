@@ -32,9 +32,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-# Local archives are named "<stem>-<YYYYMMDDHHMMSS>.tar.gz"; the stem is the
-# account or domain and is what a rotating name is built from.
-STAMP_RE = re.compile(r"-\d{14}(?=\.tar\.gz$)")
+# Local archives are named "<stem>-<YYYYMMDDHHMMSS>.tar.gz" or
+# "<stem>-<YYYYMMDDHHMMSS>-inc.tar.gz"; the stem is the account or domain.
+STAMP_RE = re.compile(r"-(\d{14})(?:-(inc|full))?(?=\.tar\.gz$)")
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 SUFFIX_MODES = ("none", "day_of_week", "week_of_month", "full_date")
@@ -56,11 +56,19 @@ def week_of_month(when: date) -> int:
     return min(5, (when.day - 1) // 7 + 1)
 
 
-def stored_name(local_name: str, mode: str, *, when: Optional[datetime] = None) -> str:
+def stored_name(
+    local_name: str,
+    mode: str,
+    *,
+    when: Optional[datetime] = None,
+    preserve_chain_base: bool = False,
+) -> str:
     """What to call this archive at the far end.
 
     Takes the local file name, strips the timestamp the panel puts on every
-    archive, and appends whatever the mode asks for.
+    archive, and appends whatever the mode asks for. Incremental archives
+    always keep a unique timestamp + '-inc.tar.gz' so they never overwrite
+    the base Full backup or earlier incrementals in the chain.
     """
     mode = (mode or DEFAULT_SUFFIX).strip().lower()
     if mode not in SUFFIX_MODES:
@@ -71,7 +79,23 @@ def stored_name(local_name: str, mode: str, *, when: Optional[datetime] = None) 
     if not base.endswith(".tar.gz"):
         # Not one of ours. Leave it exactly as it is rather than guess.
         return base
+
+    is_inc = base.endswith("-inc.tar.gz")
+    m = STAMP_RE.search(base)
+    if m and m.group(1):
+        try:
+            when = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
     stem = STAMP_RE.sub("", base)[: -len(".tar.gz")]
+    if stem.endswith("-inc"):
+        stem = stem[:-4]
+
+    if is_inc:
+        return f"{stem}-{when.strftime('%Y-%m-%d_%H%M%S')}-inc.tar.gz"
+
+    if preserve_chain_base:
+        mode = "full_date"
 
     if mode == "none":
         suffix = ""

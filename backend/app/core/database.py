@@ -107,6 +107,10 @@ def _ensure_resource_limit_columns() -> None:
         "sftp_backup_targets": [
             ("owner_id", "INTEGER DEFAULT NULL"),
         ],
+        "backup_schedules": [
+            ("backup_mode", "VARCHAR(16) NOT NULL DEFAULT 'full'"),
+            ("full_every_n", "INTEGER NOT NULL DEFAULT 7"),
+        ],
     }
     try:
         inspector = inspect(engine)

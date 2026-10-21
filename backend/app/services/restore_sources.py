@@ -62,9 +62,15 @@ def _iso(timestamp: float | int | None) -> str:
 
 
 def _row(name: str, key: str, size, modified: str, username: str = "", hostname: str = "") -> dict:
-    return {"name": name, "key": key, "size": int(size or 0), "modified": modified or "",
-            "username": username or backup.username_from_archive_name(name),
-            "hostname": hostname or ""}
+    return {
+        "name": name,
+        "key": key,
+        "size": int(size or 0),
+        "modified": modified or "",
+        "username": username or backup.username_from_archive_name(name),
+        "hostname": hostname or "",
+        "backup_type": "incremental" if (name or "").endswith("-inc.tar.gz") else "full",
+    }
 
 
 def _newest_first(rows: list[dict]) -> list[dict]:
@@ -477,3 +483,67 @@ def fetch(source: dict, key: str, size: int, db) -> tuple[str, bool]:
         finally:
             _ftp_close(ftp)
     return str(Path(backup.user_restore_dir()) / staged), True
+
+
+def fetch_chain(source: dict, key: str, size: int, db) -> tuple[str, list[str], list[str]]:
+    """Fetch a backup archive and, if it is incremental, all preceding archives in its chain.
+
+    Returns (target_path, chain_paths, cleanup_paths).
+    """
+    target_path, is_copy = fetch(source, key, size, db)
+    cleanup_paths: list[str] = [target_path] if is_copy else []
+    try:
+        manifest = backup.read_backup_manifest(target_path)
+    except Exception:
+        return target_path, [target_path], cleanup_paths
+
+    if manifest.get("backup_type") != "incremental":
+        return target_path, [target_path], cleanup_paths
+    chain_entries = manifest.get("chain_archives")
+    if not isinstance(chain_entries, list) or len(chain_entries) <= 1:
+        return target_path, [target_path], cleanup_paths
+
+    if source["kind"] == "local":
+        # Local restore_user_backup resolves local chain archives directly
+        return target_path, [], cleanup_paths
+
+    parent_dir = posixpath.dirname(key)
+    chain_paths: list[str] = []
+    try:
+        for entry in chain_entries[:-1]:
+            if not isinstance(entry, dict):
+                continue
+            candidates = []
+            for field in ("remote_name", "local_name"):
+                val = (entry.get(field) or "").strip()
+                if val and val not in candidates:
+                    candidates.append(val)
+            if not candidates:
+                continue
+            fetched_layer = ""
+            last_err: Exception | None = None
+            for cand_name in candidates:
+                cand_key = posixpath.join(parent_dir, cand_name) if parent_dir else cand_name
+                if cand_key == key:
+                    fetched_layer = target_path
+                    break
+                try:
+                    layer_path, layer_copy = fetch(source, cand_key, 0, db)
+                    fetched_layer = layer_path
+                    if layer_copy and layer_path not in cleanup_paths:
+                        cleanup_paths.append(layer_path)
+                    break
+                except Exception as exc:
+                    last_err = exc
+            if not fetched_layer:
+                missing_label = candidates[0]
+                raise RestoreSourceError(
+                    f"Cannot restore incremental backup: required base/chain archive '{missing_label}' was not found on the source ({last_err})"
+                )
+            chain_paths.append(fetched_layer)
+        chain_paths.append(target_path)
+        return target_path, chain_paths, cleanup_paths
+    except BaseException:
+        for cp in cleanup_paths:
+            Path(cp).unlink(missing_ok=True)
+        raise

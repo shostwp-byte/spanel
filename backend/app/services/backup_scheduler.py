@@ -55,7 +55,12 @@ def _upload_if_configured(db, schedule: BackupSchedule, archive: str, username: 
     if not target:
         raise ValueError("Backup target not found")
 
-    remote_name = backup_s3.stored_name(archive, getattr(schedule, "name_suffix", None))
+    is_inc_schedule = (getattr(schedule, "backup_mode", "full") or "full") == "incremental"
+    remote_name = backup_s3.stored_name(
+        archive,
+        getattr(schedule, "name_suffix", None),
+        preserve_chain_base=is_inc_schedule,
+    )
     acct = username or backup.username_from_archive_name(archive)
     subpath = f"{backup.get_server_hostname()}/{acct}" if acct else backup.get_server_hostname()
 
@@ -147,7 +152,17 @@ def run_one(db, schedule: BackupSchedule, now: datetime | None = None) -> bool:
     errors = []
     for user in users:
         try:
-            archive = backup.create_user_backup(user, db)
+            sched_mode = getattr(schedule, "backup_mode", "full") or "full"
+            sched_full_every = int(getattr(schedule, "full_every_n", 7) or 7)
+            archive = backup.create_user_backup(
+                user,
+                db,
+                use_hierarchy=True,
+                backup_mode=sched_mode,
+                target_id=schedule.target_id,
+                remote_name_mode=getattr(schedule, "name_suffix", "full_date") if schedule.target_id else None,
+                full_every_n=sched_full_every,
+            )
             target = _upload_if_configured(db, schedule, archive, username=user.username)
             if schedule.target_id:
                 # The copies live on the destination now; keeping them here

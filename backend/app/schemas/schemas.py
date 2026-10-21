@@ -1307,6 +1307,7 @@ class FirewallBlocklistUrl(BaseModel):
 
 class BackupCreate(BaseModel):
     website_id: int
+    backup_mode: Literal["full", "incremental"] = "full"
 
 
 def _validate_backup_schedule(value: str) -> str:
@@ -1320,6 +1321,7 @@ def _validate_backup_schedule(value: str) -> str:
 class UserBackupCreate(BaseModel):
     user_id: int
     target_id: Optional[int] = None
+    backup_mode: Literal["full", "incremental"] = "full"
 
 
 
@@ -1340,6 +1342,8 @@ class BackupScheduleCreate(BaseModel):
     # What the stored file is called, and so how many of them pile up at the
     # far end. See backup_s3.stored_name.
     name_suffix: str = Field(default="full_date", pattern=r"^(none|day_of_week|week_of_month|full_date)$")
+    backup_mode: str = Field(default="full", pattern=r"^(full|incremental)$")
+    full_every_n: int = Field(default=7, ge=2, le=90)
     retention: int = Field(default=7, ge=1, le=365)
     is_active: bool = True
 
@@ -1374,6 +1378,8 @@ class BackupScheduleOut(BaseModel):
     # Without it item.name_suffix was undefined in the panel and every
     # schedule read as the default whatever it really was.
     name_suffix: str = "full_date"
+    backup_mode: str = "full"
+    full_every_n: int = 7
     retention: int
     is_active: bool
     last_run_at: Optional[datetime] = None
@@ -1560,6 +1566,7 @@ class SftpBackupTargetOut(BaseModel):
 class SftpBackupRun(BaseModel):
     website_id: int
     target_id: int
+    backup_mode: Literal["full", "incremental"] = "full"
 
 
 class RestoreBackup(BaseModel):

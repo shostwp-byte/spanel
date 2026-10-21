@@ -397,6 +397,8 @@ class BackupSchedule(Base):
     # "day_of_week" rotates through seven; "week_of_month" through five;
     # "full_date" keeps one per day and grows until retention prunes it.
     name_suffix: Mapped[str] = mapped_column(String(16), default="full_date")
+    backup_mode: Mapped[str] = mapped_column(String(16), default="full")
+    full_every_n: Mapped[int] = mapped_column(Integer, default=7)
     retention: Mapped[int] = mapped_column(Integer, default=7)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

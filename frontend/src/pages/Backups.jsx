@@ -52,6 +52,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   const [selectedBackupUserId, setSelectedBackupUserId] = useState('');
   const [selectedBackupTargetId, setSelectedBackupTargetId] = useState('');
   const [selectedUserBackupTargetId, setSelectedUserBackupTargetId] = useState('');
+  const [userBackupMode, setUserBackupMode] = useState('full');
+  const [siteBackupMode, setSiteBackupMode] = useState('full');
   const [lastRestoredUserCredentials, setLastRestoredUserCredentials] = useState(null);
 
   // Schedule Builder / Editor state
@@ -62,6 +64,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     target_id: '',
     schedule: '0 2 * * *',
     name_suffix: 'full_date',
+    backup_mode: 'full',
+    full_every_n: 7,
     retention: 7,
     is_active: true,
   });
@@ -215,7 +219,10 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     try {
       const data = await request('/maintenance/backup', {
         method: 'POST',
-        body: JSON.stringify({ website_id: Number(selectedWebsiteId) }),
+        body: JSON.stringify({
+          website_id: Number(selectedWebsiteId),
+          backup_mode: siteBackupMode,
+        }),
       });
       queueBackupJob(data, t('websiteBackupRunningInBackground'));
     } catch (err) {
@@ -239,6 +246,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         body: JSON.stringify({
           user_id: targetUserId,
           target_id: selectedUserBackupTargetId ? Number(selectedUserBackupTargetId) : null,
+          backup_mode: userBackupMode,
         }),
       });
       queueBackupJob(
@@ -352,6 +360,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
       target_id: item.target_id ? String(item.target_id) : '',
       schedule: item.schedule || '0 2 * * *',
       name_suffix: item.name_suffix || 'full_date',
+      backup_mode: item.backup_mode || 'full',
+      full_every_n: Number(item.full_every_n || 7),
       retention: Number(item.retention || 7),
       is_active: Boolean(item.is_active),
     });
@@ -365,6 +375,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
       target_id: '',
       schedule: '0 2 * * *',
       name_suffix: 'full_date',
+      backup_mode: 'full',
+      full_every_n: 7,
       retention: 7,
       is_active: true,
     });
@@ -385,6 +397,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         target_id: scheduleForm.target_id ? Number(scheduleForm.target_id) : null,
         schedule: scheduleForm.schedule.trim(),
         name_suffix: scheduleForm.name_suffix,
+        backup_mode: scheduleForm.backup_mode || 'full',
+        full_every_n: Number(scheduleForm.full_every_n || 7),
         retention: Number(scheduleForm.retention || 7),
         is_active: Boolean(scheduleForm.is_active),
       };
@@ -627,6 +641,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         body: JSON.stringify({
           website_id: Number(selectedWebsiteId),
           target_id: Number(selectedBackupTargetId),
+          backup_mode: siteBackupMode,
         }),
       });
       queueBackupJob(data, t('sftpBackupRunningInBackground'));
@@ -865,7 +880,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
             <div style={{
               marginTop: '16px', padding: '16px', borderRadius: '10px',
               background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
-              display: 'grid', gridTemplateColumns: isManager ? '1fr 1fr auto' : '1fr auto', gap: '14px', alignItems: 'end',
+              display: 'grid', gridTemplateColumns: isManager ? '1fr 1fr 1fr auto' : '1fr 1fr auto', gap: '14px', alignItems: 'end',
             }}>
               {isManager && (
                 <label style={{ margin: 0 }}>
@@ -882,6 +897,15 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   </select>
                 </label>
               )}
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
+                  Chế độ sao lưu (Backup Mode)
+                </span>
+                <select value={userBackupMode} onChange={(e) => setUserBackupMode(e.target.value)}>
+                  <option value="full">Full Backup (Sao lưu toàn bộ)</option>
+                  <option value="incremental">Incremental Backup (Gia tăng - Tối ưu dung lượng)</option>
+                </select>
+              </label>
               <label style={{ margin: 0 }}>
                 <span style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '6px' }}>
                   {isManager ? 'Đích lưu trữ (Local / SFTP / S3)' : 'Đích lưu trữ của bạn (Local hoặc Kho SFTP/S3 cá nhân)'}
@@ -906,7 +930,9 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 style={{ height: '40px', padding: '0 18px', fontWeight: 600 }}
               >
                 <Archive size={16} />
-                {selectedUserBackupTargetId ? 'Backup & Đẩy lên Cloud/SFTP' : 'Tạo Full User Backup'}
+                {selectedUserBackupTargetId
+                  ? (userBackupMode === 'incremental' ? 'Backup Inc & Đẩy đi' : 'Backup & Đẩy lên Cloud/SFTP')
+                  : (userBackupMode === 'incremental' ? 'Tạo Incremental Backup' : 'Tạo Full User Backup')}
               </button>
             </div>
 
@@ -967,6 +993,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   <tr>
                     <th>Tài khoản (User)</th>
                     <th>{isManager ? 'Đường dẫn chuẩn (Hostname / User / File)' : 'Tên file Backup'}</th>
+                    <th>Loại Backup</th>
                     <th>Số Website</th>
                     <th>Thời gian tạo</th>
                     <th>Dung lượng</th>
@@ -979,6 +1006,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                     const standardizedPath = item.relative_path && item.relative_path.includes('/')
                       ? item.relative_path
                       : `${item.hostname || serverHostname}/${item.username || 'user'}/${item.filename}`;
+                    const isInc = item.backup_type === 'incremental' || (item.filename || '').endsWith('-inc.tar.gz');
                     return (
                       <tr key={item.backup_file}>
                         <td>
@@ -999,6 +1027,22 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                               {item.filename}
                             </div>
                           )}
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', alignItems: 'flex-start' }}>
+                            <span style={{
+                              padding: '2px 8px', borderRadius: '999px', fontSize: '0.73rem', fontWeight: 700,
+                              background: isInc ? 'rgba(13, 148, 136, 0.14)' : 'rgba(99, 102, 241, 0.14)',
+                              color: isInc ? 'var(--accent-primary)' : '#6366f1',
+                            }}>
+                              {isInc ? `INCREMENTAL (#${item.chain_length || 2})` : 'FULL BASE'}
+                            </span>
+                            {isInc && item.saved_bytes > 0 && (
+                              <span style={{ fontSize: '0.72rem', color: '#10b981', fontWeight: 600 }}>
+                                Tiết kiệm {formatBytes(item.saved_bytes)}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td>
                           <span style={{
@@ -1062,7 +1106,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   })}
                   {filteredUserBackups.length === 0 && (
                     <tr>
-                      <td colSpan="7">
+                      <td colSpan="8">
                         <EmptyState
                           icon={Archive}
                           title="Chưa có bản sao lưu User nào"
@@ -1098,13 +1142,22 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   )}
                 </p>
               </div>
-              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                <select
+                  value={siteBackupMode}
+                  onChange={(e) => setSiteBackupMode(e.target.value)}
+                  style={{ height: '38px', width: 'auto', minWidth: '190px', fontSize: '0.83rem' }}
+                  title="Chọn chế độ sao lưu Website"
+                >
+                  <option value="full">Full Backup (Đầy đủ)</option>
+                  <option value="incremental">Incremental (Gia tăng)</option>
+                </select>
                 <label className="button secondary-light" style={{ margin: 0, cursor: selectedWebsiteId ? 'pointer' : 'not-allowed', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                   <Upload size={15} /> Tải lên file .tar.gz
                   <input type="file" accept=".tar.gz,application/gzip" onChange={uploadBackupArchive} hidden disabled={loading || !selectedWebsiteId} />
                 </label>
                 <button type="button" onClick={createBackup} disabled={loading || !selectedWebsiteId}>
-                  <Archive size={15} /> Tạo Backup Website
+                  <Archive size={15} /> {siteBackupMode === 'incremental' ? 'Tạo Incremental Backup' : 'Tạo Backup Website'}
                 </button>
               </div>
             </div>
@@ -1158,6 +1211,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 <thead>
                   <tr>
                     <th>Tên file sao lưu</th>
+                    <th>Loại</th>
                     <th>{isManager ? 'Đường dẫn phân cấp (Hostname / User / File)' : 'Đường dẫn'}</th>
                     <th style={{ textAlign: 'right' }}>Thao tác</th>
                   </tr>
@@ -1165,12 +1219,22 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                 <tbody>
                   {backups.map((item) => {
                     const fileName = item.split('/').pop() || item;
+                    const isIncSite = fileName.endsWith('-inc.tar.gz');
                     const selectedSiteObj = websites.find((w) => String(w.id) === String(selectedWebsiteId));
                     const siteOwner = users.find((u) => u.id === selectedSiteObj?.owner_id)?.username || 'user';
                     return (
                       <tr key={item}>
                         <td>
                           <strong style={{ color: 'var(--text-main)' }}>{fileName}</strong>
+                        </td>
+                        <td>
+                          <span style={{
+                            padding: '2px 8px', borderRadius: '999px', fontSize: '0.73rem', fontWeight: 700,
+                            background: isIncSite ? 'rgba(13, 148, 136, 0.14)' : 'rgba(99, 102, 241, 0.14)',
+                            color: isIncSite ? 'var(--accent-primary)' : '#6366f1',
+                          }}>
+                            {isIncSite ? 'INCREMENTAL' : 'FULL'}
+                          </span>
                         </td>
                         <td style={{ fontFamily: 'monospace', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                           {isManager ? `${serverHostname}/${siteOwner}/${fileName}` : fileName}
@@ -1209,7 +1273,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   })}
                   {backups.length === 0 && (
                     <tr>
-                      <td colSpan="3">
+                      <td colSpan="4">
                         <EmptyState
                           icon={Archive}
                           title="Chưa có bản sao lưu nào cho Website này"
@@ -1349,7 +1413,45 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
                     <label style={{ margin: 0 }}>
-                      <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Giữ lại (Retention)</span>
+                      <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Chế độ sao lưu (Backup Mode)</span>
+                      <select
+                        value={scheduleForm.backup_mode || 'full'}
+                        onChange={(e) => setScheduleForm((p) => ({ ...p, backup_mode: e.target.value }))}
+                      >
+                        <option value="full">Full Backup (Đầy đủ mỗi phiên)</option>
+                        <option value="incremental">Incremental (Gia tăng - Tiết kiệm dung lượng)</option>
+                      </select>
+                    </label>
+                    {scheduleForm.backup_mode === 'incremental' ? (
+                      <label style={{ margin: 0 }}>
+                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Chu kỳ tạo lại Full gốc (số phiên)</span>
+                        <input
+                          type="number"
+                          min="2"
+                          max="90"
+                          value={scheduleForm.full_every_n}
+                          onChange={(e) => setScheduleForm((p) => ({ ...p, full_every_n: e.target.value }))}
+                          required
+                        />
+                      </label>
+                    ) : (
+                      <label style={{ margin: 0 }}>
+                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Quy tắc đặt tên file</span>
+                        <select
+                          value={scheduleForm.name_suffix}
+                          onChange={(e) => setScheduleForm((p) => ({ ...p, name_suffix: e.target.value }))}
+                        >
+                          <option value="full_date">Theo ngày (YYYY-MM-DD)</option>
+                          <option value="day_of_week">Theo thứ (Mon..Sun)</option>
+                          <option value="week_of_month">Theo tuần (W1..W5)</option>
+                          <option value="none">Ghi đè 1 file duy nhất</option>
+                        </select>
+                      </label>
+                    )}
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '10px' }}>
+                    <label style={{ margin: 0 }}>
+                      <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Giữ lại (Retention - tự động bảo vệ chuỗi Full gốc)</span>
                       <input
                         type="number"
                         min="1"
@@ -1358,18 +1460,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         onChange={(e) => setScheduleForm((p) => ({ ...p, retention: e.target.value }))}
                         required
                       />
-                    </label>
-                    <label style={{ margin: 0 }}>
-                      <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>Quy tắc đặt tên file</span>
-                      <select
-                        value={scheduleForm.name_suffix}
-                        onChange={(e) => setScheduleForm((p) => ({ ...p, name_suffix: e.target.value }))}
-                      >
-                        <option value="full_date">Theo ngày (YYYY-MM-DD)</option>
-                        <option value="day_of_week">Theo thứ (Mon..Sun)</option>
-                        <option value="week_of_month">Theo tuần (W1..W5)</option>
-                        <option value="none">Ghi đè 1 file duy nhất</option>
-                      </select>
                     </label>
                   </div>
                 </div>
@@ -1451,8 +1541,19 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         </td>
                         <td>
                           <code style={{ fontWeight: 600 }}>{item.schedule}</code>
-                          <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                            Suffix: {item.name_suffix || 'full_date'}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', flexWrap: 'wrap' }}>
+                            <span style={{
+                              padding: '1px 7px', borderRadius: '999px', fontSize: '0.71rem', fontWeight: 700,
+                              background: item.backup_mode === 'incremental' ? 'rgba(13, 148, 136, 0.14)' : 'rgba(99, 102, 241, 0.14)',
+                              color: item.backup_mode === 'incremental' ? 'var(--accent-primary)' : '#6366f1',
+                            }}>
+                              {item.backup_mode === 'incremental'
+                                ? `INCREMENTAL (1 Full / ${item.full_every_n || 7} phiên)`
+                                : 'FULL BACKUP'}
+                            </span>
+                            <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                              Suffix: {item.name_suffix || 'full_date'}
+                            </span>
                           </div>
                         </td>
                         <td>
@@ -1843,23 +1944,39 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                                       </span>
                                     </td>
                                     <td>
-                                      {versions.length === 1 ? (
-                                        <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                                          {chosen.modified ? new Date(chosen.modified).toLocaleString() : chosen.name}
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                        {versions.length === 1 ? (
+                                          <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                                            {chosen.modified ? new Date(chosen.modified).toLocaleString() : chosen.name}
+                                          </span>
+                                        ) : (
+                                          <select
+                                            value={chosen.key}
+                                            onChange={(e) => setRestoreChoice({ ...restoreChoice, [acct]: e.target.value })}
+                                            style={{ height: '32px', fontSize: '0.8rem' }}
+                                          >
+                                            {versions.map((v) => {
+                                              const vInc = v.backup_type === 'incremental' || (v.name || '').endsWith('-inc.tar.gz');
+                                              return (
+                                                <option key={v.key} value={v.key}>
+                                                  [{vInc ? 'INC' : 'FULL'}] {v.hostname ? `[${v.hostname}] ` : ''}{v.modified ? new Date(v.modified).toLocaleString() : v.name} ({formatBytes(v.size)})
+                                                </option>
+                                              );
+                                            })}
+                                          </select>
+                                        )}
+                                        <span style={{
+                                          padding: '2px 7px', borderRadius: '999px', fontSize: '0.71rem', fontWeight: 700,
+                                          background: (chosen.backup_type === 'incremental' || (chosen.name || '').endsWith('-inc.tar.gz'))
+                                            ? 'rgba(13, 148, 136, 0.14)'
+                                            : 'rgba(99, 102, 241, 0.14)',
+                                          color: (chosen.backup_type === 'incremental' || (chosen.name || '').endsWith('-inc.tar.gz'))
+                                            ? 'var(--accent-primary)'
+                                            : '#6366f1',
+                                        }} title="Bản Incremental sẽ tự động ghép chuỗi Full gốc + các bản Incremental trước đó khi khôi phục">
+                                          {(chosen.backup_type === 'incremental' || (chosen.name || '').endsWith('-inc.tar.gz')) ? 'INC (Tự ghép chuỗi)' : 'FULL'}
                                         </span>
-                                      ) : (
-                                        <select
-                                          value={chosen.key}
-                                          onChange={(e) => setRestoreChoice({ ...restoreChoice, [acct]: e.target.value })}
-                                          style={{ height: '32px', fontSize: '0.8rem' }}
-                                        >
-                                          {versions.map((v) => (
-                                            <option key={v.key} value={v.key}>
-                                              {v.hostname ? `[${v.hostname}] ` : ''}{v.modified ? new Date(v.modified).toLocaleString() : v.name} ({formatBytes(v.size)})
-                                            </option>
-                                          ))}
-                                        </select>
-                                      )}
+                                      </div>
                                     </td>
                                     <td style={{ fontWeight: 600 }}>{formatBytes(chosen.size)}</td>
                                   </tr>

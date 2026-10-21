@@ -96,29 +96,209 @@ def _hostname_conflicts(db, domain: str, exclude_website_id: int | None = None) 
     return safe in reserved or f"www.{safe}" in reserved
 
 
-def create_backup(website: Website, db_name: Optional[str] = None) -> str:
-    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+SITE_MANIFEST = "site_manifest.json"
+
+
+def _scan_tree_files(root: Path, arc_prefix: str) -> dict[str, list[int]]:
+    """Scan a directory tree and return {arc_path: [mtime_ms, size]} for incremental tracking."""
+    files: dict[str, list[int]] = {}
+    if not root.is_dir():
+        return files
+    clean_prefix = arc_prefix.strip("/")
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        base = Path(directory)
+        try:
+            relative = base.relative_to(root)
+        except ValueError:
+            continue
+        for name in sorted(filenames):
+            path = base / name
+            if path.is_symlink():
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            rel_posix = (relative / name).as_posix()
+            arc_path = f"{clean_prefix}/{rel_posix}" if clean_prefix else rel_posix
+            files[arc_path] = [int(st.st_mtime_ns // 1_000_000), int(st.st_size)]
+    return files
+
+
+def _add_filtered_tree(
+    tar: tarfile.TarFile,
+    root: Path,
+    arcname: str,
+    allowed_files: Optional[set[str]] = None,
+) -> None:
+    """Add a directory tree to a tarfile, optionally including only files in allowed_files."""
+    if not root.is_dir():
+        return
+    clean_arc = arcname.strip("/")
+    try:
+        tar.add(root, arcname=clean_arc, recursive=False)
+    except OSError:
+        return
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        base = Path(directory)
+        try:
+            relative = base.relative_to(root)
+        except ValueError:
+            continue
+        for name in dirnames:
+            try:
+                tar.add(base / name, arcname=f"{clean_arc}/{(relative / name).as_posix()}", recursive=False)
+            except OSError:
+                continue
+        for name in sorted(filenames):
+            path = base / name
+            if path.is_symlink():
+                continue
+            arc_path = f"{clean_arc}/{(relative / name).as_posix()}"
+            if allowed_files is not None and arc_path not in allowed_files:
+                continue
+            try:
+                tar.add(path, arcname=arc_path, recursive=False)
+            except OSError as exc:
+                logger.info("Skipped %s in backup: %s", path, exc)
+
+
+def _read_incremental_state(state_path: Path) -> Optional[dict]:
+    if not state_path.is_file():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("files"), dict) and isinstance(data.get("chain_archives"), list):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _write_incremental_state(state_path: Path, state: dict) -> None:
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = state_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(state, ensure_ascii=True), encoding="utf-8")
+        tmp_path.replace(state_path)
+    except Exception as exc:
+        logger.warning("Could not write incremental state %s: %s", state_path, exc)
+
+
+def create_backup(
+    website: Website,
+    db_name: Optional[str] = None,
+    *,
+    backup_mode: str = "full",
+    target_id: Optional[int] = None,
+    full_every_n: int = 7,
+) -> str:
+    stamp_dt = datetime.utcnow()
+    stamp = stamp_dt.strftime("%Y%m%d%H%M%S")
     backup_dir = Path(settings.backup_root) / website.domain
     owner_username = getattr(getattr(website, "owner", None), "username", "") or ""
     prefix = f"{owner_username}-{website.domain}" if owner_username else website.domain
-    archive = backup_dir / f"{prefix}-{stamp}.tar.gz"
-    sql_file = backup_dir / f"{website.domain}-{stamp}.sql"
     shell.run(["mkdir", "-p", str(backup_dir)])
     backup_dir.mkdir(parents=True, exist_ok=True)
+
+    scope = f"target-{target_id}" if target_id else "local"
+    state_path = backup_dir / f".incremental-state-{scope}.json"
+    prev_state = _read_incremental_state(state_path)
+    requested_mode = "incremental" if (backup_mode or "").lower() == "incremental" else "full"
+    effective_mode = requested_mode
+
+    if effective_mode == "incremental":
+        if not prev_state or not prev_state.get("chain_archives"):
+            effective_mode = "full"
+        elif len(prev_state["chain_archives"]) >= max(int(full_every_n or 7), 2):
+            effective_mode = "full"
+        elif scope == "local":
+            for entry in prev_state["chain_archives"]:
+                if not (backup_dir / (entry.get("local_name") or "")).is_file():
+                    effective_mode = "full"
+                    break
+
+    suffix_tag = "-inc" if effective_mode == "incremental" else ""
+    archive = backup_dir / f"{prefix}-{stamp}{suffix_tag}.tar.gz"
+    sql_file = backup_dir / f"{website.domain}-{stamp}.sql"
+    manifest_file = backup_dir / f".site-manifest-{stamp}.json"
+
+    root_path = Path(website.root_path)
+    current_files = _scan_tree_files(root_path, "site") if root_path.exists() else {}
+
+    if effective_mode == "incremental" and prev_state:
+        prev_files = prev_state.get("files") or {}
+        changed_files = {k for k, v in current_files.items() if prev_files.get(k) != v}
+        deleted_files = sorted(k for k in prev_files.keys() if k not in current_files)
+        saved_bytes = sum(v[1] for k, v in current_files.items() if k not in changed_files)
+        chain_id = prev_state.get("chain_id") or stamp
+        base_backup = prev_state.get("base_backup") or archive.name
+        chain_archives = list(prev_state.get("chain_archives") or [])
+    else:
+        changed_files = set(current_files.keys())
+        deleted_files = []
+        saved_bytes = 0
+        chain_id = stamp
+        base_backup = archive.name
+        chain_archives = []
+
+    current_chain_entry = {
+        "local_name": archive.name,
+        "remote_name": archive.name,
+        "backup_type": effective_mode,
+        "generated_at": stamp_dt.isoformat() + "Z",
+    }
+    chain_archives.append(current_chain_entry)
+
+    site_manifest = {
+        "kind": "spanel_website",
+        "version": 1,
+        "domain": website.domain,
+        "hostname": get_server_hostname(),
+        "backup_type": effective_mode,
+        "chain_id": chain_id,
+        "base_backup": base_backup,
+        "chain_archives": chain_archives,
+        "deleted_files": deleted_files,
+        "stats": {
+            "total_files": len(current_files),
+            "included_files": len(changed_files),
+            "skipped_files": len(current_files) - len(changed_files),
+            "deleted_files": len(deleted_files),
+            "saved_bytes": saved_bytes,
+        },
+        "generated_at": stamp_dt.isoformat() + "Z",
+    }
+
     if db_name:
         mariadb.export_database(db_name, str(sql_file))
         if settings.command_dry_run and not sql_file.exists():
             sql_file.write_text(f"-- DRY RUN database dump for {db_name}\n", encoding="utf-8")
     try:
+        manifest_file.write_text(json.dumps(site_manifest, ensure_ascii=True, indent=2), encoding="utf-8")
         with tarfile.open(archive, "w:gz") as tar:
-            tar.add(website.root_path, arcname="site")
+            tar.add(manifest_file, arcname=SITE_MANIFEST)
+            if root_path.exists():
+                _add_filtered_tree(
+                    tar,
+                    root_path,
+                    "site",
+                    allowed_files=changed_files if effective_mode == "incremental" else None,
+                )
             if sql_file.exists():
                 tar.add(sql_file, arcname=f"database/{sql_file.name}")
+        _write_incremental_state(state_path, {
+            "chain_id": chain_id,
+            "base_backup": base_backup,
+            "chain_archives": chain_archives,
+            "updated_at": stamp_dt.isoformat() + "Z",
+            "files": current_files,
+        })
     finally:
-        # The dump is inside the archive, and restore reads it from there.
-        # Left beside it, every website backup kept a second, uncompressed
-        # copy of the database that nothing ever removed.
         sql_file.unlink(missing_ok=True)
+        manifest_file.unlink(missing_ok=True)
     return str(archive)
 
 
@@ -153,19 +333,118 @@ def _ensure_user_dir(path: Path) -> Path:
     return path
 
 
-def create_user_backup(user: User, db, use_hierarchy: bool = True) -> str:
-    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+def create_user_backup(
+    user: User,
+    db,
+    use_hierarchy: bool = True,
+    *,
+    backup_mode: str = "full",
+    target_id: Optional[int] = None,
+    remote_name_mode: Optional[str] = None,
+    full_every_n: int = 7,
+) -> str:
+    from app.services import backup_s3
+
+    stamp_dt = datetime.utcnow()
+    stamp = stamp_dt.strftime("%Y%m%d%H%M%S")
     backup_dir = _ensure_user_dir(_user_backup_dir(user.username, use_hierarchy=use_hierarchy))
-    archive = backup_dir / f"user-{user.username}-{stamp}.tar.gz"
     websites = db.query(Website).filter(Website.owner_id == user.id).order_by(Website.id.asc()).all()
+
+    scope = f"target-{target_id}" if target_id else "local"
+    state_path = backup_dir / f".incremental-state-{scope}.json"
+    prev_state = _read_incremental_state(state_path)
+    requested_mode = "incremental" if (backup_mode or "").lower() == "incremental" else "full"
+    effective_mode = requested_mode
+
+    if effective_mode == "incremental":
+        if not prev_state or not prev_state.get("chain_archives"):
+            effective_mode = "full"
+        elif len(prev_state["chain_archives"]) >= max(int(full_every_n or 7), 2):
+            effective_mode = "full"
+        elif scope == "local":
+            for entry in prev_state["chain_archives"]:
+                if not (backup_dir / (entry.get("local_name") or "")).is_file():
+                    effective_mode = "full"
+                    break
+
+    suffix_tag = "-inc" if effective_mode == "incremental" else ""
+    archive = backup_dir / f"user-{user.username}-{stamp}{suffix_tag}.tar.gz"
+
+    if remote_name_mode:
+        computed_remote_name = backup_s3.stored_name(
+            archive.name,
+            remote_name_mode,
+            when=stamp_dt,
+            preserve_chain_base=(requested_mode == "incremental"),
+        )
+    else:
+        computed_remote_name = archive.name
 
     with tempfile.TemporaryDirectory(prefix="spanel-user-backup-", dir=str(backup_dir)) as tmp:
         tmp_dir = Path(tmp)
+        # Scan live files for incremental indexing & comparison
+        from app.services import mail
+
+        mail_boxes: list[tuple[str, Path]] = []
+        linux_user = site_users.linux_user_for_panel_username(user.username)
+        for account in (db.query(MailAccount).filter(MailAccount.owner_id == user.id)
+                        .order_by(MailAccount.domain, MailAccount.local_part).all()):
+            mail_boxes.append((f"mail/{account.domain}/{account.local_part}",
+                               Path(f"/home/{linux_user}/mail/{account.domain}/{account.local_part}")))
+
+        current_files: dict[str, list[int]] = {}
+        for website in websites:
+            root = Path(website.root_path)
+            if root.exists():
+                current_files.update(_scan_tree_files(root, f"sites/{website.domain}/site"))
+        for arcname, box in mail_boxes:
+            if box.is_dir():
+                current_files.update(_scan_tree_files(box, arcname))
+
+        if effective_mode == "incremental" and prev_state:
+            prev_files = prev_state.get("files") or {}
+            changed_files = {k for k, v in current_files.items() if prev_files.get(k) != v}
+            deleted_files = sorted(k for k in prev_files.keys() if k not in current_files)
+            saved_bytes = sum(v[1] for k, v in current_files.items() if k not in changed_files)
+            chain_id = prev_state.get("chain_id") or stamp
+            base_backup = prev_state.get("base_backup") or archive.name
+            base_remote_name = prev_state.get("base_remote_name") or computed_remote_name
+            chain_archives = list(prev_state.get("chain_archives") or [])
+        else:
+            changed_files = set(current_files.keys())
+            deleted_files = []
+            saved_bytes = 0
+            chain_id = stamp
+            base_backup = archive.name
+            base_remote_name = computed_remote_name
+            chain_archives = []
+
+        current_chain_entry = {
+            "local_name": archive.name,
+            "remote_name": computed_remote_name,
+            "backup_type": effective_mode,
+            "generated_at": stamp_dt.isoformat() + "Z",
+        }
+        chain_archives.append(current_chain_entry)
+
         manifest = {
             "kind": "spanel_user",
             "version": 1,
             "hostname": get_server_hostname(),
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "backup_type": effective_mode,
+            "chain_id": chain_id,
+            "base_backup": base_backup,
+            "base_remote_name": base_remote_name,
+            "chain_archives": chain_archives,
+            "deleted_files": deleted_files,
+            "stats": {
+                "total_files": len(current_files),
+                "included_files": len(changed_files),
+                "skipped_files": len(current_files) - len(changed_files),
+                "deleted_files": len(deleted_files),
+                "saved_bytes": saved_bytes,
+            },
+            "generated_at": stamp_dt.isoformat() + "Z",
             "user": {
                 "username": user.username,
                 "email": user.email,
@@ -179,17 +458,7 @@ def create_user_backup(user: User, db, use_hierarchy: bool = True) -> str:
             "databases": [],
             "applications": [],
         }
-        # Email addon: the account's mail domains, mailboxes (password hashes)
-        # and forwarders; the mail itself is under mail/<domain>/<name>.
-        from app.services import mail
-
         manifest["mail"] = mail.backup_manifest(db, user)
-        mail_boxes: list[tuple[str, Path]] = []
-        linux_user = site_users.linux_user_for_panel_username(user.username)
-        for account in (db.query(MailAccount).filter(MailAccount.owner_id == user.id)
-                        .order_by(MailAccount.domain, MailAccount.local_part).all()):
-            mail_boxes.append((f"mail/{account.domain}/{account.local_part}",
-                               Path(f"/home/{linux_user}/mail/{account.domain}/{account.local_part}")))
 
         app_payloads: dict[str, Path] = {}
         for app_entry, payload in _collect_applications(user, db, tmp_dir):
@@ -270,7 +539,12 @@ def create_user_backup(user: User, db, use_hierarchy: bool = True) -> str:
             for website in websites:
                 root = Path(website.root_path)
                 if root.exists():
-                    tar.add(root, arcname=f"sites/{website.domain}/site")
+                    _add_filtered_tree(
+                        tar,
+                        root,
+                        f"sites/{website.domain}/site",
+                        allowed_files=changed_files if effective_mode == "incremental" else None,
+                    )
                 sql_path = sql_files.get(website.domain)
                 if sql_path and sql_path.exists():
                     tar.add(sql_path, arcname=f"databases/{website.domain}.sql")
@@ -281,7 +555,20 @@ def create_user_backup(user: User, db, use_hierarchy: bool = True) -> str:
                 if payload.exists():
                     tar.add(payload, arcname=f"applications/{name}.tar")
             for arcname, box in mail_boxes:
-                _add_readable_tree(tar, box, arcname)
+                _add_filtered_tree(
+                    tar,
+                    box,
+                    arcname,
+                    allowed_files=changed_files if effective_mode == "incremental" else None,
+                )
+        _write_incremental_state(state_path, {
+            "chain_id": chain_id,
+            "base_backup": base_backup,
+            "base_remote_name": base_remote_name,
+            "chain_archives": chain_archives,
+            "updated_at": stamp_dt.isoformat() + "Z",
+            "files": current_files,
+        })
     return str(archive)
 
 
@@ -422,6 +709,12 @@ def describe_user_backup(backup_file: str) -> dict:
         "size": path.stat().st_size,
         "username": "",
         "generated_at": "",
+        "backup_type": "incremental" if path.name.endswith("-inc.tar.gz") else "full",
+        "base_backup": "",
+        "chain_length": 1,
+        "saved_bytes": 0,
+        "included_files": 0,
+        "deleted_files_count": 0,
         "websites": 0,
         "applications": 0,
         "valid": False,
@@ -436,6 +729,17 @@ def describe_user_backup(backup_file: str) -> dict:
         item["username"] = (manifest.get("user") or {}).get("username") or ""
         if manifest.get("hostname"):
             item["hostname"] = manifest["hostname"]
+        if manifest.get("backup_type") in {"full", "incremental"}:
+            item["backup_type"] = manifest["backup_type"]
+        item["base_backup"] = manifest.get("base_backup") or ""
+        chain_list = manifest.get("chain_archives")
+        if isinstance(chain_list, list) and chain_list:
+            item["chain_length"] = len(chain_list)
+        stats = manifest.get("stats") or {}
+        if isinstance(stats, dict):
+            item["saved_bytes"] = int(stats.get("saved_bytes") or 0)
+            item["included_files"] = int(stats.get("included_files") or 0)
+        item["deleted_files_count"] = len(manifest.get("deleted_files") or [])
         item["generated_at"] = manifest.get("generated_at") or ""
         item["websites"] = len(manifest.get("websites") or [])
         item["applications"] = len(manifest.get("applications") or [])
@@ -497,8 +801,10 @@ def username_from_archive_name(name: str) -> str:
     if not base.startswith("user-") or not base.endswith(".tar.gz"):
         return ""
     stem = base[len("user-"):-len(".tar.gz")]
+    stem = re.sub(r"-(?:inc|full)$", "", stem)
     # Strip a trailing timestamp, weekday, week number or date if present.
-    stem = re.sub(r"-(\d{14}|Mon|Tue|Wed|Thu|Fri|Sat|Sun|W[1-5]|\d{4}-\d{2}-\d{2})$", "", stem)
+    stem = re.sub(r"-(\d{14}|\d{4}-\d{2}-\d{2}_\d{6}|Mon|Tue|Wed|Thu|Fri|Sat|Sun|W[1-5]|\d{4}-\d{2}-\d{2})$", "", stem)
+    stem = re.sub(r"-(?:inc|full)$", "", stem)
     return stem
 
 
@@ -591,8 +897,27 @@ def discard_local_copy(archive: str) -> None:
 
 def prune_user_backups(username: str, keep: int) -> None:
     keep = max(int(keep or 1), 1)
-    for old_backup in list_user_backups(username)[keep:]:
-        Path(old_backup).unlink(missing_ok=True)
+    all_backups = list_user_backups(username)
+    retained = all_backups[:keep]
+    protected_names: set[str] = set()
+    for kept_path in retained:
+        protected_names.add(Path(kept_path).name)
+        try:
+            manifest = read_backup_manifest(kept_path)
+            for entry in manifest.get("chain_archives") or []:
+                if isinstance(entry, dict):
+                    if entry.get("local_name"):
+                        protected_names.add(str(entry["local_name"]))
+                    if entry.get("remote_name"):
+                        protected_names.add(str(entry["remote_name"]))
+            if manifest.get("base_backup"):
+                protected_names.add(str(manifest["base_backup"]))
+        except Exception:
+            continue
+    for old_backup in all_backups[keep:]:
+        p = Path(old_backup)
+        if p.name not in protected_names:
+            p.unlink(missing_ok=True)
 
 
 def read_backup_manifest(backup_file: str) -> dict:
@@ -602,12 +927,82 @@ def read_backup_manifest(backup_file: str) -> dict:
             member = tar.getmember(BACKUP_MANIFEST)
         except KeyError as exc:
             raise ValueError("Backup manifest not found") from exc
-        if member.size > 2 * 1024 * 1024:
+        if member.size > 16 * 1024 * 1024:
             raise ValueError("Backup manifest is too large")
         source = tar.extractfile(member)
         if source is None:
             raise ValueError("Backup manifest cannot be read")
         return json.loads(source.read().decode("utf-8"))
+
+
+def _apply_deleted_files(stage_dir: Path, prefix: str, deleted_files: list[str]) -> None:
+    """Remove files recorded in an incremental layer's deleted_files list."""
+    if not deleted_files or not stage_dir.is_dir():
+        return
+    clean_prefix = prefix.strip("/") + "/"
+    stage_resolved = stage_dir.resolve()
+    for rel_item in deleted_files:
+        if not isinstance(rel_item, str) or not rel_item.startswith(clean_prefix):
+            continue
+        sub_rel = rel_item[len(clean_prefix):].strip("/")
+        if not sub_rel or ".." in sub_rel.split("/"):
+            continue
+        try:
+            target = (stage_resolved / sub_rel).resolve()
+            if stage_resolved not in target.parents:
+                continue
+            if target.is_file() or target.is_symlink():
+                target.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _resolve_local_user_chain(archive: Path, manifest: dict, username: str) -> list[Path]:
+    """Return the ordered list of archives [base_full, inc_1, ..., archive] to apply during restore."""
+    if manifest.get("backup_type") != "incremental":
+        return [archive]
+    chain_entries = manifest.get("chain_archives")
+    if not isinstance(chain_entries, list) or len(chain_entries) <= 1:
+        return [archive]
+
+    search_dirs: list[Path] = [archive.parent]
+    if PANEL_USERNAME_RE.fullmatch(username or ""):
+        for use_h in (True, False):
+            d = _user_backup_dir(username, use_hierarchy=use_h)
+            if d not in search_dirs:
+                search_dirs.append(d)
+    restore_d = _user_restore_dir()
+    if restore_d not in search_dirs:
+        search_dirs.append(restore_d)
+
+    resolved: list[Path] = []
+    for entry in chain_entries[:-1]:
+        if not isinstance(entry, dict):
+            continue
+        candidates = [c for c in (entry.get("local_name"), entry.get("remote_name")) if c]
+        if archive.name in candidates:
+            resolved.append(archive)
+            continue
+        found_path: Optional[Path] = None
+        for cand_name in candidates:
+            safe_cand = Path(str(cand_name)).name
+            for sdir in search_dirs:
+                p = (sdir / safe_cand)
+                if p.is_file():
+                    found_path = p.resolve()
+                    break
+            if found_path:
+                break
+        if not found_path:
+            missing_label = entry.get("remote_name") or entry.get("local_name") or "base backup"
+            raise ValueError(
+                f"Cannot restore incremental backup: required chain archive '{missing_label}' is missing"
+            )
+        resolved.append(found_path)
+
+    if not resolved or resolved[-1] != archive:
+        resolved.append(archive)
+    return resolved
 
 
 def _safe_extract_prefix(archive: Path, prefix: str, destination: Path) -> None:
@@ -662,7 +1057,12 @@ def _extract_member_to_file(archive: Path, member_name: str, output_dir: Path) -
         return target
 
 
-def restore_user_backup(backup_file: str, db) -> dict:
+def restore_user_backup(
+    backup_file: str,
+    db,
+    *,
+    chain_files: Optional[list[str]] = None,
+) -> dict:
     archive = user_backup_path(backup_file)
     manifest = read_backup_manifest(str(archive))
     if manifest.get("kind") not in RESTORABLE_BACKUP_KINDS:
@@ -671,6 +1071,22 @@ def restore_user_backup(backup_file: str, db) -> dict:
     username = user_info.get("username") or ""
     if not PANEL_USERNAME_RE.fullmatch(username):
         raise ValueError("Invalid user in backup")
+
+    if chain_files:
+        resolved_chain = [user_backup_path(p) for p in chain_files]
+    else:
+        resolved_chain = _resolve_local_user_chain(archive, manifest, username)
+
+    layer_deleted_by_archive: dict[Path, list[str]] = {}
+    for layer_arc in resolved_chain:
+        if layer_arc == archive:
+            layer_deleted_by_archive[layer_arc] = list(manifest.get("deleted_files") or [])
+        else:
+            try:
+                lm = read_backup_manifest(str(layer_arc))
+                layer_deleted_by_archive[layer_arc] = list(lm.get("deleted_files") or [])
+            except Exception:
+                layer_deleted_by_archive[layer_arc] = []
 
     user = db.query(User).filter(User.username == username).first()
     created_user = False
@@ -745,7 +1161,13 @@ def restore_user_backup(backup_file: str, db) -> dict:
             runtime_php_version = php_version if app_type in {"wordpress", "php"} else None
             site_users.ensure_site_runtime(domain, root_path, runtime_php_version, linux_user)
             site_stage = tmp_dir / "site" / domain
-            _safe_extract_prefix(archive, f"sites/{domain}/site", site_stage)
+            for layer_arc in resolved_chain:
+                _safe_extract_prefix(layer_arc, f"sites/{domain}/site", site_stage)
+                _apply_deleted_files(
+                    site_stage,
+                    f"sites/{domain}/site",
+                    layer_deleted_by_archive.get(layer_arc) or [],
+                )
             site_users.import_site_files(root_path, linux_user, str(site_stage))
             # Backups from older spanel releases may contain public/. Normalize
             # the document root after extraction before rewriting the vhost.
@@ -923,8 +1345,14 @@ def restore_user_backup(backup_file: str, db) -> dict:
 
         def stage_mail(domain: str, local: str) -> Optional[Path]:
             stage = tmp_dir / "mail" / domain / local
-            _safe_extract_prefix(archive, f"mail/{domain}/{local}", stage)
-            return stage if any(stage.iterdir()) else None
+            for layer_arc in resolved_chain:
+                _safe_extract_prefix(layer_arc, f"mail/{domain}/{local}", stage)
+                _apply_deleted_files(
+                    stage,
+                    f"mail/{domain}/{local}",
+                    layer_deleted_by_archive.get(layer_arc) or [],
+                )
+            return stage if stage.is_dir() and any(stage.iterdir()) else None
 
         restored_mail = mail.restore_manifest(db, user, manifest.get("mail") or {}, stage_mail)
 
@@ -1068,13 +1496,43 @@ def save_uploaded_user_backup(filename: str, source_file) -> str:
     return str(target)
 
 
+def _read_site_manifest(archive: Path) -> Optional[dict]:
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            member = tar.getmember(SITE_MANIFEST)
+            if member.size > 16 * 1024 * 1024:
+                return None
+            src = tar.extractfile(member)
+            if src is None:
+                return None
+            return json.loads(src.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
 def restore_backup(website: Website, backup_file: str, db=None) -> str:
     archive = backup_path(website.domain, backup_file)
     destination = Path(website.root_path).resolve()
 
-    def _extract_site_to(target_dir: Path) -> Optional[str]:
+    site_manifest = _read_site_manifest(archive) or {}
+    chain_layers: list[tuple[Path, list[str]]] = []
+    if site_manifest.get("backup_type") == "incremental" and isinstance(site_manifest.get("chain_archives"), list):
+        for entry in site_manifest["chain_archives"][:-1]:
+            if not isinstance(entry, dict):
+                continue
+            cand = entry.get("local_name") or entry.get("remote_name")
+            if not cand:
+                continue
+            cand_path = archive.parent / Path(str(cand)).name
+            if not cand_path.is_file():
+                raise ValueError(f"Cannot restore incremental website backup: missing chain archive '{cand}'")
+            lm = _read_site_manifest(cand_path) or {}
+            chain_layers.append((cand_path.resolve(), list(lm.get("deleted_files") or [])))
+    chain_layers.append((archive, list(site_manifest.get("deleted_files") or [])))
+
+    def _extract_one_archive(layer_arc: Path, target_dir: Path) -> Optional[str]:
         sql_member_found: Optional[str] = None
-        with tarfile.open(archive, "r:gz") as tar:
+        with tarfile.open(layer_arc, "r:gz") as tar:
             members = list(tar.getmembers())
             has_site_prefix = any(m.name == "site" or m.name.startswith("site/") for m in members)
             for m in members:
@@ -1085,7 +1543,7 @@ def restore_backup(website: Website, backup_file: str, db=None) -> str:
             def safe_filter(member: tarfile.TarInfo, dest_path: str):
                 if member.islnk():
                     return None
-                if member.name.startswith("database/"):
+                if member.name == SITE_MANIFEST or member.name.startswith("database/"):
                     return None
                 if has_site_prefix:
                     if member.name == "site":
@@ -1098,9 +1556,9 @@ def restore_backup(website: Website, backup_file: str, db=None) -> str:
             try:
                 tar.extractall(path=str(target_dir), filter=safe_filter)
             except TypeError:
-                _ensure_safe_tar(archive, target_dir)
+                _ensure_safe_tar(layer_arc, target_dir)
                 for member in members:
-                    if member.name.startswith("database/"):
+                    if member.name == SITE_MANIFEST or member.name.startswith("database/"):
                         continue
                     if has_site_prefix:
                         if member.name == "site":
@@ -1110,6 +1568,15 @@ def restore_backup(website: Website, backup_file: str, db=None) -> str:
                         member.name = member.name[len("site/"):]
                     tar.extract(member, str(target_dir))
         return sql_member_found
+
+    def _extract_site_to(target_dir: Path) -> Optional[str]:
+        last_sql: Optional[str] = None
+        for layer_arc, deleted_list in chain_layers:
+            sql_found = _extract_one_archive(layer_arc, target_dir)
+            if sql_found:
+                last_sql = sql_found
+            _apply_deleted_files(target_dir, "site", deleted_list)
+        return last_sql
 
     sql_member: Optional[str] = None
     try:
