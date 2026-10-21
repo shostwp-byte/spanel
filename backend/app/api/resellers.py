@@ -48,7 +48,6 @@ class WebhookEndpointOut(BaseModel):
     url: str
     events: str
     is_active: bool
-    has_secret: bool = False
 
 class ResellerStatsOut(BaseModel):
     total_users: int
@@ -137,6 +136,8 @@ def _validate_webhook_url(raw_url: str) -> str:
 
 @router.get("/whitelabel/public", response_model=WhiteLabelPublicSchema)
 def get_whitelabel_public(request: Request, db: Session = Depends(get_db)):
+    from app.services import panel_settings
+    raw_panel = panel_settings._read_raw_lenient()
     host = request.headers.get("host", "").split(":")[0]
     config = db.query(WhiteLabelConfig).filter(WhiteLabelConfig.panel_domain == host).first()
     if not config:
@@ -144,19 +145,37 @@ def get_whitelabel_public(request: Request, db: Session = Depends(get_db)):
         if admin_user:
             config = db.query(WhiteLabelConfig).filter(WhiteLabelConfig.reseller_id == admin_user.id).first()
     if not config:
-        return WhiteLabelPublicSchema(company_name="SPanel", primary_color="#4f46e5")
-    return config
+        return WhiteLabelPublicSchema(
+            company_name=raw_panel.get("app_name") or "SPanel",
+            primary_color=raw_panel.get("primary_color") or "#16a34a",
+            support_url=raw_panel.get("ticket_url") or None,
+        )
+    return WhiteLabelPublicSchema(
+        company_name=config.company_name or raw_panel.get("app_name") or "SPanel",
+        logo_url=config.logo_url,
+        primary_color=config.primary_color or raw_panel.get("primary_color") or "#16a34a",
+        support_url=config.support_url or raw_panel.get("ticket_url") or None,
+    )
 
 @router.get("/whitelabel", response_model=WhiteLabelConfigSchema)
 def get_whitelabel(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
+    from app.services import panel_settings
+    raw_panel = panel_settings._read_raw_lenient() if is_admin_role(current_user.role) else {}
     config = db.query(WhiteLabelConfig).filter(WhiteLabelConfig.reseller_id == current_user.id).first()
     if not config:
         return WhiteLabelConfigSchema(
-            company_name="Control Panel",
-            primary_color="#4f46e5"
+            company_name=raw_panel.get("app_name") or "Control Panel",
+            primary_color=raw_panel.get("primary_color") or "#16a34a",
+            support_url=raw_panel.get("ticket_url") or None,
         )
-    return config
+    return WhiteLabelConfigSchema(
+        company_name=config.company_name or raw_panel.get("app_name") or "Control Panel",
+        panel_domain=config.panel_domain,
+        logo_url=config.logo_url,
+        primary_color=config.primary_color or raw_panel.get("primary_color") or "#16a34a",
+        support_url=config.support_url or raw_panel.get("ticket_url") or None,
+    )
 
 @router.put("/whitelabel", response_model=WhiteLabelConfigSchema)
 def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -166,9 +185,9 @@ def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get
     if panel_domain is not None and not _DOMAIN_RE.fullmatch(panel_domain):
         raise HTTPException(status_code=400, detail="Invalid panel domain format")
 
-    primary_color = (payload.primary_color or "#4f46e5").strip()
+    primary_color = (payload.primary_color or "#16a34a").strip()
     if not _HEX_COLOR_RE.fullmatch(primary_color):
-        raise HTTPException(status_code=400, detail="Primary color must be a valid hex color (e.g. #4f46e5)")
+        raise HTTPException(status_code=400, detail="Primary color must be a valid hex color (e.g. #16a34a)")
 
     logo_url = _validate_whitelabel_url(payload.logo_url, "logo_url", is_logo=True)
     support_url = _validate_whitelabel_url(payload.support_url, "support_url", is_logo=False)
@@ -198,24 +217,25 @@ def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get
 
     db.commit()
     db.refresh(config)
+
+    if is_admin_role(current_user.role):
+        try:
+            from app.services import panel_settings
+            panel_settings.update_settings(
+                app_name=config.company_name,
+                primary_color=config.primary_color,
+                ticket_url=config.support_url or "",
+            )
+        except Exception:
+            pass
+
     return config
-
-
-def _serialize_webhook(wh: WebhookEndpoint) -> dict:
-    return {
-        "id": wh.id,
-        "url": wh.url,
-        "events": wh.events or "*",
-        "is_active": bool(wh.is_active),
-        "has_secret": bool(wh.secret and wh.secret.strip()),
-    }
 
 
 @router.get("/webhooks", response_model=List[WebhookEndpointOut])
 def list_webhooks(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
-    rows = db.query(WebhookEndpoint).filter(WebhookEndpoint.user_id == current_user.id).order_by(WebhookEndpoint.id.desc()).all()
-    return [_serialize_webhook(w) for w in rows]
+    return db.query(WebhookEndpoint).filter(WebhookEndpoint.user_id == current_user.id).all()
 
 @router.post("/webhooks", response_model=WebhookEndpointOut)
 def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -225,14 +245,14 @@ def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db)
     webhook = WebhookEndpoint(
         user_id=current_user.id,
         url=safe_url,
-        secret=(payload.secret or "").strip() or None,
-        events=(payload.events or "*").strip() or "*",
+        secret=payload.secret,
+        events=payload.events,
         is_active=payload.is_active
     )
     db.add(webhook)
     db.commit()
     db.refresh(webhook)
-    return _serialize_webhook(webhook)
+    return webhook
 
 @router.put("/webhooks/{webhook_id}", response_model=WebhookEndpointOut)
 def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -244,37 +264,16 @@ def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session 
 
     if payload.url is not None:
         webhook.url = _validate_webhook_url(payload.url)
-    if payload.secret is not None and payload.secret.strip() != "":
-        webhook.secret = payload.secret.strip()
+    if payload.secret is not None:
+        webhook.secret = payload.secret
     if payload.events is not None:
-        webhook.events = payload.events.strip() or "*"
+        webhook.events = payload.events
     if payload.is_active is not None:
         webhook.is_active = payload.is_active
 
     db.commit()
     db.refresh(webhook)
-    return _serialize_webhook(webhook)
-
-@router.post("/webhooks/{webhook_id}/test")
-def test_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
-    webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id, WebhookEndpoint.user_id == current_user.id).first()
-    if not webhook:
-        raise HTTPException(status_code=404, detail="Webhook not found")
-    from datetime import datetime, timezone
-    from app.services.webhooks import _send_webhook
-    sample_payload = {
-        "event": "webhook_test",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "user_id": current_user.id,
-        "username": current_user.username,
-        "target": "spanel.test",
-        "detail": "Test webhook delivery from SPanel API & Billing Integration",
-    }
-    ok, status_code, detail = _send_webhook(webhook.url, webhook.secret, sample_payload)
-    if not ok:
-        raise HTTPException(status_code=502, detail=f"Webhook test failed ({detail})")
-    return {"ok": True, "status_code": status_code, "detail": detail}
+    return webhook
 
 @router.delete("/webhooks/{webhook_id}")
 def delete_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

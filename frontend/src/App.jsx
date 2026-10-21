@@ -1508,6 +1508,7 @@ function AppContent() {
           const wlData = await wlRes.json();
           if (wlData.company_name && wlData.company_name !== 'SPanel') data.app_name = wlData.company_name;
           if (wlData.logo_url) data.logo_url = wlData.logo_url;
+          if (wlData.support_url) data.ticket_url = wlData.support_url;
           if (wlData.primary_color) {
             data.primary_color = wlData.primary_color;
             document.documentElement.style.setProperty('--primary', wlData.primary_color);
@@ -4065,7 +4066,7 @@ function AppContent() {
     if (page === 'administrators') return <UsersPage {...usersProps} mode="administrators" />;
 
 
-    if (page === 'reseller_settings') return <ResellerSettingsPage request={request} API={API} panelSettings={panelSettings} setPanelSettings={setPanelSettings} />;
+    if (page === 'reseller_settings') return <ResellerSettingsPage request={request} API={API} panelSettings={panelSettings} setPanelSettings={setPanelSettings} loadPanelSettings={loadPanelSettings} />;
     if (page === 'ipmanager') return <IpManager request={request} isAdmin={isAdmin} isReseller={isReseller} users={users} />;
     if (page === 'packages') return <Packages request={request} isAdmin={isAdmin} isReseller={isReseller} mailAddonInstalled={mailAddonInstalled} users={users} mode="users" />;
     if (page === 'reseller_packages') return <Packages request={request} isAdmin={isAdmin} isReseller={isReseller} mailAddonInstalled={mailAddonInstalled} users={users} mode="resellers" />;

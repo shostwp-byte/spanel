@@ -168,7 +168,6 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
           body: JSON.stringify({
             app_name: panelSettingsForm.app_name,
             panel_port: port,
-            ticket_url: panelSettingsForm.ticket_url,
           }),
         },
         t('Saving panel settings...')
@@ -196,12 +195,10 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
         ? {
             app_name: panelSettingsForm.app_name,
             panel_url: `http://${hostname}:${port}`,
-            ticket_url: panelSettingsForm.ticket_url,
           }
         : {
             app_name: panelSettingsForm.app_name,
             panel_hostname: hostname,
-            ticket_url: panelSettingsForm.ticket_url,
           };
     const data = await request(
       '/panel-settings',
@@ -528,14 +525,6 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                 value={panelSettingsForm.panel_port}
                 onChange={(e) => setPanelSettingsForm((prev) => ({ ...prev, panel_port: e.target.value }))}
                 placeholder="2222"
-              />
-            </label>
-            <label>
-              <span>{t('Support Ticket URL')}</span>
-              <input
-                value={panelSettingsForm.ticket_url}
-                onChange={(e) => setPanelSettingsForm((prev) => ({ ...prev, ticket_url: e.target.value }))}
-                placeholder="https://my.shost.vn/submitticket.php"
               />
             </label>
             <label className="check-line panel-ssl-status">

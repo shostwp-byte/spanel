@@ -14,7 +14,7 @@ const BRAND_COLOR_PRESETS = [
   { label: 'Amber Gold', color: '#d97706' },
 ];
 
-export function ResellerSettingsPage({ request, API, panelSettings, setPanelSettings }) {
+export function ResellerSettingsPage({ request, API, panelSettings, setPanelSettings, loadPanelSettings }) {
   const { loading, setLoading, setError, setNotice, currentUser } = useAppContext();
 
   const [panelLogoFile, setPanelLogoFile] = useState(null);
@@ -62,7 +62,8 @@ export function ResellerSettingsPage({ request, API, panelSettings, setPanelSett
       });
       if (res) {
         setWhitelabel(res);
-        setNotice(t('White-label settings saved. Refresh the page to see color changes.'));
+        if (loadPanelSettings) await loadPanelSettings();
+        setNotice(t('White-label settings saved.'));
       }
     } catch (e) {
       setError(e.message);
@@ -193,7 +194,7 @@ export function ResellerSettingsPage({ request, API, panelSettings, setPanelSett
               <div className="premium-form-group">
                 <label>
                   <LifeBuoy size={13} style={{ marginRight: '4px', verticalAlign: 'middle' }} />
-                  {t('Support URL')} <span style={{ fontWeight: 'normal', color: 'var(--text-muted)' }}>({t('Optional')})</span>
+                  {t('Support Ticket URL')} <span style={{ fontWeight: 'normal', color: 'var(--text-muted)' }}>({t('Optional')})</span>
                 </label>
                 <input
                   type="url"
