@@ -177,10 +177,17 @@ def get_custombuild_status(
         },
     ]
 
+    try:
+        php_smart = php_service.check_php_updates(force_refresh=False)
+    except Exception:
+        php_smart = {}
+    smart_by_branch = {r.get("branch"): r for r in (php_smart.get("versions") or []) if r.get("branch")}
+
     php_matrix = []
     for ver in supported_php:
         is_inst = ver in installed_php
         unit = f"php{ver}-fpm"
+        s_row = smart_by_branch.get(ver) or {}
         php_matrix.append({
             "version": ver,
             "installed": is_inst,
@@ -188,12 +195,18 @@ def get_custombuild_status(
             "service_unit": unit,
             "sites_count": php_usage.get(ver, 0),
             "is_default": ver == "8.4",
+            "current_full_version": s_row.get("current_version") or (ver if is_inst else ""),
+            "latest_full_version": s_row.get("latest_version") or "",
+            "update_available": bool(s_row.get("update_available", False)),
+            "upgradable_count": int(s_row.get("upgradable_count") or 0),
+            "hardening": s_row.get("hardening") or {"protected": False, "mode": "off"},
         })
 
     return {
         "panel_version": APP_VERSION,
         "core_packages": core_packages,
         "php_versions": php_matrix,
+        "php_smart_guard": php_smart,
         "php_extensions": php_ext_data,
         "runtimes": runtimes,
         "addons": addon_items,
@@ -242,6 +255,21 @@ def run_custombuild_action(
             out = f"Retuned {res.get('pools_written', 0)} PHP-FPM pool(s)."
             entry = _append_log("Rebuild & Retune PHP-FPM Pools", out, "ok")
             return {"message": out, "log": entry}
+
+        if action == "php_safe_upgrade":
+            versions = [target] if target and target != "all" else None
+            res = php_service.upgrade_php_packages(versions=versions, trigger="manual")
+            out = res.get("summary") or "PHP security packages upgraded safely."
+            entry = _append_log(f"Smart PHP Patch ({target or 'All'})", f"{out}\n{res.get('output', '')}".strip(), "ok")
+            return {"message": out, "log": entry, "php_smart_guard": res.get("php_smart_guard")}
+
+        if action == "php_security_harden":
+            versions = [target] if target and target != "all" else None
+            mode = (payload.extra or "strict").strip().lower()
+            res = php_service.apply_php2shell_hardening(versions=versions, mode=mode)
+            out = f"Applied Anti-PHP2SHELL hardening ({mode}) to {', '.join(versions or php_service.list_installed_php())}."
+            entry = _append_log(f"Anti-PHP2SHELL Hardening ({mode})", out, "ok")
+            return {"message": out, "log": entry, "php_smart_guard": res.get("php_smart_guard")}
 
         if action == "service_restart":
             res = system_service.service_action(target, "restart")

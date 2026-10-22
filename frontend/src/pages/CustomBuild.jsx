@@ -64,6 +64,7 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
     docker: { installed: false, version: '' },
   });
   const [addonItems, setAddonItems] = useState(ctxAddons?.items || []);
+  const [phpSmartGuard, setPhpSmartGuard] = useState({});
   const [buildLogs, setBuildLogs] = useState(readStoredLogs);
 
   const busyRef = useRef(null);
@@ -121,12 +122,16 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
       setLoading(t('Loading CustomBuild software stack...'));
     }
     try {
-      const [phpVerRes, phpExtRes, addonsRes, svcListRes] = await Promise.all([
+      const [phpVerRes, phpExtRes, addonsRes, svcListRes, phpSmartRes] = await Promise.all([
         request('/maintenance/php-versions', { silent: true }),
         request('/maintenance/php-extensions', { silent: true }),
         request('/addons', { silent: true }),
         request('/services/list', { silent: true }),
+        request('/updates/php/status', { silent: true }),
       ]);
+      if (phpSmartRes) {
+        setPhpSmartGuard(phpSmartRes);
+      }
       const appAddonInstalled = Boolean(
         (addonsRes?.items || []).some(a => a.slug === 'application' && a.installed)
       );
@@ -282,6 +287,36 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
     });
   }
 
+  async function handleSmartPhpPatch(branch = null) {
+    if (busyRef.current) return;
+    const label = branch ? `PHP ${branch}` : t('tất cả các phiên bản PHP');
+    if (
+      !confirm(
+        t(
+          'Thực hiện cập nhật bản vá bảo mật cho {label} và đồng bộ lớp bảo vệ chống PHP2SHELL (Zero-Downtime Reload)?',
+          { label }
+        )
+      )
+    ) {
+      return;
+    }
+    await runLocked(branch ? `patch-php-${branch}` : 'patch-php-all', async () => {
+      const res = await request(
+        '/updates/php/run',
+        {
+          method: 'POST',
+          body: JSON.stringify({ versions: branch ? [branch] : null }),
+        }
+      );
+      if (res) {
+        if (res.php_smart_guard) setPhpSmartGuard(res.php_smart_guard);
+        appendLog(`Smart PHP Auto-Patch (${branch || 'All'})`, `${res.summary || ''}\n${res.output || ''}`.trim(), 'ok');
+        setNotice(res.summary || t('Đã hoàn tất cập nhật bản vá bảo mật PHP an toàn.'));
+        await loadStatus(true);
+      }
+    });
+  }
+
   async function handleToggleAddon(addon, install) {
     if (busyRef.current) return;
     const label = addon.name || addon.slug;
@@ -367,9 +402,15 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
     phpUsage[v] = (phpUsage[v] || 0) + 1;
   });
 
+  const smartByBranch = {};
+  (phpSmartGuard?.versions || []).forEach(r => {
+    if (r?.branch) smartByBranch[r.branch] = r;
+  });
+
   const phpMatrix = (phpVersionsData.supported || ['5.6', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']).map(ver => {
     const isInstalled = (phpVersionsData.installed || []).includes(ver);
     const unit = `php${ver}-fpm`;
+    const sRow = smartByBranch[ver] || {};
     return {
       version: ver,
       installed: isInstalled,
@@ -377,6 +418,10 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
       service_unit: unit,
       sites_count: phpUsage[ver] || 0,
       is_default: ver === '8.4',
+      current_full_version: sRow.current_version || ver,
+      latest_full_version: sRow.latest_version || sRow.current_version || ver,
+      update_available: Boolean(sRow.update_available),
+      hardening: sRow.hardening || {},
     };
   });
 
@@ -734,10 +779,23 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                 <h3 style={{ margin: 0 }}>{t('PHP-FPM Branches')}</h3>
                 <p className="hint" style={{ margin: '2px 0 0' }}>{t('Install multiple PHP versions side-by-side and assign per website.')}</p>
               </div>
-              <button type="button" className="cb-btn secondary" disabled={isBusy} onClick={handleRetunePools}>
-                {busyKey === 'retune-pools' ? <RefreshCw size={14} className="spin" /> : <Sparkles size={14} />}
-                {busyKey === 'retune-pools' ? t('Rebuilding...') : t('Rebuild & Tune FPM Pools')}
-              </button>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="cb-btn primary"
+                  disabled={isBusy}
+                  onClick={() => handleSmartPhpPatch(null)}
+                >
+                  {busyKey === 'patch-php-all' ? <RefreshCw size={14} className="spin" /> : <Shield size={14} />}
+                  {busyKey === 'patch-php-all'
+                    ? t('Đang vá bảo mật PHP...')
+                    : t('Smart Auto-Patch & Chống PHP2SHELL (Zero-Downtime)')}
+                </button>
+                <button type="button" className="cb-btn secondary" disabled={isBusy} onClick={handleRetunePools}>
+                  {busyKey === 'retune-pools' ? <RefreshCw size={14} className="spin" /> : <Sparkles size={14} />}
+                  {busyKey === 'retune-pools' ? t('Rebuilding...') : t('Rebuild & Tune FPM Pools')}
+                </button>
+              </div>
             </div>
 
             <div className="cb-grid">
@@ -747,6 +805,7 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                 const isInstallingThis = busyKey === `install-php-${p.version}`;
                 const isUninstallingThis = busyKey === `uninstall-php-${p.version}`;
                 const isRestartingThis = busyKey === `restart-${p.service_unit}`;
+                const isPatchingThis = busyKey === `patch-php-${p.version}`;
                 return (
                   <div className={`cb-card ${p.installed ? '' : 'is-uninstalled'}`} key={p.version}>
                     <div className="cb-card-top">
@@ -759,11 +818,27 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                             <h4 className="cb-card-title">PHP {p.version} (PHP-FPM)</h4>
                           </div>
                           <div className="cb-card-meta">
-                            <code>{p.service_unit}</code>
+                            <code>{p.installed ? `v${p.current_full_version}` : p.service_unit}</code>
                             {p.is_default && (
                               <>
                                 <span className="cb-dot">•</span>
                                 <span className="cb-default-tag">{t('Default')}</span>
+                              </>
+                            )}
+                            {p.installed && p.hardening?.protected && (
+                              <>
+                                <span className="cb-dot">•</span>
+                                <span className="badge ok" style={{ fontSize: '10.5px', padding: '1px 6px' }}>
+                                  Anti-PHP2SHELL
+                                </span>
+                              </>
+                            )}
+                            {p.installed && p.update_available && (
+                              <>
+                                <span className="cb-dot">•</span>
+                                <span className="badge warn" style={{ fontSize: '10.5px', padding: '1px 6px' }}>
+                                  {t('Update: {v}', { v: p.latest_full_version })}
+                                </span>
                               </>
                             )}
                           </div>
@@ -787,6 +862,17 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                       <div className="cb-card-actions">
                         {p.installed ? (
                           <>
+                            {p.update_available && (
+                              <button
+                                type="button"
+                                className="cb-btn primary"
+                                disabled={isBusy}
+                                onClick={() => handleSmartPhpPatch(p.version)}
+                              >
+                                {isPatchingThis ? <RefreshCw size={13} className="spin" /> : <Shield size={13} />}
+                                {isPatchingThis ? t('Đang vá...') : t('Vá lỗi ({v})', { v: p.latest_full_version })}
+                              </button>
+                            )}
                             <button
                               type="button"
                               className="cb-btn secondary"

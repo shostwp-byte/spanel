@@ -4,7 +4,7 @@ import json
 import time
 import threading
 from pathlib import Path
-from app.services import updates
+from app.services import updates, php
 
 AUTO_UPDATE_CONFIG = Path("/opt/spanel/backend/auto_update.json")
 
@@ -40,6 +40,8 @@ def _auto_update_worker() -> None:
     time.sleep(45)
     last_check_ts = 0.0
     last_auto_update_day = ""
+    last_php_check_ts = 0.0
+    last_php_patch_day = ""
 
     while True:
         try:
@@ -59,6 +61,33 @@ def _auto_update_worker() -> None:
                     if today_str != last_auto_update_day and current_hhmm[:2] == target_win[:2]:
                         last_auto_update_day = today_str
                         updates.run_panel_update()
+        except Exception:
+            pass
+
+        try:
+            php_state = php.check_php_updates(force_refresh=False)
+            php_interval_sec = max(3600, int(php_state.get("check_interval_hours", 6)) * 3600)
+            now = time.time()
+
+            if now - last_php_check_ts >= php_interval_sec:
+                php_state = php.check_php_updates(force_refresh=True)
+                last_php_check_ts = now
+
+            if php_state.get("auto_harden_php2shell", True) and int(php_state.get("unprotected_count") or 0) > 0:
+                php.apply_php2shell_hardening()
+                php_state = php.check_php_updates(force_refresh=False)
+
+            if php_state.get("auto_patch_enabled", True) and int(php_state.get("updates_available_count") or 0) > 0:
+                pref_win = str(php_state.get("preferred_window") or "03:00").strip().lower()
+                current_hhmm = time.strftime("%H:%M", time.localtime())
+                today_str = time.strftime("%Y-%m-%d", time.localtime())
+                should_patch = (
+                    pref_win == "immediate"
+                    or (today_str != last_php_patch_day and current_hhmm[:2] == pref_win[:2])
+                )
+                if should_patch:
+                    last_php_patch_day = today_str
+                    php.upgrade_php_packages(trigger="auto")
         except Exception:
             pass
 

@@ -402,3 +402,602 @@ def _uninstall_php_locked(php_version: str) -> dict:
         "installed": list_installed_php(),
         "output": output,
     }
+
+
+# ---------------------------------------------------------------------------
+# Smart PHP Security Guard: Auto-Patching (Zero-Downtime) & Anti-PHP2SHELL
+# ---------------------------------------------------------------------------
+
+import re
+import time
+from datetime import datetime, timezone
+
+_PHP_SMART_PRIMARY_FILE = Path("/var/lib/spanel/php-smart-update.json")
+_PHP_SMART_FALLBACK_FILE = Path(__file__).resolve().parent.parent.parent / ".spanel_php_smart_update.json"
+_PHP_SMART_CACHE_TTL = 3600  # 1 hour cache for non-forced checks
+_php_smart_bg_lock = threading.Lock()
+_php_smart_bg_running = False
+
+PHP2SHELL_STRICT_DISABLED_FUNCTIONS = (
+    "exec,passthru,shell_exec,system,proc_open,popen,"
+    "pcntl_exec,pcntl_fork,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,"
+    "show_source,highlight_file"
+)
+
+PHP2SHELL_BALANCED_DISABLED_FUNCTIONS = (
+    "passthru,system,"
+    "pcntl_exec,pcntl_fork,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,"
+    "show_source,highlight_file"
+)
+
+DEFAULT_PHP_SMART_STATE = {
+    "auto_patch_enabled": True,
+    "auto_harden_php2shell": True,
+    "harden_mode": "strict",
+    "check_interval_hours": 6,
+    "preferred_window": "03:00",
+    "last_checked_at": "",
+    "last_checked_epoch": 0.0,
+    "last_updated_at": "",
+    "last_update_status": "idle",
+    "last_update_message": "",
+    "last_notified_available_sig": "",
+    "versions": [],
+    "updates_available_count": 0,
+    "unprotected_count": 0,
+    "unacknowledged_updates": [],
+    "recent_updates": [],
+}
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_php_smart_state() -> dict:
+    state = dict(DEFAULT_PHP_SMART_STATE)
+    state["versions"] = list(DEFAULT_PHP_SMART_STATE["versions"])
+    state["unacknowledged_updates"] = list(DEFAULT_PHP_SMART_STATE["unacknowledged_updates"])
+    state["recent_updates"] = list(DEFAULT_PHP_SMART_STATE["recent_updates"])
+    for candidate in (_PHP_SMART_PRIMARY_FILE, _PHP_SMART_FALLBACK_FILE):
+        try:
+            if candidate.exists():
+                loaded = json.loads(candidate.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    state.update(loaded)
+                    break
+        except Exception:
+            continue
+    return state
+
+
+def _write_php_smart_state(state: dict) -> None:
+    payload = json.dumps(state, indent=2, ensure_ascii=False)
+    for target in (_PHP_SMART_PRIMARY_FILE, _PHP_SMART_FALLBACK_FILE):
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(payload, encoding="utf-8")
+            return
+        except Exception:
+            continue
+
+
+def _extract_clean_php_version(pkg_ver: str, branch: str) -> str:
+    if not pkg_ver:
+        return branch
+    m = re.search(r"(\d+\.\d+\.\d+)", pkg_ver)
+    if m:
+        return m.group(1)
+    return pkg_ver.split("-")[0].split("+")[0].strip() or branch
+
+
+def _inspect_php_hardening(version: str) -> dict:
+    sec_ini = Path(f"/etc/php/{version}/fpm/conf.d/98-spanel-security.ini")
+    main_ini = Path(f"/etc/php/{version}/fpm/php.ini")
+    custom_ini = Path(f"/etc/php/{version}/fpm/conf.d/99-spanel.ini")
+
+    if settings.command_dry_run and not sec_ini.exists() and not main_ini.exists():
+        state = _read_php_smart_state()
+        mode = state.get("harden_mode", "strict") if state.get("auto_harden_php2shell", True) else "off"
+        funcs = (
+            PHP2SHELL_STRICT_DISABLED_FUNCTIONS.split(",")
+            if mode == "strict"
+            else PHP2SHELL_BALANCED_DISABLED_FUNCTIONS.split(",")
+            if mode == "balanced"
+            else []
+        )
+        return {
+            "protected": mode != "off",
+            "mode": mode,
+            "disabled_functions": funcs,
+            "disabled_count": len(funcs),
+            "cgi_fix_pathinfo_safe": mode != "off",
+            "allow_url_include_off": True,
+            "expose_php_off": mode != "off",
+        }
+
+    directives: dict[str, str] = {}
+    for ini_file in (main_ini, sec_ini, custom_ini):
+        try:
+            if not ini_file.exists():
+                continue
+            for raw_line in ini_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith(";") or "=" not in line:
+                    continue
+                k, v = [p.strip() for p in line.split("=", 1)]
+                directives[k.lower()] = v
+        except Exception:
+            continue
+
+    raw_disabled = directives.get("disable_functions", "")
+    disabled_list = [fn.strip().lower() for fn in raw_disabled.split(",") if fn.strip()]
+    disabled_set = set(disabled_list)
+
+    cgi_safe = directives.get("cgi.fix_pathinfo", "").strip() == "0"
+    allow_url_inc_off = directives.get("allow_url_include", "Off").strip().lower() in {"off", "0", "false", "no"}
+    expose_off = directives.get("expose_php", "Off").strip().lower() in {"off", "0", "false", "no"}
+
+    strict_core = {"exec", "passthru", "shell_exec", "system", "proc_open", "popen"}
+    balanced_core = {"passthru", "system"}
+
+    if strict_core.issubset(disabled_set) and cgi_safe:
+        mode = "strict"
+        protected = True
+    elif balanced_core.issubset(disabled_set) and (cgi_safe or sec_ini.exists()):
+        mode = "balanced"
+        protected = True
+    elif len(disabled_set.intersection(strict_core)) >= 2:
+        mode = "custom"
+        protected = True
+    else:
+        mode = "off"
+        protected = False
+
+    return {
+        "protected": protected,
+        "mode": mode,
+        "disabled_functions": disabled_list,
+        "disabled_count": len(disabled_list),
+        "cgi_fix_pathinfo_safe": cgi_safe,
+        "allow_url_include_off": allow_url_inc_off,
+        "expose_php_off": expose_off,
+    }
+
+
+def _inspect_installed_php_branches() -> list[dict]:
+    installed_branches = list_installed_php()
+
+    # Gather upgradable php* packages from apt
+    upgradable_out = _command_output(["apt", "list", "--upgradable"])
+    upgradable_by_branch: dict[str, list[str]] = {v: [] for v in installed_branches}
+    candidate_ver_by_branch: dict[str, str] = {}
+
+    for line in upgradable_out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Listing") or "/" not in line:
+            continue
+        pkg_name = line.split("/", 1)[0].strip()
+        parts = line.split()
+        cand_pkg_ver = parts[1].strip() if len(parts) >= 2 else ""
+        for v in installed_branches:
+            if pkg_name == f"php{v}" or pkg_name.startswith(f"php{v}-"):
+                upgradable_by_branch[v].append(pkg_name)
+                if pkg_name in (f"php{v}-fpm", f"php{v}-cli", f"php{v}-common") and cand_pkg_ver:
+                    candidate_ver_by_branch[v] = cand_pkg_ver
+
+    rows: list[dict] = []
+    for v in installed_branches:
+        cli_ver_out = _command_output([f"php{v}", "-r", "echo PHP_VERSION;"]).strip()
+        policy_out = _command_output(["apt-cache", "policy", f"php{v}-fpm"])
+        inst_pkg = ""
+        cand_pkg = candidate_ver_by_branch.get(v, "")
+        for pline in policy_out.splitlines():
+            s = pline.strip()
+            if s.startswith("Installed:"):
+                val = s.split(":", 1)[1].strip()
+                if val and val != "(none)":
+                    inst_pkg = val
+            elif s.startswith("Candidate:"):
+                val = s.split(":", 1)[1].strip()
+                if val and val != "(none)":
+                    cand_pkg = val
+
+        current_full = cli_ver_out or _extract_clean_php_version(inst_pkg, v) or f"{v}.0"
+        latest_full = _extract_clean_php_version(cand_pkg, current_full) if cand_pkg else current_full
+
+        pkg_upgradable = sorted(set(upgradable_by_branch.get(v, [])))
+        update_available = bool(pkg_upgradable) or (
+            bool(inst_pkg) and bool(cand_pkg) and inst_pkg != cand_pkg
+        )
+        if update_available and latest_full == current_full and cand_pkg and inst_pkg and cand_pkg != inst_pkg:
+            # Security rebuild of the same upstream minor (e.g. 8.4.5-1ubuntu1 -> 8.4.5-1ubuntu2)
+            latest_full = f"{current_full} (Security Patch)"
+
+        fpm_state = _command_output(["systemctl", "is-active", f"php{v}-fpm"]).strip()
+        fpm_active = fpm_state == "active" or (settings.command_dry_run and not fpm_state)
+
+        hardening = _inspect_php_hardening(v)
+
+        rows.append({
+            "branch": v,
+            "current_version": current_full,
+            "latest_version": latest_full,
+            "installed_package": inst_pkg,
+            "candidate_package": cand_pkg,
+            "update_available": update_available,
+            "upgradable_packages": pkg_upgradable,
+            "upgradable_count": len(pkg_upgradable) or (1 if update_available else 0),
+            "fpm_active": fpm_active,
+            "hardening": hardening,
+        })
+    return rows
+
+
+def check_php_updates(force_refresh: bool = False) -> dict:
+    state = _read_php_smart_state()
+    now_epoch = time.time()
+    last_epoch = float(state.get("last_checked_epoch") or 0.0)
+
+    if not force_refresh and state.get("versions") and (now_epoch - last_epoch < _PHP_SMART_CACHE_TTL):
+        return state
+
+    rows = _inspect_installed_php_branches()
+    updates_count = sum(1 for r in rows if r.get("update_available"))
+    unprotected_count = sum(1 for r in rows if not (r.get("hardening") or {}).get("protected"))
+
+    state["versions"] = rows
+    state["updates_available_count"] = updates_count
+    state["unprotected_count"] = unprotected_count
+    state["last_checked_at"] = _utc_iso()
+    state["last_checked_epoch"] = now_epoch
+
+    # If updates are available and auto_patch is off, notify admin once per signature
+    if updates_count > 0 and not state.get("auto_patch_enabled", True):
+        avail_items = [
+            f"PHP {r['branch']}: {r['current_version']} → {r['latest_version']}"
+            for r in rows
+            if r.get("update_available")
+        ]
+        sig = "|".join(avail_items)
+        if sig and sig != state.get("last_notified_available_sig"):
+            state["last_notified_available_sig"] = sig
+            try:
+                from app.services import notifications
+                notifications.notify_in_background("php_update_available", {"items": avail_items}, admins=True)
+            except Exception:
+                pass
+
+    _write_php_smart_state(state)
+    return state
+
+
+def _refresh_php_smart_in_background() -> None:
+    global _php_smart_bg_running
+    with _php_smart_bg_lock:
+        if _php_smart_bg_running:
+            return
+        _php_smart_bg_running = True
+
+    def _worker() -> None:
+        global _php_smart_bg_running
+        try:
+            check_php_updates(force_refresh=True)
+        except Exception:
+            pass
+        finally:
+            with _php_smart_bg_lock:
+                _php_smart_bg_running = False
+
+    threading.Thread(target=_worker, name="spanel-php-smart-probe", daemon=True).start()
+
+
+def cached_php_update_summary() -> dict:
+    """Fast, non-blocking summary for dashboard & topbar notification bell."""
+    state = _read_php_smart_state()
+    last_epoch = float(state.get("last_checked_epoch") or 0.0)
+    if not state.get("versions") or (time.time() - last_epoch > _PHP_SMART_CACHE_TTL):
+        _refresh_php_smart_in_background()
+
+    rows = state.get("versions") or []
+    updatable_versions = [
+        f"PHP {r['branch']} ({r.get('current_version')} → {r.get('latest_version')})"
+        for r in rows
+        if r.get("update_available")
+    ]
+    unack = state.get("unacknowledged_updates") or []
+    return {
+        "auto_patch_enabled": bool(state.get("auto_patch_enabled", True)),
+        "auto_harden_php2shell": bool(state.get("auto_harden_php2shell", True)),
+        "harden_mode": state.get("harden_mode", "strict"),
+        "updates_available_count": int(state.get("updates_available_count") or len(updatable_versions)),
+        "updatable_versions": updatable_versions,
+        "unprotected_count": int(state.get("unprotected_count") or 0),
+        "unacknowledged_count": len(unack),
+        "unacknowledged_updates": unack[:5],
+        "last_updated_at": state.get("last_updated_at") or "",
+        "last_checked_at": state.get("last_checked_at") or "",
+    }
+
+
+def save_php_smart_config(payload: dict) -> dict:
+    state = _read_php_smart_state()
+    if "auto_patch_enabled" in payload and payload["auto_patch_enabled"] is not None:
+        state["auto_patch_enabled"] = bool(payload["auto_patch_enabled"])
+    if "auto_harden_php2shell" in payload and payload["auto_harden_php2shell"] is not None:
+        state["auto_harden_php2shell"] = bool(payload["auto_harden_php2shell"])
+    if "harden_mode" in payload and payload["harden_mode"] in {"strict", "balanced", "off"}:
+        state["harden_mode"] = payload["harden_mode"]
+    if "check_interval_hours" in payload and payload["check_interval_hours"] is not None:
+        state["check_interval_hours"] = max(1, min(168, int(payload["check_interval_hours"])))
+    if "preferred_window" in payload and payload["preferred_window"]:
+        state["preferred_window"] = str(payload["preferred_window"]).strip()
+
+    _write_php_smart_state(state)
+
+    # If admin toggled PHP2SHELL hardening, immediately enforce the new hardening mode on installed branches
+    if "auto_harden_php2shell" in payload or "harden_mode" in payload:
+        target_mode = state["harden_mode"] if state.get("auto_harden_php2shell", True) else "off"
+        try:
+            apply_php2shell_hardening(mode=target_mode)
+            state = _read_php_smart_state()
+        except Exception:
+            pass
+
+    return check_php_updates(force_refresh=True)
+
+
+def apply_php2shell_hardening(versions: list[str] | None = None, mode: str | None = None) -> dict:
+    state = _read_php_smart_state()
+    target_mode = mode if mode in {"strict", "balanced", "off"} else (
+        state.get("harden_mode", "strict") if state.get("auto_harden_php2shell", True) else "off"
+    )
+    installed = list_installed_php()
+    targets = [v for v in (versions or installed) if v in installed]
+    if not targets:
+        targets = installed
+
+    disabled_funcs = (
+        PHP2SHELL_STRICT_DISABLED_FUNCTIONS
+        if target_mode == "strict"
+        else PHP2SHELL_BALANCED_DISABLED_FUNCTIONS
+        if target_mode == "balanced"
+        else ""
+    )
+
+    results: list[dict] = []
+    for v in targets:
+        if settings.command_dry_run:
+            results.append({"branch": v, "mode": target_mode, "status": "ok"})
+            continue
+
+        ini_body = (
+            "; Managed by SPanel Smart Security Guard (Anti-PHP2SHELL & RCE Hardening)\n"
+            "; Applied to PHP-FPM web pools only; PHP-CLI stays unrestricted for Composer/WP-CLI.\n"
+            "cgi.fix_pathinfo = 0\n"
+            "expose_php = Off\n"
+            "allow_url_include = Off\n"
+            "enable_dl = Off\n"
+            f"disable_functions = {disabled_funcs}\n"
+        )
+        res = shell.privileged(
+            "php-security-harden",
+            helper_args=[v, target_mode],
+            check=False,
+            timeout=60,
+            fallback=[
+                "bash",
+                "-lc",
+                (
+                    'v="$1"; mode="$2"; conf="/etc/php/$v/fpm/conf.d/98-spanel-security.ini"; '
+                    'if [ "$mode" = "off" ]; then rm -f "$conf"; else cat > "$conf"; fi; '
+                    'php-fpm$v -t >/dev/null 2>&1 && (systemctl reload php$v-fpm 2>/dev/null || systemctl restart php$v-fpm 2>/dev/null || true)'
+                ),
+                "spanel-php-security-harden",
+                v,
+                target_mode,
+            ],
+            input=ini_body if target_mode != "off" else None,
+        )
+        results.append({
+            "branch": v,
+            "mode": target_mode,
+            "status": "ok" if res.returncode == 0 else "warning",
+            "output": (res.stdout or res.stderr or "").strip(),
+        })
+
+    state["auto_harden_php2shell"] = target_mode != "off"
+    if target_mode in {"strict", "balanced"}:
+        state["harden_mode"] = target_mode
+    _write_php_smart_state(state)
+    updated_state = check_php_updates(force_refresh=True)
+    return {
+        "status": "ok",
+        "mode": target_mode,
+        "results": results,
+        "php_smart_guard": updated_state,
+    }
+
+
+def upgrade_php_packages(versions: list[str] | None = None, trigger: str = "manual") -> dict:
+    """Safely upgrade installed PHP branches (Zero-Downtime minor/security patch)."""
+    op_key = "php:smart-upgrade"
+    with _php_ops_lock:
+        if op_key in _active_php_ops:
+            raise ValueError("Tiến trình cập nhật bảo mật PHP đang chạy. Vui lòng đợi trong giây lát.")
+        _active_php_ops.add(op_key)
+
+    try:
+        state = _read_php_smart_state()
+        state["last_update_status"] = "running"
+        state["last_update_message"] = "Đang kiểm tra kho lưu trữ APT và cập nhật bản vá bảo mật PHP (Zero-Downtime)..."
+        _write_php_smart_state(state)
+
+        before_rows = {r["branch"]: r for r in _inspect_installed_php_branches()}
+        installed = list(before_rows.keys()) or list_installed_php()
+        targets = [v for v in (versions or installed) if v in installed]
+        if not targets:
+            targets = installed
+
+        updated_branches: list[dict] = []
+        outputs: list[str] = []
+
+        for v in targets:
+            b_info = before_rows.get(v, {})
+            from_ver = b_info.get("current_version") or v
+            from_pkg = b_info.get("installed_package") or ""
+            pkg_count = int(b_info.get("upgradable_count") or 0)
+
+            if not settings.command_dry_run:
+                res = shell.privileged(
+                    "php-safe-upgrade",
+                    helper_args=[v],
+                    check=False,
+                    timeout=600,
+                    fallback=[
+                        "bash",
+                        "-lc",
+                        _APT_LOCK_PREAMBLE
+                        + 'v="$1"; apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true; '
+                        + 'pkgs=$(dpkg-query -W -f=\x27${Package}\t${Status}\n\x27 "php$v-*" "php$v" 2>/dev/null | awk -F"\t" \x27$2 == "install ok installed" {print $1}\x27); '
+                        + 'if [ -n "$pkgs" ]; then apt-get -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y $pkgs </dev/null; fi; '
+                        + 'php-fpm$v -t >/dev/null 2>&1 && (systemctl reload php$v-fpm 2>/dev/null || systemctl restart php$v-fpm 2>/dev/null || true)',
+                        "spanel-php-safe-upgrade",
+                        v,
+                    ],
+                )
+                # Fallback if older spanel-helper on disk does not yet recognize php-safe-upgrade
+                if res.returncode != 0 and "unknown command" in (res.stderr or "").lower():
+                    res = shell.privileged(
+                        "php-install",
+                        helper_args=[v],
+                        check=False,
+                        timeout=600,
+                    )
+                if res.stdout or res.stderr:
+                    outputs.append(f"[PHP {v}] {(res.stdout or res.stderr or '').strip()[-400:]}")
+
+        # Apply Anti-PHP2SHELL hardening if enabled
+        hardened_flag = bool(state.get("auto_harden_php2shell", True))
+        if hardened_flag and state.get("harden_mode", "strict") != "off":
+            try:
+                apply_php2shell_hardening(versions=targets, mode=state.get("harden_mode", "strict"))
+            except Exception:
+                pass
+
+        after_rows = {r["branch"]: r for r in _inspect_installed_php_branches()}
+        for v in targets:
+            b_info = before_rows.get(v, {})
+            a_info = after_rows.get(v, {})
+            from_ver = b_info.get("current_version") or v
+            to_ver = a_info.get("current_version") or from_ver
+            from_pkg = b_info.get("installed_package") or ""
+            to_pkg = a_info.get("installed_package") or ""
+            was_updatable = bool(b_info.get("update_available"))
+            changed = (from_ver != to_ver) or (from_pkg and to_pkg and from_pkg != to_pkg) or was_updatable
+
+            updated_branches.append({
+                "branch": v,
+                "from_version": from_ver,
+                "to_version": to_ver,
+                "changed": changed,
+                "packages_updated": int(b_info.get("upgradable_count") or (1 if changed else 0)),
+                "fpm_reloaded": bool(a_info.get("fpm_active", True)),
+                "hardened": bool((a_info.get("hardening") or {}).get("protected", hardened_flag)),
+            })
+
+        now_iso = _utc_iso()
+        changed_items = [b for b in updated_branches if b.get("changed")]
+        if changed_items:
+            summary_parts = [f"PHP {b['branch']} ({b['from_version']} → {b['to_version']})" for b in changed_items]
+            summary_text = f"Đã cập nhật bản vá bảo mật: {', '.join(summary_parts)} (Zero-Downtime Reload)"
+        else:
+            branch_labels = [f"PHP {b['branch']} ({b['to_version']})" for b in updated_branches]
+            summary_text = (
+                f"Đã kiểm tra & đồng bộ an toàn {', '.join(branch_labels)} — "
+                "Tất cả đã ở phiên bản bảo mật mới nhất & kích hoạt chống PHP2SHELL."
+            )
+
+        record = {
+            "id": f"php-patch-{int(time.time())}",
+            "timestamp": now_iso,
+            "trigger": trigger,
+            "status": "success",
+            "summary": summary_text,
+            "branches": updated_branches,
+            "hardened": hardened_flag,
+            "acknowledged": False if (changed_items or trigger == "auto") else True,
+        }
+
+        state = _read_php_smart_state()
+        recent = list(state.get("recent_updates") or [])
+        recent.insert(0, record)
+        state["recent_updates"] = recent[:25]
+
+        if changed_items or trigger == "auto":
+            unack = list(state.get("unacknowledged_updates") or [])
+            unack.insert(0, record)
+            state["unacknowledged_updates"] = unack[:10]
+
+        state["last_updated_at"] = now_iso
+        state["last_update_status"] = "success"
+        state["last_update_message"] = summary_text
+        state["versions"] = list(after_rows.values())
+        state["updates_available_count"] = sum(1 for r in after_rows.values() if r.get("update_available"))
+        state["unprotected_count"] = sum(
+            1 for r in after_rows.values() if not (r.get("hardening") or {}).get("protected")
+        )
+        state["last_checked_at"] = now_iso
+        state["last_checked_epoch"] = time.time()
+        _write_php_smart_state(state)
+
+        # Send Email / Telegram notification to Admin when packages were patched or auto-triggered
+        if changed_items or trigger == "auto":
+            notify_lines = [
+                f"PHP {b['branch']}: {b['from_version']} → {b['to_version']} (PHP-FPM Reloaded)"
+                for b in (changed_items or updated_branches)
+            ]
+            try:
+                from app.services import notifications
+                notifications.notify_in_background(
+                    "php_security_updated",
+                    {"items": notify_lines, "trigger": trigger, "hardened": hardened_flag},
+                    admins=True,
+                )
+            except Exception:
+                pass
+
+        return {
+            "status": "success",
+            "summary": summary_text,
+            "record": record,
+            "output": "\n".join(outputs),
+            "php_smart_guard": state,
+        }
+    except Exception as exc:
+        state = _read_php_smart_state()
+        state["last_update_status"] = "failed"
+        state["last_update_message"] = str(exc)
+        _write_php_smart_state(state)
+        raise
+    finally:
+        with _php_ops_lock:
+            _active_php_ops.discard(op_key)
+
+
+def acknowledge_php_updates(update_id: str | None = None) -> dict:
+    state = _read_php_smart_state()
+    if update_id:
+        state["unacknowledged_updates"] = [
+            u for u in (state.get("unacknowledged_updates") or []) if u.get("id") != update_id
+        ]
+        for u in state.get("recent_updates") or []:
+            if u.get("id") == update_id:
+                u["acknowledged"] = True
+    else:
+        state["unacknowledged_updates"] = []
+        for u in state.get("recent_updates") or []:
+            u["acknowledged"] = True
+    _write_php_smart_state(state)
+    return state
+

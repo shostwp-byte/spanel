@@ -6,7 +6,7 @@ from app.api.deps import get_current_user
 from app.core.permissions import Role, ensure_role
 from app.models.entities import User
 from app.schemas.schemas import SystemAutoUpdateConfig
-from app.services import updates, auto_updater
+from app.services import updates, auto_updater, php
 
 router = APIRouter(prefix="/updates", tags=["updates"])
 
@@ -114,3 +114,76 @@ def configure_panel_auto_update(payload: PanelAutoUpdatePayload, current_user: U
         auto_check=payload.auto_check_enabled,
     )
     return {"status": "success", "enabled": payload.enabled, "source": source}
+
+
+class PhpSmartConfigPayload(BaseModel):
+    auto_patch_enabled: Optional[bool] = None
+    auto_harden_php2shell: Optional[bool] = None
+    harden_mode: Optional[str] = None
+    check_interval_hours: Optional[int] = None
+    preferred_window: Optional[str] = None
+
+
+class PhpUpgradeRunPayload(BaseModel):
+    versions: Optional[list[str]] = None
+
+
+class PhpHardenPayload(BaseModel):
+    versions: Optional[list[str]] = None
+    mode: Optional[str] = None
+
+
+class PhpAcknowledgePayload(BaseModel):
+    update_id: Optional[str] = None
+
+
+@router.get("/php/status")
+def get_php_smart_status(refresh: bool = Query(default=False), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return php.check_php_updates(force_refresh=refresh)
+
+
+@router.post("/php/config")
+def update_php_smart_config(payload: PhpSmartConfigPayload, current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    state = php.save_php_smart_config(payload.model_dump(exclude_unset=True))
+    return {"status": "success", "php_smart_guard": state}
+
+
+@router.post("/php/run")
+def run_php_smart_upgrade(
+    payload: PhpUpgradeRunPayload = PhpUpgradeRunPayload(),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    try:
+        return php.upgrade_php_packages(versions=payload.versions, trigger="manual")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/php/harden")
+def run_php_security_hardening(
+    payload: PhpHardenPayload = PhpHardenPayload(),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    try:
+        return php.apply_php2shell_hardening(versions=payload.versions, mode=payload.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/php/acknowledge")
+def acknowledge_php_update_notifications(
+    payload: PhpAcknowledgePayload = PhpAcknowledgePayload(),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    state = php.acknowledge_php_updates(update_id=payload.update_id)
+    return {"status": "ok", "php_smart_guard": state}
+

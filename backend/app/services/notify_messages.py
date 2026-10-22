@@ -29,6 +29,10 @@ EVENTS: dict[str, dict] = {
                      "hint": "Switched off, or on but not filtering."},
     "update_available": {"audience": ADMIN, "label": "A panel update is available",
                          "hint": "Once per new version."},
+    "php_security_updated": {"audience": ADMIN, "label": "PHP security patches automatically applied",
+                             "hint": "Whenever Smart PHP Guard safely patches PHP versions (Zero-Downtime & Anti-PHP2SHELL)."},
+    "php_update_available": {"audience": ADMIN, "label": "PHP security updates available",
+                             "hint": "When new minor/security releases exist for installed PHP branches."},
     "backup_failed_admin": {"audience": ADMIN, "label": "A scheduled backup failed",
                             "hint": "Any schedule on the server, with the error."},
     "malware_found_admin": {"audience": ADMIN, "label": "Malware found",
@@ -170,11 +174,67 @@ def _security_change(p: dict, lang: str) -> tuple[str, list[str]]:
                  "If this was not you, change the password now and check the administrator accounts."])
 
 
+def _php_security_updated(p: dict, lang: str) -> tuple[str, list[str]]:
+    items = p.get("items") or []
+    trigger = p.get("trigger") or "auto"
+    hardened = bool(p.get("hardened", True))
+    if lang == "vi":
+        mode_label = "Tự động (Smart Auto-Patch)" if trigger == "auto" else "Thủ công (Quản trị viên)"
+        return (
+            f"Đã cập nhật bản vá bảo mật PHP an toàn ({len(items)} nhánh)",
+            [
+                f"Chế độ kích hoạt: {mode_label} — Zero-Downtime Reload (không gián đoạn dịch vụ).",
+                *_listed(items, "...và {n} nhánh PHP khác", "", lang),
+                (
+                    "Lớp bảo vệ chống tấn công PHP2SHELL / RCE trên PHP-FPM đã được đồng bộ và kiểm tra an toàn."
+                    if hardened
+                    else "Dịch vụ PHP-FPM đã được kiểm tra cú pháp (php-fpm -t) và reload an toàn."
+                ),
+            ],
+        )
+    mode_en = "Automatic (Smart Auto-Patch)" if trigger == "auto" else "Manual (Administrator)"
+    return (
+        f"PHP security patches safely applied ({len(items)} branch(es))",
+        [
+            f"Trigger: {mode_en} — Zero-Downtime FPM Reload.",
+            *_listed(items, "", "...and {n} more", lang),
+            (
+                "Anti-PHP2SHELL / RCE hardening on PHP-FPM has been verified and enforced."
+                if hardened
+                else "PHP-FPM syntax was verified (php-fpm -t) and reloaded gracefully."
+            ),
+        ],
+    )
+
+
+def _php_update_available(p: dict, lang: str) -> tuple[str, list[str]]:
+    items = p.get("items") or []
+    if lang == "vi":
+        return (
+            f"Phát hiện {len(items)} bản cập nhật bảo mật PHP mới",
+            [
+                "Các nhánh PHP dưới đây có bản vá bảo mật mới (chống lỗ hổng RCE / PHP2SHELL):",
+                *_listed(items, "...và {n} nhánh khác", "", lang),
+                "Mở trang Cập nhật hệ thống (Updates) hoặc CustomBuild để cập nhật an toàn (Zero-Downtime).",
+            ],
+        )
+    return (
+        f"{len(items)} PHP security update(s) available",
+        [
+            "The following installed PHP branches have newer security/minor releases:",
+            *_listed(items, "", "...and {n} more", lang),
+            "Open System Updates or CustomBuild to apply safe zero-downtime patching.",
+        ],
+    )
+
+
 _RENDER: dict[str, Callable[[dict, str], tuple[str, list[str]]]] = {
     "service_down": _service_down,
     "disk_high": _disk_high,
     "firewall_off": _firewall_off,
     "update_available": _update_available,
+    "php_security_updated": _php_security_updated,
+    "php_update_available": _php_update_available,
     "backup_failed_admin": _backup_failed,
     "malware_found_admin": _malware_found,
     "ssl_expiring_admin": _ssl_expiring,

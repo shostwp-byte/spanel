@@ -78,6 +78,15 @@ export function UpdatesPage({ request, isAdmin }) {
     auto_reboot: false,
   });
 
+  const [phpConfigForm, setPhpConfigForm] = useState({
+    auto_patch_enabled: true,
+    auto_harden_php2shell: true,
+    harden_mode: 'strict',
+    preferred_window: '03:00',
+  });
+  const [phpPatchingBranch, setPhpPatchingBranch] = useState('');
+  const [phpSavingConfig, setPhpSavingConfig] = useState(false);
+
   useEffect(() => {
     if (isAdmin) loadUpdates(false);
     return () => {
@@ -87,22 +96,32 @@ export function UpdatesPage({ request, isAdmin }) {
 
   function syncSourceFormFromStatus(data) {
     const src = data?.source;
-    if (!src) return;
-    setSourceForm(prev => ({
-      ...prev,
-      source_type: src.source_type || 'auto',
-      server_url: '',
-      manifest_url: '',
-      channel: src.channel || 'stable',
-      auth_token: '',
-      clear_auth_token: false,
-      verify_checksum: src.verify_checksum !== false,
-      auto_check_enabled: src.auto_check_enabled !== false,
-      auto_check_interval_hours: src.auto_check_interval_hours || 6,
-      auto_update_enabled: !!src.auto_update_enabled,
-      auto_update_window: src.auto_update_window || '02:00',
-      auto_rollback_enabled: src.auto_rollback_enabled !== false,
-    }));
+    if (src) {
+      setSourceForm(prev => ({
+        ...prev,
+        source_type: src.source_type || 'auto',
+        server_url: '',
+        manifest_url: '',
+        channel: src.channel || 'stable',
+        auth_token: '',
+        clear_auth_token: false,
+        verify_checksum: src.verify_checksum !== false,
+        auto_check_enabled: src.auto_check_enabled !== false,
+        auto_check_interval_hours: src.auto_check_interval_hours || 6,
+        auto_update_enabled: !!src.auto_update_enabled,
+        auto_update_window: src.auto_update_window || '02:00',
+        auto_rollback_enabled: src.auto_rollback_enabled !== false,
+      }));
+    }
+    const pg = data?.php_smart_guard;
+    if (pg) {
+      setPhpConfigForm({
+        auto_patch_enabled: pg.auto_patch_enabled !== false,
+        auto_harden_php2shell: pg.auto_harden_php2shell !== false,
+        harden_mode: pg.auto_harden_php2shell === false ? 'off' : pg.harden_mode || 'strict',
+        preferred_window: pg.preferred_window || '03:00',
+      });
+    }
   }
 
   async function loadUpdates(force = false) {
@@ -278,6 +297,71 @@ export function UpdatesPage({ request, isAdmin }) {
     }
   }
 
+  async function handleSavePhpSmartConfig() {
+    setPhpSavingConfig(true);
+    const payload = {
+      auto_patch_enabled: !!phpConfigForm.auto_patch_enabled,
+      auto_harden_php2shell: phpConfigForm.harden_mode !== 'off',
+      harden_mode: phpConfigForm.harden_mode || 'strict',
+      preferred_window: phpConfigForm.preferred_window || '03:00',
+    };
+    const res = await request(
+      '/updates/php/config',
+      { method: 'POST', body: JSON.stringify(payload) },
+      t('Đang lưu cấu hình Smart PHP Auto-Patch & lớp bảo vệ chống PHP2SHELL...')
+    );
+    setPhpSavingConfig(false);
+    if (res?.php_smart_guard) {
+      setUpdatesStatus(prev => (prev ? { ...prev, php_smart_guard: res.php_smart_guard } : prev));
+      setNotice(t('Đã lưu cấu hình Smart PHP Auto-Patch và đồng bộ lớp bảo vệ chống PHP2SHELL.'));
+    }
+  }
+
+  async function handleRunPhpPatch(branch = null) {
+    const label = branch ? `PHP ${branch}` : t('tất cả các phiên bản PHP');
+    if (
+      !window.confirm(
+        t(
+          'Thực hiện cập nhật bản vá bảo mật cho {label} ngay bây giờ? Hệ thống chỉ nâng cấp trong cùng nhánh major.minor, kiểm tra cú pháp php-fpm -t và reload mượt mà (Zero-Downtime, không làm gián đoạn website).',
+          { label }
+        )
+      )
+    ) {
+      return;
+    }
+    setPhpPatchingBranch(branch || 'all');
+    const res = await request(
+      '/updates/php/run',
+      {
+        method: 'POST',
+        body: JSON.stringify({ versions: branch ? [branch] : null }),
+      },
+      t('Đang cập nhật bản vá bảo mật PHP & kiểm tra Zero-Downtime Reload...')
+    );
+    setPhpPatchingBranch('');
+    if (res) {
+      if (res.php_smart_guard) {
+        setUpdatesStatus(prev => (prev ? { ...prev, php_smart_guard: res.php_smart_guard } : prev));
+      }
+      setNotice(res.summary || t('Đã hoàn tất cập nhật bản vá bảo mật PHP an toàn.'));
+    }
+  }
+
+  async function handleAcknowledgePhpUpdates(updateId = null) {
+    const res = await request(
+      '/updates/php/acknowledge',
+      {
+        method: 'POST',
+        body: JSON.stringify({ update_id: updateId }),
+        silent: true,
+      },
+      null
+    );
+    if (res?.php_smart_guard) {
+      setUpdatesStatus(prev => (prev ? { ...prev, php_smart_guard: res.php_smart_guard } : prev));
+    }
+  }
+
   if (!isAdmin) {
     return (
       <div className="section">
@@ -290,6 +374,13 @@ export function UpdatesPage({ request, isAdmin }) {
   const panelUpdate = updatesStatus?.panel || {};
   const sourceInfo = updatesStatus?.source || {};
   const snapshots = updatesStatus?.snapshots || [];
+  const phpSmartGuard = updatesStatus?.php_smart_guard || {};
+  const phpVersions = Array.isArray(phpSmartGuard.versions) ? phpSmartGuard.versions : [];
+  const phpUnacknowledged = Array.isArray(phpSmartGuard.unacknowledged_updates)
+    ? phpSmartGuard.unacknowledged_updates
+    : [];
+  const phpRecentUpdates = Array.isArray(phpSmartGuard.recent_updates) ? phpSmartGuard.recent_updates : [];
+  const phpUpdatableCount = Number(phpSmartGuard.updates_available_count || 0);
   const statusText = updatesStatus?.stdout || updatesStatus?.stderr || t('No OS package logs yet.');
   const updateAvailable = panelUpdate.update_available === true;
   const currentPanelVersion = panelUpdate.current_version || appVersion || '1.0.0';
@@ -747,6 +838,322 @@ export function UpdatesPage({ request, isAdmin }) {
           </pre>
         </div>
       )}
+
+      {/* 4B. Smart PHP Auto-Patch Notification Banner (Unacknowledged Updates) */}
+      {phpUnacknowledged.length > 0 && (
+        <div
+          style={{
+            border: '1px solid rgba(16, 185, 129, 0.45)',
+            borderRadius: '14px',
+            padding: '16px 20px',
+            background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.08), var(--surface))',
+            marginBottom: '16px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: '14px',
+          }}
+        >
+          <div style={{ flex: '1 1 420px', minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <CheckCircle size={17} style={{ color: '#10b981', flexShrink: 0 }} />
+              <strong style={{ fontSize: '14.5px', color: 'var(--text)' }}>
+                {t('Thông báo Smart Guard: Hệ thống vừa cập nhật bản vá bảo mật PHP an toàn')}
+              </strong>
+              <span className="badge ok">{t('Zero-Downtime Verified')}</span>
+              <span className="badge">{t('Anti-PHP2SHELL Active')}</span>
+            </div>
+            <div style={{ marginTop: '6px', fontSize: '13px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+              {phpUnacknowledged[0]?.summary}
+              {phpUnacknowledged[0]?.timestamp && (
+                <span style={{ marginLeft: '10px', color: 'var(--text-muted)' }}>
+                  ({fmtDateTime(phpUnacknowledged[0].timestamp)})
+                </span>
+              )}
+            </div>
+          </div>
+          <button
+            type="button"
+            className="cb-btn secondary"
+            style={{ height: '34px', padding: '0 14px' }}
+            onClick={() => handleAcknowledgePhpUpdates(null)}
+          >
+            <CheckCircle size={13} /> {t('Đã xem / Xác nhận')}
+          </button>
+        </div>
+      )}
+
+      {/* 4C. Smart PHP Auto-Patching & Anti-PHP2SHELL Security Guard Card */}
+      <div
+        style={{
+          border: phpUpdatableCount > 0 ? '1px solid rgba(245, 158, 11, 0.45)' : '1px solid var(--border)',
+          borderRadius: '14px',
+          overflow: 'hidden',
+          background: 'var(--surface)',
+          marginBottom: '16px',
+        }}
+      >
+        <div
+          style={{
+            background: 'var(--surface-alt)',
+            padding: '15px 20px',
+            borderBottom: '1px solid var(--border)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: '12px',
+          }}
+        >
+          <div style={{ flex: '1 1 440px', minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <ShieldCheck size={17} style={{ color: '#10b981' }} />
+              <strong style={{ fontSize: '15px', color: 'var(--text)' }}>
+                {t('Smart PHP Auto-Patch & Chống tấn công PHP2SHELL (Zero-Downtime)')}
+              </strong>
+              <span className={`badge ${phpUpdatableCount > 0 ? 'warn' : 'ok'}`}>
+                {phpUpdatableCount > 0
+                  ? t('{n} bản vá bảo mật mới', { n: phpUpdatableCount })
+                  : t('Tất cả nhánh PHP đã mới nhất')}
+              </span>
+              <span className={`badge ${phpConfigForm.harden_mode !== 'off' ? 'ok' : 'warn'}`}>
+                {phpConfigForm.harden_mode === 'strict'
+                  ? t('Anti-PHP2SHELL: Nghiêm ngặt (Strict)')
+                  : phpConfigForm.harden_mode === 'balanced'
+                    ? t('Anti-PHP2SHELL: Cân bằng')
+                    : t('Anti-PHP2SHELL: Tắt')}
+              </span>
+            </div>
+            <span style={{ display: 'block', marginTop: '4px', fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+              {t(
+                'Tự động phát hiện và cập nhật bản vá bảo mật mới nhất trong cùng nhánh major.minor (không tự ý đổi phiên bản PHP của website), kiểm tra cú pháp php-fpm -t trước khi reload mượt mà và khóa các hàm thực thi shell nguy hiểm (exec, shell_exec, system, proc_open, passthru) trên PHP-FPM để chặn đứng PHP2SHELL.'
+              )}
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className={`cb-btn ${phpUpdatableCount > 0 ? 'primary' : 'secondary'}`}
+              style={{ height: '36px', padding: '0 14px', fontWeight: 600 }}
+              disabled={!!loading || !!phpPatchingBranch}
+              onClick={() => handleRunPhpPatch(null)}
+            >
+              <RefreshCw size={14} className={phpPatchingBranch === 'all' ? 'spin' : ''} />
+              {phpPatchingBranch === 'all'
+                ? t('Đang cập nhật PHP an toàn...')
+                : phpUpdatableCount > 0
+                  ? t('Cập nhật bản vá PHP ngay ({n})', { n: phpUpdatableCount })
+                  : t('Kiểm tra & Đồng bộ bảo mật PHP')}
+            </button>
+          </div>
+        </div>
+
+        {/* Configuration Bar */}
+        <div
+          style={{
+            padding: '14px 20px',
+            borderBottom: '1px solid var(--border)',
+            background: 'var(--surface)',
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+            gap: '12px',
+            alignItems: 'end',
+          }}
+        >
+          <label style={fieldLabelStyle}>
+            <span style={fieldTitleStyle}>{t('Tự động cập nhật bản vá PHP (Zero-Downtime)')}</span>
+            <select
+              style={selectInputStyle}
+              value={phpConfigForm.auto_patch_enabled ? 'on' : 'off'}
+              onChange={e =>
+                setPhpConfigForm(prev => ({ ...prev, auto_patch_enabled: e.target.value === 'on' }))
+              }
+            >
+              <option value="on">{t('Bật — Tự động vá lỗi an toàn & thông báo')}</option>
+              <option value="off">{t('Tắt — Chỉ cảnh báo khi có bản vá mới')}</option>
+            </select>
+          </label>
+
+          <label style={fieldLabelStyle}>
+            <span style={fieldTitleStyle}>{t('Khung giờ tự động vá lỗi PHP')}</span>
+            <select
+              style={selectInputStyle}
+              value={phpConfigForm.preferred_window}
+              onChange={e =>
+                setPhpConfigForm(prev => ({ ...prev, preferred_window: e.target.value }))
+              }
+            >
+              <option value="03:00">{t('03:00 AM (Ban đêm — Khuyên dùng)')}</option>
+              <option value="02:00">02:00 AM</option>
+              <option value="04:00">04:00 AM</option>
+              <option value="immediate">{t('Cập nhật ngay khi phát hiện bản vá')}</option>
+            </select>
+          </label>
+
+          <label style={fieldLabelStyle}>
+            <span style={fieldTitleStyle}>{t('Lớp bảo vệ chống PHP2SHELL / RCE (PHP-FPM)')}</span>
+            <select
+              style={selectInputStyle}
+              value={phpConfigForm.harden_mode}
+              onChange={e =>
+                setPhpConfigForm(prev => ({
+                  ...prev,
+                  harden_mode: e.target.value,
+                  auto_harden_php2shell: e.target.value !== 'off',
+                }))
+              }
+            >
+              <option value="strict">
+                {t('Nghiêm ngặt — Khóa 15 hàm Shell & CGI (Khuyên dùng)')}
+              </option>
+              <option value="balanced">
+                {t('Cân bằng — Khóa system/passthru/pcntl (Tương thích cũ)')}
+              </option>
+              <option value="off">{t('Tắt lớp khóa hàm tự động')}</option>
+            </select>
+          </label>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              type="button"
+              className="cb-btn primary"
+              style={{ height: '38px', padding: '0 16px', width: '100%', justifyContent: 'center', fontWeight: 600 }}
+              disabled={!!loading || phpSavingConfig}
+              onClick={handleSavePhpSmartConfig}
+            >
+              {phpSavingConfig ? t('Đang lưu...') : t('Lưu cấu hình Smart PHP')}
+            </button>
+          </div>
+        </div>
+
+        {/* Installed PHP Branches Status Table */}
+        {phpVersions.length > 0 && (
+          <div style={{ width: '100%', overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13.5px' }}>
+              <thead>
+                <tr style={{ background: 'var(--surface-alt)', borderBottom: '1px solid var(--border)' }}>
+                  <th style={{ padding: '10px 20px' }}>{t('Nhánh PHP')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Phiên bản đang chạy')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Bản vá mới nhất (APT Repo)')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Trạng thái PHP-FPM')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Chống PHP2SHELL / RCE')}</th>
+                  <th style={{ padding: '10px 20px', textAlign: 'right' }}>{t('Thao tác')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {phpVersions.map(row => {
+                  const hasUpd = !!row.update_available;
+                  const hard = row.hardening || {};
+                  return (
+                    <tr key={row.branch} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '10px 20px', fontWeight: 600 }}>
+                        PHP {row.branch}
+                      </td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <code>{row.current_version || row.branch}</code>
+                      </td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <code>{row.latest_version || row.current_version}</code>
+                          <span className={`badge ${hasUpd ? 'warn' : 'ok'}`}>
+                            {hasUpd
+                              ? t('Có bản vá mới ({n} gói)', { n: row.upgradable_count || 1 })
+                              : t('Đã mới nhất')}
+                          </span>
+                        </div>
+                      </td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <span className={`badge ${row.fpm_active ? 'ok' : 'warn'}`}>
+                          {row.fpm_active ? 'Active (Zero-Downtime)' : 'Inactive'}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <span
+                          className={`badge ${hard.protected ? 'ok' : 'warn'}`}
+                          title={
+                            Array.isArray(hard.disabled_functions) && hard.disabled_functions.length > 0
+                              ? `disable_functions: ${hard.disabled_functions.join(', ')}`
+                              : ''
+                          }
+                        >
+                          {hard.protected
+                            ? t('Đã bảo vệ ({mode} · {n} hàm bị khóa)', {
+                                mode: hard.mode === 'strict' ? 'Strict' : hard.mode === 'balanced' ? 'Balanced' : 'Custom',
+                                n: hard.disabled_count || 0,
+                              })
+                            : t('Chưa bật khóa hàm')}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 20px', textAlign: 'right' }}>
+                        <button
+                          type="button"
+                          className={`cb-btn ${hasUpd ? 'primary' : 'secondary'}`}
+                          style={{ height: '30px', padding: '0 12px', fontSize: '12.5px' }}
+                          disabled={!!loading || !!phpPatchingBranch}
+                          onClick={() => handleRunPhpPatch(row.branch)}
+                        >
+                          <RefreshCw size={12} className={phpPatchingBranch === row.branch ? 'spin' : ''} />
+                          {phpPatchingBranch === row.branch
+                            ? t('Đang vá...')
+                            : hasUpd
+                              ? t('Cập nhật ngay')
+                              : t('Đồng bộ lại')}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Recent Auto-Patch & Security Audit Log */}
+        {phpRecentUpdates.length > 0 && (
+          <div
+            style={{
+              padding: '12px 20px',
+              background: 'var(--surface-alt)',
+              borderTop: '1px solid var(--border)',
+            }}
+          >
+            <strong style={{ fontSize: '12.5px', color: 'var(--text-secondary)', display: 'block', marginBottom: '8px' }}>
+              {t('Lịch sử cập nhật bảo mật PHP gần đây (Audit Trail):')}
+            </strong>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {phpRecentUpdates.slice(0, 4).map(rec => (
+                <div
+                  key={rec.id}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: '8px',
+                    fontSize: '12.5px',
+                    padding: '7px 10px',
+                    borderRadius: '8px',
+                    background: 'var(--surface)',
+                    border: '1px solid var(--border)',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span className={`badge ${rec.trigger === 'auto' ? 'ok' : ''}`}>
+                      {rec.trigger === 'auto' ? t('Tự động (Smart Guard)') : t('Thủ công')}
+                    </span>
+                    <span style={{ color: 'var(--text)', fontWeight: 500 }}>{rec.summary}</span>
+                  </div>
+                  <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
+                    {fmtDateTime(rec.timestamp)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* 5. Recovery Snapshots & 1-Click Rollback Card */}
       <div

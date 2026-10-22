@@ -3993,12 +3993,88 @@ install_php_version() {
     echo "Skipping PHP packages not available in repo: ${missing_packages[*]}"
   fi
   [[ ${#available_packages[@]} -gt 0 ]] || deny "No package found for PHP ${version}"
-  apt-get install -y "${available_packages[@]}" || { echo "Failed to install PHP $version"; return 1; }
+  apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y "${available_packages[@]}" || { echo "Failed to install PHP $version"; return 1; }
   install_ioncube_loader "$version"
-  # Enable and start PHP-FPM
+  # Enable and start/reload PHP-FPM
   systemctl enable "php${version}-fpm" 2>/dev/null || true
-  systemctl start "php${version}-fpm" 2>/dev/null || true
+  if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
+    "php-fpm${version}" -t >/dev/null 2>&1 && systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm" 2>/dev/null || true
+  else
+    systemctl start "php${version}-fpm" 2>/dev/null || true
+  fi
   echo "PHP $version installed successfully"
+}
+
+upgrade_php_version() {
+  local version="$1"
+  export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
+  require_php_version "$version"
+  [[ -f "/etc/php/${version}/fpm/php-fpm.conf" ]] || deny "PHP ${version} is not installed"
+  apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true
+  local installed_pkgs=() pkg
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] && installed_pkgs+=("$pkg")
+  done < <(dpkg-query -W -f='${Package}\t${Status}\n' "php${version}-*" "php${version}" 2>/dev/null | awk -F'\t' '$2 == "install ok installed" {print $1}')
+  if [[ ${#installed_pkgs[@]} -gt 0 ]]; then
+    apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${installed_pkgs[@]}" || deny "Failed to upgrade PHP ${version} packages"
+  fi
+  if command -v "php-fpm${version}" >/dev/null 2>&1; then
+    "php-fpm${version}" -t >/dev/null 2>&1 || deny "php-fpm${version} configuration test failed after upgrade"
+  fi
+  if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
+    systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  else
+    systemctl start "php${version}-fpm" 2>/dev/null || true
+  fi
+  echo "PHP ${version} packages safely upgraded and php${version}-fpm reloaded"
+}
+
+harden_php_security() {
+  local version="$1" mode="${2:-strict}" conf_dir target tmp disabled_funcs
+  require_php_version "$version"
+  conf_dir="/etc/php/${version}/fpm/conf.d"
+  [[ -d "$conf_dir" ]] || deny "PHP FPM config directory not found: $conf_dir"
+  target="${conf_dir}/98-spanel-security.ini"
+  case "$mode" in
+    off|disable|disabled|0)
+      rm -f -- "$target"
+      if command -v "php-fpm${version}" >/dev/null 2>&1; then
+        "php-fpm${version}" -t >/dev/null 2>&1 || true
+      fi
+      systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm" 2>/dev/null || true
+      echo "PHP ${version} anti-PHP2SHELL hardening disabled"
+      return 0
+      ;;
+    balanced)
+      disabled_funcs="passthru,system,pcntl_exec,pcntl_fork,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,show_source,highlight_file"
+      ;;
+    strict|on|enable|enabled|1|*)
+      disabled_funcs="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,pcntl_fork,posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid,show_source,highlight_file"
+      ;;
+  esac
+  tmp="$(mktemp "${conf_dir}/.98-spanel-security.ini.XXXXXX")" || deny "cannot create temporary PHP security config"
+  cat >"$tmp" <<INI
+; Managed by SPanel Smart Security Guard (Anti-PHP2SHELL & RCE Hardening)
+; Applied to PHP-FPM web pools only; PHP-CLI stays unrestricted for Composer/WP-CLI.
+cgi.fix_pathinfo = 0
+expose_php = Off
+allow_url_include = Off
+enable_dl = Off
+disable_functions = ${disabled_funcs}
+INI
+  chown root:root "$tmp"
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$target"
+  if command -v "php-fpm${version}" >/dev/null 2>&1; then
+    if ! "php-fpm${version}" -t >/dev/null 2>&1; then
+      rm -f -- "$target"
+      deny "php-fpm${version} configuration test failed when applying security hardening"
+    fi
+  fi
+  if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
+    systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  fi
+  echo "PHP ${version} anti-PHP2SHELL hardening (${mode}) applied: ${target}"
 }
 
 uninstall_php_version() {
@@ -7844,6 +7920,16 @@ case "$cmd" in
   php-install)
     [[ $# -eq 1 ]] || deny "usage: php-install <version>"
     install_php_version "$1"
+    ;;
+
+  php-safe-upgrade)
+    [[ $# -eq 1 ]] || deny "usage: php-safe-upgrade <version>"
+    upgrade_php_version "$1"
+    ;;
+
+  php-security-harden)
+    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: php-security-harden <version> [strict|balanced|off]"
+    harden_php_security "$1" "${2:-strict}"
     ;;
 
   php-uninstall)

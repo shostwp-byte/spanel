@@ -581,6 +581,11 @@ def status(force_refresh: bool = False) -> dict:
     payload["source"] = get_masked_source_info()
     payload["snapshots"] = list_snapshots()
     payload["panel_update_log"] = _read_panel_update_log()
+    try:
+        from app.services import php as php_service
+        payload["php_smart_guard"] = php_service.check_php_updates(force_refresh=force_refresh)
+    except Exception:
+        payload["php_smart_guard"] = None
     return payload
 
 

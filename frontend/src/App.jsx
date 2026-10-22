@@ -895,6 +895,31 @@ function AppContent() {
       if (sum.updates?.update_available) {
         flag('info', t('Update'), t('Panel update {version} is available.', { version: sum.updates.latest_version }), 'updates', t('Update'), RefreshCw);
       }
+      if (sum.php_updates?.updates_available_count > 0) {
+        const verList = (sum.php_updates.updatable_versions || []).join(', ');
+        flag(
+          'warn',
+          t('Security'),
+          t('Phát hiện {n} bản vá bảo mật PHP mới ({versions}) chống lỗ hổng RCE / PHP2SHELL.', {
+            n: sum.php_updates.updates_available_count,
+            versions: verList || 'PHP',
+          }),
+          'updates',
+          t('Cập nhật'),
+          ShieldAlert
+        );
+      }
+      if (sum.php_updates?.unacknowledged_count > 0) {
+        const latestRec = (sum.php_updates.unacknowledged_updates || [])[0];
+        flag(
+          'info',
+          t('Smart Guard'),
+          latestRec?.summary || t('Smart Guard vừa tự động cập nhật bản vá bảo mật PHP an toàn (Zero-Downtime).'),
+          'updates',
+          t('Xem chi tiết'),
+          RefreshCw
+        );
+      }
       return attention;
     }
 
