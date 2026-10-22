@@ -900,7 +900,7 @@ function AppContent() {
         flag(
           'warn',
           t('Security'),
-          t('Phát hiện {n} bản vá bảo mật PHP mới ({versions}) chống lỗ hổng RCE / PHP2SHELL.', {
+          t('Smart PHP Auto-Patch: Phát hiện {n} bản vá bảo mật PHP mới ({versions}).', {
             n: sum.php_updates.updates_available_count,
             versions: verList || 'PHP',
           }),
@@ -913,8 +913,8 @@ function AppContent() {
         const latestRec = (sum.php_updates.unacknowledged_updates || [])[0];
         flag(
           'info',
-          t('Smart Guard'),
-          latestRec?.summary || t('Smart Guard vừa tự động cập nhật bản vá bảo mật PHP an toàn (Zero-Downtime).'),
+          t('Smart PHP Auto-Patch'),
+          latestRec?.summary || t('Smart PHP Auto-Patch vừa tự động cập nhật bản vá bảo mật PHP an toàn.'),
           'updates',
           t('Xem chi tiết'),
           RefreshCw

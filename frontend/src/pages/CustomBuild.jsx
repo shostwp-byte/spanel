@@ -293,7 +293,7 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
     if (
       !confirm(
         t(
-          'Thực hiện cập nhật bản vá bảo mật cho {label} và đồng bộ lớp bảo vệ chống PHP2SHELL (Zero-Downtime Reload)?',
+          'Thực hiện cập nhật bản vá bảo mật cho {label} thông qua Smart PHP Auto-Patch (Zero-Downtime Reload)?',
           { label }
         )
       )
@@ -789,7 +789,7 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                   {busyKey === 'patch-php-all' ? <RefreshCw size={14} className="spin" /> : <Shield size={14} />}
                   {busyKey === 'patch-php-all'
                     ? t('Đang vá bảo mật PHP...')
-                    : t('Smart Auto-Patch & Chống PHP2SHELL (Zero-Downtime)')}
+                    : t('Smart PHP Auto-Patch')}
                 </button>
                 <button type="button" className="cb-btn secondary" disabled={isBusy} onClick={handleRetunePools}>
                   {busyKey === 'retune-pools' ? <RefreshCw size={14} className="spin" /> : <Sparkles size={14} />}
@@ -829,7 +829,7 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                               <>
                                 <span className="cb-dot">•</span>
                                 <span className="badge ok" style={{ fontSize: '10.5px', padding: '1px 6px' }}>
-                                  Anti-PHP2SHELL
+                                  FPM Hardened
                                 </span>
                               </>
                             )}

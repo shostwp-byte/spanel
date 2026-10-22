@@ -308,12 +308,12 @@ export function UpdatesPage({ request, isAdmin }) {
     const res = await request(
       '/updates/php/config',
       { method: 'POST', body: JSON.stringify(payload) },
-      t('Đang lưu cấu hình Smart PHP Auto-Patch & lớp bảo vệ chống PHP2SHELL...')
+      t('Đang lưu cấu hình Smart PHP Auto-Patch...')
     );
     setPhpSavingConfig(false);
     if (res?.php_smart_guard) {
       setUpdatesStatus(prev => (prev ? { ...prev, php_smart_guard: res.php_smart_guard } : prev));
-      setNotice(t('Đã lưu cấu hình Smart PHP Auto-Patch và đồng bộ lớp bảo vệ chống PHP2SHELL.'));
+      setNotice(t('Đã lưu cấu hình Smart PHP Auto-Patch thành công.'));
     }
   }
 
@@ -859,10 +859,9 @@ export function UpdatesPage({ request, isAdmin }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
               <CheckCircle size={17} style={{ color: '#10b981', flexShrink: 0 }} />
               <strong style={{ fontSize: '14.5px', color: 'var(--text)' }}>
-                {t('Thông báo Smart Guard: Hệ thống vừa cập nhật bản vá bảo mật PHP an toàn')}
+                {t('Smart PHP Auto-Patch: Hệ thống vừa cập nhật bản vá bảo mật PHP an toàn')}
               </strong>
               <span className="badge ok">{t('Zero-Downtime Verified')}</span>
-              <span className="badge">{t('Anti-PHP2SHELL Active')}</span>
             </div>
             <div style={{ marginTop: '6px', fontSize: '13px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
               {phpUnacknowledged[0]?.summary}
@@ -910,7 +909,7 @@ export function UpdatesPage({ request, isAdmin }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
               <ShieldCheck size={17} style={{ color: '#10b981' }} />
               <strong style={{ fontSize: '15px', color: 'var(--text)' }}>
-                {t('Smart PHP Auto-Patch & Chống tấn công PHP2SHELL (Zero-Downtime)')}
+                {t('Smart PHP Auto-Patch')}
               </strong>
               <span className={`badge ${phpUpdatableCount > 0 ? 'warn' : 'ok'}`}>
                 {phpUpdatableCount > 0
@@ -919,15 +918,15 @@ export function UpdatesPage({ request, isAdmin }) {
               </span>
               <span className={`badge ${phpConfigForm.harden_mode !== 'off' ? 'ok' : 'warn'}`}>
                 {phpConfigForm.harden_mode === 'strict'
-                  ? t('Anti-PHP2SHELL: Nghiêm ngặt (Strict)')
+                  ? t('FPM Hardening: Nghiêm ngặt (Strict)')
                   : phpConfigForm.harden_mode === 'balanced'
-                    ? t('Anti-PHP2SHELL: Cân bằng')
-                    : t('Anti-PHP2SHELL: Tắt')}
+                    ? t('FPM Hardening: Cân bằng')
+                    : t('FPM Hardening: Tắt')}
               </span>
             </div>
             <span style={{ display: 'block', marginTop: '4px', fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.45 }}>
               {t(
-                'Tự động phát hiện và cập nhật bản vá bảo mật mới nhất trong cùng nhánh major.minor (không tự ý đổi phiên bản PHP của website), kiểm tra cú pháp php-fpm -t trước khi reload mượt mà và khóa các hàm thực thi shell nguy hiểm (exec, shell_exec, system, proc_open, passthru) trên PHP-FPM để chặn đứng PHP2SHELL.'
+                'Tự động nhận diện các bản cập nhật bảo mật mới nhất cho từng nhánh PHP đang cài đặt và nâng cấp an toàn trong cùng nhánh major.minor (kiểm tra cú pháp php-fpm -t và reload mượt mà, không làm gián đoạn hoạt động của máy chủ).'
               )}
             </span>
           </div>
@@ -993,7 +992,7 @@ export function UpdatesPage({ request, isAdmin }) {
           </label>
 
           <label style={fieldLabelStyle}>
-            <span style={fieldTitleStyle}>{t('Lớp bảo vệ chống PHP2SHELL / RCE (PHP-FPM)')}</span>
+            <span style={fieldTitleStyle}>{t('Bảo vệ hàm hệ thống PHP-FPM (Security Hardening)')}</span>
             <select
               style={selectInputStyle}
               value={phpConfigForm.harden_mode}
@@ -1038,7 +1037,7 @@ export function UpdatesPage({ request, isAdmin }) {
                   <th style={{ padding: '10px 16px' }}>{t('Phiên bản đang chạy')}</th>
                   <th style={{ padding: '10px 16px' }}>{t('Bản vá mới nhất (APT Repo)')}</th>
                   <th style={{ padding: '10px 16px' }}>{t('Trạng thái PHP-FPM')}</th>
-                  <th style={{ padding: '10px 16px' }}>{t('Chống PHP2SHELL / RCE')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Bảo mật PHP-FPM')}</th>
                   <th style={{ padding: '10px 20px', textAlign: 'right' }}>{t('Thao tác')}</th>
                 </tr>
               </thead>

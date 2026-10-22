@@ -910,12 +910,12 @@ def upgrade_php_packages(versions: list[str] | None = None, trigger: str = "manu
         changed_items = [b for b in updated_branches if b.get("changed")]
         if changed_items:
             summary_parts = [f"PHP {b['branch']} ({b['from_version']} → {b['to_version']})" for b in changed_items]
-            summary_text = f"Đã cập nhật bản vá bảo mật: {', '.join(summary_parts)} (Zero-Downtime Reload)"
+            summary_text = f"Smart PHP Auto-Patch: Đã cập nhật bản vá bảo mật {', '.join(summary_parts)}"
         else:
             branch_labels = [f"PHP {b['branch']} ({b['to_version']})" for b in updated_branches]
             summary_text = (
-                f"Đã kiểm tra & đồng bộ an toàn {', '.join(branch_labels)} — "
-                "Tất cả đã ở phiên bản bảo mật mới nhất & kích hoạt chống PHP2SHELL."
+                f"Smart PHP Auto-Patch: Đã kiểm tra & đồng bộ an toàn {', '.join(branch_labels)} — "
+                "Tất cả đang ở bản vá bảo mật mới nhất."
             )
 
         record = {

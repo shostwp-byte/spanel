@@ -177,32 +177,23 @@ def _security_change(p: dict, lang: str) -> tuple[str, list[str]]:
 def _php_security_updated(p: dict, lang: str) -> tuple[str, list[str]]:
     items = p.get("items") or []
     trigger = p.get("trigger") or "auto"
-    hardened = bool(p.get("hardened", True))
     if lang == "vi":
-        mode_label = "Tự động (Smart Auto-Patch)" if trigger == "auto" else "Thủ công (Quản trị viên)"
+        mode_label = "Tự động (Smart PHP Auto-Patch)" if trigger == "auto" else "Thủ công (Quản trị viên)"
         return (
-            f"Đã cập nhật bản vá bảo mật PHP an toàn ({len(items)} nhánh)",
+            f"Smart PHP Auto-Patch: Đã cập nhật bản vá bảo mật PHP ({len(items)} nhánh)",
             [
-                f"Chế độ kích hoạt: {mode_label} — Zero-Downtime Reload (không gián đoạn dịch vụ).",
+                f"Chế độ kích hoạt: {mode_label}.",
                 *_listed(items, "...và {n} nhánh PHP khác", "", lang),
-                (
-                    "Lớp bảo vệ chống tấn công PHP2SHELL / RCE trên PHP-FPM đã được đồng bộ và kiểm tra an toàn."
-                    if hardened
-                    else "Dịch vụ PHP-FPM đã được kiểm tra cú pháp (php-fpm -t) và reload an toàn."
-                ),
+                "Dịch vụ PHP-FPM đã được kiểm tra cú pháp (php-fpm -t) và reload an toàn, không làm gián đoạn hoạt động của máy chủ.",
             ],
         )
-    mode_en = "Automatic (Smart Auto-Patch)" if trigger == "auto" else "Manual (Administrator)"
+    mode_en = "Automatic (Smart PHP Auto-Patch)" if trigger == "auto" else "Manual (Administrator)"
     return (
-        f"PHP security patches safely applied ({len(items)} branch(es))",
+        f"Smart PHP Auto-Patch: PHP security patches applied ({len(items)} branch(es))",
         [
-            f"Trigger: {mode_en} — Zero-Downtime FPM Reload.",
+            f"Trigger: {mode_en}.",
             *_listed(items, "", "...and {n} more", lang),
-            (
-                "Anti-PHP2SHELL / RCE hardening on PHP-FPM has been verified and enforced."
-                if hardened
-                else "PHP-FPM syntax was verified (php-fpm -t) and reloaded gracefully."
-            ),
+            "PHP-FPM syntax was verified (php-fpm -t) and reloaded gracefully with zero downtime.",
         ],
     )
 
@@ -211,19 +202,19 @@ def _php_update_available(p: dict, lang: str) -> tuple[str, list[str]]:
     items = p.get("items") or []
     if lang == "vi":
         return (
-            f"Phát hiện {len(items)} bản cập nhật bảo mật PHP mới",
+            f"Smart PHP Auto-Patch: Phát hiện {len(items)} bản cập nhật bảo mật PHP mới",
             [
-                "Các nhánh PHP dưới đây có bản vá bảo mật mới (chống lỗ hổng RCE / PHP2SHELL):",
+                "Các nhánh PHP dưới đây có bản vá bảo mật mới:",
                 *_listed(items, "...và {n} nhánh khác", "", lang),
-                "Mở trang Cập nhật hệ thống (Updates) hoặc CustomBuild để cập nhật an toàn (Zero-Downtime).",
+                "Mở trang Cập nhật hệ thống (Updates) hoặc CustomBuild để cập nhật an toàn.",
             ],
         )
     return (
-        f"{len(items)} PHP security update(s) available",
+        f"Smart PHP Auto-Patch: {len(items)} PHP security update(s) available",
         [
             "The following installed PHP branches have newer security/minor releases:",
             *_listed(items, "", "...and {n} more", lang),
-            "Open System Updates or CustomBuild to apply safe zero-downtime patching.",
+            "Open System Updates or CustomBuild to apply safe patching.",
         ],
     )
 
