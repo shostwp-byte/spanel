@@ -239,7 +239,19 @@ def _hostname_conflicts(db: Session, domain: str, *, exclude_website_id: int | N
     safe_domain = (domain or "").strip().lower()
     if not safe_domain:
         return True
-    return bool({safe_domain, f"www.{safe_domain}"} & _reserved_hostnames(db, exclude_website_id=exclude_website_id, exclude_alias_id=exclude_alias_id))
+    local_conflict = bool({safe_domain, f"www.{safe_domain}"} & _reserved_hostnames(db, exclude_website_id=exclude_website_id, exclude_alias_id=exclude_alias_id))
+    if local_conflict:
+        return True
+    if exclude_website_id is None and exclude_alias_id is None:
+        from app.services import multi_server
+
+        cluster_check = multi_server.check_cluster_conflict(domain=safe_domain)
+        if cluster_check.get("conflict"):
+            raise HTTPException(
+                status_code=409,
+                detail=cluster_check.get("message") or f"Domain '{safe_domain}' already exists on a peer server in the Multi-Server Cluster.",
+            )
+    return False
 
 
 def _resolve_app_for_owner(db: Session, owner_id: int, app_id: int | None, current_user: User) -> SiteApp:
@@ -394,14 +406,12 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
     )
     existing_root_domains_count = len(existing_domains) - existing_subdomains_count
     if is_subdomain_create:
-        raw_sub_lim = getattr(owner.package, "subdomain_limit", None) if getattr(owner, "package", None) else None
-        eff_subdomain_limit = int(-1 if raw_sub_lim is None else raw_sub_lim)
-        if not is_admin_role(owner.role) and eff_subdomain_limit >= 0 and existing_subdomains_count >= eff_subdomain_limit:
+        eff_subdomain_limit = int((owner.package.subdomain_limit if getattr(owner, "package", None) else 0) or 0)
+        if not is_admin_role(owner.role) and eff_subdomain_limit > 0 and existing_subdomains_count >= eff_subdomain_limit:
             raise HTTPException(status_code=403, detail="Subdomain limit reached")
     else:
-        raw_site_lim = owner.website_limit if owner.website_limit is not None else (getattr(owner.package, "website_limit", None) if getattr(owner, "package", None) else None)
-        eff_site_limit = int(-1 if raw_site_lim is None else raw_site_lim)
-        if not is_admin_role(owner.role) and eff_site_limit >= 0 and existing_root_domains_count >= eff_site_limit:
+        eff_site_limit = int(owner.website_limit if owner.website_limit is not None else (owner.package.website_limit if getattr(owner, "package", None) else 0) or 0)
+        if not is_admin_role(owner.role) and eff_site_limit != 0 and existing_root_domains_count >= eff_site_limit:
             raise HTTPException(status_code=403, detail="Website limit reached")
 
     install_wp = payload.install_wordpress and payload.app_type == "wordpress"

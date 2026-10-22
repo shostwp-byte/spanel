@@ -8,9 +8,9 @@ from pydantic import BaseModel
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.services import storage_quota
+from app.services import panel_settings, storage_quota, webhooks as webhooks_service
 from app.core.permissions import Role, ensure_role, is_admin_role
-from app.models.entities import User, WhiteLabelConfig, WebhookEndpoint, UserPackage, Website, DatabaseAccount
+from app.models.entities import ApiToken, User, WhiteLabelConfig, WebhookEndpoint, UserPackage, Website, DatabaseAccount
 
 router = APIRouter(prefix="/resellers", tags=["resellers"])
 
@@ -48,6 +48,7 @@ class WebhookEndpointOut(BaseModel):
     url: str
     events: str
     is_active: bool
+    has_secret: bool = False
 
 class ResellerStatsOut(BaseModel):
     total_users: int
@@ -136,8 +137,6 @@ def _validate_webhook_url(raw_url: str) -> str:
 
 @router.get("/whitelabel/public", response_model=WhiteLabelPublicSchema)
 def get_whitelabel_public(request: Request, db: Session = Depends(get_db)):
-    from app.services import panel_settings
-    raw_panel = panel_settings._read_raw_lenient()
     host = request.headers.get("host", "").split(":")[0]
     config = db.query(WhiteLabelConfig).filter(WhiteLabelConfig.panel_domain == host).first()
     if not config:
@@ -145,37 +144,19 @@ def get_whitelabel_public(request: Request, db: Session = Depends(get_db)):
         if admin_user:
             config = db.query(WhiteLabelConfig).filter(WhiteLabelConfig.reseller_id == admin_user.id).first()
     if not config:
-        return WhiteLabelPublicSchema(
-            company_name=raw_panel.get("app_name") or "SPanel",
-            primary_color=raw_panel.get("primary_color") or "#16a34a",
-            support_url=raw_panel.get("ticket_url") or None,
-        )
-    return WhiteLabelPublicSchema(
-        company_name=config.company_name or raw_panel.get("app_name") or "SPanel",
-        logo_url=config.logo_url,
-        primary_color=config.primary_color or raw_panel.get("primary_color") or "#16a34a",
-        support_url=config.support_url or raw_panel.get("ticket_url") or None,
-    )
+        return WhiteLabelPublicSchema(company_name="SPanel", primary_color="#4f46e5")
+    return config
 
 @router.get("/whitelabel", response_model=WhiteLabelConfigSchema)
 def get_whitelabel(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
-    from app.services import panel_settings
-    raw_panel = panel_settings._read_raw_lenient() if is_admin_role(current_user.role) else {}
     config = db.query(WhiteLabelConfig).filter(WhiteLabelConfig.reseller_id == current_user.id).first()
     if not config:
         return WhiteLabelConfigSchema(
-            company_name=raw_panel.get("app_name") or "Control Panel",
-            primary_color=raw_panel.get("primary_color") or "#16a34a",
-            support_url=raw_panel.get("ticket_url") or None,
+            company_name="Control Panel",
+            primary_color="#4f46e5"
         )
-    return WhiteLabelConfigSchema(
-        company_name=config.company_name or raw_panel.get("app_name") or "Control Panel",
-        panel_domain=config.panel_domain,
-        logo_url=config.logo_url,
-        primary_color=config.primary_color or raw_panel.get("primary_color") or "#16a34a",
-        support_url=config.support_url or raw_panel.get("ticket_url") or None,
-    )
+    return config
 
 @router.put("/whitelabel", response_model=WhiteLabelConfigSchema)
 def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -185,9 +166,9 @@ def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get
     if panel_domain is not None and not _DOMAIN_RE.fullmatch(panel_domain):
         raise HTTPException(status_code=400, detail="Invalid panel domain format")
 
-    primary_color = (payload.primary_color or "#16a34a").strip()
+    primary_color = (payload.primary_color or "#4f46e5").strip()
     if not _HEX_COLOR_RE.fullmatch(primary_color):
-        raise HTTPException(status_code=400, detail="Primary color must be a valid hex color (e.g. #16a34a)")
+        raise HTTPException(status_code=400, detail="Primary color must be a valid hex color (e.g. #4f46e5)")
 
     logo_url = _validate_whitelabel_url(payload.logo_url, "logo_url", is_logo=True)
     support_url = _validate_whitelabel_url(payload.support_url, "support_url", is_logo=False)
@@ -217,25 +198,24 @@ def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get
 
     db.commit()
     db.refresh(config)
-
-    if is_admin_role(current_user.role):
-        try:
-            from app.services import panel_settings
-            panel_settings.update_settings(
-                app_name=config.company_name,
-                primary_color=config.primary_color,
-                ticket_url=config.support_url or "",
-            )
-        except Exception:
-            pass
-
     return config
+
+
+def _webhook_to_out(webhook: WebhookEndpoint) -> dict:
+    return {
+        "id": webhook.id,
+        "url": webhook.url,
+        "events": webhook.events,
+        "is_active": bool(webhook.is_active),
+        "has_secret": bool(webhook.secret),
+    }
 
 
 @router.get("/webhooks", response_model=List[WebhookEndpointOut])
 def list_webhooks(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
-    return db.query(WebhookEndpoint).filter(WebhookEndpoint.user_id == current_user.id).all()
+    rows = db.query(WebhookEndpoint).filter(WebhookEndpoint.user_id == current_user.id).all()
+    return [_webhook_to_out(row) for row in rows]
 
 @router.post("/webhooks", response_model=WebhookEndpointOut)
 def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -252,7 +232,7 @@ def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db)
     db.add(webhook)
     db.commit()
     db.refresh(webhook)
-    return webhook
+    return _webhook_to_out(webhook)
 
 @router.put("/webhooks/{webhook_id}", response_model=WebhookEndpointOut)
 def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -264,8 +244,8 @@ def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session 
 
     if payload.url is not None:
         webhook.url = _validate_webhook_url(payload.url)
-    if payload.secret is not None:
-        webhook.secret = payload.secret
+    if payload.secret is not None and payload.secret.strip():
+        webhook.secret = payload.secret.strip()
     if payload.events is not None:
         webhook.events = payload.events
     if payload.is_active is not None:
@@ -273,7 +253,7 @@ def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session 
 
     db.commit()
     db.refresh(webhook)
-    return webhook
+    return _webhook_to_out(webhook)
 
 @router.delete("/webhooks/{webhook_id}")
 def delete_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -286,3 +266,151 @@ def delete_webhook(webhook_id: int, db: Session = Depends(get_db), current_user:
     db.delete(webhook)
     db.commit()
     return {"ok": True}
+
+
+@router.post("/webhooks/{webhook_id}/test")
+def test_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.reseller)
+    webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id, WebhookEndpoint.user_id == current_user.id).first()
+    if not webhook and is_admin_role(current_user.role):
+        webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id).first()
+    if not webhook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+
+    test_payload = {
+        "event": "webhook_test",
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "target": "spanel_diagnostic",
+        "detail": "Gói tin kiểm tra kết nối Outbound Webhook từ SPanel",
+    }
+    delivery = webhooks_service.send_webhook_sync(
+        webhook.url,
+        webhook.secret,
+        test_payload,
+        webhook_id=webhook.id,
+        user_id=current_user.id,
+    )
+    if delivery.get("status") != "success":
+        raise HTTPException(
+            status_code=502,
+            detail=f"Máy chủ đích phản hồi lỗi ({delivery.get('status_code') or 'Timeout'}): {delivery.get('response_preview')}",
+        )
+    return delivery
+
+
+@router.get("/webhooks/deliveries")
+def list_webhook_deliveries(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.reseller)
+    return {
+        "items": webhooks_service.list_deliveries(
+            user_id=current_user.id,
+            is_admin=is_admin_role(current_user.role),
+            limit=50,
+        )
+    }
+
+
+@router.post("/webhooks/deliveries/{delivery_id}/replay")
+def replay_webhook_delivery(delivery_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.reseller)
+    try:
+        delivery = webhooks_service.replay_delivery(
+            db,
+            delivery_id,
+            user_id=current_user.id,
+            is_admin=is_admin_role(current_user.role),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return delivery
+
+
+@router.delete("/webhooks/deliveries")
+def clear_webhook_deliveries(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.reseller)
+    removed = webhooks_service.clear_deliveries(
+        user_id=current_user.id,
+        is_admin=is_admin_role(current_user.role),
+    )
+    return {"ok": True, "removed": removed, "message": f"Đã xóa {removed} bản ghi lịch sử Webhook."}
+
+
+@router.get("/whmcs-diagnostic")
+def whmcs_connection_diagnostic(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Comprehensive diagnostic for WHMCS, HostBill, Blesta & Perfex CRM integration."""
+    ensure_role(current_user.role, Role.admin)
+    active_tokens = db.query(ApiToken).filter(ApiToken.is_active == True).all()  # noqa: E712
+    write_tokens = [
+        t for t in active_tokens
+        if "provisioning:write" in (t.scopes or "") and "provisioning:read" in (t.scopes or "")
+    ]
+    packages_count = db.query(UserPackage).count()
+    p_settings = panel_settings.current_settings()
+    ssl_enabled = bool(p_settings.get("ssl_enabled"))
+    hostname = p_settings.get("panel_hostname") or ""
+    port = int(p_settings.get("panel_port") or 2222)
+    deliveries = webhooks_service.list_deliveries(is_admin=True, limit=20)
+    failed_deliveries = [d for d in deliveries if d.get("status") != "success"]
+
+    checks = [
+        {
+            "key": "api_token",
+            "title": "Khóa Provisioning API Token (Đọc & Ghi)",
+            "ok": len(write_tokens) > 0,
+            "status": "ready" if len(write_tokens) > 0 else "warn",
+            "detail": (
+                f"Đang có {len(write_tokens)} API Token hoạt động đủ quyền provisioning:read & provisioning:write."
+                if len(write_tokens) > 0
+                else "Chưa có API Token nào có quyền ghi (provisioning:write). Hãy tạo 1 Token ở khung bên dưới để dán vào WHMCS."
+            ),
+        },
+        {
+            "key": "packages",
+            "title": "Gói dịch vụ Hosting (Hosting Plans / Packages)",
+            "ok": packages_count > 0,
+            "status": "ready" if packages_count > 0 else "warn",
+            "detail": (
+                f"Đã cấu hình {packages_count} gói Hosting sẵn sàng đồng bộ sang WHMCS/HostBill qua /api/provisioning/v1/plans."
+                if packages_count > 0
+                else "Chưa có gói Hosting nào trong Manage User Packages. WHMCS cần ít nhất 1 Package để tạo tài khoản."
+            ),
+        },
+        {
+            "key": "panel_https",
+            "title": "Giao thức kết nối Panel & Cổng API (Port 2222)",
+            "ok": True,
+            "status": "ready" if ssl_enabled else "info",
+            "detail": (
+                f"HTTPS SSL đã bật trên {hostname}:{port} — kết nối WHMCS mã hóa TLS an toàn."
+                if ssl_enabled and hostname
+                else f"Đang chạy trên cổng {port} (HTTP). Khuyến nghị bật Panel SSL nếu kết nối WHMCS qua Internet."
+            ),
+        },
+        {
+            "key": "webhooks_health",
+            "title": "Trạng thái Outbound Webhooks & Đồng bộ Sự kiện",
+            "ok": len(failed_deliveries) == 0,
+            "status": "ready" if len(failed_deliveries) == 0 else "warn",
+            "detail": (
+                f"Tất cả {len(deliveries)} sự kiện Webhook gần nhất đều gửi thành công 100%."
+                if deliveries and len(failed_deliveries) == 0
+                else (
+                    f"Phát hiện {len(failed_deliveries)}/{len(deliveries)} gói tin Webhook lỗi gần đây — có thể nhấn nút 'Gửi lại (Replay)' ở bảng lịch sử bên dưới."
+                    if failed_deliveries
+                    else "Sẵn sàng gửi sự kiện (chưa phát sinh gói tin lỗi nào)."
+                )
+            ),
+        },
+    ]
+    ready_count = sum(1 for c in checks if c["ok"])
+    return {
+        "ready": ready_count >= 3 and len(write_tokens) > 0 and packages_count > 0,
+        "score": f"{ready_count}/{len(checks)}",
+        "active_tokens_count": len(active_tokens),
+        "write_tokens_count": len(write_tokens),
+        "packages_count": packages_count,
+        "ssl_enabled": ssl_enabled,
+        "panel_port": port,
+        "checks": checks,
+    }

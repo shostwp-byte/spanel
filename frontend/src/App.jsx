@@ -71,6 +71,8 @@ import { ServerStatisticsPage } from './pages/ServerStatistics.jsx';
 import { RedirectsPage } from './pages/Redirects.jsx';
 import { ApacheHandlersPage } from './pages/ApacheHandlers.jsx';
 import { ResourceMonitorPage } from './pages/ResourceMonitor.jsx';
+import { MultiServerPage } from './pages/MultiServer.jsx';
+import { LicensingPage } from './pages/Licensing.jsx';
 
 
 
@@ -209,6 +211,8 @@ const PAGE_ROUTES = {
   ipmanager: '/ipmanager',
   packages: '/packages',
   migration: '/migration',
+  multi_server: '/multi-server',
+  licensing: '/licensing',
 };
 
 /* ---------------------------------------------------------------
@@ -900,7 +904,7 @@ function AppContent() {
         flag(
           'warn',
           t('Security'),
-          t('Smart PHP Auto-Patch: Phát hiện {n} bản vá bảo mật PHP mới ({versions}).', {
+          t('Phát hiện {n} bản vá bảo mật PHP mới ({versions}) chống lỗ hổng RCE / PHP2SHELL.', {
             n: sum.php_updates.updates_available_count,
             versions: verList || 'PHP',
           }),
@@ -913,8 +917,8 @@ function AppContent() {
         const latestRec = (sum.php_updates.unacknowledged_updates || [])[0];
         flag(
           'info',
-          t('Smart PHP Auto-Patch'),
-          latestRec?.summary || t('Smart PHP Auto-Patch vừa tự động cập nhật bản vá bảo mật PHP an toàn.'),
+          t('Smart Guard'),
+          latestRec?.summary || t('Smart Guard vừa tự động cập nhật bản vá bảo mật PHP an toàn (Zero-Downtime).'),
           'updates',
           t('Xem chi tiết'),
           RefreshCw
@@ -2987,10 +2991,7 @@ function AppContent() {
   }
   navSections = navSections.filter(section => Array.isArray(section.items) && section.items.length > 0);
 
-  const UNIMPLEMENTED_NAV_KEYS = [
-    'multi_server',
-    'licensing',
-  ];
+  const UNIMPLEMENTED_NAV_KEYS = [];
 
   function handleNavSelect(key) {
     if (UNIMPLEMENTED_NAV_KEYS.includes(key)) {
@@ -4096,6 +4097,8 @@ function AppContent() {
     if (page === 'packages') return <Packages request={request} isAdmin={isAdmin} isReseller={isReseller} mailAddonInstalled={mailAddonInstalled} users={users} mode="users" />;
     if (page === 'reseller_packages') return <Packages request={request} isAdmin={isAdmin} isReseller={isReseller} mailAddonInstalled={mailAddonInstalled} users={users} mode="resellers" />;
     if (page === 'migration') return <Migration request={request} setError={setError} setNotice={setNotice} loading={loading} />;
+    if (page === 'multi_server') return <MultiServerPage request={request} isAdmin={isAdmin} />;
+    if (page === 'licensing') return <LicensingPage request={request} isAdmin={isAdmin} appVersion={appVersion} />;
     if (page !== 'dashboard') {
       return <div className="section" style={{ textAlign: 'center', padding: '100px 20px', color: 'var(--text-secondary)' }}>
         <Tool size={48} style={{ opacity: 0.2, margin: '0 auto 20px' }} />

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
-  Check, Clock, Code2, Copy, Edit2, Globe, KeyRound, Lock, Plus,
-  RefreshCw, Send, Server, Settings as SettingsIcon, ShieldCheck,
+  Activity, AlertCircle, Check, CheckCircle, Clock, Code2, Copy, Edit2, Globe, KeyRound, Lock, Plus,
+  RefreshCw, RotateCcw, Send, Server, Settings as SettingsIcon, ShieldCheck,
   Trash2, Zap, ExternalLink
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
@@ -94,6 +94,8 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
 
   // Outbound Webhooks state
   const [webhooks, setWebhooks] = useState([]);
+  const [webhookDeliveries, setWebhookDeliveries] = useState([]);
+  const [whmcsDiagnostic, setWhmcsDiagnostic] = useState(null);
   const [showWebhookForm, setShowWebhookForm] = useState(false);
   const [webhookForm, setWebhookForm] = useState({
     id: null,
@@ -122,6 +124,8 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     if (isAdmin) {
       loadApiTokens();
       loadWebhooks();
+      loadWebhookDeliveries();
+      loadWhmcsDiagnostic();
       request('/panel-settings').then((data) => {
         if (data) setPanelSettings(data);
       });
@@ -264,6 +268,62 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     }
   }
 
+  async function loadWebhookDeliveries() {
+    try {
+      const data = await request('/resellers/webhooks/deliveries', { silent: true });
+      if (data?.items) setWebhookDeliveries(data.items);
+    } catch {
+      setWebhookDeliveries([]);
+    }
+  }
+
+  async function loadWhmcsDiagnostic(announce = false) {
+    try {
+      const data = await request(
+        '/resellers/whmcs-diagnostic',
+        announce ? {} : { silent: true },
+        announce ? 'Đang kiểm tra kết nối WHMCS & Billing...' : ''
+      );
+      if (data) {
+        setWhmcsDiagnostic(data);
+        if (announce) {
+          setNotice(
+            data.ready
+              ? `Hệ thống đạt chuẩn sẵn sàng kết nối WHMCS / Billing (${data.score}).`
+              : `Hoàn tất kiểm tra WHMCS (${data.score}). Hãy xem các mục khuyến nghị bên dưới.`
+          );
+        }
+      }
+    } catch {}
+  }
+
+  async function replayWebhookDelivery(delivery) {
+    const res = await request(
+      `/resellers/webhooks/deliveries/${delivery.id}/replay`,
+      { method: 'POST' },
+      'Đang gửi lại sự kiện Webhook...'
+    );
+    if (res) {
+      if (res.status === 'success') {
+        setNotice(`Đã gửi lại sự kiện "${res.event}" thành công (HTTP ${res.status_code}, ${res.latency_ms}ms).`);
+      } else {
+        setError(`Gửi lại thất bại (${res.status_code || 'Timeout'}): ${res.response_preview}`);
+      }
+      await loadWebhookDeliveries();
+      await loadWhmcsDiagnostic();
+    }
+  }
+
+  async function clearWebhookDeliveriesLog() {
+    if (!confirm('Xóa toàn bộ lịch sử gửi Webhook?')) return;
+    const res = await request('/resellers/webhooks/deliveries', { method: 'DELETE' }, 'Đang xóa lịch sử Webhook...');
+    if (res) {
+      setNotice(res.message || 'Đã xóa lịch sử Webhook.');
+      await loadWebhookDeliveries();
+      await loadWhmcsDiagnostic();
+    }
+  }
+
   function handleSelectPlatform(platformId) {
     setSelectedPlatform(platformId);
     const found = INTEGRATION_PLATFORMS.find((p) => p.id === platformId);
@@ -354,10 +414,13 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     try {
       const res = await request(`/resellers/webhooks/${wh.id}/test`, { method: 'POST' });
       if (res) {
-        setNotice(`Đã gửi sự kiện thử nghiệm thành công tới ${wh.url} (HTTP ${res.status_code || 200}).`);
+        setNotice(`Đã gửi sự kiện thử nghiệm thành công tới ${wh.url} (HTTP ${res.status_code || 200}, ${res.latency_ms || 0}ms).`);
       }
+      await loadWebhookDeliveries();
+      await loadWhmcsDiagnostic();
     } catch (err) {
       setError(err.message);
+      await loadWebhookDeliveries();
     }
     setLoading('');
   }
@@ -686,7 +749,16 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   Cấp quyền cho hệ thống Billing / CRM bên ngoài gọi vào SPanel để tự động khởi tạo Hosting, khóa/mở khóa, nâng cấp gói và đăng nhập 1-click (SSO).
                 </p>
               </div>
-              <div style={{ display: 'flex', gap: '8px' }}>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="secondary-light"
+                  disabled={!!loading}
+                  onClick={() => loadWhmcsDiagnostic(true)}
+                >
+                  <ShieldCheck size={14} />
+                  Kiểm tra chuẩn WHMCS
+                </button>
                 <button
                   type="button"
                   className="secondary-light"
@@ -702,12 +774,71 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   onClick={() => {
                     loadApiTokens();
                     loadWebhooks();
+                    loadWebhookDeliveries();
+                    loadWhmcsDiagnostic();
                   }}
                 >
                   <RefreshCw size={14} /> {t('Refresh')}
                 </button>
               </div>
             </div>
+
+            {/* WHMCS / Billing Readiness Diagnostic Strip */}
+            {whmcsDiagnostic && (
+              <div style={{
+                padding: '12px 15px',
+                borderRadius: '10px',
+                background: whmcsDiagnostic.ready ? 'rgba(16, 185, 129, 0.08)' : 'rgba(245, 158, 11, 0.08)',
+                border: whmcsDiagnostic.ready ? '1px solid rgba(16, 185, 129, 0.28)' : '1px solid rgba(245, 158, 11, 0.28)',
+                marginBottom: '16px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    {whmcsDiagnostic.ready ? (
+                      <CheckCircle size={16} style={{ color: '#10b981' }} />
+                    ) : (
+                      <AlertCircle size={16} style={{ color: '#f59e0b' }} />
+                    )}
+                    <strong style={{ fontSize: '0.86rem', color: 'var(--text-main)' }}>
+                      Chẩn đoán Độ sẵn sàng Tích hợp WHMCS / HostBill / Perfex CRM ({whmcsDiagnostic.score} hạng mục đạt)
+                    </strong>
+                  </div>
+                  <span style={{
+                    padding: '2px 10px',
+                    borderRadius: '999px',
+                    fontSize: '0.74rem',
+                    fontWeight: 700,
+                    background: whmcsDiagnostic.ready ? 'rgba(16, 185, 129, 0.16)' : 'rgba(245, 158, 11, 0.16)',
+                    color: whmcsDiagnostic.ready ? '#10b981' : '#f59e0b',
+                  }}>
+                    {whmcsDiagnostic.ready ? 'SẴN SÀNG KẾT NỐI 100%' : 'CẦN BỔ SUNG CẤU HÌNH'}
+                  </span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: '8px' }}>
+                  {(whmcsDiagnostic.checks || []).map((chk) => (
+                    <div
+                      key={chk.key}
+                      style={{
+                        padding: '8px 10px',
+                        borderRadius: '8px',
+                        background: 'var(--surface-1)',
+                        border: '1px solid var(--border-subtle)',
+                        fontSize: '0.78rem',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, color: chk.ok ? '#10b981' : '#f59e0b', marginBottom: '3px' }}>
+                        {chk.ok ? <Check size={13} /> : <AlertCircle size={13} />}
+                        <span>{chk.title}</span>
+                      </div>
+                      <div style={{ color: 'var(--text-muted)', lineHeight: 1.4 }}>{chk.detail}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Platform Selector Pills + Quick Connection Info */}
             <div style={{
@@ -1227,6 +1358,121 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   )}
                 </tbody>
               </table>
+            </div>
+
+            {/* WEBHOOK DELIVERY LOG & 1-CLICK REPLAY */}
+            <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid var(--border-subtle)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px', marginBottom: '12px' }}>
+                <div>
+                  <h4 style={{ margin: 0, fontSize: '0.95rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Activity size={16} style={{ color: 'var(--accent-primary)' }} />
+                    Nhật ký Gửi Sự kiện Webhook & Công cụ Gửi lại (Webhook Delivery Log & Replay)
+                  </h4>
+                  <p style={{ margin: '3px 0 0', fontSize: '0.79rem', color: 'var(--text-muted)' }}>
+                    Theo dõi mã phản hồi HTTP, độ trễ mạng và gửi lại (Replay) tức thì các gói tin Webhook bị lỡ khi máy chủ CRM/Billing bảo trì.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    type="button"
+                    className="secondary-light"
+                    disabled={!!loading}
+                    onClick={loadWebhookDeliveries}
+                    style={{ padding: '5px 10px', fontSize: '0.78rem' }}
+                  >
+                    <RefreshCw size={13} /> Làm mới nhật ký
+                  </button>
+                  {webhookDeliveries.length > 0 && (
+                    <button
+                      type="button"
+                      className="secondary-light"
+                      disabled={!!loading}
+                      onClick={clearWebhookDeliveriesLog}
+                      style={{ padding: '5px 10px', fontSize: '0.78rem' }}
+                    >
+                      <Trash2 size={13} /> Xóa nhật ký
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="pkg-table-wrap">
+                <table className="pkg-clean-table">
+                  <thead>
+                    <tr>
+                      <th>Thời gian</th>
+                      <th>Sự kiện (Event)</th>
+                      <th>Đích nhận (URL)</th>
+                      <th>Phản hồi HTTP</th>
+                      <th>Độ trễ</th>
+                      <th>Chi tiết phản hồi</th>
+                      <th style={{ textAlign: 'right' }}>Thao tác</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {webhookDeliveries.map((deliv) => {
+                      const isOk = deliv.status === 'success';
+                      return (
+                        <tr key={deliv.id}>
+                          <td style={{ fontSize: '0.78rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+                            {deliv.created_at ? new Date(deliv.created_at).toLocaleString() : '—'}
+                          </td>
+                          <td>
+                            <code style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--accent-primary)' }}>
+                              {deliv.event}
+                            </code>
+                            {deliv.replayed_from && (
+                              <span style={{ marginLeft: '6px', fontSize: '0.68rem', padding: '1px 5px', borderRadius: '4px', background: 'var(--surface-3)', color: 'var(--text-muted)' }}>
+                                Replayed
+                              </span>
+                            )}
+                          </td>
+                          <td>
+                            <code style={{ fontSize: '0.76rem', wordBreak: 'break-all' }}>{deliv.url}</code>
+                          </td>
+                          <td>
+                            <span style={{
+                              padding: '2px 8px',
+                              borderRadius: '999px',
+                              fontSize: '0.73rem',
+                              fontWeight: 700,
+                              background: isOk ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)',
+                              color: isOk ? '#10b981' : '#ef4444',
+                            }}>
+                              {deliv.status_code ? `HTTP ${deliv.status_code}` : (isOk ? '200 OK' : 'Timeout / Error')}
+                            </span>
+                          </td>
+                          <td style={{ fontSize: '0.78rem', fontFamily: 'monospace', color: 'var(--text-muted)' }}>
+                            {deliv.latency_ms ? `${deliv.latency_ms} ms` : '—'}
+                          </td>
+                          <td style={{ fontSize: '0.77rem', color: 'var(--text-muted)', maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={deliv.response_preview || ''}>
+                            {deliv.response_preview || '—'}
+                          </td>
+                          <td style={{ textAlign: 'right' }}>
+                            <button
+                              type="button"
+                              className="secondary-light"
+                              style={{ padding: '5px 10px', fontSize: '0.76rem' }}
+                              disabled={!!loading}
+                              onClick={() => replayWebhookDelivery(deliv)}
+                              title="Gửi lại gói tin sự kiện này tới URL đích"
+                            >
+                              <RotateCcw size={13} /> Gửi lại (Replay)
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {webhookDeliveries.length === 0 && (
+                      <tr>
+                        <td colSpan="7" style={{ textAlign: 'center', padding: '18px', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                          Chưa có bản ghi lịch sử gửi Webhook nào. Nhấn nút <strong>"Gửi thử"</strong> trên một Webhook Endpoint bất kỳ để kiểm tra kết nối.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>

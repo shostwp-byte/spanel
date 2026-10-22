@@ -563,13 +563,14 @@ def create_zone(db: Session, name: str, owner_id: int | None, *, claim_existing:
     db.add(DnsZone(name=zone, owner_id=owner_id))
     db.commit()
     # A mail domain in it gets its mail records now, not at its next change.
-    from app.services import mail
+    from app.services import mail, multi_server
 
     mail.publish_all_quietly(db, zone)
+    multi_server.trigger_background_zone_sync(zone, action="upsert")
     return zone
 
 
-def delete_zone(db: Session, zone: str) -> None:
+def delete_zone(db: Session, zone: str, *, sync_cluster: bool = True) -> None:
     try:
         _request("DELETE", f"/zones/{_absolute(zone)}")
     except DnsError as exc:
@@ -579,6 +580,10 @@ def delete_zone(db: Session, zone: str) -> None:
     if row is not None:
         db.delete(row)
         db.commit()
+    if sync_cluster:
+        from app.services import multi_server
+
+        multi_server.trigger_background_zone_sync(zone, action="delete")
 
 
 def _zone_data(zone: str) -> dict:
@@ -653,6 +658,9 @@ def _patch(zone: str, changes: dict[tuple[str, str], tuple[int, list[str]]]) -> 
         else:
             rrsets.append({"name": name, "type": rtype, "changetype": "DELETE"})
     _request("PATCH", f"/zones/{_absolute(zone)}", {"rrsets": rrsets})
+    from app.services import multi_server
+
+    multi_server.trigger_background_zone_sync(zone, action="upsert")
 
 
 def add_record(zone: str, record: dict, *, admin: bool) -> None:
