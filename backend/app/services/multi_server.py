@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.core.version import APP_VERSION
 from app.models.entities import DnsZone, User, Website, WebsiteAlias
-from app.services import dns, panel_settings, resources as resources_service, server_network
+from app.services import dns, panel_settings, server_network, system as system_service
 
 logger = logging.getLogger("spanel.multi_server")
 
@@ -169,7 +169,7 @@ def local_node_summary(db: Session) -> dict[str, Any]:
     """Live metrics and identity of this local SPanel server."""
     res = {}
     try:
-        res = resources_service.system_resources()
+        res = system_service.resource_usage()
     except Exception:
         res = {}
 
