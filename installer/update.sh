@@ -1919,8 +1919,9 @@ update_progress 80 "frontend" "Building frontend"
 cd "$APP_DIR/frontend"
 
 FRONTEND_INPUTS=(src public index.html package.json package-lock.json)
+FRONTEND_FP="$(fingerprint "${FRONTEND_INPUTS[@]}" || true)"
 FRONTEND_REBUILT=0
-if [[ -f dist/index.html ]] && ! step_inputs_changed frontend "${FRONTEND_INPUTS[@]}"; then
+if [[ -f dist/index.html && -f dist/.build-fingerprint && -n "$FRONTEND_FP" && "$(cat dist/.build-fingerprint 2>/dev/null)" == "$FRONTEND_FP" ]] && ! step_inputs_changed frontend "${FRONTEND_INPUTS[@]}"; then
   log "Frontend unchanged since last update; keeping the built bundle"
 else
   FRONTEND_REBUILT=1
@@ -1948,6 +1949,7 @@ else
   [[ -f dist/index.html ]] || fail "Frontend build failed: dist/index.html missing"
   HASHED=$(grep -oE 'index-[a-zA-Z0-9_-]+\.js' dist/index.html | head -n1 || true)
   echo "Built bundle: ${HASHED:-unknown}"
+  [[ -n "$FRONTEND_FP" ]] && printf '%s' "$FRONTEND_FP" >dist/.build-fingerprint
   step_mark_done frontend "${FRONTEND_INPUTS[@]}"
 fi
 

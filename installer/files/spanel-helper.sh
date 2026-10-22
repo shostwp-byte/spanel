@@ -522,6 +522,7 @@ panel_snapshot_restore() {
   fi
 
   rm -rf "$work"
+  rm -rf /var/lib/spanel/update-state 2>/dev/null || true
   systemctl restart spanel-api >/dev/null 2>&1 || true
   systemctl reload nginx >/dev/null 2>&1 || true
   echo "restored=${snap_id}"
