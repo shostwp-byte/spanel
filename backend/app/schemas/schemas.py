@@ -1200,7 +1200,9 @@ class MalwareScanStatus(BaseModel):
     lmd_updated_at: str = ""
     realtime_enabled: bool = False
     scan_on_upload: bool = False
-    scan_on_upload_is_cheap: bool = False
+    scan_on_upload_is_cheap: bool = True
+    zero_ram_heuristics: bool = True
+    quarantine_count: int = 0
     monitor_running: bool = False
     socket: str = "/run/clamav/clamd.sock"
     detail: Optional[str] = None
@@ -1331,6 +1333,7 @@ class UsersMove(BaseModel):
 
 class UserRestoreBackup(BaseModel):
     backup_file: str
+    restore_mode: Literal["full", "files_only", "database_only", "mail_only"] = "full"
 
 
 class BackupScheduleCreate(BaseModel):
@@ -1572,6 +1575,7 @@ class SftpBackupRun(BaseModel):
 class RestoreBackup(BaseModel):
     website_id: int
     backup_file: str
+    restore_mode: Literal["full", "files_only", "database_only"] = "full"
 
 
 class PhpConfigUpdate(BaseModel):

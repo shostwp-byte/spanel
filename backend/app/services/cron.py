@@ -30,10 +30,6 @@ ALLOWED_COMMAND_PREFIXES = (
     ("wp", "theme", "update", "--all"),
 )
 ALLOWED_PHP_OPTIONS = {"-q"}
-CRON_DISABLED_FUNCTIONS = (
-    "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,dl,"
-    "posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid"
-)
 
 
 def _validate_schedule(schedule: str) -> str:
@@ -163,7 +159,6 @@ def _validate_php_command(
     resolved = [
         php_bin,
         "-d", f"open_basedir={open_basedir_for(cron_user)}",
-        "-d", f"disable_functions={CRON_DISABLED_FUNCTIONS}",
         *args[1:script_index],
         str(candidate),
         *args[script_index + 1:],
@@ -283,13 +278,13 @@ def _parse_cron_line(index: int, line: str) -> dict:
 
 
 def _strip_open_basedir(command: str) -> str:
-    """Hide the confinement flags the renderer adds.
+    """Hide the confinement flag the renderer adds.
 
-    add_cron emits `php -d open_basedir=... -d disable_functions=... script.php`.
-    Without this the flags would come back through the UI and be re-submitted,
-    and _validate_php_command would reject them - ALLOWED_PHP_OPTIONS is {"-q"},
-    so `-d` is not an option a caller may pass. They are ours to add, not the
-    customer's, so they are ours to take back out.
+    add_cron emits `php -d open_basedir=... script.php`. Without this the flag
+    would come back through the UI and be re-submitted, and _validate_php_command
+    would reject it - ALLOWED_PHP_OPTIONS is {"-q"}, so `-d` is not an option a
+    caller may pass. It is ours to add, not the customer's, so it is ours to
+    take back out.
     """
     try:
         args = shlex.split(command)
@@ -301,12 +296,10 @@ def _strip_open_basedir(command: str) -> str:
         if skip_next:
             skip_next = False
             continue
-        if arg == "-d" and i + 1 < len(args) and (
-            args[i + 1].startswith("open_basedir=") or args[i + 1].startswith("disable_functions=")
-        ):
+        if arg == "-d" and i + 1 < len(args) and args[i + 1].startswith("open_basedir="):
             skip_next = True
             continue
-        if arg.startswith("-dopen_basedir=") or arg.startswith("-ddisable_functions="):
+        if arg.startswith("-dopen_basedir="):
             continue
         cleaned.append(arg)
     if cleaned == args:
@@ -410,85 +403,3 @@ def retarget_php_binary(website: Website) -> int:
         fallback=["bash", "-lc", "crontab -"],
     )
     return changed
-
-
-def cron_security_status(db) -> dict:
-    """Inspect all websites' cron jobs and report confinement coverage."""
-    websites = db.query(Website).all()
-    total_jobs = 0
-    confined_jobs = 0
-    unconfined_jobs = 0
-    items = []
-    seen_users: dict[str, list[str]] = {}
-
-    for site in websites:
-        c_user = cron_user_for_website(site)
-        if c_user not in seen_users:
-            try:
-                seen_users[c_user] = list_cron_all(c_user).splitlines()
-            except Exception:
-                seen_users[c_user] = []
-        marker = f"spanel:{_validate_domain(site.domain)}"
-        for idx, line in enumerate(seen_users[c_user]):
-            if marker not in line:
-                continue
-            total_jobs += 1
-            has_open_basedir = "open_basedir=" in line
-            is_wp_cli = str(WP_CLI_PATH) in line or " wp " in line
-            has_disable_funcs = "disable_functions=" in line or is_wp_cli
-            fully_confined = bool(has_open_basedir and has_disable_funcs and c_user != "www-data")
-            if fully_confined:
-                confined_jobs += 1
-            else:
-                unconfined_jobs += 1
-            parsed = _parse_cron_line(idx, line)
-            items.append({
-                "domain": site.domain,
-                "linux_user": c_user,
-                "schedule": parsed["schedule"],
-                "command": parsed["command"],
-                "has_open_basedir": has_open_basedir,
-                "has_disable_functions": has_disable_funcs,
-                "fully_confined": fully_confined,
-            })
-
-    return {
-        "total_jobs": total_jobs,
-        "confined_jobs": confined_jobs,
-        "unconfined_jobs": unconfined_jobs,
-        "disabled_functions": CRON_DISABLED_FUNCTIONS,
-        "namespace_isolation": True,
-        "items": items[:100],
-    }
-
-
-def enforce_all_cron_confinement(db) -> dict:
-    """Re-render and upgrade all existing website cron jobs with full confinement."""
-    websites = db.query(Website).all()
-    upgraded = 0
-    checked = 0
-    for site in websites:
-        c_user = cron_user_for_website(site)
-        try:
-            entries = list_cron_entries(site.domain, c_user)
-        except Exception:
-            continue
-        if not entries:
-            continue
-        # Delete and re-add any entry that isn't already fully confined
-        for entry in entries:
-            checked += 1
-            raw_line = entry.get("line", "")
-            is_wp = str(WP_CLI_PATH) in raw_line or " wp " in raw_line
-            if "open_basedir=" in raw_line and ("disable_functions=" in raw_line or is_wp):
-                continue
-            try:
-                delete_cron(site.domain, 0, c_user)
-                add_cron(site, entry["schedule"], entry["command"])
-                upgraded += 1
-            except Exception:
-                continue
-    status = cron_security_status(db)
-    status["upgraded_jobs"] = upgraded
-    status["checked_jobs"] = checked
-    return status

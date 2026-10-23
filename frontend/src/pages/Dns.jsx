@@ -22,6 +22,7 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
   const [dnsPage, setDnsPage] = useState(1);
   const [dnsZone, setDnsZone] = useState(null);
   const [dnsDelegation, setDnsDelegation] = useState(null);
+  const [dnsDnssec, setDnsDnssec] = useState(null);
   const [dnsRecordFilter, setDnsRecordFilter] = useState('');
   const [dnsSettings, setDnsSettings] = useState(null);
 
@@ -52,14 +53,33 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
     setDnsTab('zones');
     setDnsZone({ zone, records: null });
     setDnsDelegation(null);
+    setDnsDnssec(null);
     setDnsRecordEdit(null);
     setDnsRecordFilter('');
     setDnsRecordForm(emptyDnsRecord());
     const data = await request(`${dnsPath(zone)}/records`);
     if (!data) { setDnsZone(null); return; }
     setDnsZone({ zone, records: data.records || [] });
-    const check = await request(`${dnsPath(zone)}/delegation`, { silent: true });
+    const [check, sec] = await Promise.all([
+      request(`${dnsPath(zone)}/delegation`, { silent: true }),
+      request(`${dnsPath(zone)}/dnssec`, { silent: true }),
+    ]);
     setDnsDelegation(check || { status: 'unknown', expected: [], found: [] });
+    setDnsDnssec(sec || { enabled: false, ds_records: [], dnskey_records: [] });
+  }
+
+  async function toggleZoneDnssec(enable) {
+    if (!dnsZone?.zone) return;
+    const zName = dnsZone.zone.name || dnsZone.zone;
+    if (!enable && !window.confirm(`Bạn có chắc chắn muốn tắt DNSSEC cho tên miền ${zName}? Hãy đảm bảo bạn đã xóa bản ghi DS tại nhà đăng ký tên miền (Registrar) trước khi tắt để tránh lỗi phân giải DNS.`)) {
+      return;
+    }
+    const endpoint = enable ? `${dnsPath(dnsZone.zone)}/dnssec/enable` : `${dnsPath(dnsZone.zone)}/dnssec/disable`;
+    const data = await request(endpoint, { method: 'POST' }, enable ? 'Đang khởi tạo khóa CSK & ký số DNSSEC...' : 'Đang tắt DNSSEC...');
+    if (data) {
+      setDnsDnssec(data);
+      setNotice(enable ? `Đã kích hoạt 1-Click DNSSEC (ECDSAP256SHA256) cho ${zName}.` : `Đã tắt DNSSEC cho ${zName}.`);
+    }
   }
 
   function dnsRecordBody(form) {
@@ -349,6 +369,54 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
       <div className="dns-delegation">
         <span className={`badge ${statusClass[delegation?.status] || ''}`}>{delegation ? statusLabel[delegation.status] || delegation.status : '…'}</span>
         <span className="hint">{delegationText}</span>
+      </div>
+      <div className="create-inline" style={{ marginBottom: '14px' }}>
+        <div className="create-inline-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <ShieldCheck size={16} style={{ color: dnsDnssec?.enabled ? '#10b981' : 'var(--text-muted)' }} />
+            <strong>1-Click DNSSEC (Bảo mật chống giả mạo DNS — DS / DNSKEY)</strong>
+            <span className={`badge ${dnsDnssec?.enabled ? 'ok' : ''}`}>
+              {dnsDnssec?.enabled ? 'Đã kích hoạt (ECDSAP256SHA256)' : 'Chưa bật'}
+            </span>
+          </div>
+          <div>
+            {dnsDnssec?.enabled ? (
+              <button type="button" className="mini danger" disabled={!!loading} onClick={() => toggleZoneDnssec(false)}>
+                Tắt DNSSEC
+              </button>
+            ) : (
+              <button type="button" className="mini" disabled={!!loading} onClick={() => toggleZoneDnssec(true)}>
+                <KeyRound size={13} /> Bật 1-Click DNSSEC
+              </button>
+            )}
+          </div>
+        </div>
+        <p className="hint" style={{ marginTop: '4px' }}>
+          {dnsDnssec?.enabled
+            ? 'Zone đã được ký số tự động bằng thuật toán chuẩn công nghiệp ECDSAP256SHA256 (Algorithm 13). Sao chép các thông số DS Record bên dưới và dán vào mục DNSSEC tại Nhà đăng ký tên miền (Registrar) của bạn.'
+            : 'Tự động sinh khóa Combined Signing Key (CSK) chuẩn ECDSA P-256 SHA-256 và xuất bản ghi DS / DNSKEY chỉ với 1 cú nhấp chuột.'}
+        </p>
+        {dnsDnssec?.enabled && dnsDnssec.primary_ds && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '8px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '8px' }}>
+              <div className="info-box" style={{ margin: 0, padding: '8px 12px' }}>
+                <small className="hint" style={{ display: 'block' }}>Key Tag</small>
+                <strong><code>{dnsDnssec.primary_ds.key_tag}</code></strong>
+              </div>
+              <div className="info-box" style={{ margin: 0, padding: '8px 12px' }}>
+                <small className="hint" style={{ display: 'block' }}>Algorithm</small>
+                <strong><code>{dnsDnssec.primary_ds.algorithm_name}</code></strong>
+              </div>
+              <div className="info-box" style={{ margin: 0, padding: '8px 12px' }}>
+                <small className="hint" style={{ display: 'block' }}>Digest Type</small>
+                <strong><code>{dnsDnssec.primary_ds.digest_type_name}</code></strong>
+              </div>
+            </div>
+            {renderCopyBlock('DS Digest (SHA-256)', dnsDnssec.primary_ds.digest)}
+            {renderCopyBlock('Bản ghi DS đầy đủ (Full DS Record)', dnsDnssec.primary_ds.record)}
+            {dnsDnssec.dnskey_records?.[0] && renderCopyBlock('Bản ghi DNSKEY (Public Signing Key)', dnsDnssec.dnskey_records[0])}
+          </div>
+        )}
       </div>
       <div className="create-inline dns-record-form">
         <div className="create-inline-head"><strong>{t('Add a record')}</strong></div>

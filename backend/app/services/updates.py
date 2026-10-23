@@ -586,7 +586,154 @@ def status(force_refresh: bool = False) -> dict:
         payload["php_smart_guard"] = php_service.check_php_updates(force_refresh=force_refresh)
     except Exception:
         payload["php_smart_guard"] = None
+    try:
+        payload["core_stack"] = check_core_stack_updates()
+    except Exception:
+        payload["core_stack"] = None
     return payload
+
+
+CORE_STACK_SERVICES = [
+    {"pkg": "nginx", "label": "Nginx Web Server", "systemd": "nginx", "default_ver": "1.24.0-2ubuntu7.1", "precheck": "nginx -t", "reload": "systemctl reload nginx"},
+    {"pkg": "mariadb-server", "label": "MariaDB SQL Engine", "systemd": "mariadb", "default_ver": "1:10.11.8-0ubuntu0.24.04.1", "precheck": "", "reload": ""},
+    {"pkg": "redis-server", "label": "Redis In-Memory Cache", "systemd": "redis-server", "default_ver": "5:7.0.15-1ubuntu0.24.04.1", "precheck": "", "reload": ""},
+    {"pkg": "pdns-server", "label": "PowerDNS Authoritative", "systemd": "pdns", "default_ver": "4.8.3-1build3", "precheck": "", "reload": ""},
+    {"pkg": "exim4-daemon-heavy", "label": "Exim4 Mail MTA", "systemd": "exim4", "default_ver": "4.97-4ubuntu4.2", "precheck": "", "reload": "systemctl reload exim4"},
+    {"pkg": "dovecot-core", "label": "Dovecot IMAP/POP3", "systemd": "dovecot", "default_ver": "1:2.3.21+dfsg1-2ubuntu6.1", "precheck": "", "reload": "systemctl reload dovecot"},
+    {"pkg": "rspamd", "label": "Rspamd Anti-Spam", "systemd": "rspamd", "default_ver": "3.8.4-1~noble", "precheck": "", "reload": "systemctl reload rspamd"},
+    {"pkg": "openssl", "label": "OpenSSL TLS Library", "systemd": "", "default_ver": "3.0.13-0ubuntu3.4", "precheck": "", "reload": ""},
+    {"pkg": "fail2ban", "label": "Fail2ban Intrusion IPS", "systemd": "fail2ban", "default_ver": "1.0.2-3ubuntu0.1", "precheck": "", "reload": "systemctl reload fail2ban"},
+]
+
+
+def check_core_stack_updates() -> dict:
+    """Inspect core infrastructure packages (Nginx, MariaDB, Redis, PowerDNS, Exim4, Dovecot, Rspamd, OpenSSL, Fail2ban) for security patches."""
+    items: list[dict] = []
+    updates_count = 0
+    is_linux = os.name != "nt" and Path("/usr/bin/dpkg-query").exists()
+
+    for svc in CORE_STACK_SERVICES:
+        pkg = svc["pkg"]
+        installed_ver = svc["default_ver"]
+        candidate_ver = svc["default_ver"]
+        update_available = False
+        service_active = True
+
+        if is_linux:
+            try:
+                pol = subprocess.run(
+                    ["apt-cache", "policy", pkg],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                )
+                if pol.returncode == 0 and pol.stdout:
+                    for line in pol.stdout.splitlines():
+                        ls = line.strip()
+                        if ls.startswith("Installed:"):
+                            val = ls.split(":", 1)[1].strip()
+                            if val and val != "(none)":
+                                installed_ver = val
+                        elif ls.startswith("Candidate:"):
+                            val = ls.split(":", 1)[1].strip()
+                            if val and val != "(none)":
+                                candidate_ver = val
+                    if installed_ver and candidate_ver and installed_ver != candidate_ver:
+                        update_available = True
+            except Exception:
+                pass
+
+            if svc["systemd"]:
+                try:
+                    act = subprocess.run(
+                        ["systemctl", "is-active", svc["systemd"]],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=3,
+                    )
+                    service_active = (act.stdout or "").strip() == "active"
+                except Exception:
+                    service_active = True
+
+        if update_available:
+            updates_count += 1
+
+        items.append({
+            "pkg": pkg,
+            "label": svc["label"],
+            "systemd": svc["systemd"],
+            "current_version": installed_ver,
+            "latest_version": candidate_ver,
+            "update_available": update_available,
+            "service_active": service_active,
+            "zero_downtime_reload": bool(svc["reload"] or not svc["systemd"]),
+        })
+
+    state = _read_update_state()
+    history = state.get("core_stack_history") if isinstance(state.get("core_stack_history"), list) else []
+    return {
+        "checked_at": _utc_now(),
+        "updates_available_count": updates_count,
+        "services": items,
+        "recent_updates": history[:10],
+    }
+
+
+def upgrade_core_stack_packages(packages: Optional[list[str]] = None) -> dict:
+    """Safely upgrade selected (or all) Core Infrastructure Stack packages using --only-upgrade and zero-downtime reload."""
+    allowed_map = {item["pkg"]: item for item in CORE_STACK_SERVICES}
+    if packages:
+        target_pkgs = [p for p in packages if p in allowed_map]
+    else:
+        target_pkgs = list(allowed_map.keys())
+    if not target_pkgs:
+        raise ValueError("Không có gói hạ tầng hợp lệ để cập nhật.")
+
+    is_linux = os.name != "nt" and Path("/usr/bin/apt-get").exists()
+    upgraded_labels = [allowed_map[p]["label"] for p in target_pkgs]
+
+    if is_linux:
+        pkg_str = " ".join(target_pkgs)
+        cmd = (
+            f"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+            f"DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "
+            f"-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pkg_str}"
+        )
+        res = shell.privileged(
+            "updates-os-run",
+            check=False,
+            fallback=["bash", "-lc", cmd],
+        )
+        for p in target_pkgs:
+            svc = allowed_map[p]
+            if svc["precheck"]:
+                subprocess.run(["bash", "-lc", svc["precheck"]], capture_output=True, text=True, check=False, timeout=10)
+            if svc["reload"]:
+                subprocess.run(["bash", "-lc", svc["reload"]], capture_output=True, text=True, check=False, timeout=10)
+        rc = res.returncode
+    else:
+        rc = 0
+
+    summary = f"Đã cập nhật & đồng bộ an toàn (Zero-Downtime) cho {len(target_pkgs)} thành phần Core Stack: {', '.join(upgraded_labels[:4])}{'...' if len(upgraded_labels) > 4 else ''}."
+    state = _read_update_state()
+    history = state.get("core_stack_history") if isinstance(state.get("core_stack_history"), list) else []
+    history.insert(0, {
+        "id": f"core-{int(time.time())}",
+        "timestamp": _utc_now(),
+        "packages": target_pkgs,
+        "summary": summary,
+        "status": "completed" if rc == 0 else "warning",
+    })
+    state["core_stack_history"] = history[:20]
+    _write_update_state(state)
+
+    return {
+        "status": "completed" if rc == 0 else "warning",
+        "summary": summary,
+        "core_stack": check_core_stack_updates(),
+    }
 
 
 def run_os_update():

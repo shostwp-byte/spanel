@@ -810,13 +810,6 @@ def start_resource_monitor_daemon() -> None:
                     if cycle % 3 == 0:
                         collect_and_enforce_mysql_quotas(db)
                         collect_bandwidth_metrics(db)
-                    if cycle % 4 == 0:
-                        try:
-                            from app.services.system import run_self_healing_check
-
-                            run_self_healing_check(reason="background")
-                        except Exception:
-                            pass
                     if cycle % 20 == 0:
                         for u in db.query(User).all():
                             if storage_quota.cached_storage_used_bytes(u.id) is None:

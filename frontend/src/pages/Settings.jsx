@@ -114,13 +114,6 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     code: '',
   });
 
-  // Security Audit Trail & Cron Confinement state
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [auditChain, setAuditChain] = useState(null);
-  const [auditSearch, setAuditSearch] = useState('');
-  const [cronSecurity, setCronSecurity] = useState(null);
-  const [busyAudit, setBusyAudit] = useState(false);
-
   useEffect(() => {
     if (currentUser?.email) {
       setAdminAccountForm((prev) => ({ ...prev, email: prev.email || currentUser.email }));
@@ -133,61 +126,11 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
       loadWebhooks();
       loadWebhookDeliveries();
       loadWhmcsDiagnostic();
-      loadAuditAndCronSecurity();
       request('/panel-settings').then((data) => {
         if (data) setPanelSettings(data);
       });
     }
   }, [isAdmin]);
-
-  async function loadAuditAndCronSecurity(searchQuery = auditSearch) {
-    try {
-      const qParam = searchQuery ? `?q=${encodeURIComponent(searchQuery)}&limit=100` : '?limit=100';
-      const [auditRes, cronRes] = await Promise.all([
-        request(`/panel-settings/audit-logs${qParam}`),
-        request('/panel-settings/cron-security'),
-      ]);
-      if (auditRes) {
-        setAuditLogs(auditRes.items || []);
-        setAuditChain(auditRes.chain || null);
-      }
-      if (cronRes) {
-        setCronSecurity(cronRes);
-      }
-    } catch {}
-  }
-
-  async function verifyAuditChainNow() {
-    setBusyAudit(true);
-    try {
-      const res = await request('/panel-settings/audit-logs/verify', { method: 'POST' }, 'Đang xác thực chuỗi băm SHA-256...');
-      if (res) {
-        setAuditChain(res);
-        if (res.valid) {
-          setNotice(`Xác thực chuỗi SHA-256 thành công: Toàn vẹn 100% trên ${res.total_entries} bản ghi (Head: ${(res.head_hash || '').slice(0, 16)}...).`);
-        } else {
-          setError(`Cảnh báo: Phát hiện ${res.tampered_entries?.length || 1} bản ghi có dấu hiệu sai lệch mã băm SHA-256!`);
-        }
-        await loadAuditAndCronSecurity();
-      }
-    } finally {
-      setBusyAudit(false);
-    }
-  }
-
-  async function enforceCronConfinementNow() {
-    setBusyAudit(true);
-    try {
-      const res = await request('/panel-settings/cron-security/enforce', { method: 'POST' }, 'Đang chuẩn hóa & bọc cô lập Cron...');
-      if (res) {
-        setCronSecurity(res);
-        setNotice(`Đã chuẩn hóa bảo mật Cron thành công (${res.confined_jobs}/${res.total_jobs} tác vụ được bọc open_basedir + disable_functions).`);
-        await loadAuditAndCronSecurity();
-      }
-    } finally {
-      setBusyAudit(false);
-    }
-  }
 
   useEffect(() => {
     setPanelSettingsForm(formFromPanelSettings(panelSettings));
@@ -571,7 +514,6 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     ['general', 'General', SettingsIcon],
     ['account', 'Admin account', Lock],
     ['api', 'API & Billing Integration', KeyRound],
-    ['audit', 'Security Audit & Cron Jail', ShieldCheck],
   ];
   const activeTab = tabs.some(([id]) => id === panelSettingsTab) ? panelSettingsTab : 'general';
   const taspanel = (id, content) =>
@@ -1531,191 +1473,6 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   </tbody>
                 </table>
               </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* TAB 4: SECURITY AUDIT TRAIL (SHA-256 HASH-CHAINED) & CRON JAIL */}
-      {taspanel(
-        'audit',
-        <div className="panel-settings-layout" style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          {/* Section 1: Cron Namespace & PHP CLI Confinement */}
-          <div style={{ padding: '20px 22px', borderRadius: '14px', background: 'var(--surface-2)', border: '1px solid var(--border-subtle)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '14px', flexWrap: 'wrap', marginBottom: '14px' }}>
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <ShieldCheck size={18} style={{ color: '#10b981' }} />
-                  <h3 style={{ margin: 0, fontSize: '1rem' }}>Cron & Terminal Namespace Confinement (Zero-Escape Jail)</h3>
-                  <span className="badge ok">ACTIVE ENFORCEMENT</span>
-                </div>
-                <p className="hint" style={{ margin: '4px 0 0 0', fontSize: '0.82rem' }}>
-                  Mọi tác vụ Cron PHP và Terminal đều bị khóa cứng trong <code>open_basedir</code> riêng của từng Linux User, vô hiệu hóa hàm thực thi shell (<code>disable_functions</code>) và cô lập Mount Namespace (<code>unshare --mount --propagation private</code>).
-                </p>
-              </div>
-              <button
-                type="button"
-                className="primary"
-                style={{ padding: '8px 14px', fontSize: '0.82rem' }}
-                disabled={busyAudit}
-                onClick={enforceCronConfinementNow}
-              >
-                <Zap size={14} /> Chuẩn hóa & Bọc cô lập toàn bộ Cron
-              </button>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' }}>
-              <div style={{ padding: '12px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
-                <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>Tổng số tác vụ Cron</div>
-                <div style={{ fontSize: '1.15rem', fontWeight: 700, marginTop: '2px' }}>
-                  {cronSecurity?.total_jobs ?? 0} tác vụ
-                </div>
-              </div>
-              <div style={{ padding: '12px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
-                <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>Đã bọc cô lập hoàn toàn</div>
-                <div style={{ fontSize: '1.15rem', fontWeight: 700, color: '#10b981', marginTop: '2px' }}>
-                  {cronSecurity?.confined_jobs ?? 0} / {cronSecurity?.total_jobs ?? 0}
-                </div>
-              </div>
-              <div style={{ padding: '12px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
-                <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>Mount Namespace Isolation</div>
-                <div style={{ fontSize: '0.9rem', fontWeight: 700, color: '#10b981', marginTop: '4px' }}>
-                  Private /home tmpfs + Bind-Mount
-                </div>
-              </div>
-              <div style={{ padding: '12px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
-                <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>Chặn hàm nguy hiểm PHP CLI</div>
-                <div style={{ fontSize: '0.75rem', fontFamily: 'monospace', marginTop: '4px', wordBreak: 'break-all' }}>
-                  {cronSecurity?.disabled_functions || 'exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec...'}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Section 2: Tamper-Evident SHA-256 Hash-Chained Security Audit Trail */}
-          <div style={{ padding: '20px 22px', borderRadius: '14px', background: 'var(--surface-2)', border: '1px solid var(--border-subtle)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '14px', flexWrap: 'wrap', marginBottom: '16px' }}>
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <Lock size={18} style={{ color: 'var(--accent-primary)' }} />
-                  <h3 style={{ margin: 0, fontSize: '1rem' }}>Tamper-Evident Security Audit Trail (SHA-256 Hash Chain)</h3>
-                  <span className={auditChain?.valid !== false ? 'badge ok' : 'badge bad'}>
-                    {auditChain?.valid !== false ? 'CHUỖI BĂM SHA-256 TOÀN VẸN 100%' : 'PHÁT HIỆN SAI LỆCH CHUỖI BĂM'}
-                  </span>
-                </div>
-                <p className="hint" style={{ margin: '4px 0 0 0', fontSize: '0.82rem' }}>
-                  Mỗi hành động quản trị đều được ký băm mật mã học <code>SHA-256(prev_hash | user | action | target | detail | timestamp)</code> nối tiếp nhau như chuỗi khối (Blockchain), giúp phát hiện ngay lập tức mọi hành vi xóa hoặc sửa trộm nhật ký trong DB.
-                </p>
-              </div>
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <button
-                  type="button"
-                  className="secondary"
-                  style={{ padding: '8px 12px', fontSize: '0.8rem' }}
-                  disabled={busyAudit}
-                  onClick={() => loadAuditAndCronSecurity(auditSearch)}
-                >
-                  <RefreshCw size={14} /> Làm mới
-                </button>
-                <button
-                  type="button"
-                  className="primary"
-                  style={{ padding: '8px 14px', fontSize: '0.8rem' }}
-                  disabled={busyAudit}
-                  onClick={verifyAuditChainNow}
-                >
-                  <ShieldCheck size={14} /> Xác thực toàn vẹn chuỗi SHA-256
-                </button>
-              </div>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '10px', marginBottom: '16px' }}>
-              <div style={{ padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
-                <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Tổng số bản ghi đã ký</div>
-                <div style={{ fontSize: '1.1rem', fontWeight: 700, marginTop: '2px' }}>
-                  {auditChain?.verified_entries ?? 0} / {auditChain?.total_entries ?? 0} bản ghi
-                </div>
-              </div>
-              <div style={{ padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
-                <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Trạng thái kiểm toán</div>
-                <div style={{ fontSize: '0.95rem', fontWeight: 700, color: auditChain?.valid !== false ? '#10b981' : '#ef4444', marginTop: '3px' }}>
-                  {auditChain?.valid !== false ? 'Verified • Không có chỉnh sửa trái phép' : `${auditChain?.tampered_entries?.length || 1} bản ghi bị can thiệp`}
-                </div>
-              </div>
-              <div style={{ padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
-                <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Mã băm đỉnh chuỗi (Head SHA-256)</div>
-                <div style={{ fontSize: '0.78rem', fontFamily: 'monospace', fontWeight: 600, marginTop: '4px', wordBreak: 'break-all' }}>
-                  {auditChain?.head_hash ? `${auditChain.head_hash.slice(0, 28)}...` : '—'}
-                </div>
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', gap: '10px', marginBottom: '12px' }}>
-              <input
-                type="text"
-                placeholder="Tìm theo hành động (login, create_website...), đối tượng, địa chỉ IP hoặc mã băm SHA-256..."
-                value={auditSearch}
-                onChange={(e) => setAuditSearch(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') loadAuditAndCronSecurity(auditSearch);
-                }}
-                style={{ flex: 1 }}
-              />
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => loadAuditAndCronSecurity(auditSearch)}
-              >
-                Tìm kiếm
-              </button>
-            </div>
-
-            <div className="pkg-table-scroll" style={{ maxHeight: '460px', overflowY: 'auto' }}>
-              <table className="pkg-clean-table">
-                <thead>
-                  <tr>
-                    <th>#ID</th>
-                    <th>Thời gian (UTC)</th>
-                    <th>Tài khoản</th>
-                    <th>Hành động</th>
-                    <th>Đối tượng</th>
-                    <th>Chi tiết & Địa chỉ IP</th>
-                    <th>Chuỗi băm SHA-256 (Prev → Entry)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {auditLogs.map((row) => (
-                    <tr key={row.id}>
-                      <td style={{ fontFamily: 'monospace', fontSize: '0.78rem', color: 'var(--text-muted)' }}>#{row.id}</td>
-                      <td style={{ fontSize: '0.78rem', whiteSpace: 'nowrap' }}>
-                        {row.created_at ? new Date(row.created_at).toLocaleString() : '—'}
-                      </td>
-                      <td>
-                        <strong style={{ fontSize: '0.8rem' }}>{row.username}</strong>
-                      </td>
-                      <td>
-                        <code style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--accent-primary)' }}>{row.action}</code>
-                      </td>
-                      <td style={{ fontSize: '0.8rem', fontWeight: 600 }}>{row.target}</td>
-                      <td style={{ fontSize: '0.76rem', color: 'var(--text-muted)', maxWidth: '280px', wordBreak: 'break-word' }}>
-                        {row.detail || '—'}
-                      </td>
-                      <td style={{ fontFamily: 'monospace', fontSize: '0.73rem', whiteSpace: 'nowrap' }} title={`Prev: ${row.prev_hash}\nEntry: ${row.entry_hash}`}>
-                        <span style={{ color: 'var(--text-muted)' }}>{(row.prev_hash || '').slice(0, 8)}</span>
-                        {' → '}
-                        <strong style={{ color: '#10b981' }}>{(row.entry_hash || '').slice(0, 12)}</strong>
-                      </td>
-                    </tr>
-                  ))}
-                  {auditLogs.length === 0 && (
-                    <tr>
-                      <td colSpan="7" style={{ textAlign: 'center', padding: '18px', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
-                        Không tìm thấy bản ghi nhật ký bảo mật nào khớp với bộ lọc.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
             </div>
           </div>
         </div>

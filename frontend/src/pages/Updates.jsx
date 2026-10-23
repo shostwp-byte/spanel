@@ -86,6 +86,7 @@ export function UpdatesPage({ request, isAdmin }) {
   });
   const [phpPatchingBranch, setPhpPatchingBranch] = useState('');
   const [phpSavingConfig, setPhpSavingConfig] = useState(false);
+  const [corePatchingPkg, setCorePatchingPkg] = useState('');
 
   useEffect(() => {
     if (isAdmin) loadUpdates(false);
@@ -362,6 +363,36 @@ export function UpdatesPage({ request, isAdmin }) {
     }
   }
 
+  async function handleRunCoreStackPatch(pkg = null) {
+    const label = pkg || t('tất cả dịch vụ Core Stack (Nginx, MariaDB, Redis, PowerDNS, Mail, OpenSSL, Fail2ban)');
+    if (
+      !window.confirm(
+        t(
+          'Thực hiện cập nhật bản vá bảo mật cho {label} ngay bây giờ? Hệ thống chỉ nâng cấp gói hiện có (--only-upgrade), giữ nguyên cấu hình (confold) và reload mượt mà (Zero-Downtime).',
+          { label }
+        )
+      )
+    ) {
+      return;
+    }
+    setCorePatchingPkg(pkg || 'all');
+    const res = await request(
+      '/updates/core-stack/run',
+      {
+        method: 'POST',
+        body: JSON.stringify({ packages: pkg ? [pkg] : null }),
+      },
+      t('Đang cập nhật bản vá bảo mật Core Stack & kiểm tra Zero-Downtime Reload...')
+    );
+    setCorePatchingPkg('');
+    if (res) {
+      if (res.core_stack) {
+        setUpdatesStatus(prev => (prev ? { ...prev, core_stack: res.core_stack } : prev));
+      }
+      setNotice(res.summary || t('Đã hoàn tất cập nhật bản vá bảo mật Core Stack an toàn.'));
+    }
+  }
+
   if (!isAdmin) {
     return (
       <div className="section">
@@ -381,6 +412,10 @@ export function UpdatesPage({ request, isAdmin }) {
     : [];
   const phpRecentUpdates = Array.isArray(phpSmartGuard.recent_updates) ? phpSmartGuard.recent_updates : [];
   const phpUpdatableCount = Number(phpSmartGuard.updates_available_count || 0);
+  const coreStack = updatesStatus?.core_stack || {};
+  const coreServices = Array.isArray(coreStack.services) ? coreStack.services : [];
+  const coreUpdatableCount = Number(coreStack.updates_available_count || 0);
+  const coreRecentUpdates = Array.isArray(coreStack.recent_updates) ? coreStack.recent_updates : [];
   const statusText = updatesStatus?.stdout || updatesStatus?.stderr || t('No OS package logs yet.');
   const updateAvailable = panelUpdate.update_available === true;
   const currentPanelVersion = panelUpdate.current_version || appVersion || '1.0.0';
@@ -1153,6 +1188,171 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         )}
       </div>
+
+      {/* 4D. Smart Core Infrastructure Auto-Patch Card */}
+      {coreServices.length > 0 && (
+        <div
+          style={{
+            border: coreUpdatableCount > 0 ? '1px solid rgba(245, 158, 11, 0.45)' : '1px solid var(--border)',
+            borderRadius: '14px',
+            overflow: 'hidden',
+            background: 'var(--surface)',
+            marginBottom: '16px',
+          }}
+        >
+          <div
+            style={{
+              background: 'var(--surface-alt)',
+              padding: '15px 20px',
+              borderBottom: '1px solid var(--border)',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: '12px',
+            }}
+          >
+            <div style={{ flex: '1 1 440px', minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <Server size={17} style={{ color: 'var(--primary)' }} />
+                <strong style={{ fontSize: '15px', color: 'var(--text)' }}>
+                  {t('Smart Core Infrastructure Auto-Patch')}
+                </strong>
+                <span className={`badge ${coreUpdatableCount > 0 ? 'warn' : 'ok'}`}>
+                  {coreUpdatableCount > 0
+                    ? t('{n} gói hạ tầng có bản vá mới', { n: coreUpdatableCount })
+                    : t('9/9 Dịch vụ Core Stack đã mới nhất')}
+                </span>
+                <span className="badge ok">confold · Zero-Downtime Reload</span>
+              </div>
+              <span style={{ display: 'block', marginTop: '4px', fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+                {t(
+                  'Giám sát và cập nhật an toàn các thành phần hạ tầng cốt lõi (Nginx, MariaDB, Redis, PowerDNS, Exim4, Dovecot, Rspamd, OpenSSL, Fail2ban) giữ nguyên cấu hình (Dpkg confold) và kiểm tra cú pháp trước khi reload.'
+                )}
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className={`cb-btn ${coreUpdatableCount > 0 ? 'primary' : 'secondary'}`}
+                style={{ height: '36px', padding: '0 14px', fontWeight: 600 }}
+                disabled={!!loading || !!corePatchingPkg}
+                onClick={() => handleRunCoreStackPatch(null)}
+              >
+                <RefreshCw size={14} className={corePatchingPkg === 'all' ? 'spin' : ''} />
+                {corePatchingPkg === 'all'
+                  ? t('Đang cập nhật Core Stack...')
+                  : coreUpdatableCount > 0
+                    ? t('Cập nhật Core Stack ngay ({n})', { n: coreUpdatableCount })
+                    : t('Đồng bộ toàn bộ Core Stack')}
+              </button>
+            </div>
+          </div>
+
+          <div style={{ width: '100%', overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '13.5px' }}>
+              <thead>
+                <tr style={{ background: 'var(--surface-alt)', borderBottom: '1px solid var(--border)' }}>
+                  <th style={{ padding: '10px 20px' }}>{t('Thành phần Hạ tầng')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Gói APT')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Phiên bản đang chạy')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Bản vá mới nhất (APT Repo)')}</th>
+                  <th style={{ padding: '10px 16px' }}>{t('Trạng thái Dịch vụ')}</th>
+                  <th style={{ padding: '10px 20px', textAlign: 'right' }}>{t('Thao tác')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {coreServices.map(svc => {
+                  const hasUpd = !!svc.update_available;
+                  return (
+                    <tr key={svc.pkg} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '10px 20px', fontWeight: 600 }}>{svc.label}</td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <code>{svc.pkg}</code>
+                      </td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <code>{svc.current_version}</code>
+                      </td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                          <code>{svc.latest_version}</code>
+                          <span className={`badge ${hasUpd ? 'warn' : 'ok'}`}>
+                            {hasUpd ? t('Có bản vá mới') : t('Đã mới nhất')}
+                          </span>
+                        </div>
+                      </td>
+                      <td style={{ padding: '10px 16px' }}>
+                        <span className={`badge ${svc.service_active ? 'ok' : 'warn'}`}>
+                          {svc.systemd
+                            ? svc.service_active
+                              ? 'Active (Healthy)'
+                              : 'Inactive'
+                            : 'System Library (Active)'}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 20px', textAlign: 'right' }}>
+                        <button
+                          type="button"
+                          className={`cb-btn ${hasUpd ? 'primary' : 'secondary'}`}
+                          style={{ height: '30px', padding: '0 12px', fontSize: '12.5px' }}
+                          disabled={!!loading || !!corePatchingPkg}
+                          onClick={() => handleRunCoreStackPatch(svc.pkg)}
+                        >
+                          <RefreshCw size={12} className={corePatchingPkg === svc.pkg ? 'spin' : ''} />
+                          {corePatchingPkg === svc.pkg
+                            ? t('Đang vá...')
+                            : hasUpd
+                              ? t('Cập nhật ngay')
+                              : t('Đồng bộ')}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {coreRecentUpdates.length > 0 && (
+            <div
+              style={{
+                padding: '12px 20px',
+                background: 'var(--surface-alt)',
+                borderTop: '1px solid var(--border)',
+              }}
+            >
+              <strong style={{ fontSize: '12.5px', color: 'var(--text-secondary)', display: 'block', marginBottom: '8px' }}>
+                {t('Lịch sử cập nhật Core Infrastructure gần đây:')}
+              </strong>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                {coreRecentUpdates.slice(0, 3).map(rec => (
+                  <div
+                    key={rec.id}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      flexWrap: 'wrap',
+                      gap: '8px',
+                      fontSize: '12.5px',
+                      padding: '7px 10px',
+                      borderRadius: '8px',
+                      background: 'var(--surface)',
+                      border: '1px solid var(--border)',
+                    }}
+                  >
+                    <span style={{ color: 'var(--text)', fontWeight: 500 }}>{rec.summary}</span>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>
+                      {fmtDateTime(rec.timestamp)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 5. Recovery Snapshots & 1-Click Rollback Card */}
       <div

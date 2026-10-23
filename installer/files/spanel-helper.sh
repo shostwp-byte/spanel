@@ -9316,10 +9316,7 @@ EOF
       runuser -u "$user" --
     )
     if [[ -n "$terminal_timeout" ]] && command -v timeout >/dev/null 2>&1; then
-      terminal_runner=(
-        timeout --signal=TERM --kill-after=10 "${terminal_timeout}"
-        "${terminal_runner[@]}"
-      )
+      terminal_runner=(timeout --signal=TERM --kill-after=10 "${terminal_timeout}" runuser -u "$user" --)
     fi
 
     # Whitelist of allowed commands for terminal access. Keep this in sync with

@@ -748,16 +748,17 @@ def get_backup_job(job_id: str, current_user: User = Depends(get_current_user)):
 @router.post("/restore")
 def restore_backup(payload: RestoreBackup, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = get_owned_website(db, current_user, payload.website_id)
+    mode = getattr(payload, "restore_mode", "full") or "full"
     try:
-        path = backup.restore_backup(website, payload.backup_file, db=db)
+        path = backup.restore_backup(website, payload.backup_file, db=db, restore_mode=mode)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if website.linux_user:
+    if website.linux_user and mode in {"full", "files_only"}:
         runtime_php_version = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
         site_users.ensure_site_runtime(website.domain, website.root_path, runtime_php_version, website.linux_user)
-    wordpress.fix_permissions(website.root_path, website.linux_user)
-    log_action(db, current_user.id, "restore", website.domain, payload.backup_file)
-    return {"restored_to": path}
+        wordpress.fix_permissions(website.root_path, website.linux_user)
+    log_action(db, current_user.id, "restore", website.domain, f"{payload.backup_file} ({mode})")
+    return {"restored_to": path, "restore_mode": mode}
 
 
 @router.get("/backups/{website_id}")
@@ -899,12 +900,42 @@ def upload_user_backup(file: UploadFile = File(...), db: Session = Depends(get_d
 @router.post("/user-backups/restore")
 def restore_user_backup(payload: UserRestoreBackup, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
+    mode = getattr(payload, "restore_mode", "full") or "full"
     try:
-        result = backup.restore_user_backup(payload.backup_file, db)
+        result = backup.restore_user_backup(payload.backup_file, db, restore_mode=mode)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    log_action(db, current_user.id, "restore_user", result.get("username", "user"), payload.backup_file, request=request)
+    log_action(db, current_user.id, "restore_user", result.get("username", "user"), f"{payload.backup_file} ({mode})", request=request)
     return result
+
+
+@router.post("/backups/verify")
+def verify_backup_archive(
+    backup_file: str,
+    website_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if website_id is not None:
+        website = get_owned_website(db, current_user, website_id)
+        try:
+            path = backup.backup_path(website.domain, backup_file)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Backup not found") from exc
+    else:
+        try:
+            path = backup.user_backup_path(backup_file)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Backup not found") from exc
+        allowed = _allowed_backup_usernames(db, current_user)
+        if allowed is not None:
+            info = backup.describe_user_backup(str(path))
+            if info.get("username") not in allowed:
+                raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        return backup.verify_backup_integrity(path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Backup not found") from exc
 
 
 @router.delete("/user-backups")

@@ -222,9 +222,28 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     }
   }
 
+  async function blockMailSender(value) {
+    if (!confirm(`Chặn vĩnh viễn toàn bộ thư gửi từ "${value}" (Sender / Domain Blacklist)?`)) return;
+    const data = await request('/mail/rspamd/block', { method: 'POST', body: JSON.stringify({ value }) }, t('Saving...'));
+    if (data) {
+      setNotice(`Đã thêm ${value} vào danh sách chặn (Blacklist).`);
+      applyMailSettings({ ...(mailSettings || {}), settings: data.settings });
+      loadRspamdHistory(rspamdFilter.page);
+    }
+  }
+
   function applyMailSettings(data) {
     setMailSettings(data);
-    setMailSettingsForm({ ...data.settings, allow: (data.settings?.allow || []).join('\n') });
+    const domainLimitsObj = data.settings?.domain_rate_limits || {};
+    const domainLimitsText = Object.entries(domainLimitsObj)
+      .map(([dom, limit]) => `${dom}=${limit}`)
+      .join('\n');
+    setMailSettingsForm({
+      ...data.settings,
+      allow: (data.settings?.allow || []).join('\n'),
+      block: (data.settings?.block || []).join('\n'),
+      domain_rate_limits_text: domainLimitsText,
+    });
   }
 
   async function loadMailSettings() {
@@ -234,16 +253,31 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
 
   async function saveMailSettings() {
     const f = mailSettingsForm;
+    const domainLimits = {};
+    for (const rawLine of String(f.domain_rate_limits_text || '').split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const [dom, lim] = line.split(/[=:,\s]+/, 2);
+      if (dom && lim !== undefined && !Number.isNaN(Number(lim))) {
+        domainLimits[dom.trim().toLowerCase()] = Number(lim);
+      }
+    }
     const body = {
       auth_rate_per_hour: Number(f.auth_rate_per_hour) || 0,
       local_rate_per_hour: Number(f.local_rate_per_hour) || 0,
+      domain_rate_per_hour: Number(f.domain_rate_per_hour ?? 500),
+      auto_hold_on_rate_exceed: f.auto_hold_on_rate_exceed !== false,
+      domain_rate_limits: domainLimits,
       max_message_mb: Number(f.max_message_mb) || 50,
       spam_enabled: !!f.spam_enabled,
       spam_header_score: Number(f.spam_header_score) || 6,
+      spam_rewrite_score: Number(f.spam_rewrite_score) || 8,
       spam_reject_score: Number(f.spam_reject_score) || 15,
+      spam_subject_tag: String(f.spam_subject_tag || '[SPAM]').trim() || '[SPAM]',
       greylisting: !!f.greylisting,
       default_quota_mb: Number(f.default_quota_mb) || 1024,
       allow: splitAddresses(f.allow),
+      block: splitAddresses(f.block),
     };
     const data = await request('/mail/settings', { method: 'PUT', body: JSON.stringify(body) }, t('Applying mail settings...'));
     if (data) { setNotice(t('Mail settings applied.')); loadMailSettings(); }
@@ -613,7 +647,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
           <div className="mail-stat" key={action}><small>{rspamdActionLabel(action)}</small><strong>{count}</strong></div>)}
       </div>
       <div className="segmented-control" role="tablist" aria-label="Rspamd">
-        {[['history', 'Scan history'], ['log', 'Log'], ['allow', 'Allowlist']].map(([id, label]) => <button key={id} type="button" role="tab"
+        {[['history', 'Scan history'], ['log', 'Log'], ['allow', 'Whitelist & Blacklist']].map(([id, label]) => <button key={id} type="button" role="tab"
           aria-selected={rspamdView === id} className={rspamdView === id ? 'active' : ''} onClick={() => setRspamdView(id)}>{t(label)}</button>)}
       </div>
       {rspamdView === 'history' && <>
@@ -645,9 +679,17 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
                 {item.ip && <small>{item.ip}{item.user ? ` · ${t('signed in as {user}', { user: item.user })}` : ''}</small>}
                 {item.allowed
                   ? <small className="rspamd-allowed">{t('This sender is on the allowlist.')}</small>
-                  : sender && item.action !== 'no action' && <span className="rspamd-allow">
-                      <button className="mini secondary-light" disabled={!!loading} onClick={() => allowMailSender(sender)}><Check size={12}/> {t('Allow {sender}', { sender })}</button>
-                      {senderDomain && <button className="mini secondary-light" disabled={!!loading} onClick={() => allowMailSender(senderDomain)}><Check size={12}/> {t('Allow everyone at {domain}', { domain: senderDomain })}</button>}
+                  : item.blocked
+                  ? <small className="badge danger" style={{ width: 'fit-content' }}>Đã chặn (Blacklist)</small>
+                  : sender && <span className="rspamd-allow" style={{ display: 'inline-flex', gap: '6px', flexWrap: 'wrap', marginTop: '4px' }}>
+                      {item.action !== 'no action' && (
+                        <>
+                          <button className="mini secondary-light" disabled={!!loading} onClick={() => allowMailSender(sender)}><Check size={12}/> {t('Allow {sender}', { sender })}</button>
+                          {senderDomain && <button className="mini secondary-light" disabled={!!loading} onClick={() => allowMailSender(senderDomain)}><Check size={12}/> {t('Allow everyone at {domain}', { domain: senderDomain })}</button>}
+                        </>
+                      )}
+                      <button className="mini danger" disabled={!!loading} onClick={() => blockMailSender(sender)}><Ban size={12}/> Chặn {sender}</button>
+                      {senderDomain && <button className="mini danger" disabled={!!loading} onClick={() => blockMailSender(senderDomain)}><Ban size={12}/> Chặn @{senderDomain}</button>}
                     </span>}
               </span>
               <span className="rspamd-score"><strong>{item.score}</strong><small>/ {item.required}</small></span>
@@ -665,10 +707,21 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
       </>}
       {rspamdView === 'log' && renderLogViewer(rspamdLog, rspamdLogQuery, setRspamdLogQuery, loadRspamdLog)}
       {rspamdView === 'allow' && (f ? <div className="create-inline mail-settings">
-        <p className="hint">{t('One email address or domain per line. Mail from them is never blocked or sent to Junk: use it when the scan history shows a mistake.')}</p>
-        <textarea className="mail-allow" rows={8} value={f.allow || ''} spellCheck={false} placeholder={'friend@example.com\nexample.org'}
-          onChange={e => setMailSettingsForm(prev => ({ ...prev, allow: e.target.value }))} />
-        <div className="actions"><button type="button" disabled={!!loading} onClick={saveMailSettings}><Save size={14}/> {t('Save allowlist')}</button></div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
+          <div>
+            <strong style={{ display: 'block', marginBottom: '4px', color: 'var(--text-main)' }}>Danh sách cho phép (Sender / Domain Whitelist)</strong>
+            <p className="hint">{t('One email address or domain per line. Mail from them is never blocked or sent to Junk: use it when the scan history shows a mistake.')}</p>
+            <textarea className="mail-allow" rows={8} value={f.allow || ''} spellCheck={false} placeholder={'friend@example.com\nexample.org'}
+              onChange={e => setMailSettingsForm(prev => ({ ...prev, allow: e.target.value }))} />
+          </div>
+          <div>
+            <strong style={{ display: 'block', marginBottom: '4px', color: 'var(--text-main)' }}>Danh sách chặn vĩnh viễn (Sender / Domain Blacklist)</strong>
+            <p className="hint">Mỗi dòng 1 địa chỉ email hoặc tên miền. Thư gửi đến từ danh sách này sẽ bị Rspamd từ chối thẳng (Reject) ở tầng SMTP.</p>
+            <textarea className="mail-allow" rows={8} value={f.block || ''} spellCheck={false} placeholder={'spammer@bad-domain.com\nbad-domain.org'}
+              onChange={e => setMailSettingsForm(prev => ({ ...prev, block: e.target.value }))} />
+          </div>
+        </div>
+        <div className="actions"><button type="button" disabled={!!loading} onClick={saveMailSettings}><Save size={14}/> Lưu Whitelist & Blacklist</button></div>
       </div> : <p className="hint">{t('Loading…')}</p>)}
     </div>;
   }
@@ -679,7 +732,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     const set = patch => setMailSettingsForm(prev => ({ ...prev, ...patch }));
     return <div className="mail-tab">
       {!f ? <p className="hint">{t('Loading…')}</p> : <div className="create-inline mail-settings">
-        <div className="create-inline-head"><strong>{t('Mail server')}</strong></div>
+        <div className="create-inline-head"><strong>{t('Mail server')} & Anti-Spam / Outbound Rate-Limiting</strong></div>
         <p className="hint">{t('Server name: {host}. Messages waiting to be sent: {queue}.', { host: mailSettings?.hostname || '—', queue: mailSettings?.queue ?? '—' })}</p>
         <div className="dns-server">
           {[['exim', 'Exim'], ['dovecot', 'Dovecot'], ['rspamd', 'Rspamd'], ['webmail', 'Webmail']].map(([key, label]) =>
@@ -691,11 +744,20 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
         <div className="mail-settings-grid">
           <label className="field"><span className="field-label">{t('Recipients per mailbox per hour')} <em>{t('0 = no limit')}</em></span><input type="number" min="0" value={f.auth_rate_per_hour ?? 300} onChange={e => set({ auth_rate_per_hour: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('Messages per website account per hour')} <em>{t('0 = no limit')}</em></span><input type="number" min="0" value={f.local_rate_per_hour ?? 300} onChange={e => set({ local_rate_per_hour: e.target.value })} /></label>
+          <label className="field"><span className="field-label">Giới hạn gửi ra theo Domain / giờ (Outbound Domain Limit) <em>0 = không giới hạn</em></span><input type="number" min="0" value={f.domain_rate_per_hour ?? 500} onChange={e => set({ domain_rate_per_hour: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('Largest message (MB)')}</span><input type="number" min="1" max="200" value={f.max_message_mb ?? 50} onChange={e => set({ max_message_mb: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('New mailbox size (MB)')}</span><input type="number" min="1" value={f.default_quota_mb ?? 1024} onChange={e => set({ default_quota_mb: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('Spam score: move to Junk')}</span><input type="number" min="1" max="100" step="0.5" value={f.spam_header_score ?? 6} disabled={!f.spam_enabled} onChange={e => set({ spam_header_score: e.target.value })} /></label>
+          <label className="field"><span className="field-label">Spam score: gắn nhãn tiêu đề (Rewrite Subject)</span><input type="number" min="1" max="100" step="0.5" value={f.spam_rewrite_score ?? 8} disabled={!f.spam_enabled} onChange={e => set({ spam_rewrite_score: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('Spam score: refuse')}</span><input type="number" min="1" max="100" step="0.5" value={f.spam_reject_score ?? 15} disabled={!f.spam_enabled} onChange={e => set({ spam_reject_score: e.target.value })} /></label>
+          <label className="field"><span className="field-label">Nhãn tiêu đề Spam (Subject Tag)</span><input type="text" maxLength={32} value={f.spam_subject_tag ?? '[SPAM]'} disabled={!f.spam_enabled} onChange={e => set({ spam_subject_tag: e.target.value })} /></label>
         </div>
+        <label className="field" style={{ marginTop: '8px' }}>
+          <span className="field-label">Giới hạn gửi SMTP tùy chỉnh cho từng Domain (Per-Domain Outbound Rate Limit — định dạng <code>domain.com=200</code> mỗi dòng)</span>
+          <textarea rows={3} value={f.domain_rate_limits_text || ''} spellCheck={false} placeholder={'example.com=200\nnewsletter.example.org=1000'} onChange={e => set({ domain_rate_limits_text: e.target.value })} />
+        </label>
+        <label className="check-line"><input type="checkbox" checked={f.auto_hold_on_rate_exceed !== false} onChange={e => set({ auto_hold_on_rate_exceed: e.target.checked })} />
+          Tự động tạm giữ hàng đợi (Auto-Hold Queue) và cảnh báo khi tài khoản/domain vượt ngưỡng gửi mail mỗi giờ để bảo vệ uy tín IP máy chủ</label>
         <label className="check-line"><input type="checkbox" checked={!!f.spam_enabled} onChange={e => set({ spam_enabled: e.target.checked })} />
           {t('Spam filter (Rspamd) for mail from outside')}</label>
         <label className="check-line"><input type="checkbox" checked={!!f.greylisting} disabled={!f.spam_enabled} onChange={e => set({ greylisting: e.target.checked })} />

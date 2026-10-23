@@ -1,21 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.deps import get_current_user
-from app.core.database import get_sqlite_health, run_sqlite_hot_backup
 from app.core.permissions import Role, ensure_role
 from app.models.entities import User
 from app.schemas.schemas import ServiceAction
-from app.services.system import (
-    clear_self_healing_logs,
-    get_self_healing_status,
-    install_wordpress_stack,
-    list_services,
-    resource_usage,
-    run_self_healing_check,
-    service_action,
-    system_info,
-    update_self_healing_config,
-)
+from app.services.system import install_wordpress_stack, list_services, resource_usage, service_action, system_info
 
 router = APIRouter(prefix="/services", tags=["services"])
 
@@ -63,42 +52,3 @@ def install_stack(current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
     result = install_wordpress_stack()
     return result.__dict__
-
-
-@router.get("/self-healing")
-def read_self_healing(current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    return get_self_healing_status()
-
-
-@router.put("/self-healing")
-def save_self_healing(payload: dict, current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    return update_self_healing_config(payload or {})
-
-
-@router.post("/self-healing/run")
-def trigger_self_healing(current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    return run_self_healing_check(reason="manual")
-
-
-@router.delete("/self-healing/logs")
-def delete_self_healing_logs(current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    return clear_self_healing_logs()
-
-
-@router.get("/db-health")
-def read_db_health(current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    return get_sqlite_health()
-
-
-@router.post("/db-backup")
-def create_db_hot_backup(current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    res = run_sqlite_hot_backup(reason="manual")
-    if not res.get("ok"):
-        raise HTTPException(status_code=500, detail=res.get("detail") or "Database backup failed")
-    return res

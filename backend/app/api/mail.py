@@ -111,13 +111,19 @@ class RelayTestIn(BaseModel):
 class MailSettingsIn(BaseModel):
     auth_rate_per_hour: int | None = Field(default=None, ge=0, le=100000)
     local_rate_per_hour: int | None = Field(default=None, ge=0, le=100000)
+    domain_rate_per_hour: int | None = Field(default=None, ge=0, le=100000)
+    auto_hold_on_rate_exceed: bool | None = None
+    domain_rate_limits: dict[str, int] | None = None
     max_message_mb: int | None = Field(default=None, ge=1, le=200)
     spam_enabled: bool | None = None
     spam_header_score: float | None = Field(default=None, ge=1, le=100)
+    spam_rewrite_score: float | None = Field(default=None, ge=1, le=100)
     spam_reject_score: float | None = Field(default=None, ge=1, le=100)
+    spam_subject_tag: str | None = Field(default=None, max_length=32)
     greylisting: bool | None = None
     default_quota_mb: int | None = Field(default=None, ge=1, le=mail.MAX_USER_QUOTA_MB)
     allow: list[str] | None = Field(default=None, max_length=mail.MAX_ALLOW)
+    block: list[str] | None = Field(default=None, max_length=mail.MAX_ALLOW)
 
 
 class AllowIn(BaseModel):
@@ -444,4 +450,14 @@ def post_rspamd_allow(payload: AllowIn, request: Request, db: Session = Depends(
     ensure_role(current_user.role, Role.admin)
     result = _answer(lambda: mail.allow_sender(payload.value))
     log_action(db, current_user.id, "mail_spam_allow", payload.value, "", request=request)
+    return {"settings": result}
+
+
+@router.post("/rspamd/block")
+def post_rspamd_block(payload: AllowIn, request: Request, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    """A sender or a domain the spam filter always rejects, from the history."""
+    ensure_role(current_user.role, Role.admin)
+    result = _answer(lambda: mail.block_sender(payload.value))
+    log_action(db, current_user.id, "mail_spam_block", payload.value, "", request=request)
     return {"settings": result}

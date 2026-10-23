@@ -97,6 +97,85 @@ def _hostname_conflicts(db, domain: str, exclude_website_id: int | None = None) 
 
 
 SITE_MANIFEST = "site_manifest.json"
+VALID_RESTORE_MODES = ("full", "files_only", "database_only", "mail_only")
+
+
+def _compute_sha256(path: Path) -> str:
+    """Compute the SHA-256 hex digest of a backup file in 1 MB chunks."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_sidecar_path(archive: Path) -> Path:
+    return archive.with_name(archive.name + ".sha256")
+
+
+def _write_sha256_sidecar(archive: Path) -> str:
+    """Compute and write a `<archive>.sha256` sidecar file next to a backup archive."""
+    if not archive.is_file():
+        return ""
+    try:
+        digest = _compute_sha256(archive)
+        sidecar = _sha256_sidecar_path(archive)
+        sidecar.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+        return digest
+    except OSError as exc:
+        logger.warning("Could not write SHA-256 sidecar for %s: %s", archive, exc)
+        return ""
+
+
+def _read_sha256_sidecar(archive: Path, *, compute_if_missing: bool = True) -> str:
+    """Read the SHA-256 digest from the `.sha256` sidecar, or compute & persist it if missing."""
+    sidecar = _sha256_sidecar_path(archive)
+    if sidecar.is_file():
+        try:
+            first_token = (sidecar.read_text(encoding="utf-8").strip().split() or [""])[0].lower()
+            if re.fullmatch(r"[0-9a-f]{64}", first_token):
+                return first_token
+        except OSError:
+            pass
+    if compute_if_missing and archive.is_file():
+        return _write_sha256_sidecar(archive)
+    return ""
+
+
+def verify_backup_integrity(archive_path: str | Path) -> dict:
+    """Verify SHA-256 checksum and tar.gz archive structure before or after restore."""
+    path = Path(archive_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError("Backup archive not found")
+    expected_sha = _read_sha256_sidecar(path, compute_if_missing=False)
+    actual_sha = _compute_sha256(path)
+    if not expected_sha:
+        _write_sha256_sidecar(path)
+        expected_sha = actual_sha
+    sidecar_match = (actual_sha == expected_sha)
+    member_count = 0
+    tar_ok = False
+    error_detail = ""
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            members = tar.getnames()
+            member_count = len(members)
+            tar_ok = member_count > 0
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        error_detail = f"Corrupted tar.gz archive: {exc}"
+    if not sidecar_match and not error_detail:
+        error_detail = f"SHA-256 checksum mismatch (expected {expected_sha[:12]}..., got {actual_sha[:12]}...)"
+    valid = bool(sidecar_match and tar_ok)
+    return {
+        "valid": valid,
+        "filename": path.name,
+        "size": path.stat().st_size,
+        "sha256": actual_sha,
+        "expected_sha256": expected_sha,
+        "sidecar_match": sidecar_match,
+        "member_count": member_count,
+        "error": error_detail,
+    }
 
 
 def _scan_tree_files(root: Path, arc_prefix: str) -> dict[str, list[int]]:
@@ -296,6 +375,7 @@ def create_backup(
             "updated_at": stamp_dt.isoformat() + "Z",
             "files": current_files,
         })
+        _write_sha256_sidecar(archive)
     finally:
         sql_file.unlink(missing_ok=True)
         manifest_file.unlink(missing_ok=True)
@@ -569,6 +649,7 @@ def create_user_backup(
             "updated_at": stamp_dt.isoformat() + "Z",
             "files": current_files,
         })
+        _write_sha256_sidecar(archive)
     return str(archive)
 
 
@@ -707,6 +788,7 @@ def describe_user_backup(backup_file: str) -> dict:
         "relative_path": rel_path,
         "hostname": get_server_hostname(),
         "size": path.stat().st_size,
+        "sha256": _read_sha256_sidecar(path),
         "username": "",
         "generated_at": "",
         "backup_type": "incremental" if path.name.endswith("-inc.tar.gz") else "full",
@@ -866,6 +948,7 @@ def user_backup_path(backup_file: str) -> Path:
 
 def delete_user_backup(backup_file: str) -> str:
     path = user_backup_path(backup_file)
+    _sha256_sidecar_path(path).unlink(missing_ok=True)
     path.unlink()
     return str(path)
 
@@ -875,6 +958,7 @@ def delete_user_restore_backup(backup_file: str) -> str:
     restore_dir = _user_restore_dir().resolve()
     if restore_dir not in path.parents:
         raise FileNotFoundError("Backup not found")
+    _sha256_sidecar_path(path).unlink(missing_ok=True)
     path.unlink()
     return str(path)
 
@@ -890,7 +974,9 @@ def discard_local_copy(archive: str) -> None:
     it stays. Never reaches outside the backup folder.
     """
     try:
-        user_backup_path(archive).unlink()
+        p = user_backup_path(archive)
+        _sha256_sidecar_path(p).unlink(missing_ok=True)
+        p.unlink()
     except FileNotFoundError:
         pass
 
@@ -917,6 +1003,7 @@ def prune_user_backups(username: str, keep: int) -> None:
     for old_backup in all_backups[keep:]:
         p = Path(old_backup)
         if p.name not in protected_names:
+            _sha256_sidecar_path(p).unlink(missing_ok=True)
             p.unlink(missing_ok=True)
 
 
@@ -1062,8 +1149,15 @@ def restore_user_backup(
     db,
     *,
     chain_files: Optional[list[str]] = None,
+    restore_mode: str = "full",
 ) -> dict:
+    mode = (restore_mode or "full").strip().lower()
+    if mode not in VALID_RESTORE_MODES:
+        mode = "full"
     archive = user_backup_path(backup_file)
+    check = verify_backup_integrity(archive)
+    if not check["valid"]:
+        raise ValueError(check["error"] or "Backup archive failed SHA-256 integrity check")
     manifest = read_backup_manifest(str(archive))
     if manifest.get("kind") not in RESTORABLE_BACKUP_KINDS:
         raise ValueError("This is not a spanel or opanel user backup")
@@ -1097,17 +1191,6 @@ def restore_user_backup(
             email = f"{username}@users.spanel.invalid"
         if db.query(User).filter(User.email == email).first():
             email = f"{username}-{secrets.token_hex(4)}@users.spanel.invalid"
-        # An archive is untrusted input: the manifest is written by whoever
-        # produced the .tar.gz, and RESTORABLE_BACKUP_KINDS deliberately accepts
-        # archives from another panel. Taking the role from it let a file mint a
-        # panel admin, and taking hashed_password let it choose that admin's
-        # password. The panel admin is the principal the root sudo helper obeys,
-        # so that was a file deciding who gets the server.
-        #
-        # Restore always creates an end_user with a credential generated here.
-        # An operator who genuinely wants to promote the account does it through
-        # PATCH /api/users/{id}, which is audited and bumps token_version.
-        # da_import._ensure_panel_user_record has always done it this way.
         generated_password = secrets.token_urlsafe(18)
         user = User(
             username=username,
@@ -1117,10 +1200,6 @@ def restore_user_backup(
             is_active=bool(user_info.get("is_active", True)),
             website_limit=int(user_info.get("website_limit") or 5),
             storage_limit_mb=int(user_info.get("storage_limit_mb") or 1024),
-            # Its own SFTP secret, like every other creation path. Leaving this
-            # NULL would claim the Linux password is the panel password, which
-            # is not true here - and NULL is what tells the panel an account is
-            # still sharing one secret.
             sftp_password_set_at=datetime.utcnow(),
         )
         db.add(user)
@@ -1131,245 +1210,244 @@ def restore_user_backup(
         site_users.ensure_panel_user(user.username)
 
     restored_websites = []
-    # Stage under the panel-owned import area: the helper only copies site files
-    # into place from there (the site dir belongs to its Linux user, not spanel).
+    restored_apps = []
+    restored_mail = []
     site_users.IMPORT_STAGE_BASE.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix="spanel-user-restore-", dir=str(site_users.IMPORT_STAGE_BASE)
     ) as tmp:
         tmp_dir = Path(tmp)
-        for site_info in manifest.get("websites") or []:
-            domain = (site_info.get("domain") or "").strip().lower()
-            if not site_users.DOMAIN_RE.fullmatch(domain):
-                raise ValueError(f"Invalid domain in backup: {domain}")
-            php_version = site_info.get("php_version") or settings.default_php_version
-            app_type = site_info.get("app_type") or "wordpress"
-            if app_type not in {"wordpress", "php", "static"}:
-                app_type = "wordpress"
-            nginx_rewrite_mode = site_info.get("nginx_rewrite_mode")
-            if nginx_rewrite_mode not in {"none", "front_controller", "laravel", "codeigniter", "seohburl"}:
-                nginx_rewrite_mode = "front_controller" if app_type in {"wordpress", "php"} else "none"
-            document_root = site_users.validate_document_root(site_info.get("document_root") or "public_html")
-            backup_aliases = [
-                (alias or "").strip().lower()
-                for alias in (site_info.get("aliases") or [])
-                if (alias or "").strip()
-            ]
-            backup_aliases = sorted({alias for alias in backup_aliases if alias != domain})
-            linux_user = site_users.linux_user_for_panel_username(user.username)
-            root_path = site_users.site_root_for_panel_user(user.username, domain)
-            runtime_php_version = php_version if app_type in {"wordpress", "php"} else None
-            site_users.ensure_site_runtime(domain, root_path, runtime_php_version, linux_user)
-            site_stage = tmp_dir / "site" / domain
-            for layer_arc in resolved_chain:
-                _safe_extract_prefix(layer_arc, f"sites/{domain}/site", site_stage)
-                _apply_deleted_files(
-                    site_stage,
-                    f"sites/{domain}/site",
-                    layer_deleted_by_archive.get(layer_arc) or [],
-                )
-            site_users.import_site_files(root_path, linux_user, str(site_stage))
-            # Backups from older spanel releases may contain public/. Normalize
-            # the document root after extraction before rewriting the vhost.
-            site_users.ensure_site_runtime(domain, root_path, runtime_php_version, linux_user)
-            site_users.ensure_document_root(root_path, document_root, linux_user)
+        if mode in {"full", "files_only", "database_only"}:
+            for site_info in manifest.get("websites") or []:
+                domain = (site_info.get("domain") or "").strip().lower()
+                if not site_users.DOMAIN_RE.fullmatch(domain):
+                    raise ValueError(f"Invalid domain in backup: {domain}")
+                php_version = site_info.get("php_version") or settings.default_php_version
+                app_type = site_info.get("app_type") or "wordpress"
+                if app_type not in {"wordpress", "php", "static"}:
+                    app_type = "wordpress"
+                nginx_rewrite_mode = site_info.get("nginx_rewrite_mode")
+                if nginx_rewrite_mode not in {"none", "front_controller", "laravel", "codeigniter", "seohburl"}:
+                    nginx_rewrite_mode = "front_controller" if app_type in {"wordpress", "php"} else "none"
+                document_root = site_users.validate_document_root(site_info.get("document_root") or "public_html")
+                backup_aliases = [
+                    (alias or "").strip().lower()
+                    for alias in (site_info.get("aliases") or [])
+                    if (alias or "").strip()
+                ]
+                backup_aliases = sorted({alias for alias in backup_aliases if alias != domain})
+                linux_user = site_users.linux_user_for_panel_username(user.username)
+                root_path = site_users.site_root_for_panel_user(user.username, domain)
+                runtime_php_version = php_version if app_type in {"wordpress", "php"} else None
 
-            website = db.query(Website).filter(Website.domain == domain).first()
-            created_site = False
-            if website is None:
-                website = Website(
-                    domain=domain,
-                    owner_id=user.id,
-                    root_path=root_path,
-                    document_root=document_root,
-                    linux_user=linux_user,
-                    php_version=php_version,
-                    app_type=app_type,
-                    ssl_enabled=False,
-                    status=site_info.get("status") or "active",
-                    nginx_custom=site_info.get("nginx_custom") or "",
-                    nginx_config_mode="managed",
-                    nginx_rewrite_mode=nginx_rewrite_mode,
-                    waf_enabled=bool(site_info.get("waf_enabled", True)),
-                    waf_default_rules=site_info.get("waf_default_rules") or "",
-                    waf_custom_rules=site_info.get("waf_custom_rules") or "",
-                    http_flood_enabled=bool(site_info.get("http_flood_enabled", False)),
-                    http_flood_config=site_info.get("http_flood_config") or "",
-                )
-                db.add(website)
-                db.flush()
-                created_site = True
-            else:
-                # The alias loop below already refuses a domain that belongs to
-                # someone else (_hostname_conflicts, a few lines down), but the
-                # primary domain never got the same check: restoring an archive
-                # that names a live domain silently moved that Website row to the
-                # archive's user and rewrote the vhost to serve their files.
-                if website.owner_id != user.id:
-                    raise ValueError(f"Domain already belongs to another user: {domain}")
-                website.root_path = root_path
-                website.document_root = document_root
-                website.linux_user = linux_user
-                website.php_version = php_version
-                website.app_type = app_type
-                website.status = site_info.get("status") or "active"
-                website.nginx_custom = site_info.get("nginx_custom") or ""
-                website.nginx_config_mode = "managed"
-                website.nginx_rewrite_mode = nginx_rewrite_mode
-                website.waf_enabled = bool(site_info.get("waf_enabled", True))
-                website.waf_default_rules = site_info.get("waf_default_rules") or ""
-                website.waf_custom_rules = site_info.get("waf_custom_rules") or ""
-                website.http_flood_enabled = bool(site_info.get("http_flood_enabled", False))
-                website.http_flood_config = site_info.get("http_flood_config") or ""
-                db.flush()
+                if mode in {"full", "files_only"}:
+                    site_users.ensure_site_runtime(domain, root_path, runtime_php_version, linux_user)
+                    site_stage = tmp_dir / "site" / domain
+                    for layer_arc in resolved_chain:
+                        _safe_extract_prefix(layer_arc, f"sites/{domain}/site", site_stage)
+                        _apply_deleted_files(
+                            site_stage,
+                            f"sites/{domain}/site",
+                            layer_deleted_by_archive.get(layer_arc) or [],
+                        )
+                    site_users.import_site_files(root_path, linux_user, str(site_stage))
+                    site_users.ensure_site_runtime(domain, root_path, runtime_php_version, linux_user)
+                    site_users.ensure_document_root(root_path, document_root, linux_user)
 
-            existing_aliases = {
-                alias.domain: alias
-                for alias in db.query(WebsiteAlias).filter(WebsiteAlias.website_id == website.id).all()
-            }
-            for alias_domain in backup_aliases:
-                if _hostname_conflicts(db, alias_domain, exclude_website_id=website.id):
-                    raise ValueError(f"Alias domain already belongs to another website: {alias_domain}")
-                if alias_domain not in existing_aliases:
-                    db.add(WebsiteAlias(website_id=website.id, domain=alias_domain, mode="alias"))
-            for alias_domain, alias_obj in existing_aliases.items():
-                if alias_domain not in backup_aliases:
-                    db.delete(alias_obj)
+                website = db.query(Website).filter(Website.domain == domain).first()
+                created_site = False
+                if website is None:
+                    website = Website(
+                        domain=domain,
+                        owner_id=user.id,
+                        root_path=root_path,
+                        document_root=document_root,
+                        linux_user=linux_user,
+                        php_version=php_version,
+                        app_type=app_type,
+                        ssl_enabled=False,
+                        status=site_info.get("status") or "active",
+                        nginx_custom=site_info.get("nginx_custom") or "",
+                        nginx_config_mode="managed",
+                        nginx_rewrite_mode=nginx_rewrite_mode,
+                        waf_enabled=bool(site_info.get("waf_enabled", True)),
+                        waf_default_rules=site_info.get("waf_default_rules") or "",
+                        waf_custom_rules=site_info.get("waf_custom_rules") or "",
+                        http_flood_enabled=bool(site_info.get("http_flood_enabled", False)),
+                        http_flood_config=site_info.get("http_flood_config") or "",
+                    )
+                    db.add(website)
+                    db.flush()
+                    created_site = True
+                else:
+                    if website.owner_id != user.id:
+                        raise ValueError(f"Domain already belongs to another user: {domain}")
+                    if mode in {"full", "files_only"}:
+                        website.root_path = root_path
+                        website.document_root = document_root
+                        website.linux_user = linux_user
+                        website.php_version = php_version
+                        website.app_type = app_type
+                        website.status = site_info.get("status") or "active"
+                        website.nginx_custom = site_info.get("nginx_custom") or ""
+                        website.nginx_config_mode = "managed"
+                        website.nginx_rewrite_mode = nginx_rewrite_mode
+                        website.waf_enabled = bool(site_info.get("waf_enabled", True))
+                        website.waf_default_rules = site_info.get("waf_default_rules") or ""
+                        website.waf_custom_rules = site_info.get("waf_custom_rules") or ""
+                        website.http_flood_enabled = bool(site_info.get("http_flood_enabled", False))
+                        website.http_flood_config = site_info.get("http_flood_config") or ""
+                        db.flush()
 
-            db_info = site_info.get("database") or None
-            if db_info:
-                db_name = db_info.get("db_name")
-                db_user = db_info.get("db_user")
-                db_password = db_info.get("db_password") or mariadb.random_password()
+                if mode in {"full", "files_only"}:
+                    existing_aliases = {
+                        alias.domain: alias
+                        for alias in db.query(WebsiteAlias).filter(WebsiteAlias.website_id == website.id).all()
+                    }
+                    for alias_domain in backup_aliases:
+                        if _hostname_conflicts(db, alias_domain, exclude_website_id=website.id):
+                            raise ValueError(f"Alias domain already belongs to another website: {alias_domain}")
+                        if alias_domain not in existing_aliases:
+                            db.add(WebsiteAlias(website_id=website.id, domain=alias_domain, mode="alias"))
+                    for alias_domain, alias_obj in existing_aliases.items():
+                        if alias_domain not in backup_aliases:
+                            db.delete(alias_obj)
+
+                db_info = site_info.get("database") or None
+                if db_info and mode in {"full", "database_only"}:
+                    db_name = db_info.get("db_name")
+                    db_user = db_info.get("db_user")
+                    db_password = db_info.get("db_password") or mariadb.random_password()
+                    conflict = db.query(DatabaseAccount).filter(
+                        DatabaseAccount.db_name == db_name,
+                        DatabaseAccount.website_id != website.id,
+                    ).first()
+                    if conflict:
+                        raise ValueError(f"Database name already belongs to another website: {db_name}")
+                    mariadb.create_database_credentials(
+                        db_name, db_user, db_password, allow_existing_user=True
+                    )
+                    sql_member = db_info.get("sql_member") or f"databases/{domain}.sql"
+                    sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
+                    if sql_path:
+                        mariadb.import_database(db_name, str(sql_path))
+                    db_account = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
+                    if db_account is None:
+                        db.add(DatabaseAccount(
+                            owner_id=website.owner_id,
+                            website_id=website.id,
+                            db_name=db_name,
+                            db_user=db_user,
+                            db_password=encrypt(db_password),
+                        ))
+                    else:
+                        db_account.owner_id = website.owner_id
+                        db_account.db_name = db_name
+                        db_account.db_user = db_user
+                        db_account.db_password = encrypt(db_password)
+
+                if mode in {"full", "files_only"}:
+                    result = waf.sync_website_rules(website)
+                    if result.returncode != 0:
+                        raise RuntimeError((result.stderr or result.stdout or "Could not write WAF rules").strip())
+                    if website.http_flood_enabled:
+                        result = nginx.sync_http_flood_zones(db.query(Website).all())
+                        if result.returncode != 0:
+                            raise RuntimeError((result.stderr or result.stdout or "Could not write HTTP flood zones").strip())
+                    nginx.rewrite_vhost(
+                        domain,
+                        root_path,
+                        app_type=app_type,
+                        php_version=php_version,
+                        custom_directives=website.nginx_custom or "",
+                        php_fpm_socket_override=site_users.site_php_fpm_socket(linux_user, root_path, runtime_php_version),
+                        waf_enabled=website.waf_enabled,
+                        http_flood_enabled=website.http_flood_enabled,
+                        http_flood_config=website.http_flood_config or "",
+                        document_root=document_root,
+                        rewrite_mode=nginx_rewrite_mode,
+                        aliases=backup_aliases,
+                    )
+                    if not website.http_flood_enabled:
+                        result = nginx.sync_http_flood_zones(db.query(Website).all())
+                        if result.returncode != 0:
+                            raise RuntimeError((result.stderr or result.stdout or "Could not write HTTP flood zones").strip())
+                    wordpress.fix_permissions(root_path, linux_user)
+                restored_websites.append({"domain": domain, "created": created_site})
+
+        if mode in {"full", "database_only"}:
+            for extra_db in manifest.get("databases") or []:
+                db_name = (extra_db.get("db_name") or "").strip()
+                db_user = (extra_db.get("db_user") or "").strip()
+                if not db_name or not db_user:
+                    continue
+                db_password = extra_db.get("db_password") or mariadb.random_password()
                 conflict = db.query(DatabaseAccount).filter(
                     DatabaseAccount.db_name == db_name,
-                    DatabaseAccount.website_id != website.id,
+                    DatabaseAccount.owner_id != user.id,
                 ).first()
                 if conflict:
-                    raise ValueError(f"Database name already belongs to another website: {db_name}")
-                # A restore recreates the account this archive already owned.
+                    raise ValueError(f"Database name already belongs to another user: {db_name}")
                 mariadb.create_database_credentials(
                     db_name, db_user, db_password, allow_existing_user=True
                 )
-                sql_member = db_info.get("sql_member") or f"databases/{domain}.sql"
-                sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
-                if sql_path:
-                    mariadb.import_database(db_name, str(sql_path))
-                db_account = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
+                sql_member = extra_db.get("sql_member")
+                if sql_member:
+                    sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
+                    if sql_path:
+                        mariadb.import_database(db_name, str(sql_path))
+                linked_website_id = None
+                linked_domain = (extra_db.get("website_domain") or "").strip().lower()
+                if linked_domain:
+                    linked_site = db.query(Website).filter(Website.domain == linked_domain, Website.owner_id == user.id).first()
+                    if linked_site:
+                        linked_website_id = linked_site.id
+                db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
                 if db_account is None:
                     db.add(DatabaseAccount(
-                        owner_id=website.owner_id,
-                        website_id=website.id,
+                        owner_id=user.id,
+                        website_id=linked_website_id,
                         db_name=db_name,
                         db_user=db_user,
                         db_password=encrypt(db_password),
                     ))
                 else:
-                    db_account.owner_id = website.owner_id
-                    db_account.db_name = db_name
+                    db_account.owner_id = user.id
+                    db_account.website_id = linked_website_id
                     db_account.db_user = db_user
                     db_account.db_password = encrypt(db_password)
 
-            result = waf.sync_website_rules(website)
-            if result.returncode != 0:
-                raise RuntimeError((result.stderr or result.stdout or "Could not write WAF rules").strip())
-            if website.http_flood_enabled:
-                result = nginx.sync_http_flood_zones(db.query(Website).all())
-                if result.returncode != 0:
-                    raise RuntimeError((result.stderr or result.stdout or "Could not write HTTP flood zones").strip())
-            nginx.rewrite_vhost(
-                domain,
-                root_path,
-                app_type=app_type,
-                php_version=php_version,
-                custom_directives=website.nginx_custom or "",
-                php_fpm_socket_override=site_users.site_php_fpm_socket(linux_user, root_path, runtime_php_version),
-                waf_enabled=website.waf_enabled,
-                http_flood_enabled=website.http_flood_enabled,
-                http_flood_config=website.http_flood_config or "",
-                document_root=document_root,
-                rewrite_mode=nginx_rewrite_mode,
-                aliases=backup_aliases,
-            )
-            if not website.http_flood_enabled:
-                result = nginx.sync_http_flood_zones(db.query(Website).all())
-                if result.returncode != 0:
-                    raise RuntimeError((result.stderr or result.stdout or "Could not write HTTP flood zones").strip())
-            wordpress.fix_permissions(root_path, linux_user)
-            restored_websites.append({"domain": domain, "created": created_site})
-
-        for extra_db in manifest.get("databases") or []:
-            db_name = (extra_db.get("db_name") or "").strip()
-            db_user = (extra_db.get("db_user") or "").strip()
-            if not db_name or not db_user:
-                continue
-            db_password = extra_db.get("db_password") or mariadb.random_password()
-            conflict = db.query(DatabaseAccount).filter(
-                DatabaseAccount.db_name == db_name,
-                DatabaseAccount.owner_id != user.id,
-            ).first()
-            if conflict:
-                raise ValueError(f"Database name already belongs to another user: {db_name}")
-            mariadb.create_database_credentials(
-                db_name, db_user, db_password, allow_existing_user=True
-            )
-            sql_member = extra_db.get("sql_member")
-            if sql_member:
-                sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
-                if sql_path:
-                    mariadb.import_database(db_name, str(sql_path))
-            linked_website_id = None
-            linked_domain = (extra_db.get("website_domain") or "").strip().lower()
-            if linked_domain:
-                linked_site = db.query(Website).filter(Website.domain == linked_domain, Website.owner_id == user.id).first()
-                if linked_site:
-                    linked_website_id = linked_site.id
-            db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
-            if db_account is None:
-                db.add(DatabaseAccount(
-                    owner_id=user.id,
-                    website_id=linked_website_id,
-                    db_name=db_name,
-                    db_user=db_user,
-                    db_password=encrypt(db_password),
-                ))
-            else:
-                db_account.owner_id = user.id
-                db_account.website_id = linked_website_id
-                db_account.db_user = db_user
-                db_account.db_password = encrypt(db_password)
-
-        restored_apps = _restore_applications(manifest, user, db, archive, tmp_dir)
+        if mode in {"full", "files_only"}:
+            restored_apps = _restore_applications(manifest, user, db, archive, tmp_dir)
 
         from app.services import mail
 
-        def stage_mail(domain: str, local: str) -> Optional[Path]:
-            stage = tmp_dir / "mail" / domain / local
-            for layer_arc in resolved_chain:
-                _safe_extract_prefix(layer_arc, f"mail/{domain}/{local}", stage)
-                _apply_deleted_files(
-                    stage,
-                    f"mail/{domain}/{local}",
-                    layer_deleted_by_archive.get(layer_arc) or [],
-                )
-            return stage if stage.is_dir() and any(stage.iterdir()) else None
+        if mode in {"full", "mail_only"}:
+            def stage_mail(domain: str, local: str) -> Optional[Path]:
+                stage = tmp_dir / "mail" / domain / local
+                for layer_arc in resolved_chain:
+                    _safe_extract_prefix(layer_arc, f"mail/{domain}/{local}", stage)
+                    _apply_deleted_files(
+                        stage,
+                        f"mail/{domain}/{local}",
+                        layer_deleted_by_archive.get(layer_arc) or [],
+                    )
+                return stage if stage.is_dir() and any(stage.iterdir()) else None
 
-        restored_mail = mail.restore_manifest(db, user, manifest.get("mail") or {}, stage_mail)
+            restored_mail = mail.restore_manifest(db, user, manifest.get("mail") or {}, stage_mail)
 
     db.commit()
-    # DNS Manager: the restored domains get their zones, owned by the account.
     from app.services import dns
 
     dns.sync_quietly(db)
-    # Email: the restored mailboxes reach the mail server, and their DKIM the zones.
     mail.sync_quietly(db)
     return {
         "created_user": created_user,
         "username": username,
-        # Only set when restore created the account. The archive no longer
-        # chooses the password, so the operator needs this to hand it over.
         "generated_password": generated_password,
         "role": user.role,
+        "restore_mode": mode,
+        "sha256": check["sha256"],
         "websites": restored_websites,
         "applications": restored_apps,
         "mailboxes": restored_mail,
@@ -1510,8 +1588,20 @@ def _read_site_manifest(archive: Path) -> Optional[dict]:
         return None
 
 
-def restore_backup(website: Website, backup_file: str, db=None) -> str:
+def restore_backup(
+    website: Website,
+    backup_file: str,
+    db=None,
+    *,
+    restore_mode: str = "full",
+) -> str:
+    mode = (restore_mode or "full").strip().lower()
+    if mode not in {"full", "files_only", "database_only"}:
+        mode = "full"
     archive = backup_path(website.domain, backup_file)
+    check = verify_backup_integrity(archive)
+    if not check["valid"]:
+        raise ValueError(check["error"] or "Backup archive failed SHA-256 integrity check")
     destination = Path(website.root_path).resolve()
 
     site_manifest = _read_site_manifest(archive) or {}
@@ -1529,6 +1619,13 @@ def restore_backup(website: Website, backup_file: str, db=None) -> str:
             lm = _read_site_manifest(cand_path) or {}
             chain_layers.append((cand_path.resolve(), list(lm.get("deleted_files") or [])))
     chain_layers.append((archive, list(site_manifest.get("deleted_files") or [])))
+
+    def _find_sql_member(layer_arc: Path) -> Optional[str]:
+        with tarfile.open(layer_arc, "r:gz") as tar:
+            for m in tar.getmembers():
+                if m.isfile() and m.name.startswith("database/") and m.name.endswith(".sql"):
+                    return m.name
+        return None
 
     def _extract_one_archive(layer_arc: Path, target_dir: Path) -> Optional[str]:
         sql_member_found: Optional[str] = None
@@ -1579,21 +1676,24 @@ def restore_backup(website: Website, backup_file: str, db=None) -> str:
         return last_sql
 
     sql_member: Optional[str] = None
-    try:
-        sql_member = _extract_site_to(destination)
-    except PermissionError:
-        if not website.linux_user:
-            raise
-        site_users.IMPORT_STAGE_BASE.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="spanel-site-restore-", dir=str(site_users.IMPORT_STAGE_BASE)
-        ) as stage_tmp:
-            stage_dir = Path(stage_tmp) / "site"
-            stage_dir.mkdir(parents=True, exist_ok=True)
-            sql_member = _extract_site_to(stage_dir)
-            site_users.import_site_files(str(destination), website.linux_user, str(stage_dir))
+    if mode in {"full", "files_only"}:
+        try:
+            sql_member = _extract_site_to(destination)
+        except PermissionError:
+            if not website.linux_user:
+                raise
+            site_users.IMPORT_STAGE_BASE.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix="spanel-site-restore-", dir=str(site_users.IMPORT_STAGE_BASE)
+            ) as stage_tmp:
+                stage_dir = Path(stage_tmp) / "site"
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                sql_member = _extract_site_to(stage_dir)
+                site_users.import_site_files(str(destination), website.linux_user, str(stage_dir))
+    else:
+        sql_member = _find_sql_member(archive)
 
-    if sql_member and db is not None:
+    if mode in {"full", "database_only"} and sql_member and db is not None:
         db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
         if db_item and db_item.db_name:
             with tempfile.TemporaryDirectory(prefix="spanel-site-sql-") as sql_tmp:
@@ -1626,6 +1726,7 @@ def _ensure_safe_tar(archive: Path, destination: Path) -> None:
 
 def delete_backup(domain: str, backup_file: str) -> str:
     path = backup_path(domain, backup_file)
+    _sha256_sidecar_path(path).unlink(missing_ok=True)
     path.unlink()
     return str(path)
 
