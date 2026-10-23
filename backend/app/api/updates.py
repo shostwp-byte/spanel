@@ -187,28 +187,3 @@ def acknowledge_php_update_notifications(
     state = php.acknowledge_php_updates(update_id=payload.update_id)
     return {"status": "ok", "php_smart_guard": state}
 
-
-class CoreStackUpgradePayload(BaseModel):
-    packages: Optional[list[str]] = None
-
-
-@router.get("/core-stack/status")
-def get_core_stack_status(current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    return updates.check_core_stack_updates()
-
-
-@router.post("/core-stack/run")
-def run_core_stack_upgrade(
-    payload: CoreStackUpgradePayload = CoreStackUpgradePayload(),
-    current_user: User = Depends(get_current_user),
-):
-    ensure_role(current_user.role, Role.admin)
-    try:
-        return updates.upgrade_core_stack_packages(packages=payload.packages)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-

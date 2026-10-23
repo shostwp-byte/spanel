@@ -122,30 +122,6 @@ def zone_delegation(zone: str, db: Session = Depends(get_db), current_user: User
     return dns.delegation(name)
 
 
-@router.get("/zones/{zone}/dnssec")
-def get_zone_dnssec(zone: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    name = _answer(lambda: dns.may_edit(db, current_user, zone))
-    return _answer(lambda: dns.get_dnssec_status(name))
-
-
-@router.post("/zones/{zone}/dnssec/enable")
-def enable_zone_dnssec(zone: str, request: Request, db: Session = Depends(get_db),
-                       current_user: User = Depends(get_current_user)):
-    name = _answer(lambda: dns.may_edit(db, current_user, zone))
-    status = _answer(lambda: dns.enable_dnssec(name))
-    log_action(db, current_user.id, "dns_dnssec_enable", name, "ECDSAP256SHA256", request=request)
-    return {**status, "message": f"DNSSEC enabled for {name}."}
-
-
-@router.post("/zones/{zone}/dnssec/disable")
-def disable_zone_dnssec(zone: str, request: Request, db: Session = Depends(get_db),
-                        current_user: User = Depends(get_current_user)):
-    name = _answer(lambda: dns.may_edit(db, current_user, zone))
-    status = _answer(lambda: dns.disable_dnssec(name))
-    log_action(db, current_user.id, "dns_dnssec_disable", name, "", request=request)
-    return {**status, "message": f"DNSSEC disabled for {name}."}
-
-
 @router.post("/zones/{zone}/defaults")
 def restore_zone_defaults(zone: str, request: Request, db: Session = Depends(get_db),
                           current_user: User = Depends(get_current_user)):

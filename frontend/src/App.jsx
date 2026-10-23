@@ -3032,6 +3032,120 @@ function AppContent() {
   const activeNavItem = page === 'dashboard' ? ['dashboard', 'Dashboard', Home] : (allNavItems.find(([key]) => key === navPage) || allNavItems[0]);
   const pageItem = page === 'dashboard' ? ['dashboard', 'Dashboard', Home] : (allNavItems.find(([key]) => key === basePage) || activeNavItem);
 
+  const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
+  const [cmdPaletteQuery, setCmdPaletteQuery] = useState('');
+  const [cmdPaletteIndex, setCmdPaletteIndex] = useState(0);
+
+  useEffect(() => {
+    if (!isAuthenticated || standaloneEditor) return undefined;
+    const onKeyDown = e => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCmdPaletteOpen(prev => {
+          const next = !prev;
+          if (next) {
+            setCmdPaletteQuery('');
+            setCmdPaletteIndex(0);
+          }
+          return next;
+        });
+      } else if (e.key === 'Escape' && cmdPaletteOpen) {
+        setCmdPaletteOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isAuthenticated, standaloneEditor, cmdPaletteOpen]);
+
+  const cmdPaletteItems = React.useMemo(() => {
+    const list = [
+      {
+        id: 'nav-dashboard',
+        category: t('Navigation'),
+        title: t('Dashboard'),
+        subtitle: '/',
+        icon: Home,
+        run: () => navigateToPage('dashboard'),
+      },
+    ];
+    navSections.forEach(sec => {
+      (sec.items || []).forEach(([key, label, Icon]) => {
+        if (key === 'create_ticket') return;
+        list.push({
+          id: `nav-${key}`,
+          category: t(sec.title || 'Menu'),
+          title: t(label),
+          subtitle: PAGE_ROUTES[key] || `/${key}`,
+          icon: Icon || Globe,
+          run: () => handleNavSelect(key),
+        });
+      });
+    });
+    (websites || []).forEach(site => {
+      list.push({
+        id: `site-${site.id}`,
+        category: t('Website'),
+        title: site.domain,
+        subtitle: `PHP ${site.php_version || '8.4'} · ${site.root_path || ''}`,
+        icon: Globe,
+        run: () => {
+          setSelectedWebsiteId(String(site.id));
+          navigateToPage('websites');
+        },
+      });
+      list.push({
+        id: `site-files-${site.id}`,
+        category: t('File Manager'),
+        title: `${site.domain} — ${t('Files')}`,
+        subtitle: site.root_path || '/public_html',
+        icon: FolderOpen,
+        run: () => openWebsiteFileManager(site),
+      });
+    });
+    (databases || []).forEach(db => {
+      list.push({
+        id: `db-${db.id || db.name}`,
+        category: t('Database'),
+        title: db.name,
+        subtitle: db.username ? `User: ${db.username}` : 'MariaDB / MySQL',
+        icon: Database,
+        run: () => navigateToPage('databases'),
+      });
+    });
+    (siteApps?.items || []).forEach(app => {
+      list.push({
+        id: `app-${app.id}`,
+        category: t('Application'),
+        title: app.name,
+        subtitle: `${app.kind} · 127.0.0.1:${app.port}`,
+        icon: Cpu,
+        run: () => navigateToPage('applications'),
+      });
+    });
+    if (isAdmin || isReseller) {
+      (users || []).forEach(u => {
+        list.push({
+          id: `user-${u.id}`,
+          category: t('Account'),
+          title: u.username,
+          subtitle: `${u.role || 'user'}${u.email ? ` · ${u.email}` : ''}`,
+          icon: Users,
+          run: () => navigateToPage('users'),
+        });
+      });
+    }
+    const q = cmdPaletteQuery.trim().toLowerCase();
+    if (!q) return list.slice(0, 25);
+    return list
+      .filter(
+        item =>
+          item.title.toLowerCase().includes(q) ||
+          item.category.toLowerCase().includes(q) ||
+          (item.subtitle || '').toLowerCase().includes(q)
+      )
+      .slice(0, 25);
+  }, [navSections, websites, databases, siteApps, users, isAdmin, isReseller, cmdPaletteQuery, t]);
+
   function renderNotifications() {
     const errorMessage = formatApiError(error, '').trim();
     const noticeMessage = formatApiError(notice, '').trim();
@@ -4292,6 +4406,44 @@ function AppContent() {
             <div className="top-utility-group">
               <button
                 type="button"
+                className="secondary-light mini"
+                onClick={() => {
+                  setCmdPaletteQuery('');
+                  setCmdPaletteIndex(0);
+                  setCmdPaletteOpen(true);
+                }}
+                title={`${t('Quick Search & Command Palette')} (Ctrl+K)`}
+                aria-label={t('Quick Search & Command Palette')}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  height: '32px',
+                  minHeight: '32px',
+                  padding: '0 10px',
+                  borderRadius: '8px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                }}
+              >
+                <Search size={14} />
+                <span className="donate-trigger-label">{t('Quick Jump')}</span>
+                <kbd
+                  style={{
+                    fontSize: '10.5px',
+                    padding: '1px 5px',
+                    borderRadius: '4px',
+                    background: 'var(--surface-alt)',
+                    border: '1px solid var(--border)',
+                    color: 'var(--text-muted)',
+                    fontFamily: 'monospace',
+                  }}
+                >
+                  Ctrl+K
+                </kbd>
+              </button>
+              <button
+                type="button"
                 className="donate-trigger-btn"
                 onClick={() => setDonateModalOpen(true)}
                 title={t('Donate to SPanel')}
@@ -4533,6 +4685,143 @@ function AppContent() {
         </div>
       </div>
     </section>
+
+    {cmdPaletteOpen && (
+      <div
+        className="modal-backdrop"
+        onClick={() => setCmdPaletteOpen(false)}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          zIndex: 1300,
+          background: 'rgba(15, 23, 42, 0.58)',
+          backdropFilter: 'blur(4px)',
+          display: 'flex',
+          alignItems: 'flex-start',
+          justifyContent: 'center',
+          padding: '8vh 14px 14px',
+        }}
+      >
+        <div
+          className="modal"
+          onClick={e => e.stopPropagation()}
+          style={{
+            width: '100%',
+            maxWidth: '580px',
+            borderRadius: '14px',
+            background: 'var(--bg-elevated, var(--surface))',
+            border: '1px solid var(--border-strong, var(--border))',
+            boxShadow: '0 24px 48px rgba(15, 23, 42, 0.32)',
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '10px',
+              padding: '12px 16px',
+              borderBottom: '1px solid var(--border)',
+            }}
+          >
+            <Search size={17} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+            <input
+              type="text"
+              autoFocus
+              value={cmdPaletteQuery}
+              onChange={e => {
+                setCmdPaletteQuery(e.target.value);
+                setCmdPaletteIndex(0);
+              }}
+              onKeyDown={e => {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setCmdPaletteIndex(i => Math.min(cmdPaletteItems.length - 1, i + 1));
+                } else if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setCmdPaletteIndex(i => Math.max(0, i - 1));
+                } else if (e.key === 'Enter' && cmdPaletteItems[cmdPaletteIndex]) {
+                  e.preventDefault();
+                  const chosen = cmdPaletteItems[cmdPaletteIndex];
+                  setCmdPaletteOpen(false);
+                  chosen.run();
+                }
+              }}
+              placeholder={t('Type a domain, user, database, app, or panel tool...')}
+              style={{
+                border: 'none',
+                background: 'transparent',
+                outline: 'none',
+                width: '100%',
+                fontSize: '14px',
+                color: 'var(--text)',
+                boxShadow: 'none',
+                padding: '4px 0',
+              }}
+            />
+            <kbd
+              style={{
+                fontSize: '11px',
+                padding: '2px 6px',
+                borderRadius: '5px',
+                background: 'var(--surface-alt)',
+                border: '1px solid var(--border)',
+                color: 'var(--text-muted)',
+                cursor: 'pointer',
+              }}
+              onClick={() => setCmdPaletteOpen(false)}
+            >
+              ESC
+            </kbd>
+          </div>
+          <div style={{ maxHeight: '360px', overflowY: 'auto', padding: '8px' }}>
+            {cmdPaletteItems.length === 0 ? (
+              <div style={{ padding: '24px', textAlign: 'center' }} className="hint">
+                {t('No matching domains, accounts, databases, or tools found.')}
+              </div>
+            ) : (
+              cmdPaletteItems.map((item, idx) => {
+                const ItemIcon = item.icon || Globe;
+                const active = idx === cmdPaletteIndex;
+                return (
+                  <div
+                    key={item.id}
+                    onMouseEnter={() => setCmdPaletteIndex(idx)}
+                    onClick={() => {
+                      setCmdPaletteOpen(false);
+                      item.run();
+                    }}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '12px',
+                      padding: '9px 12px',
+                      borderRadius: '9px',
+                      cursor: 'pointer',
+                      background: active ? 'var(--surface-alt)' : 'transparent',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
+                      <ItemIcon size={16} style={{ color: active ? 'var(--primary)' : 'var(--text-muted)', flexShrink: 0 }} />
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: '13.5px', color: 'var(--text)' }}>{item.title}</div>
+                        {item.subtitle && (
+                          <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {item.subtitle}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <span className="badge" style={{ flexShrink: 0 }}>{item.category}</span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+    )}
 
     {donateModalOpen && (
       <div

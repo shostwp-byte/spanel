@@ -74,6 +74,13 @@ def _app_out(app: SiteApp) -> dict:
         payload["unit"] = site_apps.unit_name(app)
     except ValueError:
         payload["unit"] = ""
+    try:
+        token = site_apps.webhook_token_for(app)
+        payload["webhook_token"] = token
+        payload["webhook_path"] = f"/api/site-apps/webhook/{app.id}/{token}"
+    except Exception:
+        payload["webhook_token"] = ""
+        payload["webhook_path"] = ""
     payload["websites"] = [website.domain for website in app.websites]
     return payload
 
@@ -151,6 +158,11 @@ def create_site_app(payload: SiteAppCreate, db: Session = Depends(get_db), curre
         if kind == "node":
             start_kind, start_arg = site_apps.validate_start(payload.start_kind, payload.start_arg)
             node_major = site_apps.validate_node_major(payload.node_major) or "22"
+        elif kind == "python":
+            start_kind, start_arg = site_apps.validate_start(
+                payload.start_kind or "uvicorn",
+                payload.start_arg or "main:app",
+            )
         elif kind == "docker":
             image = site_apps.validate_image(payload.image, enforce_registry=not is_admin)
             container_port = site_apps.validate_container_port(payload.container_port)
@@ -465,6 +477,55 @@ def site_app_logs(app_id: int, lines: int = 200, db: Session = Depends(get_db), 
         return {"log": site_apps.logs(app, lines)}
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{app_id}/git-deploy")
+def trigger_git_deploy(
+    app_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.end_user)
+    app = _owned_app(db, current_user, app_id)
+    try:
+        result = site_apps.git_auto_deploy(app)
+    except (RuntimeError, ValueError) as exc:
+        _record_status(db, app, "error", str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _record_status(db, app, result.get("status", "running"))
+    log_action(db, current_user.id, "git_deploy_site_app", app.name, f":{app.port}")
+    return {
+        "ok": result.get("ok", True),
+        "status": app.status,
+        "git_output": result.get("git_output", ""),
+        "deps_output": result.get("deps_output", ""),
+        "message": f"Git auto-deploy completed for {app.name}.",
+    }
+
+
+@router.post("/webhook/{app_id}/{token}")
+def git_webhook_auto_deploy(
+    app_id: int,
+    token: str,
+    db: Session = Depends(get_db),
+):
+    """Unauthenticated HMAC-verified webhook endpoint for GitHub / GitLab push auto-deploy."""
+    app = db.query(SiteApp).filter(SiteApp.id == app_id).first()
+    if not app or not site_apps.verify_webhook_token(app, token):
+        raise HTTPException(status_code=403, detail="Invalid or expired webhook token")
+    try:
+        result = site_apps.git_auto_deploy(app)
+    except (RuntimeError, ValueError) as exc:
+        _record_status(db, app, "error", str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _record_status(db, app, result.get("status", "running"))
+    log_action(db, app.owner_id, "webhook_deploy_site_app", app.name, f":{app.port}")
+    return {
+        "ok": result.get("ok", True),
+        "app": app.name,
+        "status": app.status,
+        "git_output": result.get("git_output", ""),
+    }
 
 
 # --- server side runtimes ---------------------------------------------------

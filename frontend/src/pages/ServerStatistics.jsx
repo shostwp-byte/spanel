@@ -42,6 +42,7 @@ export function ServerStatisticsPage({ request, isAdmin, isReseller, page }) {
   const [resourceUsage, setResourceUsage] = useState(null);
   const [systemInfo, setSystemInfo] = useState(null);
   const [dashSummary, setDashSummary] = useState(null);
+  const [domainTraffic, setDomainTraffic] = useState(null);
   const [accountFilter, setAccountFilter] = useState('');
   const [domainFilter, setDomainFilter] = useState('');
 
@@ -49,17 +50,23 @@ export function ServerStatisticsPage({ request, isAdmin, isReseller, page }) {
     setLoading(t('Loading statistics & resource telemetry...'));
     try {
       if (isAdmin) {
-        const [resUsage, sysInfo, summary] = await Promise.all([
+        const [resUsage, sysInfo, summary, traffic] = await Promise.all([
           request('/services/resource-usage', { silent: true }),
           request('/services/system-info', { silent: true }),
           request('/dashboard/summary', { silent: true }),
+          request('/resources/domain-traffic', { silent: true }),
         ]);
         if (resUsage) setResourceUsage(resUsage);
         if (sysInfo) setSystemInfo(sysInfo);
         if (summary) setDashSummary(summary);
+        if (traffic) setDomainTraffic(traffic);
       } else {
-        const summary = await request('/dashboard/summary', { silent: true });
+        const [summary, traffic] = await Promise.all([
+          request('/dashboard/summary', { silent: true }),
+          request('/resources/domain-traffic', { silent: true }),
+        ]);
         if (summary) setDashSummary(summary);
+        if (traffic) setDomainTraffic(traffic);
         if (isReseller && users.length === 0 && loadUsers) {
           await loadUsers();
         }
@@ -539,14 +546,17 @@ export function ServerStatisticsPage({ request, isAdmin, isReseller, page }) {
                   <tr style={{ background: 'var(--surface-alt)', borderBottom: '1px solid var(--border)' }}>
                     <th style={{ padding: '12px 16px' }}>{t('Domain')}</th>
                     <th style={{ padding: '12px 16px' }}>{t('Linux User')}</th>
-                    <th style={{ padding: '12px 16px' }}>{t('Runtime / PHP')}</th>
+                    <th style={{ padding: '12px 16px' }}>{t('Runtime & Acceleration')}</th>
+                    <th style={{ padding: '12px 16px' }}>{t('Bandwidth & HTTP Status')}</th>
                     <th style={{ padding: '12px 16px' }}>{t('SSL Status')}</th>
                     <th style={{ padding: '12px 16px' }}>{t('WAF')}</th>
                     <th style={{ padding: '12px 16px', textAlign: 'right' }}>{t('Quick Actions')}</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredWebsites.map(site => (
+                  {filteredWebsites.map(site => {
+                    const tItem = (domainTraffic?.items || []).find(row => Number(row.website_id) === Number(site.id) || row.domain === site.domain);
+                    return (
                     <tr key={site.id} style={{ borderBottom: '1px solid var(--border)' }}>
                       <td style={{ padding: '12px 16px' }}>
                         <div style={{ fontWeight: 600 }}>{site.domain}</div>
@@ -556,7 +566,22 @@ export function ServerStatisticsPage({ request, isAdmin, isReseller, page }) {
                         <code>{site.linux_user || 'www-data'}</code>
                       </td>
                       <td style={{ padding: '12px 16px' }}>
-                        <span className="badge">PHP {site.php_version || '8.4'}</span>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                          <span className="badge">PHP {site.php_version || '8.4'}</span>
+                          {(tItem?.fastcgi_cache_enabled || tItem?.fastcgi_cache || site.app_type === 'wordpress') && <span className="badge ok" title={t('Nginx FastCGI Micro-Cache with WooCommerce Bypass')}>FastCGI Cache</span>}
+                          {(tItem?.http3_quic_ready ?? tItem?.http3_quic ?? site.ssl_enabled) && <span className="badge ok" title={t('HTTP/3 QUIC UDP/443 Active')}>HTTP/3</span>}
+                        </div>
+                      </td>
+                      <td style={{ padding: '12px 16px' }}>
+                        <div style={{ fontWeight: 600 }}>
+                          {formatBytesVal(tItem?.bandwidth_bytes ?? tItem?.bytes_sent ?? 0)}
+                          <span className="hint" style={{ fontWeight: 400, marginLeft: '6px' }}>
+                            ({tItem?.requests_total ?? tItem?.total_requests ?? 0} reqs)
+                          </span>
+                        </div>
+                        <small className="hint">
+                          2xx: {tItem?.status_2xx || 0} · 3xx: {tItem?.status_3xx || 0} · 4xx: {tItem?.status_4xx || 0} · <strong style={{ color: (tItem?.status_5xx || 0) > 0 ? 'var(--danger)' : 'inherit' }}>5xx: {tItem?.status_5xx || 0}</strong>
+                        </small>
                       </td>
                       <td style={{ padding: '12px 16px' }}>
                         <span className={`badge ${site.ssl_enabled ? 'ok' : 'warn'}`}>
@@ -595,10 +620,11 @@ export function ServerStatisticsPage({ request, isAdmin, isReseller, page }) {
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                   {filteredWebsites.length === 0 && (
                     <tr>
-                      <td colSpan={6} style={{ padding: '32px', textAlign: 'center' }} className="hint">
+                      <td colSpan={7} style={{ padding: '32px', textAlign: 'center' }} className="hint">
                         {t('No matching websites found.')}
                       </td>
                     </tr>

@@ -771,6 +771,342 @@ def collect_bandwidth_metrics(db: Session) -> None:
         _user_bandwidth_bytes.update(user_bw)
 
 
+def inspect_slow_bottlenecks(
+    db: Session,
+    *,
+    allowed_user_ids: set[int] | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """Inspect MySQL Slow Queries and PHP-FPM Slowlog Stack Traces mapped to tenants."""
+    all_users = {u.id: u for u in db.query(User).all()}
+    user_by_name = {u.username: u for u in all_users.values()}
+    all_dbs = db.query(DatabaseAccount).all()
+    db_by_user = {d.db_user: d for d in all_dbs if d.db_user}
+    db_by_name = {d.db_name: d for d in all_dbs if d.db_name}
+    all_sites = db.query(Website).all()
+    sites_by_user: dict[str, list[str]] = {}
+    for s in all_sites:
+        lu = getattr(s, "linux_user", None) or (all_users.get(s.owner_id).username if s.owner_id in all_users else "")
+        if lu:
+            sites_by_user.setdefault(lu, []).append(s.domain)
+
+    mysql_slow: list[dict[str, Any]] = []
+
+    # 1. Live active slow queries from information_schema.PROCESSLIST
+    if not settings.command_dry_run:
+        proc_res = shell.privileged(
+            "mysql",
+            helper_args=[
+                "-N",
+                "-B",
+                "-e",
+                (
+                    "SELECT ID, USER, DB, TIME, STATE, LEFT(REPLACE(REPLACE(INFO, '\\n', ' '), '\\t', ' '), 240) "
+                    "FROM information_schema.PROCESSLIST "
+                    "WHERE COMMAND != 'Sleep' AND INFO IS NOT NULL AND TIME >= 1 "
+                    "ORDER BY TIME DESC LIMIT 20;"
+                ),
+            ],
+            check=False,
+            fallback=["bash", "-lc", "true"],
+        )
+        for line in (proc_res.get("stdout") or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 6:
+                continue
+            qid, db_user, db_name, qtime, state, sql_text = parts[:6]
+            acct = db_by_user.get(db_user) or db_by_name.get(db_name)
+            owner_id = acct.owner_id if acct else None
+            if allowed_user_ids is not None and owner_id not in allowed_user_ids:
+                continue
+            owner_user = all_users.get(owner_id) if owner_id else None
+            try:
+                duration_s = float(qtime)
+            except ValueError:
+                duration_s = 1.0
+            mysql_slow.append({
+                "source": "live_processlist",
+                "query_id": qid,
+                "username": owner_user.username if owner_user else db_user,
+                "owner_id": owner_id,
+                "db_name": db_name or (acct.db_name if acct else "—"),
+                "db_user": db_user,
+                "query_time_sec": round(duration_s, 3),
+                "lock_time_sec": 0.0,
+                "rows_examined": 0,
+                "state": state or "executing",
+                "sql": sql_text.strip(),
+            })
+
+    # 2. Historical slow queries from /var/log/mysql/spanel-slow.log
+    slow_log_paths = [
+        Path("/var/log/mysql/spanel-slow.log"),
+        Path("/var/log/mysql/mysql-slow.log"),
+    ]
+    for slow_path in slow_log_paths:
+        try:
+            if not slow_path.is_file():
+                continue
+            raw_size = slow_path.stat().st_size
+            with slow_path.open("rb") as fh:
+                if raw_size > 131072:
+                    fh.seek(raw_size - 131072)
+                tail_text = fh.read().decode("utf-8", errors="replace")
+            current_user_db = ""
+            current_db_name = ""
+            current_qtime = 0.0
+            current_lock = 0.0
+            current_rows = 0
+            sql_lines: list[str] = []
+            for ln in tail_text.splitlines():
+                if ln.startswith("# User@Host:"):
+                    if sql_lines and current_qtime > 0:
+                        acct = db_by_user.get(current_user_db) or db_by_name.get(current_db_name)
+                        owner_id = acct.owner_id if acct else None
+                        if allowed_user_ids is None or owner_id in allowed_user_ids:
+                            owner_user = all_users.get(owner_id) if owner_id else None
+                            mysql_slow.append({
+                                "source": "slow_log",
+                                "query_id": "",
+                                "username": owner_user.username if owner_user else (current_user_db or "mysql"),
+                                "owner_id": owner_id,
+                                "db_name": current_db_name or (acct.db_name if acct else "—"),
+                                "db_user": current_user_db or "—",
+                                "query_time_sec": round(current_qtime, 3),
+                                "lock_time_sec": round(current_lock, 3),
+                                "rows_examined": current_rows,
+                                "state": "logged",
+                                "sql": " ".join(sql_lines)[:260],
+                            })
+                    sql_lines = []
+                    m_u = re.search(r"\[\s*([a-zA-Z0-9_]+)\s*\]", ln)
+                    current_user_db = m_u.group(1) if m_u else ""
+                elif ln.startswith("# Query_time:"):
+                    m_q = re.search(
+                        r"Query_time:\s*([0-9.]+)\s+Lock_time:\s*([0-9.]+).*?Rows_examined:\s*(\d+)",
+                        ln,
+                    )
+                    if m_q:
+                        current_qtime = float(m_q.group(1))
+                        current_lock = float(m_q.group(2))
+                        current_rows = int(m_q.group(3))
+                elif ln.lower().startswith("use ") and ln.endswith(";"):
+                    current_db_name = ln[4:-1].strip().strip("`")
+                elif not ln.startswith("#") and not ln.startswith("SET timestamp="):
+                    if ln.strip():
+                        sql_lines.append(ln.strip())
+            if sql_lines and current_qtime > 0:
+                acct = db_by_user.get(current_user_db) or db_by_name.get(current_db_name)
+                owner_id = acct.owner_id if acct else None
+                if allowed_user_ids is None or owner_id in allowed_user_ids:
+                    owner_user = all_users.get(owner_id) if owner_id else None
+                    mysql_slow.append({
+                        "source": "slow_log",
+                        "query_id": "",
+                        "username": owner_user.username if owner_user else (current_user_db or "mysql"),
+                        "owner_id": owner_id,
+                        "db_name": current_db_name or (acct.db_name if acct else "—"),
+                        "db_user": current_user_db or "—",
+                        "query_time_sec": round(current_qtime, 3),
+                        "lock_time_sec": round(current_lock, 3),
+                        "rows_examined": current_rows,
+                        "state": "logged",
+                        "sql": " ".join(sql_lines)[:260],
+                    })
+            break
+        except OSError:
+            continue
+
+    mysql_slow.sort(key=lambda x: x.get("query_time_sec", 0.0), reverse=True)
+    mysql_slow = mysql_slow[:limit]
+
+    # 3. PHP-FPM Slowlog Stack Traces
+    php_traces: list[dict[str, Any]] = []
+    php_log_dir = Path("/var/log/php")
+    slow_files: list[Path] = []
+    try:
+        if php_log_dir.is_dir():
+            slow_files.extend(sorted(php_log_dir.glob("spanel-slow-*.log")))
+        var_log = Path("/var/log")
+        if var_log.is_dir():
+            slow_files.extend(sorted(var_log.glob("php*-fpm*slow*.log")))
+    except OSError:
+        pass
+
+    for sf in slow_files:
+        try:
+            if not sf.is_file():
+                continue
+            raw_size = sf.stat().st_size
+            with sf.open("rb") as fh:
+                if raw_size > 65536:
+                    fh.seek(raw_size - 65536)
+                content = fh.read().decode("utf-8", errors="replace")
+            blocks = re.split(r"\n\s*\n", content.strip())
+            for blk in reversed(blocks[-20:]):
+                lines = [l.strip() for l in blk.splitlines() if l.strip()]
+                if not lines:
+                    continue
+                header = lines[0]
+                m_pool = re.search(r"\[pool\s+([^\]]+)\]", header)
+                pool_name = m_pool.group(1) if m_pool else sf.stem
+                linux_user = ""
+                m_lu = re.match(r"^spanel-([a-z0-9_-]+)-[0-9a-f]{12}-", pool_name)
+                if m_lu:
+                    linux_user = m_lu.group(1)
+                owner_user = user_by_name.get(linux_user)
+                owner_id = owner_user.id if owner_user else None
+                if allowed_user_ids is not None and owner_id not in allowed_user_ids:
+                    continue
+                script_file = ""
+                stack_frames: list[str] = []
+                for l in lines[1:]:
+                    if l.startswith("script_filename ="):
+                        script_file = l.split("=", 1)[1].strip()
+                    elif l.startswith("[0x"):
+                        parts_f = l.split("]", 1)
+                        frame_str = parts_f[1].strip() if len(parts_f) > 1 else l
+                        stack_frames.append(frame_str)
+                if script_file or stack_frames:
+                    domains = sites_by_user.get(linux_user, [])
+                    matched_domain = next((d for d in domains if d in script_file), domains[0] if domains else "—")
+                    php_traces.append({
+                        "pool": pool_name,
+                        "username": linux_user or "www-data",
+                        "owner_id": owner_id,
+                        "domain": matched_domain,
+                        "script_filename": script_file or "index.php",
+                        "top_frame": stack_frames[0] if stack_frames else "main()",
+                        "stack": stack_frames[:6],
+                        "header": header[:120],
+                    })
+                    if len(php_traces) >= limit:
+                        break
+        except OSError:
+            continue
+
+    return {
+        "summary": {
+            "mysql_slow_count": len(mysql_slow),
+            "php_slow_count": len(php_traces),
+            "slow_query_log_enabled": True,
+            "long_query_time_sec": 2,
+            "php_slowlog_timeout_sec": 5,
+        },
+        "mysql_slow_queries": mysql_slow,
+        "php_slow_traces": php_traces,
+    }
+
+
+def collect_domain_traffic_analytics(
+    db: Session,
+    *,
+    allowed_user_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Collect per-domain HTTP status distribution (2xx/3xx/4xx/5xx), bandwidth, and FastCGI cache hit ratio."""
+    q = db.query(Website)
+    if allowed_user_ids is not None:
+        if not allowed_user_ids:
+            return {
+                "summary": {
+                    "total_domains": 0,
+                    "total_requests": 0,
+                    "total_bandwidth_bytes": 0,
+                    "status_2xx": 0,
+                    "status_3xx": 0,
+                    "status_4xx": 0,
+                    "status_5xx": 0,
+                },
+                "items": [],
+            }
+        q = q.filter(Website.owner_id.in_(allowed_user_ids))
+
+    sites = q.order_by(Website.id.desc()).all()
+    users_map = {u.id: u.username for u in db.query(User).all()}
+    items: list[dict[str, Any]] = []
+
+    tot_req = 0
+    tot_bw = 0
+    tot_2xx = 0
+    tot_3xx = 0
+    tot_4xx = 0
+    tot_5xx = 0
+
+    for site in sites:
+        s_2xx = 0
+        s_3xx = 0
+        s_4xx = 0
+        s_5xx = 0
+        log_bytes = 0
+        log_path = Path(f"/var/log/nginx/{site.domain}.access.log")
+        try:
+            if log_path.is_file():
+                fsize = log_path.stat().st_size
+                with log_path.open("rb") as fh:
+                    if fsize > 131072:
+                        fh.seek(fsize - 131072)
+                    chunk = fh.read()
+                for raw_line in chunk.splitlines():
+                    parts = raw_line.split(b'"')
+                    if len(parts) >= 3:
+                        sb = parts[2].strip().split()
+                        if len(sb) >= 2 and sb[0].isdigit():
+                            code = int(sb[0])
+                            if 200 <= code < 300:
+                                s_2xx += 1
+                            elif 300 <= code < 400:
+                                s_3xx += 1
+                            elif 400 <= code < 500:
+                                s_4xx += 1
+                            elif code >= 500:
+                                s_5xx += 1
+                            if sb[1].isdigit():
+                                log_bytes += int(sb[1])
+        except OSError:
+            pass
+
+        req_count = s_2xx + s_3xx + s_4xx + s_5xx
+        bw_bytes = max(cached_site_bandwidth_bytes(site.id), log_bytes)
+        tot_req += req_count
+        tot_bw += bw_bytes
+        tot_2xx += s_2xx
+        tot_3xx += s_3xx
+        tot_4xx += s_4xx
+        tot_5xx += s_5xx
+
+        items.append({
+            "website_id": site.id,
+            "domain": site.domain,
+            "owner_id": site.owner_id,
+            "owner_username": users_map.get(site.owner_id, f"user#{site.owner_id}"),
+            "app_type": site.app_type,
+            "php_version": site.php_version,
+            "ssl_enabled": bool(site.ssl_enabled),
+            "http3_quic_ready": bool(site.ssl_enabled),
+            "fastcgi_cache_enabled": site.app_type == "wordpress",
+            "requests_total": req_count,
+            "status_2xx": s_2xx,
+            "status_3xx": s_3xx,
+            "status_4xx": s_4xx,
+            "status_5xx": s_5xx,
+            "bandwidth_bytes": bw_bytes,
+        })
+
+    items.sort(key=lambda x: (x["bandwidth_bytes"], x["requests_total"]), reverse=True)
+    return {
+        "summary": {
+            "total_domains": len(items),
+            "total_requests": tot_req,
+            "total_bandwidth_bytes": tot_bw,
+            "status_2xx": tot_2xx,
+            "status_3xx": tot_3xx,
+            "status_4xx": tot_4xx,
+            "status_5xx": tot_5xx,
+        },
+        "items": items,
+    }
+
+
 def refresh_all_telemetry(db: Session | None = None, *, refresh_disk: bool = False) -> None:
     own_session = False
     if db is None:

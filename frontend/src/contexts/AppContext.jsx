@@ -42,10 +42,11 @@ export const NGINX_REWRITE_MODES = [
   { value: 'seohburl', label: 'SEO HB URL' },
 ];
 
-export const SITE_APP_KIND_LABELS = { node: 'Node.js', docker: 'Container', compose: 'Compose' };
+export const SITE_APP_KIND_LABELS = { node: 'Node.js', python: 'Python', docker: 'Container', compose: 'Compose' };
 
 export const SITE_APP_KINDS = [
   ['node', 'Node.js', 'spanel installs dependencies and keeps the process running under systemd.'],
+  ['python', 'Python (ASGI / WSGI)', 'spanel provisions an isolated .venv, installs requirements.txt/pyproject.toml, and runs uvicorn, gunicorn, or python under systemd.'],
   ['docker', 'Container', 'spanel pulls the image and runs it, published on loopback only.'],
   ['compose', 'Docker Compose', 'Paste your project\u2019s docker-compose.yml. spanel checks it and runs a file it generates from what it accepted.'],
 ];

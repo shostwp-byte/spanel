@@ -54,8 +54,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   const [selectedUserBackupTargetId, setSelectedUserBackupTargetId] = useState('');
   const [userBackupMode, setUserBackupMode] = useState('full');
   const [siteBackupMode, setSiteBackupMode] = useState('full');
-  const [userRestoreMode, setUserRestoreMode] = useState('full');
-  const [siteRestoreMode, setSiteRestoreMode] = useState('full');
   const [lastRestoredUserCredentials, setLastRestoredUserCredentials] = useState(null);
 
   // Schedule Builder / Editor state
@@ -265,20 +263,14 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   async function restoreUserBackupItem(item) {
     if (!item?.backup_file) return;
     const label = item.username ? `${item.username} (${item.filename})` : item.filename;
-    const modeLabels = {
-      full: 'Toàn bộ (Web + Database + Email)',
-      files_only: 'Chỉ mã nguồn Website (Files Only)',
-      database_only: 'Chỉ Cơ sở dữ liệu (Database Only)',
-      mail_only: 'Chỉ Hộp thư Email (Mail Only)',
-    };
-    if (!window.confirm(`Bạn có chắc chắn muốn khôi phục bản sao lưu "${label}" theo chế độ [${modeLabels[userRestoreMode] || userRestoreMode}]?`)) return;
+    if (!window.confirm(t('confirmRestoreUserBackup', { name: label }))) return;
     setLoading(true);
     setError('');
     setLastRestoredUserCredentials(null);
     try {
       const data = await request('/maintenance/user-backups/restore', {
         method: 'POST',
-        body: JSON.stringify({ backup_file: item.backup_file, restore_mode: userRestoreMode }),
+        body: JSON.stringify({ backup_file: item.backup_file }),
       });
       await Promise.all([
         refreshAll ? refreshAll() : Promise.resolve(),
@@ -294,27 +286,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
       setNotice(t('restoredUserBackupSummary', {
         username: data.username,
         count: data.websites?.length || 0,
-      }) + ` (Chế độ: ${modeLabels[userRestoreMode] || userRestoreMode})`);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function verifyBackupArchive(backupFile, websiteId = null) {
-    if (!backupFile) return;
-    setLoading(true);
-    setError('');
-    try {
-      const params = new URLSearchParams({ backup_file: backupFile });
-      if (websiteId) params.set('website_id', String(websiteId));
-      const res = await request(`/maintenance/backups/verify?${params.toString()}`, { method: 'POST' });
-      if (res?.valid) {
-        setNotice(`Xác thực toàn vẹn SHA-256 thành công cho ${res.filename}: SHA-256=${String(res.sha256 || '').slice(0, 16)}... (${res.member_count} mục trong gói .tar.gz).`);
-      } else {
-        setError(res?.error || 'Bản sao lưu không vượt qua kiểm tra toàn vẹn SHA-256.');
-      }
+      }));
     } catch (err) {
       setError(err.message);
     } finally {
@@ -705,24 +677,15 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   async function restoreBackup(backupFile) {
     if (!selectedWebsiteId) return;
     const filename = backupFile.split('/').pop() || backupFile;
-    const modeLabels = {
-      full: 'Toàn bộ (Mã nguồn + Database SQL)',
-      files_only: 'Chỉ Mã nguồn Website (Files Only)',
-      database_only: 'Chỉ Cơ sở dữ liệu SQL (Database Only)',
-    };
-    if (!window.confirm(`Bạn có chắc chắn muốn khôi phục website từ bản sao lưu "${filename}" theo chế độ [${modeLabels[siteRestoreMode] || siteRestoreMode}]?`)) return;
+    if (!window.confirm(`Bạn có chắc chắn muốn khôi phục website từ bản sao lưu "${filename}"? Dữ liệu mã nguồn và Database hiện tại của website sẽ được ghi đè.`)) return;
     setLoading(true);
     setError('');
     try {
       const data = await request('/maintenance/restore', {
         method: 'POST',
-        body: JSON.stringify({
-          website_id: Number(selectedWebsiteId),
-          backup_file: backupFile,
-          restore_mode: siteRestoreMode,
-        }),
+        body: JSON.stringify({ website_id: Number(selectedWebsiteId), backup_file: backupFile }),
       });
-      setNotice(`${t('restoredWebsiteTo', { path: data.restored_to })} (${modeLabels[siteRestoreMode] || siteRestoreMode})`);
+      setNotice(t('restoredWebsiteTo', { path: data.restored_to }));
     } catch (err) {
       setError(err.message);
     } finally {
@@ -986,32 +949,15 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   Danh sách bản sao lưu User ({filteredUserBackups.length})
                 </h4>
               </div>
-              <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
-                {isAdmin && (
-                  <label style={{ margin: 0, display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)' }}>
-                    <span>Chế độ Khôi phục (Granular Restore):</span>
-                    <select
-                      value={userRestoreMode}
-                      onChange={(e) => setUserRestoreMode(e.target.value)}
-                      style={{ height: '36px', width: 'auto', minWidth: '210px', fontSize: '0.82rem' }}
-                    >
-                      <option value="full">Full: Toàn bộ (Web + DB + Email)</option>
-                      <option value="files_only">Files Only: Chỉ mã nguồn Web</option>
-                      <option value="database_only">Database Only: Chỉ CSDL SQL</option>
-                      <option value="mail_only">Mail Only: Chỉ Hộp thư Email</option>
-                    </select>
-                  </label>
-                )}
-                <div style={{ position: 'relative', minWidth: '260px' }}>
-                  <Search size={15} style={{ position: 'absolute', left: '11px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                  <input
-                    type="search"
-                    placeholder="Tìm theo username, hostname hoặc tên file..."
-                    value={userBackupFilter}
-                    onChange={(e) => setUserBackupFilter(e.target.value)}
-                    style={{ paddingLeft: '34px', height: '36px', fontSize: '0.84rem' }}
-                  />
-                </div>
+              <div style={{ position: 'relative', minWidth: '260px' }}>
+                <Search size={15} style={{ position: 'absolute', left: '11px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+                <input
+                  type="search"
+                  placeholder="Tìm theo username, hostname hoặc tên file..."
+                  value={userBackupFilter}
+                  onChange={(e) => setUserBackupFilter(e.target.value)}
+                  style={{ paddingLeft: '34px', height: '36px', fontSize: '0.84rem' }}
+                />
               </div>
             </div>
 
@@ -1085,41 +1031,25 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         </td>
                         <td style={{ fontWeight: 600, fontSize: '0.84rem' }}>{formatBytes(item.size)}</td>
                         <td>
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', alignItems: 'flex-start' }}>
-                            <span style={{
-                              display: 'inline-flex', alignItems: 'center', gap: '5px',
-                              padding: '3px 9px', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 600,
-                              background: item.valid ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
-                              color: item.valid ? '#10b981' : '#ef4444',
-                            }}>
-                              {item.valid ? <CheckCircle size={13} /> : <AlertCircle size={13} />}
-                              {item.valid ? 'Hợp lệ' : (item.error || 'Lỗi')}
-                            </span>
-                            {item.sha256 && (
-                              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontFamily: 'monospace' }} title={`SHA-256: ${item.sha256}`}>
-                                SHA256: {item.sha256.slice(0, 10)}…
-                              </span>
-                            )}
-                          </div>
+                          <span style={{
+                            display: 'inline-flex', alignItems: 'center', gap: '5px',
+                            padding: '3px 9px', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 600,
+                            background: item.valid ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
+                            color: item.valid ? '#10b981' : '#ef4444',
+                          }}>
+                            {item.valid ? <CheckCircle size={13} /> : <AlertCircle size={13} />}
+                            {item.valid ? 'Hợp lệ' : (item.error || 'Lỗi')}
+                          </span>
                         </td>
                         <td style={{ textAlign: 'right' }}>
                           <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
-                            <button
-                              type="button"
-                              className="secondary-light"
-                              onClick={() => verifyBackupArchive(item.backup_file, null)}
-                              disabled={loading}
-                              title="Kiểm tra toàn vẹn SHA-256 & cấu trúc gói .tar.gz"
-                            >
-                              <ShieldCheck size={14} /> SHA-256
-                            </button>
                             {isAdmin && (
                               <button
                                 type="button"
                                 className="secondary-light"
                                 onClick={() => restoreUserBackupItem(item)}
                                 disabled={loading || !item.valid}
-                                title="Khôi phục tài khoản này theo chế độ Granular đã chọn"
+                                title="Khôi phục tài khoản này"
                               >
                                 <RotateCcw size={14} /> Khôi phục
                               </button>
@@ -1243,23 +1173,9 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
           </div>
 
           <div className="pkg-card" style={{ padding: '20px 22px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '14px' }}>
-              <h4 style={{ margin: 0, fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-main)' }}>
-                Danh sách bản sao lưu của Website ({backups.length})
-              </h4>
-              <label style={{ margin: 0, display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-muted)' }}>
-                <span>Chế độ Khôi phục (Granular Restore):</span>
-                <select
-                  value={siteRestoreMode}
-                  onChange={(e) => setSiteRestoreMode(e.target.value)}
-                  style={{ height: '36px', width: 'auto', minWidth: '210px', fontSize: '0.82rem' }}
-                >
-                  <option value="full">Full: Toàn bộ (Mã nguồn + Database)</option>
-                  <option value="files_only">Files Only: Chỉ mã nguồn Website</option>
-                  <option value="database_only">Database Only: Chỉ Cơ sở dữ liệu SQL</option>
-                </select>
-              </label>
-            </div>
+            <h4 style={{ margin: '0 0 14px', fontSize: '0.98rem', fontWeight: 700, color: 'var(--text-main)' }}>
+              Danh sách bản sao lưu của Website ({backups.length})
+            </h4>
             <div className="pkg-table-wrap">
               <table className="pkg-clean-table">
                 <thead>
@@ -1295,15 +1211,6 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         </td>
                         <td style={{ textAlign: 'right' }}>
                           <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
-                            <button
-                              type="button"
-                              className="secondary-light"
-                              onClick={() => verifyBackupArchive(item, selectedWebsiteId)}
-                              disabled={loading}
-                              title="Kiểm tra toàn vẹn SHA-256 & cấu trúc gói .tar.gz"
-                            >
-                              <ShieldCheck size={14} /> SHA-256
-                            </button>
                             <button
                               type="button"
                               className="secondary-light"

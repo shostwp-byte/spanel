@@ -64,6 +64,19 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
 
   const [inspectTablesModal, setInspectTablesModal] = useState(null);
   const [limitsForm, setLimitsForm] = useState(null);
+  const [bottlenecksOpen, setBottlenecksOpen] = useState(false);
+  const [bottlenecksData, setBottlenecksData] = useState(null);
+  const [bottlenecksLoading, setBottlenecksLoading] = useState(false);
+
+  async function loadBottlenecks(silent = false) {
+    if (!silent) setBottlenecksLoading(true);
+    try {
+      const res = await request('/resources/bottlenecks?limit=30', { silent: true });
+      if (res) setBottlenecksData(res);
+    } finally {
+      if (!silent) setBottlenecksLoading(false);
+    }
+  }
 
   async function loadResourceUsers(silent = false) {
     const res = await request('/resources/users', { silent }, silent ? '' : t('Loading user resource telemetry...'));
@@ -321,7 +334,19 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
             <input type="checkbox" checked={autoRefresh} onChange={e => setAutoRefresh(e.target.checked)} style={{ width: '15px', height: '15px', minHeight: 0 }} />
             <span>{t('Live 15s')}</span>
           </label>
-          <button type="button" className="secondary-light" disabled={!!loading} onClick={() => loadResourceUsers(false)}>
+          <button
+            type="button"
+            className={bottlenecksOpen ? 'primary' : 'secondary-light'}
+            disabled={!!loading}
+            onClick={() => {
+              const next = !bottlenecksOpen;
+              setBottlenecksOpen(next);
+              if (next) loadBottlenecks(false);
+            }}
+          >
+            <Activity size={14} /> {t('Slow Query & PHP Bottleneck Inspector')}
+          </button>
+          <button type="button" className="secondary-light" disabled={!!loading} onClick={() => { loadResourceUsers(false); if (bottlenecksOpen) loadBottlenecks(true); }}>
             <RefreshCw size={14} /> {t('Refresh')}
           </button>
           <button type="button" disabled={!!loading} onClick={handleForceScan}>
@@ -329,6 +354,110 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
           </button>
         </div>
       </div>
+
+      {/* MySQL Slow Query & PHP-FPM Slowlog Bottleneck Inspector */}
+      {bottlenecksOpen && (
+        <div
+          className="card"
+          style={{
+            marginBottom: '18px',
+            border: '1px solid var(--primary)',
+            background: 'var(--surface)',
+            padding: '16px',
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px', marginBottom: '12px' }}>
+            <div>
+              <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px', fontSize: '15px' }}>
+                <Activity size={17} />
+                <span>{t('MySQL Slow Query & PHP-FPM Slowlog Bottleneck Inspector')}</span>
+                <span className="badge ok">Auto-Indexed</span>
+              </h3>
+              <p className="hint" style={{ margin: '3px 0 0' }}>
+                {t('Pinpoints exact SQL queries (>2s) and PHP-FPM function stack traces (>5s) causing server CPU or I/O bottlenecks.')}
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button type="button" className="mini secondary-light" disabled={bottlenecksLoading} onClick={() => loadBottlenecks(false)}>
+                <RefreshCw size={13} /> {t('Rescan Logs')}
+              </button>
+              <button type="button" className="mini secondary-light" onClick={() => setBottlenecksOpen(false)}>
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+
+          {bottlenecksLoading ? (
+            <p className="hint">{t('Analyzing MariaDB slow query log, live PROCESSLIST, and PHP-FPM slowlog stack traces...')}</p>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: '14px' }}>
+              <div style={{ background: 'var(--surface-alt)', border: '1px solid var(--border)', borderRadius: '10px', padding: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <strong style={{ fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                    <Database size={14} /> {t('MySQL Slow Queries')} ({bottlenecksData?.mysql_slow_queries?.length || 0})
+                  </strong>
+                  <span className="badge">{t('Threshold')}: &ge;{bottlenecksData?.summary?.long_query_time_sec || 2}s</span>
+                </div>
+                {(!bottlenecksData?.mysql_slow_queries || bottlenecksData.mysql_slow_queries.length === 0) ? (
+                  <p className="hint" style={{ margin: 0 }}>{t('No slow SQL queries detected. MariaDB InnoDB buffer pool & indexes are healthy.')}</p>
+                ) : (
+                  <div className="table" style={{ maxHeight: '260px', overflowY: 'auto' }}>
+                    {bottlenecksData.mysql_slow_queries.map((q, idx) => (
+                      <div className="row" key={`msq-${idx}`} style={{ flexDirection: 'column', alignItems: 'stretch', gap: '4px', padding: '8px 10px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', flexWrap: 'wrap', gap: '6px' }}>
+                          <span>
+                            <strong>{q.username}</strong> · <code>{q.db_name}</code>
+                            {q.source === 'live_processlist' && <span className="badge danger" style={{ marginLeft: '6px' }}>LIVE</span>}
+                          </span>
+                          <span className="badge warn">
+                            {q.query_time_sec}s {q.rows_examined ? `· ${q.rows_examined.toLocaleString()} rows` : ''}
+                          </span>
+                        </div>
+                        <code style={{ fontSize: '11.5px', color: 'var(--text-secondary)', wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}>
+                          {q.sql}
+                        </code>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ background: 'var(--surface-alt)', border: '1px solid var(--border)', borderRadius: '10px', padding: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <strong style={{ fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                    <Cpu size={14} /> {t('PHP-FPM Slowlog Stack Traces')} ({bottlenecksData?.php_slow_traces?.length || 0})
+                  </strong>
+                  <span className="badge">{t('Threshold')}: &ge;{bottlenecksData?.summary?.php_slowlog_timeout_sec || 5}s</span>
+                </div>
+                {(!bottlenecksData?.php_slow_traces || bottlenecksData.php_slow_traces.length === 0) ? (
+                  <p className="hint" style={{ margin: 0 }}>{t('No slow PHP-FPM scripts or hanging plugin calls recorded.')}</p>
+                ) : (
+                  <div className="table" style={{ maxHeight: '260px', overflowY: 'auto' }}>
+                    {bottlenecksData.php_slow_traces.map((tr, idx) => (
+                      <div className="row" key={`php-tr-${idx}`} style={{ flexDirection: 'column', alignItems: 'stretch', gap: '4px', padding: '8px 10px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', flexWrap: 'wrap', gap: '6px' }}>
+                          <span>
+                            <strong>{tr.username}</strong> · <code>{tr.domain}</code>
+                          </span>
+                          <span className="badge">{tr.top_frame}</span>
+                        </div>
+                        <small style={{ fontSize: '11px', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>
+                          {tr.script_filename}
+                        </small>
+                        {tr.stack?.length > 0 && (
+                          <pre style={{ margin: '2px 0 0', fontSize: '10.5px', padding: '6px', borderRadius: '6px', background: 'var(--surface)', overflowX: 'auto' }}>
+                            {tr.stack.join('\n')}
+                          </pre>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Top KPI Strip */}
       <div className="cb-stats-strip" style={{ marginBottom: '16px' }}>

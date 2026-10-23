@@ -528,3 +528,39 @@ def force_refresh_telemetry(
     ensure_role(current_user.role, Role.reseller)
     resource_monitor.refresh_all_telemetry(db, refresh_disk=refresh_disk)
     return {"ok": True}
+
+
+@router.get("/bottlenecks")
+def get_slow_bottlenecks(
+    limit: int = 30,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.reseller)
+    allowed_ids: set[int] | None = None
+    if current_user.role == Role.reseller:
+        managed = db.query(User.id).filter(User.reseller_id == current_user.id).all()
+        allowed_ids = {r[0] for r in managed} | {current_user.id}
+    return resource_monitor.inspect_slow_bottlenecks(
+        db,
+        allowed_user_ids=allowed_ids,
+        limit=max(5, min(100, int(limit or 30))),
+    )
+
+
+@router.get("/domain-traffic")
+def get_domain_traffic_analytics(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    allowed_ids: set[int] | None = None
+    if current_user.role == Role.reseller:
+        managed = db.query(User.id).filter(User.reseller_id == current_user.id).all()
+        allowed_ids = {r[0] for r in managed} | {current_user.id}
+    elif current_user.role != Role.admin:
+        allowed_ids = {current_user.id}
+    return resource_monitor.collect_domain_traffic_analytics(
+        db,
+        allowed_user_ids=allowed_ids,
+    )
+

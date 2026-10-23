@@ -92,6 +92,23 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
     }
   }
 
+  async function gitDeploySiteApp(app) {
+    const data = await request(`/site-apps/${app.id}/git-deploy`, { method: 'POST' }, `Git Pull & Deploying ${app.name}...`);
+    if (data) {
+      setNotice(data.running ? `${app.name} pulled from Git and is running on port ${app.port}.` : `${app.name} Git deploy finished — check the log.`);
+      const combinedLog = [data.git_output, data.output].filter(Boolean).join('\n\n--- Runtime Deploy Output ---\n');
+      if (combinedLog) setSiteAppLog({ name: `${app.name} git-deploy`, log: combinedLog });
+      await loadSiteApps();
+    }
+  }
+
+  function copyWebhookUrl(app) {
+    const path = app.webhook_path || `/api/site-apps/webhook/${app.id}/${app.webhook_token || ''}`;
+    const fullUrl = `${window.location.origin}${path}`;
+    navigator.clipboard?.writeText(fullUrl);
+    setNotice(t('Copied Git Webhook Auto-Deploy URL to clipboard.'));
+  }
+
   async function controlSiteApp(app, action) {
     const data = await request(`/site-apps/${app.id}/control`, { method: 'POST', body: JSON.stringify({ action }) }, `${action} ${app.name}...`);
     if (data) {
@@ -117,6 +134,10 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
       body.start_kind = siteAppDraft.start_kind;
       body.start_arg = siteAppDraft.start_arg;
       body.node_major = siteAppDraft.node_major;
+    }
+    if (siteAppDraft.kind === 'python') {
+      body.start_kind = ['uvicorn', 'gunicorn', 'python'].includes(siteAppDraft.start_kind) ? siteAppDraft.start_kind : 'uvicorn';
+      body.start_arg = siteAppDraft.start_arg || 'main:app';
     }
     if (siteAppDraft.kind === 'docker') {
       body.image = siteAppDraft.image.trim();
@@ -201,7 +222,19 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
             <input value={siteAppDraft.name} disabled={!!loading} onChange={e => setSiteAppDraft(prev => ({ ...prev, name: e.target.value }))} />
           </label>
           <label><span>{t('Runtime')}</span>
-            <select value={siteAppDraft.kind} disabled={!!loading} onChange={e => setSiteAppDraft(prev => ({ ...prev, kind: e.target.value }))}>
+            <select
+              value={siteAppDraft.kind}
+              disabled={!!loading}
+              onChange={e => {
+                const nextKind = e.target.value;
+                setSiteAppDraft(prev => ({
+                  ...prev,
+                  kind: nextKind,
+                  start_kind: nextKind === 'python' ? 'uvicorn' : (nextKind === 'node' ? 'npm' : prev.start_kind),
+                  start_arg: nextKind === 'python' ? 'main:app' : (nextKind === 'node' ? 'start' : prev.start_arg),
+                }));
+              }}
+            >
               {SITE_APP_KINDS.map(([value, label]) => <option key={value} value={value} disabled={value === 'docker' && !dockerReady}>{t(label)}</option>)}
             </select>
           </label>
@@ -243,6 +276,18 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
               <select value={siteAppDraft.node_major} disabled={!!loading} onChange={e => setSiteAppDraft(prev => ({ ...prev, node_major: e.target.value }))}>
                 {(siteRuntimes.node_majors?.length ? siteRuntimes.node_majors : ['22']).map(major => <option key={major} value={major}>Node {major}</option>)}
               </select>
+            </label>
+          </>}
+          {siteAppDraft.kind === 'python' && <>
+            <label><span>{t('Python Runner')}</span>
+              <select value={['uvicorn', 'gunicorn', 'python'].includes(siteAppDraft.start_kind) ? siteAppDraft.start_kind : 'uvicorn'} disabled={!!loading} onChange={e => setSiteAppDraft(prev => ({ ...prev, start_kind: e.target.value }))}>
+                <option value="uvicorn">uvicorn (FastAPI / ASGI)</option>
+                <option value="gunicorn">gunicorn (Flask / Django WSGI)</option>
+                <option value="python">python (Custom Script)</option>
+              </select>
+            </label>
+            <label><span>{siteAppDraft.start_kind === 'python' ? t('Entry script') : t('ASGI / WSGI module:app')}</span>
+              <input value={siteAppDraft.start_arg} disabled={!!loading} onChange={e => setSiteAppDraft(prev => ({ ...prev, start_arg: e.target.value }))} placeholder={siteAppDraft.start_kind === 'python' ? 'app.py' : 'main:app'} />
             </label>
           </>}
           {siteAppDraft.kind === 'compose' && <>
@@ -347,10 +392,12 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
               <div><dt>{t('Upload code to')}</dt><dd><code>{app.directory}</code></dd></div>
               {app.kind === 'node' && <div><dt>{t('Start')}</dt><dd><code>{app.start_kind} {app.start_arg}</code></dd></div>}
               {app.kind === 'node' && <div><dt>Node</dt><dd>v{app.node_major || '22'}</dd></div>}
+              {app.kind === 'python' && <div><dt>{t('Python Runner')}</dt><dd><code>{app.start_kind} {app.start_arg}</code> (.venv)</dd></div>}
               {app.kind === 'compose' && <div><dt>{t('Serves domain')}</dt><dd><code>{app.web_service}</code></dd></div>}
               {app.kind === 'docker' && <div><dt>{t('Image')}</dt><dd><code>{app.image}</code></dd></div>}
               {app.kind === 'docker' && <div><dt>{t('In container')}</dt><dd>port {app.container_port} · {app.cpu_limit} CPU</dd></div>}
               <div><dt>{t('Unit')}</dt><dd><code>{app.unit}</code></dd></div>
+              {app.webhook_path && <div><dt>{t('Git Webhook')}</dt><dd><code>{app.webhook_path}</code></dd></div>}
             </dl>
             <div className="site-app-actions">
               <div className="site-app-fields">
@@ -397,6 +444,8 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
               <div className="site-app-buttons">
                 <button className="mini secondary-light" disabled={!!loading} onClick={() => openSiteAppEdit(app)}><Pencil size={13}/> {app.kind === 'compose' ? 'Compose' : 'Environment'}</button>
                 <button className="mini secondary-light" disabled={!!loading} onClick={() => openAppFileManager(app)}><FolderOpen size={13}/>{t('Files')}</button>
+                <button className="mini secondary-light" disabled={!!loading} onClick={() => copyWebhookUrl(app)} title={t('Copy GitHub/GitLab Push Webhook URL')}><Copy size={13}/>{t('Webhook')}</button>
+                <button className="mini secondary-light" disabled={!!loading} onClick={() => gitDeploySiteApp(app)} title={t('Pull latest Git commit & redeploy')}><Download size={13}/>{t('Git Deploy')}</button>
                 <button className="mini" disabled={!!loading} onClick={() => deploySiteApp(app)}><Play size={13}/>{t('Deploy')}</button>
                 <button className="mini secondary-light" disabled={!!loading} onClick={() => controlSiteApp(app, 'restart')}><RotateCcw size={13}/>{t('Restart')}</button>
                 <button className="mini secondary-light" disabled={!!loading} onClick={() => controlSiteApp(app, 'stop')}><Square size={13}/>{t('Stop')}</button>

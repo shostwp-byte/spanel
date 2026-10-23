@@ -92,14 +92,10 @@ SHA512_RE = re.compile(r"^\{SHA512-CRYPT\}\$6\$(rounds=[0-9]{4,9}\$)?[./A-Za-z0-
 SETTINGS_DEFAULTS = {
     "auth_rate_per_hour": 300,
     "local_rate_per_hour": 300,
-    "domain_rate_per_hour": 500,
-    "auto_hold_on_rate_exceed": True,
     "max_message_mb": 50,
     "spam_enabled": True,
     "spam_header_score": 6.0,
-    "spam_rewrite_score": 8.0,
     "spam_reject_score": 15.0,
-    "spam_subject_tag": "[SPAM]",
     "greylisting": True,
     "default_quota_mb": DEFAULT_QUOTA_MB,
 }
@@ -1408,22 +1404,11 @@ def current_settings() -> dict:
         if key in stored:
             merged[key] = stored[key]
     merged["allow"] = [str(item) for item in stored.get("allow") or [] if str(item).strip()]
-    merged["block"] = [str(item) for item in stored.get("block") or [] if str(item).strip()]
-    raw_limits = stored.get("domain_rate_limits")
-    domain_limits: dict[str, int] = {}
-    if isinstance(raw_limits, dict):
-        for k, v in raw_limits.items():
-            try:
-                d = normalize_domain(str(k))
-                domain_limits[d] = max(0, min(100000, int(v)))
-            except (MailError, TypeError, ValueError):
-                continue
-    merged["domain_rate_limits"] = domain_limits
     return merged
 
 
-def _split_allow(entries, label: str = "allowlist") -> tuple[list[str], list[str], list[str]]:
-    """An allowlist or blocklist as typed -> (addresses, domains, the cleaned list)."""
+def _split_allow(entries) -> tuple[list[str], list[str], list[str]]:
+    """An allowlist as typed -> (addresses, domains, the cleaned list)."""
     senders, domains, cleaned = [], [], []
     for entry in entries or []:
         item = str(entry).strip().lower()
@@ -1431,17 +1416,17 @@ def _split_allow(entries, label: str = "allowlist") -> tuple[list[str], list[str
             continue
         if "@" in item:
             if not ADDRESS_RE.fullmatch(item):
-                raise MailError(f"Each {label} line is an email address or a domain, such as friend@example.com or example.com.")
+                raise MailError("Each allowlist line is an email address or a domain, such as friend@example.com or example.com.")
             senders.append(item)
         else:
             try:
                 item = normalize_domain(item)
             except MailError as exc:
-                raise MailError(f"Each {label} line is an email address or a domain, such as friend@example.com or example.com.") from exc
+                raise MailError("Each allowlist line is an email address or a domain, such as friend@example.com or example.com.") from exc
             domains.append(item)
         cleaned.append(item)
     if len(cleaned) > MAX_ALLOW:
-        raise MailError(f"The {label} is limited to 5000 lines.")
+        raise MailError("The allowlist is limited to 5000 lines.")
     return senders, domains, cleaned
 
 
@@ -1471,45 +1456,22 @@ def save_settings(payload: dict) -> dict:
         merged["auth_rate_per_hour"] = whole("auth_rate_per_hour", 0, 100000, "A sending limit is 0 (none) to 100000.")
     if "local_rate_per_hour" in payload:
         merged["local_rate_per_hour"] = whole("local_rate_per_hour", 0, 100000, "A sending limit is 0 (none) to 100000.")
-    if "domain_rate_per_hour" in payload:
-        merged["domain_rate_per_hour"] = whole("domain_rate_per_hour", 0, 100000, "A domain sending limit is 0 (none) to 100000.")
-    if "auto_hold_on_rate_exceed" in payload:
-        merged["auto_hold_on_rate_exceed"] = bool(payload["auto_hold_on_rate_exceed"])
     if "max_message_mb" in payload:
         merged["max_message_mb"] = whole("max_message_mb", 1, 200, "The largest message is 1 to 200 MB.")
     if "default_quota_mb" in payload:
         merged["default_quota_mb"] = whole("default_quota_mb", 1, MAX_USER_QUOTA_MB, "The size of a new mailbox is 1 to 51200 MB.")
     if "spam_header_score" in payload:
         merged["spam_header_score"] = score("spam_header_score")
-    if "spam_rewrite_score" in payload:
-        merged["spam_rewrite_score"] = score("spam_rewrite_score")
     if "spam_reject_score" in payload:
         merged["spam_reject_score"] = score("spam_reject_score")
     if merged["spam_reject_score"] <= merged["spam_header_score"]:
         raise MailError("The reject score must be higher than the Junk score.")
-    if "spam_subject_tag" in payload:
-        tag = str(payload["spam_subject_tag"] or "[SPAM]").strip()[:32]
-        merged["spam_subject_tag"] = tag or "[SPAM]"
     if "greylisting" in payload:
         merged["greylisting"] = bool(payload["greylisting"])
     if "spam_enabled" in payload:
         merged["spam_enabled"] = bool(payload["spam_enabled"])
     if "allow" in payload:
-        _, _, merged["allow"] = _split_allow(payload["allow"], "allowlist")
-    if "block" in payload:
-        _, _, merged["block"] = _split_allow(payload["block"], "blocklist")
-    if "domain_rate_limits" in payload and isinstance(payload["domain_rate_limits"], dict):
-        clean_limits: dict[str, int] = {}
-        for k, v in payload["domain_rate_limits"].items():
-            d = normalize_domain(str(k))
-            try:
-                limit_val = int(v)
-            except (TypeError, ValueError) as exc:
-                raise MailError("A domain rate limit must be an integer between 0 and 100000.") from exc
-            if not 0 <= limit_val <= 100000:
-                raise MailError("A domain rate limit must be between 0 and 100000.")
-            clean_limits[d] = limit_val
-        merged["domain_rate_limits"] = clean_limits
+        _, _, merged["allow"] = _split_allow(payload["allow"])
     stored.update(merged)
     _store(stored)
     if active():
@@ -1662,8 +1624,7 @@ def _relays_changed(db: Session, old_default_spf: str) -> None:
 def helper_settings() -> dict:
     """What mail-configure receives, relay passwords in clear."""
     values = current_settings()
-    senders, domains, _ = _split_allow(values["allow"], "allowlist")
-    block_senders, block_domains, _ = _split_allow(values.get("block") or [], "blocklist")
+    senders, domains, _ = _split_allow(values["allow"])
     relays = []
     for relay in _relays():
         password = ""
@@ -1678,20 +1639,13 @@ def helper_settings() -> dict:
     return {
         "auth_rate_per_hour": int(values["auth_rate_per_hour"]),
         "local_rate_per_hour": int(values["local_rate_per_hour"]),
-        "domain_rate_per_hour": int(values.get("domain_rate_per_hour", 500)),
-        "auto_hold_on_rate_exceed": bool(values.get("auto_hold_on_rate_exceed", True)),
-        "domain_rate_limits": dict(values.get("domain_rate_limits") or {}),
         "max_message_mb": int(values["max_message_mb"]),
         "spam_enabled": bool(values["spam_enabled"]),
         "spam_header_score": float(values["spam_header_score"]),
-        "spam_rewrite_score": float(values.get("spam_rewrite_score", 8.0)),
         "spam_reject_score": float(values["spam_reject_score"]),
-        "spam_subject_tag": str(values.get("spam_subject_tag") or "[SPAM]"),
         "greylisting": bool(values["greylisting"]),
         "allow_senders": senders,
         "allow_domains": domains,
-        "block_senders": block_senders,
-        "block_domains": block_domains,
         "relays": relays,
     }
 
@@ -1815,7 +1769,6 @@ def _history_row(row: dict) -> dict:
         "user": str(row.get("user") or ""),
         "message_id": str(row.get("message-id") or ""),
         "allowed": any(item["name"].startswith("spanel_ALLOW") for item in ranked),
-        "blocked": any(item["name"].startswith("spanel_BLOCK") for item in ranked),
     }
 
 
@@ -1837,17 +1790,7 @@ def rspamd_history(page: int = 1, per_page: int = 50, q: str = "", action: str =
 def allow_sender(value: str) -> dict:
     """Put a sender or a domain on the spam filter's allowlist."""
     settings = current_settings()
-    clean_val = str(value or "").strip().lower()
-    block_list = [item for item in (settings.get("block") or []) if item.lower() != clean_val]
-    return save_settings({"allow": settings["allow"] + [value], "block": block_list})
-
-
-def block_sender(value: str) -> dict:
-    """Put a sender or a domain on the spam filter's blocklist (blacklist)."""
-    settings = current_settings()
-    clean_val = str(value or "").strip().lower()
-    allow_list = [item for item in (settings.get("allow") or []) if item.lower() != clean_val]
-    return save_settings({"block": (settings.get("block") or []) + [value], "allow": allow_list})
+    return save_settings({"allow": settings["allow"] + [value]})
 
 
 # --- webmail -------------------------------------------------------------------------------------

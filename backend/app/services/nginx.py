@@ -296,11 +296,14 @@ FASTCGI_CACHE_SERVER_BLOCK = """    # SPANEL FASTCGI CACHE SERVER BEGIN
     set $spanel_skip_cache 0;
     if ($request_method = POST) { set $spanel_skip_cache 1; }
     if ($query_string != "") { set $spanel_skip_cache 1; }
+    if ($query_string ~* "^(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*)(?:&(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*))*$") { set $spanel_skip_cache 0; }
+    if ($query_string ~* "add-to-cart=|wc-ajax=| nocache=") { set $spanel_skip_cache 1; }
     if ($http_cache_control ~* "no-cache|no-store|max-age=0") { set $spanel_skip_cache 1; }
     if ($http_pragma = "no-cache") { set $spanel_skip_cache 1; }
-    if ($request_uri ~* "/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?\\.xml") { set $spanel_skip_cache 1; }
+    if ($request_uri ~* "/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?\\.xml|/cart/|/checkout/|/my-account/|/wc-api/|/addons/") { set $spanel_skip_cache 1; }
     if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wordpress_logged_in|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|edd_items_in_cart") { set $spanel_skip_cache 1; }
     add_header X-FastCGI-Cache $upstream_cache_status always;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
     # SPANEL FASTCGI CACHE SERVER END"""
 # Kept byte-identical to the block in templates/nginx/wordpress.conf.j2: this
 # copy is injected into vhosts that already exist, that one renders new ones,
@@ -321,13 +324,15 @@ FASTCGI_CACHE_LOCATION_BLOCK = """        # SPANEL FASTCGI CACHE LOCATION BEGIN
         fastcgi_cache_valid 200 301 302 10m;
         fastcgi_cache_valid 404 1m;
         fastcgi_cache_min_uses 1;
-        fastcgi_cache_use_stale error timeout invalid_header updating http_500 http_503;
+        fastcgi_cache_use_stale error timeout invalid_header updating http_500 http_503 http_429;
         fastcgi_cache_background_update on;
         fastcgi_cache_revalidate on;
         fastcgi_cache_bypass $spanel_skip_cache;
         fastcgi_no_cache $spanel_skip_cache;
         fastcgi_no_cache $upstream_http_set_cookie;
         fastcgi_cache_lock on;
+        fastcgi_cache_lock_timeout 5s;
+        fastcgi_cache_lock_age 5s;
         # SPANEL FASTCGI CACHE LOCATION END"""
 
 # Block-opening directives that nest scopes; matched against the original

@@ -10,6 +10,8 @@ two domains silently answering for each other, so the DB holds the unique
 constraint and the kernel gets the final say through `ss` before a port is used.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -21,6 +23,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.entities import SiteApp, User, Website
 from app.services import site_users
 from app.services.shell import shell
@@ -31,13 +34,15 @@ PORT_RANGE_START = 21000
 PORT_RANGE_END = 21999
 
 APP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}[a-z0-9]$|^[a-z0-9]$")
-APP_KINDS = {"node", "docker", "compose"}
+APP_KINDS = {"node", "python", "docker", "compose"}
 # Every app is run by the panel now; the old routing-only kind is gone.
 MANAGED_KINDS = APP_KINDS
 # Apps live side by side here, one directory each, reachable over the customer's
 # own SFTP because that is chrooted to their home.
 APPS_DIR_NAME = "apps"
-START_KINDS = {"node", "npm", "npx", "yarn"}
+NODE_START_KINDS = {"node", "npm", "npx", "yarn"}
+PYTHON_START_KINDS = {"uvicorn", "gunicorn", "python"}
+START_KINDS = NODE_START_KINDS | PYTHON_START_KINDS
 NODE_MAJOR_RE = re.compile(r"^(1[0-9]|[2-9][0-9])$")
 IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,159}(:[A-Za-z0-9._-]{1,127})?(@sha256:[a-f0-9]{64})?$")
 CPU_LIMIT_RE = re.compile(r"^[0-9]{1,2}(\.[0-9])?$")
@@ -138,6 +143,18 @@ def validate_start(start_kind: str | None, start_arg: str | None) -> tuple[str, 
             target.relative_to(base)
         except ValueError as exc:
             raise ValueError("Entry file must be inside the app directory") from exc
+    elif kind == "python":
+        if not arg.endswith(".py"):
+            raise ValueError("python must be given a .py entry file")
+        base = Path("/app").resolve(strict=False)
+        target = (base / arg).resolve(strict=False)
+        try:
+            target.relative_to(base)
+        except ValueError as exc:
+            raise ValueError("Entry file must be inside the app directory") from exc
+    elif kind in {"uvicorn", "gunicorn"}:
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]{1,120}", arg) or ".." in arg:
+            raise ValueError("WSGI/ASGI module target must be like main:app or wsgi:application")
     elif not re.fullmatch(r"[A-Za-z0-9._@/-]{1,120}", arg):
         raise ValueError("Script or package name contains characters that are not allowed")
     return kind, arg
@@ -505,6 +522,12 @@ def write_runtime(app: SiteApp) -> str:
             f"--exec={start_kind}",
             f"--arg={start_arg}",
         ]
+    elif app.kind == "python":
+        start_kind, start_arg = validate_start(app.start_kind or "uvicorn", app.start_arg or "main:app")
+        helper_args += [
+            f"--exec={start_kind}",
+            f"--arg={start_arg}",
+        ]
     elif app.kind == "docker":
         helper_args += [
             f"--image={validate_image(app.image)}",
@@ -672,8 +695,22 @@ def delete_runtime(app: SiteApp, name: str | None = None) -> None:
 
 
 def install_dependencies(app: SiteApp) -> str:
+    if app.kind == "python":
+        result = shell.privileged(
+            "site-app-python-deps",
+            helper_args=[
+                owner_linux_user(app),
+                validate_name(app.name),
+            ],
+            check=False,
+            timeout=960,
+            fallback=["bash", "-lc", "echo dry-run-python-install"],
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "pip install failed").strip()[-4000:])
+        return (result.stdout or "").strip()[-4000:]
     if app.kind != "node":
-        raise ValueError("Only Node.js applications install dependencies")
+        raise ValueError("Only Node.js and Python applications install dependencies")
     result = shell.privileged(
         "site-app-install-deps",
         helper_args=[
@@ -688,6 +725,53 @@ def install_dependencies(app: SiteApp) -> str:
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "npm install failed").strip()[-4000:])
     return (result.stdout or "").strip()[-4000:]
+
+
+def webhook_token_for(app: SiteApp) -> str:
+    """Deterministic HMAC-SHA256 webhook token for 1-Click Git Auto-Deploy."""
+    secret = (settings.secret_key or "spanel-default-secret").encode("utf-8")
+    msg = f"site-app-webhook:{app.id}:{app.owner_id}:{app.name}".encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def verify_webhook_token(app: SiteApp, token: str) -> bool:
+    expected = webhook_token_for(app)
+    provided = (token or "").strip()
+    return bool(provided) and hmac.compare_digest(expected, provided)
+
+
+def git_auto_deploy(app: SiteApp) -> dict:
+    """Pull latest git commit in the application directory, install dependencies, and restart unit."""
+    linux_user = owner_linux_user(app)
+    safe_name = validate_name(app.name)
+    pull_res = shell.privileged(
+        "site-app-git-pull",
+        helper_args=[linux_user, safe_name],
+        check=False,
+        timeout=300,
+        fallback=["bash", "-lc", "echo 'Already up to date.'"],
+    )
+    git_output = ((pull_res.stdout or "") + "\n" + (pull_res.stderr or "")).strip()[-2000:]
+    deps_output = ""
+    try:
+        if app.kind in {"node", "python"}:
+            deps_output = install_dependencies(app)
+        elif app.kind in {"docker", "compose"}:
+            deps_output = fetch_images(app)
+    except Exception as exc:
+        deps_output = str(exc)
+
+    write_runtime(app)
+    if app.autostart:
+        control(app, "enable")
+    control(app, "restart")
+    state = settled_state(app, checks=2, delay=0.5)
+    return {
+        "ok": state == "active" or settings.command_dry_run,
+        "status": "running" if (state == "active" or settings.command_dry_run) else "error",
+        "git_output": git_output,
+        "deps_output": deps_output[:1000],
+    }
 
 
 def pull_image(app: SiteApp) -> str:

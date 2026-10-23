@@ -922,7 +922,7 @@ class ComposeValidateRequest(BaseModel):
 
 class SiteAppCreate(BaseModel):
     name: str = "app"
-    kind: Literal["node", "docker", "compose"] = "node"
+    kind: Literal["node", "python", "docker", "compose"] = "node"
     # Compose runtimes: the file the customer pasted and which service serves
     # the domain.
     compose_source: Optional[str] = None
@@ -931,7 +931,7 @@ class SiteAppCreate(BaseModel):
     owner_id: Optional[int] = None
     # Omit to let the panel pick a free port from its own range.
     port: Optional[int] = None
-    start_kind: Optional[Literal["node", "npm", "npx", "yarn"]] = None
+    start_kind: Optional[Literal["node", "npm", "npx", "yarn", "uvicorn", "gunicorn", "python"]] = None
     start_arg: Optional[str] = None
     node_major: Optional[str] = None
     image: Optional[str] = None
@@ -947,7 +947,7 @@ class SiteAppUpdate(BaseModel):
     port: Optional[int] = None
     compose_source: Optional[str] = None
     web_service: Optional[str] = None
-    start_kind: Optional[Literal["node", "npm", "npx", "yarn"]] = None
+    start_kind: Optional[Literal["node", "npm", "npx", "yarn", "uvicorn", "gunicorn", "python"]] = None
     start_arg: Optional[str] = None
     node_major: Optional[str] = None
     image: Optional[str] = None
@@ -985,6 +985,8 @@ class SiteAppOut(BaseModel):
     autostart: bool = True
     status: str = "stopped"
     last_error: str = ""
+    webhook_token: str = ""
+    webhook_path: str = ""
     created_at: Optional[datetime] = None
 
     class Config:
@@ -1200,9 +1202,7 @@ class MalwareScanStatus(BaseModel):
     lmd_updated_at: str = ""
     realtime_enabled: bool = False
     scan_on_upload: bool = False
-    scan_on_upload_is_cheap: bool = True
-    zero_ram_heuristics: bool = True
-    quarantine_count: int = 0
+    scan_on_upload_is_cheap: bool = False
     monitor_running: bool = False
     socket: str = "/run/clamav/clamd.sock"
     detail: Optional[str] = None
@@ -1333,7 +1333,6 @@ class UsersMove(BaseModel):
 
 class UserRestoreBackup(BaseModel):
     backup_file: str
-    restore_mode: Literal["full", "files_only", "database_only", "mail_only"] = "full"
 
 
 class BackupScheduleCreate(BaseModel):
@@ -1575,7 +1574,6 @@ class SftpBackupRun(BaseModel):
 class RestoreBackup(BaseModel):
     website_id: int
     backup_file: str
-    restore_mode: Literal["full", "files_only", "database_only"] = "full"
 
 
 class PhpConfigUpdate(BaseModel):

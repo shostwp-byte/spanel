@@ -46,11 +46,14 @@ server {
     set $spanel_skip_cache 0;
     if ($request_method = POST) { set $spanel_skip_cache 1; }
     if ($query_string != "") { set $spanel_skip_cache 1; }
+    if ($query_string ~* "^(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*)(?:&(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*))*$") { set $spanel_skip_cache 0; }
+    if ($query_string ~* "add-to-cart=|wc-ajax=| nocache=") { set $spanel_skip_cache 1; }
     if ($http_cache_control ~* "no-cache|no-store|max-age=0") { set $spanel_skip_cache 1; }
     if ($http_pragma = "no-cache") { set $spanel_skip_cache 1; }
-    if ($request_uri ~* "/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?\.xml") { set $spanel_skip_cache 1; }
+    if ($request_uri ~* "/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?\.xml|/cart/|/checkout/|/my-account/|/wc-api/|/addons/") { set $spanel_skip_cache 1; }
     if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wordpress_logged_in|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|edd_items_in_cart") { set $spanel_skip_cache 1; }
     add_header X-FastCGI-Cache $upstream_cache_status always;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
     # SPANEL FASTCGI CACHE SERVER END
 
     add_header X-Frame-Options "SAMEORIGIN" always;

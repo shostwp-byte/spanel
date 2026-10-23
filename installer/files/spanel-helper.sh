@@ -6066,6 +6066,77 @@ WantedBy=multi-user.target
 UNIT
 }
 
+write_python_app_unit() {
+  local unit_path="$1" app_label="$2" user="$3" app_dir="$4" env_file="$5"
+  local port="$6" memory="$7" app_exec="${8}" app_arg="${9}"
+  local venv_dir="${app_dir}/.venv" exec_start identifier
+  if [[ ! -x "${venv_dir}/bin/python" ]]; then
+    command -v python3 >/dev/null 2>&1 || deny "python3 is not installed on the server"
+    runuser -u "$user" -- python3 -m venv "$venv_dir" 2>/dev/null \
+      || deny "failed to initialize Python virtualenv in ${venv_dir}; install python3-venv"
+  fi
+  case "$app_exec" in
+    uvicorn)
+      exec_start="${venv_dir}/bin/python -m uvicorn ${app_arg} --host 127.0.0.1 --port ${port}"
+      ;;
+    gunicorn)
+      exec_start="${venv_dir}/bin/python -m gunicorn ${app_arg} --bind 127.0.0.1:${port}"
+      ;;
+    python)
+      exec_start="${venv_dir}/bin/python ${app_arg}"
+      ;;
+    *) deny "invalid Python start command: $app_exec" ;;
+  esac
+  identifier="$(basename "$unit_path" .service)"
+  cat >"$unit_path" <<UNIT
+[Unit]
+Description=SPanel Python application ${app_label} (${user})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${user}
+Group=${user}
+WorkingDirectory=${app_dir}
+EnvironmentFile=-${env_file}
+Environment=HOST=127.0.0.1
+Environment=PORT=${port}
+Environment=PYTHONUNBUFFERED=1
+Environment=VIRTUAL_ENV=${venv_dir}
+Environment=HOME=${HOME_ROOT}/${user}
+Environment=PATH=${venv_dir}/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=${exec_start}
+Restart=always
+RestartSec=5
+MemoryAccounting=yes
+MemoryMax=${memory}M
+TasksMax=256
+LimitNOFILE=8192
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${app_dir}
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${identifier}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
 write_docker_app_unit() {
   local unit_path="$1" app_label="$2" user="$3" container="$4" app_dir="$5" env_file="$6"
   local port="$7" memory="$8" image="$9" container_port="${10}" cpus="${11}"
@@ -7354,6 +7425,8 @@ pm.max_children = ${PHP_FPM_MAX_CHILDREN}
 pm.process_idle_timeout = ${PHP_FPM_PROCESS_IDLE_TIMEOUT}s
 pm.max_requests = ${PHP_FPM_MAX_REQUESTS}
 request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s
+request_slowlog_timeout = 5s
+slowlog = /var/log/php/spanel-slow-${pool_name}.log
 chdir = /
 php_admin_value[open_basedir] = ${target}:${sess_dir}:${upload_dir}:/usr/share/php
 php_admin_value[upload_tmp_dir] = ${upload_dir}
@@ -7368,6 +7441,7 @@ ensure_php_runtime_dirs() {
   local upload_dir="/var/lib/php/uploads/${user}"
   ensure_sites_group
   require_linux_user "$user"
+  install -d -o root -g "$SPANEL_SITES_GROUP" -m 0750 /var/log/php 2>/dev/null || true
   install -d -o "$user" -g "$user" -m 0700 "$sess_dir"
   # PHP keeps uploaded files in this directory before WordPress renames them
   # into wp-content/uploads. Keep the directory private to the site user, but
@@ -9382,13 +9456,13 @@ EOF
     echo "websocket upgrade map present"
     ;;
 
-  # ---- managed application runtimes (node / docker) --------------------
+  # ---- managed application runtimes (node / python / docker) -----------
   site-app-write)
-    [[ $# -ge 3 ]] || deny "usage: site-app-write <owner-user> <name> <node|docker> [--flags]"
+    [[ $# -ge 3 ]] || deny "usage: site-app-write <owner-user> <name> <node|python|docker|compose> [--flags]"
     user="$1"; app_name="$2"; app_runtime="$3"; shift 3
     require_linux_user "$user"
     require_app_name "$app_name"
-    is_in "$app_runtime" node docker compose || deny "invalid runtime: $app_runtime"
+    is_in "$app_runtime" node python docker compose || deny "invalid runtime: $app_runtime"
     app_port=""; app_memory="512"; app_node_major=""
     app_exec=""; app_arg=""; app_image=""; app_container_port="3000"; app_cpus="1"
     while [[ $# -gt 0 ]]; do
@@ -9433,6 +9507,10 @@ EOF
       [[ "$app_arg" =~ ^[A-Za-z0-9._@/-]{1,120}$ ]] || deny "invalid start argument: $app_arg"
       write_node_app_unit "$unit_path" "$app_name" "$user" "$app_dir" "$env_file" \
         "$app_port" "$app_memory" "$app_node_major" "$app_exec" "$app_arg"
+    elif [[ "$app_runtime" == "python" ]]; then
+      [[ "$app_arg" =~ ^[A-Za-z0-9._:@/-]{1,120}$ ]] || deny "invalid Python start argument: $app_arg"
+      write_python_app_unit "$unit_path" "$app_name" "$user" "$app_dir" "$env_file" \
+        "$app_port" "$app_memory" "$app_exec" "$app_arg"
     else
       command -v docker >/dev/null 2>&1 || deny "Docker is not installed; run docker-install first"
       require_docker_image "$app_image"
@@ -9639,6 +9717,48 @@ EOF
       PATH="${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
       NODE_ENV=production \
       "${bin_dir}/npm" install --omit=dev --no-audit --no-fund --prefix "$app_dir"
+    ;;
+
+  site-app-python-deps)
+    [[ $# -eq 2 ]] || deny "usage: site-app-python-deps <owner-user> <name>"
+    user="$1"; app_name="$2"
+    require_linux_user "$user"
+    require_app_name "$app_name"
+    app_dir="$(ensure_app_directory "$user" "$app_name")"
+    venv_dir="${app_dir}/.venv"
+    if [[ ! -x "${venv_dir}/bin/python" ]]; then
+      runuser -u "$user" -- python3 -m venv "$venv_dir" \
+        || deny "failed to create Python virtualenv in ${venv_dir}"
+    fi
+    if [[ -f "${app_dir}/requirements.txt" ]]; then
+      exec timeout 900 runuser -u "$user" -- env -i \
+        HOME="${HOME_ROOT}/${user}" \
+        PATH="${venv_dir}/bin:/usr/local/bin:/usr/bin:/bin" \
+        "${venv_dir}/bin/pip" install --no-cache-dir -r "${app_dir}/requirements.txt"
+    elif [[ -f "${app_dir}/pyproject.toml" ]]; then
+      exec timeout 900 runuser -u "$user" -- env -i \
+        HOME="${HOME_ROOT}/${user}" \
+        PATH="${venv_dir}/bin:/usr/local/bin:/usr/bin:/bin" \
+        "${venv_dir}/bin/pip" install --no-cache-dir "$app_dir"
+    else
+      echo "Python virtualenv initialized at ${venv_dir} (no requirements.txt found)"
+    fi
+    ;;
+
+  site-app-git-pull)
+    [[ $# -eq 2 ]] || deny "usage: site-app-git-pull <owner-user> <name>"
+    user="$1"; app_name="$2"
+    require_linux_user "$user"
+    require_app_name "$app_name"
+    app_dir="$(ensure_app_directory "$user" "$app_name")"
+    if [[ -d "${app_dir}/.git" ]]; then
+      timeout 120 runuser -u "$user" -- env -i \
+        HOME="${HOME_ROOT}/${user}" \
+        PATH="/usr/local/bin:/usr/bin:/bin" \
+        git -C "$app_dir" pull --ff-only 2>&1 || true
+    else
+      echo "No .git repository detected in ${app_dir}; skipping git pull and proceeding with redeploy."
+    fi
     ;;
 
   site-app-compose-ps)
