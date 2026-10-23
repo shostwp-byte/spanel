@@ -1,9 +1,15 @@
+import datetime as dt
+import json
 import os
 import shutil
 import time
 from pathlib import Path
 
+from app.core.config import settings
 from app.services.shell import shell
+
+SELF_HEALING_FILE = Path("/var/lib/spanel/self-healing.json")
+FALLBACK_SELF_HEALING_FILE = Path(__file__).resolve().parent.parent.parent / ".spanel_self_healing.json"
 
 BASE_SERVICES = ("spanel-api", "nginx", "mariadb", "redis-server")
 OPTIONAL_SERVICES = ("fail2ban", "clamav-daemon", "exim4", "dovecot", "rspamd", "pdns", "maldet", "docker")
@@ -161,3 +167,252 @@ def install_wordpress_stack():
         "Installing the system stack from the panel is disabled. "
         "Run installer/install.sh on the server instead."
     )
+
+
+def _self_healing_path() -> Path:
+    try:
+        if SELF_HEALING_FILE.parent.exists() and os.access(SELF_HEALING_FILE.parent, os.W_OK):
+            return SELF_HEALING_FILE
+    except OSError:
+        pass
+    return FALLBACK_SELF_HEALING_FILE
+
+
+def _load_self_healing_data() -> dict:
+    path = _self_healing_path()
+    default_data = {
+        "enabled": True,
+        "validate_config_before_restart": True,
+        "auto_db_backup_enabled": True,
+        "max_restarts_per_hour": 5,
+        "last_check_at": None,
+        "last_healed_at": None,
+        "total_healed_count": 0,
+        "service_states": {},
+        "restart_history": {},
+        "events": [],
+    }
+    if not path.exists():
+        return default_data
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            default_data.update(raw)
+    except Exception:
+        pass
+    return default_data
+
+
+def _save_self_healing_data(data: dict) -> None:
+    path = _self_healing_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _validate_service_config(name: str) -> tuple[bool, str]:
+    if os.name == "nt" or settings.command_dry_run:
+        return True, "config syntax ok (dry-run)"
+    if name == "nginx" and shutil.which("nginx"):
+        res = shell.run(["nginx", "-t"], check=False)
+        if res.returncode != 0:
+            return False, (res.stderr or res.stdout or "nginx -t failed")[:240]
+        return True, "nginx -t syntax ok"
+    if name.startswith("php") and name.endswith("-fpm"):
+        ver = name.removeprefix("php").removesuffix("-fpm")
+        fpm_bin = f"/usr/sbin/php-fpm{ver}"
+        if Path(fpm_bin).exists():
+            res = shell.run([fpm_bin, "-t"], check=False)
+            if res.returncode != 0:
+                return False, (res.stderr or res.stdout or f"php-fpm{ver} -t failed")[:240]
+            return True, f"php-fpm{ver} -t syntax ok"
+    return True, "unit ready"
+
+
+def get_self_healing_status() -> dict:
+    data = _load_self_healing_data()
+    services = [s for s in list_services() if s != "spanel-api"]
+    if not data.get("service_states"):
+        states = {}
+        if os.name != "nt" and not settings.command_dry_run and services:
+            res = shell.run(["systemctl", "is-active", *services], check=False)
+            answers = (res.stdout or "").split()[: len(services)]
+            answers += ["unknown"] * (len(services) - len(answers))
+            for s, ans in zip(services, answers):
+                states[s] = ans
+        else:
+            for s in services:
+                states[s] = "active"
+        data["service_states"] = states
+    data["monitored_services"] = services
+    return data
+
+
+def update_self_healing_config(payload: dict) -> dict:
+    data = _load_self_healing_data()
+    if "enabled" in payload:
+        data["enabled"] = bool(payload["enabled"])
+    if "validate_config_before_restart" in payload:
+        data["validate_config_before_restart"] = bool(payload["validate_config_before_restart"])
+    if "auto_db_backup_enabled" in payload:
+        data["auto_db_backup_enabled"] = bool(payload["auto_db_backup_enabled"])
+    if "max_restarts_per_hour" in payload:
+        data["max_restarts_per_hour"] = max(1, min(20, int(payload["max_restarts_per_hour"])))
+    _save_self_healing_data(data)
+    return get_self_healing_status()
+
+
+def clear_self_healing_logs() -> dict:
+    data = _load_self_healing_data()
+    data["events"] = []
+    _save_self_healing_data(data)
+    return get_self_healing_status()
+
+
+def run_self_healing_check(reason: str = "manual") -> dict:
+    data = _load_self_healing_data()
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    now_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_ts = time.time()
+
+    services = [s for s in list_services() if s != "spanel-api"]
+    if os.name != "nt" and not settings.command_dry_run and services:
+        res = shell.run(["systemctl", "is-active", *services], check=False)
+        answers = (res.stdout or "").split()[: len(services)]
+        answers += ["unknown"] * (len(services) - len(answers))
+    else:
+        answers = ["active"] * len(services)
+
+    states = {}
+    healed_now = []
+    failed_now = []
+    restart_history = dict(data.get("restart_history") or {})
+    max_per_hour = int(data.get("max_restarts_per_hour") or 5)
+    should_heal = bool(data.get("enabled", True)) or reason == "manual"
+
+    for name, answer in zip(services, answers):
+        if answer == "active":
+            states[name] = "active"
+            continue
+
+        states[name] = answer
+        if not should_heal:
+            continue
+
+        # Prune restart timestamps older than 1 hour
+        recent_ts = [float(t) for t in (restart_history.get(name) or []) if now_ts - float(t) < 3600]
+        if len(recent_ts) >= max_per_hour and reason != "manual":
+            event = {
+                "timestamp": now_iso,
+                "service": name,
+                "previous_state": answer,
+                "action": "circuit_breaker_tripped",
+                "recovered": False,
+                "reason": reason,
+                "detail": f"Exceeded {max_per_hour} restarts/hour safety cap; manual inspection required.",
+            }
+            data.setdefault("events", []).insert(0, event)
+            failed_now.append(name)
+            continue
+
+        if data.get("validate_config_before_restart", True):
+            cfg_ok, cfg_detail = _validate_service_config(name)
+            if not cfg_ok:
+                event = {
+                    "timestamp": now_iso,
+                    "service": name,
+                    "previous_state": answer,
+                    "action": "config_check_failed",
+                    "recovered": False,
+                    "reason": reason,
+                    "detail": f"Pre-restart syntax check failed: {cfg_detail}",
+                }
+                data.setdefault("events", []).insert(0, event)
+                failed_now.append(name)
+                continue
+        else:
+            cfg_detail = "syntax check skipped"
+
+        try:
+            act_res = service_action(name, "restart")
+            recent_ts.append(now_ts)
+            restart_history[name] = recent_ts
+            verify_res = shell.run(["systemctl", "is-active", name], check=False)
+            recovered = (verify_res.stdout or "").strip() == "active"
+            states[name] = "active" if recovered else "failed"
+            detail_msg = f"Auto-restarted ({cfg_detail}) -> {'ACTIVE' if recovered else 'FAILED'}"
+            if not recovered and act_res.stderr:
+                detail_msg += f" | {act_res.stderr.strip()[:160]}"
+        except Exception as exc:
+            recovered = False
+            detail_msg = f"Exception during restart: {exc}"
+
+        event = {
+            "timestamp": now_iso,
+            "service": name,
+            "previous_state": answer,
+            "action": "auto_restart",
+            "recovered": recovered,
+            "reason": reason,
+            "detail": detail_msg,
+        }
+        data.setdefault("events", []).insert(0, event)
+        if recovered:
+            healed_now.append(name)
+            data["total_healed_count"] = int(data.get("total_healed_count") or 0) + 1
+            data["last_healed_at"] = now_iso
+        else:
+            failed_now.append(name)
+
+    # Periodic SQLite Hot Backup check (every 6 hours)
+    if data.get("auto_db_backup_enabled", True):
+        try:
+            from app.core.database import get_sqlite_health, run_sqlite_hot_backup
+
+            db_health = get_sqlite_health()
+            need_backup = False
+            if db_health.get("backup_count", 0) == 0:
+                need_backup = True
+            elif db_health.get("last_backup_at"):
+                try:
+                    last_dt = dt.datetime.strptime(db_health["last_backup_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+                    if (now_utc - last_dt).total_seconds() >= 21600:
+                        need_backup = True
+                except Exception:
+                    pass
+            if need_backup:
+                run_sqlite_hot_backup(reason="watchdog")
+        except Exception:
+            pass
+
+    data["last_check_at"] = now_iso
+    data["service_states"] = states
+    data["restart_history"] = restart_history
+    data["events"] = (data.get("events") or [])[:100]
+    _save_self_healing_data(data)
+
+    if healed_now or failed_now:
+        try:
+            from app.services import notifications
+
+            if healed_now:
+                notifications.notify(
+                    "service_down",
+                    {"services": healed_now, "recovered": True, "self_healed": True},
+                    admins=True,
+                )
+            if failed_now:
+                notifications.notify(
+                    "service_down",
+                    {"services": failed_now, "recovered": False, "self_healed": False},
+                    admins=True,
+                )
+        except Exception:
+            pass
+
+    result = get_self_healing_status()
+    result["healed_now"] = healed_now
+    result["failed_now"] = failed_now
+    return result

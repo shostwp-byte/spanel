@@ -522,7 +522,6 @@ panel_snapshot_restore() {
   fi
 
   rm -rf "$work"
-  rm -rf /var/lib/spanel/update-state 2>/dev/null || true
   systemctl restart spanel-api >/dev/null 2>&1 || true
   systemctl reload nginx >/dev/null 2>&1 || true
   echo "restored=${snap_id}"
@@ -9317,7 +9316,10 @@ EOF
       runuser -u "$user" --
     )
     if [[ -n "$terminal_timeout" ]] && command -v timeout >/dev/null 2>&1; then
-      terminal_runner=(timeout --signal=TERM --kill-after=10 "${terminal_timeout}" runuser -u "$user" --)
+      terminal_runner=(
+        timeout --signal=TERM --kill-after=10 "${terminal_timeout}"
+        "${terminal_runner[@]}"
+      )
     fi
 
     # Whitelist of allowed commands for terminal access. Keep this in sync with
