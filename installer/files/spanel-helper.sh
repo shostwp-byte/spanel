@@ -405,6 +405,53 @@ run_os_update() {
   echo "OS update started in background. Log: /var/log/spanel-os-update.log"
 }
 
+upgrade_core_stack_packages() {
+  export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
+  local valid_pkgs=() pkg need_nginx_check=0
+  for pkg in "$@"; do
+    case "$pkg" in
+      nginx)
+        valid_pkgs+=("nginx")
+        need_nginx_check=1
+        ;;
+      mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|postfix|dovecot-core|rspamd|openssl|fail2ban)
+        valid_pkgs+=("$pkg")
+        ;;
+      *)
+        deny "core stack package not allowed: $pkg"
+        ;;
+    esac
+  done
+  [[ ${#valid_pkgs[@]} -gt 0 ]] || deny "no core stack packages specified"
+
+  if [[ "$need_nginx_check" -eq 1 ]] && command -v nginx >/dev/null 2>&1; then
+    nginx -t >/dev/null 2>&1 || deny "nginx -t pre-upgrade configuration test failed"
+  fi
+
+  apt-mark unhold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
+  apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true
+  local upgrade_rc=0
+  apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
+  apt-mark hold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
+
+  [[ "$upgrade_rc" -eq 0 ]] || deny "apt-get --only-upgrade failed for core stack packages"
+
+  if [[ "$need_nginx_check" -eq 1 ]] && command -v nginx >/dev/null 2>&1; then
+    nginx -t >/dev/null 2>&1 || deny "nginx -t post-upgrade configuration test failed"
+    systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+
+  echo "Core stack packages selectively upgraded and pinned: ${valid_pkgs[*]}"
+}
+
+ensure_cron_jail_binary() {
+  local src="${APP_DIR}/installer/files/spanel-cron-jail.sh"
+  local dst="/usr/local/bin/spanel-cron-jail"
+  if [[ -f "$src" ]]; then
+    install -o root -g root -m 0755 "$src" "$dst" 2>/dev/null || true
+  fi
+}
+
 
 PANEL_SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
 
@@ -522,6 +569,7 @@ panel_snapshot_restore() {
   fi
 
   rm -rf "$work"
+  rm -rf /var/lib/spanel/update-state 2>/dev/null || true
   systemctl restart spanel-api >/dev/null 2>&1 || true
   systemctl reload nginx >/dev/null 2>&1 || true
   echo "restored=${snap_id}"
@@ -4016,7 +4064,12 @@ upgrade_php_version() {
     [[ -n "$pkg" ]] && installed_pkgs+=("$pkg")
   done < <(dpkg-query -W -f='${Package}\t${Status}\n' "php${version}-*" "php${version}" 2>/dev/null | awk -F'\t' '$2 == "install ok installed" {print $1}')
   if [[ ${#installed_pkgs[@]} -gt 0 ]]; then
-    apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${installed_pkgs[@]}" || deny "Failed to upgrade PHP ${version} packages"
+    apt-mark unhold "${installed_pkgs[@]}" >/dev/null 2>&1 || true
+    apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${installed_pkgs[@]}" || {
+      apt-mark hold "${installed_pkgs[@]}" >/dev/null 2>&1 || true
+      deny "Failed to upgrade PHP ${version} packages"
+    }
+    apt-mark hold "${installed_pkgs[@]}" >/dev/null 2>&1 || true
   fi
   if command -v "php-fpm${version}" >/dev/null 2>&1; then
     "php-fpm${version}" -t >/dev/null 2>&1 || deny "php-fpm${version} configuration test failed after upgrade"
@@ -7613,6 +7666,17 @@ case "$cmd" in
     run_os_update
     ;;
 
+  updates-core-stack-patch)
+    [[ $# -ge 1 ]] || deny "usage: updates-core-stack-patch <pkg> [pkg...]"
+    upgrade_core_stack_packages "$@"
+    ;;
+
+  watchdog-run)
+    if [[ -x "${APP_DIR}/backend/.venv/bin/python" ]]; then
+      exec "${APP_DIR}/backend/.venv/bin/python" -c "from app.services.system import run_self_healing_check; import json; print(json.dumps(run_self_healing_check(reason='systemd-timer')))"
+    fi
+    ;;
+
   updates-os-auto)
     [[ $# -eq 3 ]] || deny "usage: updates-os-auto <on|off> <security|all> <on|off>"
     configure_unattended_upgrades "$1" "$2" "$3"
@@ -9268,6 +9332,7 @@ EOF
     # crontab content is fed via stdin
     user="${1:-www-data}"
     if [[ "$user" != "www-data" ]]; then require_linux_user "$user"; fi
+    ensure_cron_jail_binary
     exec runuser -u "$user" -- crontab -
     ;;
 
@@ -9390,7 +9455,10 @@ EOF
       runuser -u "$user" --
     )
     if [[ -n "$terminal_timeout" ]] && command -v timeout >/dev/null 2>&1; then
-      terminal_runner=(timeout --signal=TERM --kill-after=10 "${terminal_timeout}" runuser -u "$user" --)
+      terminal_runner=(
+        timeout --signal=TERM --kill-after=10 "${terminal_timeout}"
+        "${terminal_runner[@]}"
+      )
     fi
 
     # Whitelist of allowed commands for terminal access. Keep this in sync with

@@ -325,7 +325,22 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(128))
     target: Mapped[str] = mapped_column(String(255))
     detail: Mapped[str] = mapped_column(Text, default="")
+    prev_hash: Mapped[str] = mapped_column(String(64), default="")
+    entry_hash: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class WatchdogIncident(Base):
+    __tablename__ = "watchdog_incidents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    service: Mapped[str] = mapped_column(String(64), index=True)
+    previous_state: Mapped[str] = mapped_column(String(32), default="failed")
+    action: Mapped[str] = mapped_column(String(64), default="auto_restart")
+    recovered: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str] = mapped_column(String(64), default="background")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class RevokedToken(Base):

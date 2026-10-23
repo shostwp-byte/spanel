@@ -1,0 +1,11 @@
+[Unit]
+Description=SPanel Autonomous Self-Healing Service Watchdog
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/spanel/backend
+ExecStart=/usr/local/sbin/spanel-helper watchdog-run
+StandardOutput=journal
+StandardError=journal

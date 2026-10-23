@@ -1,0 +1,12 @@
+[Unit]
+Description=Run SPanel Self-Healing Service Watchdog every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+Unit=spanel-watchdog.service
+
+[Install]
+WantedBy=timers.target

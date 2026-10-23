@@ -64,7 +64,12 @@ def save_state(state: dict) -> None:
 # --- every run --------------------------------------------------------------
 
 def check_services(state: dict) -> None:
-    from app.services.system import list_services
+    from app.services.system import list_services, run_self_healing_check
+
+    try:
+        run_self_healing_check(reason="notify_watch")
+    except Exception:
+        pass
 
     names = list_services()
     result = shell.run(["systemctl", "is-active", *names], check=False)

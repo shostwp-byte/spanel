@@ -12,9 +12,13 @@ PHP_VERSION_RE = re.compile(r"^\d\.\d$")
 PHP_INTERPRETER_RE = re.compile(r"^php(?:\d\.\d)?$")
 PHP_BIN_DIR = Path("/usr/bin")
 WP_CLI_PATH = Path("/usr/local/bin/wp")
+CRON_JAIL_BIN = "/usr/local/bin/spanel-cron-jail"
 # Matches the interpreter token of an already installed cron line so it can be
 # repointed when the website switches PHP version.
-CRON_PHP_TOKEN_RE = re.compile(r"(&&\s+)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)")
+CRON_PHP_TOKEN_RE = re.compile(
+    r"(&&\s+(?:/usr/local/bin/spanel-cron-jail\s+.+?\s+--\s+)?)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)"
+)
+CRON_JAIL_PREFIX_RE = re.compile(r"^/usr/local/bin/spanel-cron-jail\s+.+?\s+--\s+")
 # `>file`, `>>file` and `2>file` open a target; `2>&1` / `1>&2` only duplicate a
 # descriptor. Cron executes commands with /bin/sh, so bash-only forms such as
 # `&>` are rejected instead of silently doing nothing.
@@ -30,6 +34,10 @@ ALLOWED_COMMAND_PREFIXES = (
     ("wp", "theme", "update", "--all"),
 )
 ALLOWED_PHP_OPTIONS = {"-q"}
+CRON_DISABLED_FUNCTIONS = (
+    "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,dl,"
+    "posix_kill,posix_mkfifo,posix_setpgid,posix_setsid,posix_setuid"
+)
 
 
 def _validate_schedule(schedule: str) -> str:
@@ -159,8 +167,9 @@ def _validate_php_command(
     resolved = [
         php_bin,
         "-d", f"open_basedir={open_basedir_for(cron_user)}",
+        "-d", f"disable_functions={CRON_DISABLED_FUNCTIONS}",
         *args[1:script_index],
-        str(candidate),
+        candidate.as_posix(),
         *args[script_index + 1:],
     ]
     return " ".join(shlex.quote(arg) for arg in resolved)
@@ -272,19 +281,20 @@ def _parse_cron_line(index: int, line: str) -> dict:
     command = re.sub(r"\s+#\s*spanel:[^\s]+\s*$", "", command).strip()
     if command.startswith("cd ") and " && " in command:
         command = command.split(" && ", 1)[1].strip()
+    command = CRON_JAIL_PREFIX_RE.sub("", command).strip()
     command = _unescape_percent(command).replace(" --allow-root", "").strip()
     command = _strip_open_basedir(command)
     return {"index": index, "schedule": schedule, "command": command, "line": line}
 
 
 def _strip_open_basedir(command: str) -> str:
-    """Hide the confinement flag the renderer adds.
+    """Hide the confinement flags the renderer adds.
 
-    add_cron emits `php -d open_basedir=... script.php`. Without this the flag
-    would come back through the UI and be re-submitted, and _validate_php_command
-    would reject it - ALLOWED_PHP_OPTIONS is {"-q"}, so `-d` is not an option a
-    caller may pass. It is ours to add, not the customer's, so it is ours to
-    take back out.
+    add_cron emits `php -d open_basedir=... -d disable_functions=... script.php`.
+    Without this the flags would come back through the UI and be re-submitted,
+    and _validate_php_command would reject them - ALLOWED_PHP_OPTIONS is {"-q"},
+    so `-d` is not an option a caller may pass. They are ours to add, not the
+    customer's, so they are ours to take back out.
     """
     try:
         args = shlex.split(command)
@@ -296,10 +306,12 @@ def _strip_open_basedir(command: str) -> str:
         if skip_next:
             skip_next = False
             continue
-        if arg == "-d" and i + 1 < len(args) and args[i + 1].startswith("open_basedir="):
+        if arg == "-d" and i + 1 < len(args) and (
+            args[i + 1].startswith("open_basedir=") or args[i + 1].startswith("disable_functions=")
+        ):
             skip_next = True
             continue
-        if arg.startswith("-dopen_basedir="):
+        if arg.startswith("-dopen_basedir=") or arg.startswith("-ddisable_functions="):
             continue
         cleaned.append(arg)
     if cleaned == args:
@@ -318,7 +330,12 @@ def add_cron(website: Website, schedule: str, command: str) -> str:
     )
     safe_domain = _validate_domain(website.domain)
     marker = f"# spanel:{safe_domain}"
-    line = f"{safe_schedule} cd {shlex.quote(str(document_root))} && {_escape_percent(safe_command)} {marker}"
+    doc_root_str = str(document_root)
+    if cron_user != "www-data":
+        jail_prefix = f"{CRON_JAIL_BIN} {shlex.quote(cron_user)} {shlex.quote(doc_root_str)} -- "
+    else:
+        jail_prefix = ""
+    line = f"{safe_schedule} cd {shlex.quote(doc_root_str)} && {jail_prefix}{_escape_percent(safe_command)} {marker}"
     if cron_user != "www-data":
         runtime_php_version = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
         site_users.ensure_site_runtime(website.domain, website.root_path, runtime_php_version, cron_user)
@@ -403,3 +420,94 @@ def retarget_php_binary(website: Website) -> int:
         fallback=["bash", "-lc", "crontab -"],
     )
     return changed
+
+
+def cron_security_status(db) -> dict:
+    """Inspect all websites' cron jobs and report confinement coverage."""
+    websites = db.query(Website).all()
+    total_jobs = 0
+    confined_jobs = 0
+    unconfined_jobs = 0
+    items = []
+    seen_users: dict[str, list[str]] = {}
+
+    for site in websites:
+        c_user = cron_user_for_website(site)
+        if c_user not in seen_users:
+            try:
+                seen_users[c_user] = list_cron_all(c_user).splitlines()
+            except Exception:
+                seen_users[c_user] = []
+        marker = f"spanel:{_validate_domain(site.domain)}"
+        for idx, line in enumerate(seen_users[c_user]):
+            if marker not in line:
+                continue
+            total_jobs += 1
+            has_open_basedir = "open_basedir=" in line
+            is_wp_cli = str(WP_CLI_PATH) in line or " wp " in line
+            has_disable_funcs = "disable_functions=" in line or is_wp_cli
+            has_namespace_jail = CRON_JAIL_BIN in line
+            fully_confined = bool(
+                has_open_basedir and has_disable_funcs and has_namespace_jail and c_user != "www-data"
+            )
+            if fully_confined:
+                confined_jobs += 1
+            else:
+                unconfined_jobs += 1
+            parsed = _parse_cron_line(idx, line)
+            items.append({
+                "domain": site.domain,
+                "linux_user": c_user,
+                "schedule": parsed["schedule"],
+                "command": parsed["command"],
+                "has_open_basedir": has_open_basedir,
+                "has_disable_functions": has_disable_funcs,
+                "has_namespace_jail": has_namespace_jail,
+                "fully_confined": fully_confined,
+            })
+
+    return {
+        "total_jobs": total_jobs,
+        "confined_jobs": confined_jobs,
+        "unconfined_jobs": unconfined_jobs,
+        "disabled_functions": CRON_DISABLED_FUNCTIONS,
+        "namespace_isolation": True,
+        "jail_wrapper": CRON_JAIL_BIN,
+        "items": items[:100],
+    }
+
+
+def enforce_all_cron_confinement(db) -> dict:
+    """Re-render and upgrade all existing website cron jobs with full confinement."""
+    websites = db.query(Website).all()
+    upgraded = 0
+    checked = 0
+    for site in websites:
+        c_user = cron_user_for_website(site)
+        try:
+            entries = list_cron_entries(site.domain, c_user)
+        except Exception:
+            continue
+        if not entries:
+            continue
+        # Delete and re-add any entry that isn't already fully confined
+        for entry in entries:
+            checked += 1
+            raw_line = entry.get("line", "")
+            is_wp = str(WP_CLI_PATH) in raw_line or " wp " in raw_line
+            if (
+                "open_basedir=" in raw_line
+                and ("disable_functions=" in raw_line or is_wp)
+                and (CRON_JAIL_BIN in raw_line or c_user == "www-data")
+            ):
+                continue
+            try:
+                delete_cron(site.domain, 0, c_user)
+                add_cron(site, entry["schedule"], entry["command"])
+                upgraded += 1
+            except Exception:
+                continue
+    status = cron_security_status(db)
+    status["upgraded_jobs"] = upgraded
+    status["checked_jobs"] = checked
+    return status

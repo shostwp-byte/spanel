@@ -17,8 +17,8 @@ from app.schemas.schemas import (
     PanelSslInstall,
     PanelSslUseDomain,
 )
-from app.services import panel_ipv6, panel_settings, site_users
-from app.services.audit import log_action
+from app.services import cron, panel_ipv6, panel_settings, site_users
+from app.services.audit import list_audit_logs, log_action, verify_audit_chain
 
 
 router = APIRouter(prefix="/panel-settings", tags=["panel-settings"])
@@ -236,6 +236,65 @@ def toggle_ipv6(
     settings_out = panel_settings.current_settings()
     settings_out["message"] = result.get("message")
     return settings_out
+
+
+@router.get("/audit-logs")
+def get_audit_logs(
+    q: str = "",
+    action_filter: str = "",
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    return list_audit_logs(db, q=q, action_filter=action_filter, limit=limit)
+
+
+@router.post("/audit-logs/verify")
+def verify_audit_logs_chain(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    res = verify_audit_chain(db, seal_unhashed=True)
+    log_action(
+        db,
+        current_user.id,
+        "verify_audit_chain",
+        "audit_logs",
+        detail=f"valid={res.get('valid')} total={res.get('total_entries')}",
+        request=request,
+    )
+    return verify_audit_chain(db, seal_unhashed=True)
+
+
+@router.get("/cron-security")
+def get_cron_security(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    return cron.cron_security_status(db)
+
+
+@router.post("/cron-security/enforce")
+def enforce_cron_security(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    res = cron.enforce_all_cron_confinement(db)
+    log_action(
+        db,
+        current_user.id,
+        "enforce_cron_confinement",
+        "cron",
+        detail=f"upgraded={res.get('upgraded_jobs', 0)} total={res.get('total_jobs', 0)}",
+        request=request,
+    )
+    return res
 
 
 
