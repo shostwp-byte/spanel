@@ -15,7 +15,7 @@ from app.api.provisioning import _get_provisioning_token
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role
 from app.models.entities import ApiToken, User
-from app.services import backup, cluster_dns, cluster_peer, cluster_transfer, cluster_worker, multi_server
+from app.services import backup, cluster_dns, cluster_peer, cluster_placement, cluster_transfer, cluster_worker, multi_server
 from app.services.audit import log_action
 from app.services.provisioning import create_api_token
 
@@ -377,6 +377,18 @@ def dns_sync_retry(row_id: int, db: Session = Depends(get_db), current_user: Use
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     cluster_worker.kick()
     return {"ok": True}
+
+
+@router.get("/placement")
+def placement_suggestion(
+    purpose: str = Query(default="account", pattern="^(account|transfer)$"),
+    user_id: Optional[int] = Query(default=None, ge=1),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Which node a new account (or the account being moved) is best placed on."""
+    ensure_role(current_user.role, Role.admin)
+    return cluster_placement.suggest_node(db, purpose=purpose, user_id=user_id)
 
 
 @router.get("/transfers")
