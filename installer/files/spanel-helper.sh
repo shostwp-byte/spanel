@@ -1742,6 +1742,12 @@ MAIL_SIEVE_DIR="/etc/dovecot/spanel-sieve"
 MAIL_SETTINGS_FILE="/etc/exim4/spanel/settings.json"
 MAIL_UNBOUND_PORT="5335"
 MAIL_UNBOUND_CONF="/etc/unbound/unbound.conf.d/spanel-mail.conf"
+# Renders and checks what the Email commands below write (installer/files/
+# spanel_mailtool.py, installed root-owned by install.sh and update.sh).
+MAIL_TOOL_DIR="/usr/local/lib/spanel"
+MAIL_TOOL="${MAIL_TOOL_DIR}/spanel_mailtool.py"
+# A mailbox's autoresponder, written by mail-sync into the mailbox's home.
+MAIL_VACATION_SCRIPT="spanel-vacation.sieve"
 
 mail_port_taken() {
   # "<port> (<program>)" for each mail port some other program already holds.
@@ -2436,6 +2442,9 @@ plugin {
   quota_grace = 10%%
   # Mail the spam filter marked goes to Junk, before anything of the mailbox's own.
   sieve_before = ${MAIL_SIEVE_DIR}/spam-to-junk.sieve
+  # Then the mailbox's autoresponder, which mail-sync writes into its home
+  # from the panel's list; a mailbox without one has no such file.
+  sieve_before2 = ~/${MAIL_VACATION_SCRIPT}
 }
 
 protocol imap {
@@ -2768,26 +2777,29 @@ mail_sync() {
   #    "forwarders": [{"address", "to": [...]}],
   #    "senders": {mailbox: [domains it may send as]},
   #    "local_senders": {linux user: [domains its PHP mail is signed for]},
-  #    "relay_routes": {domain: relay id or "direct"}, "default_relay": id}
+  #    "relay_routes": {domain: relay id or "direct"}, "default_relay": id,
+  #    "autoresponders": [{"address", "subject", "body", "start", "end", "days"}]}
   # Every field is checked again here and nothing is written unless all of it
   # passes. Writes what Exim and Dovecot read, makes missing mail directories
-  # and DKIM keys, and prints each domain's DKIM public key. Neither service
+  # and DKIM keys, writes each mailbox's autoresponder (a Sieve vacation in
+  # its home), and prints each domain's DKIM public key. Neither service
   # needs a reload: both notice a changed file on the next lookup.
   [[ -f "$MAIL_EXIM_CONF" ]] || deny "the Email addon is not installed"
   local payload status=0
   payload="$(mktemp)"
   head -c 8000000 >"$payload"
-  python3 - "$payload" "$MAIL_EXIM_DIR" "$MAIL_DOVECOT_DIR" <<'PY' || status=$?
+  python3 - "$payload" "$MAIL_EXIM_DIR" "$MAIL_DOVECOT_DIR" "$MAIL_TOOL_DIR" "$MAIL_VACATION_SCRIPT" <<'PY' || status=$?
 import base64
 import grp
 import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 
-payload_path, exim_dir, dovecot_dir = sys.argv[1:4]
+payload_path, exim_dir, dovecot_dir, tool_dir, vacation_name = sys.argv[1:6]
 
 DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 LOCAL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
@@ -2923,6 +2935,22 @@ if default_relay:
         fail(f"invalid default relay {default_relay!r}")
     routes.append(f"*: {default_relay}")
 
+# Autoresponders, rendered (and checked again) by the mail tool.
+vacations = {}
+if data.get("autoresponders"):
+    sys.path.insert(0, tool_dir)
+    try:
+        import spanel_mailtool
+    except ImportError:
+        fail(f"{tool_dir}/spanel_mailtool.py is missing - run the SPanel update again")
+    try:
+        vacations = spanel_mailtool.vacation_scripts(data.get("autoresponders"))
+    except spanel_mailtool.ToolError as exc:
+        fail(str(exc))
+    for address in vacations:
+        if address not in seen:
+            fail(f"autoresponder for {address}, which is not a mailbox")
+
 exim_gid = grp.getgrnam("Debian-exim").gr_gid
 dovecot_gid = grp.getgrnam("dovecot").gr_gid
 spanel_gid = grp.getgrnam("spanel").gr_gid
@@ -2946,6 +2974,47 @@ def open_dir(parent_fd, name, uid, gid, mode):
     return fd
 
 
+def put_vacation(box_fd, box):
+    """The mailbox's autoresponder script, or none. The mailbox directory is
+    its owner's, who could plant a link or a FIFO under either name: nothing
+    is followed or read that is not a plain file, and a failure is that
+    mailbox's alone - it never stops the sync of everyone else."""
+    script = vacations.get(box["address"])
+    try:
+        if script is None:
+            for name in (vacation_name, vacation_name[:-len(".sieve")] + ".svbin"):
+                try:
+                    os.unlink(name, dir_fd=box_fd)
+                except FileNotFoundError:
+                    pass
+            return
+        wanted = script.encode()
+        try:
+            fd = os.open(vacation_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=box_fd)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode) and os.read(fd, len(wanted) + 1) == wanted:
+                    return
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        tmp = "." + vacation_name + ".new"
+        try:
+            os.unlink(tmp, dir_fd=box_fd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=box_fd)
+        try:
+            os.fchown(fd, box["uid"], spanel_gid)
+            os.fchmod(fd, 0o640)
+            os.write(fd, wanted)
+        finally:
+            os.close(fd)
+        os.replace(tmp, vacation_name, src_dir_fd=box_fd, dst_dir_fd=box_fd)
+    except OSError as exc:
+        print(f"spanel-helper: mail-sync: autoresponder of {box['address']} not written: {exc}", file=sys.stderr)
+
+
 for box in boxes:
     # /home/<user> is root's (the SFTP chroot); mail/ and mail/<domain>/ are
     # root's too, so the customer cannot rearrange them. From the mailbox down
@@ -2960,6 +3029,7 @@ for box in boxes:
         fds.append(open_dir(fds[-1], "Maildir", box["uid"], spanel_gid, 0o2750))
         for part in ("cur", "new", "tmp"):
             os.close(open_dir(fds[-1], part, box["uid"], spanel_gid, 0o2750))
+        put_vacation(fds[3], box)
     finally:
         for fd in reversed(fds):
             os.close(fd)
@@ -3034,7 +3104,8 @@ for line in denied:
     if address not in previously_denied:
         subprocess.run(["doveadm", "kick", address], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
-print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim}))
+print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim,
+                  "autoresponders": len(vacations)}))
 PY
   rm -f "$payload"
   [[ $status -eq 0 ]] || exit "$status"
@@ -3550,6 +3621,24 @@ PY
     setsid exim4 -qf >/dev/null 2>&1 < /dev/null &
   fi
   echo "Mail settings applied."
+}
+
+mail_reconfigure() {
+  # An update brought a newer helper: Exim's and Dovecot's configuration and
+  # the Sieve scripts are written again from what is saved, so a server
+  # installed before a feature gets it without reinstalling the addon.
+  # Nothing to do where the addon was never installed.
+  if [[ ! -f "$MAIL_EXIM_CONF" ]] || ! grep -qF "$MAIL_MARKER" "$MAIL_EXIM_CONF"; then
+    echo "The Email addon is not installed; nothing to reconfigure."
+    return 0
+  fi
+  mail_ensure_maps
+  mail_write_exim_conf
+  mail_write_sieve
+  mail_write_dovecot_conf
+  if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
+  if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
+  echo "Mail configuration rewritten."
 }
 
 mail_dkim() {
@@ -8014,6 +8103,11 @@ case "$cmd" in
   mail-configure)
     [[ $# -eq 0 ]] || deny "usage: mail-configure < settings.json"
     mail_configure
+    ;;
+
+  mail-reconfigure)
+    [[ $# -eq 0 ]] || deny "usage: mail-reconfigure"
+    mail_reconfigure
     ;;
 
   mail-dkim)

@@ -67,13 +67,23 @@ class ForwarderUpdate(BaseModel):
 class AutoresponderIn(BaseModel):
     domain_id: int = Field(gt=0)
     local_part: str = Field(min_length=1, max_length=64)
-    subject: str = Field(max_length=255)
-    body: str = Field()
+    subject: str = Field(max_length=mail.AUTORESPONDER_SUBJECT_MAX)
+    body: str = Field(max_length=mail.AUTORESPONDER_BODY_MAX + 200)
+    enabled: bool = True
+    # YYYY-MM-DD; empty is open-ended.
+    start_date: str = Field(default="", max_length=10)
+    end_date: str = Field(default="", max_length=10)
+    interval_days: int = Field(default=1, ge=1, le=30)
 
 
 class AutoresponderUpdate(BaseModel):
-    subject: str = Field(max_length=255)
-    body: str = Field()
+    subject: str = Field(max_length=mail.AUTORESPONDER_SUBJECT_MAX)
+    body: str = Field(max_length=mail.AUTORESPONDER_BODY_MAX + 200)
+    # None keeps what is saved (an older page sends only subject and body).
+    enabled: bool | None = None
+    start_date: str | None = Field(default=None, max_length=10)
+    end_date: str | None = Field(default=None, max_length=10)
+    interval_days: int | None = Field(default=None, ge=1, le=30)
 
 
 class DnsRecordIn(BaseModel):
@@ -314,19 +324,23 @@ def get_autoresponders(domain_id: int | None = None, q: str = "", page: int = 1,
 def post_autoresponder(payload: AutoresponderIn, request: Request, db: Session = Depends(get_db),
                        current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.end_user)
-    row = _answer(lambda: mail.create_autoresponder(db, current_user, payload.domain_id, payload.local_part,
-                                                    payload.subject, payload.body))
+    row = _answer(lambda: mail.create_autoresponder(
+        db, current_user, payload.domain_id, payload.local_part, payload.subject, payload.body,
+        enabled=payload.enabled, start_date=payload.start_date, end_date=payload.end_date,
+        interval_days=payload.interval_days))
     log_action(db, current_user.id, "mail_autoresponder_create", row.address, row.subject, request=request)
-    return {"id": row.id, "address": row.address, "subject": row.subject}
+    return {"id": row.id, "address": row.address, "subject": row.subject, "enabled": row.enabled}
 
 
 @router.put("/autoresponders/{autoresponder_id}")
 def put_autoresponder(autoresponder_id: int, payload: AutoresponderUpdate, request: Request, db: Session = Depends(get_db),
                       current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.end_user)
-    row = _answer(lambda: mail.update_autoresponder(db, current_user, autoresponder_id, payload.subject, payload.body))
+    row = _answer(lambda: mail.update_autoresponder(
+        db, current_user, autoresponder_id, payload.subject, payload.body, enabled=payload.enabled,
+        start_date=payload.start_date, end_date=payload.end_date, interval_days=payload.interval_days))
     log_action(db, current_user.id, "mail_autoresponder_update", row.address, row.subject, request=request)
-    return {"id": row.id, "address": row.address, "subject": row.subject}
+    return {"id": row.id, "address": row.address, "subject": row.subject, "enabled": row.enabled}
 
 
 @router.delete("/autoresponders/{autoresponder_id}")

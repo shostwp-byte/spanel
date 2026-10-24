@@ -1563,6 +1563,11 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
     if [[ -f "$SOURCE_DIR/installer/files/spanel-cron-jail.sh" ]]; then
       install -m 0755 -o root -g root "$SOURCE_DIR/installer/files/spanel-cron-jail.sh" /usr/local/bin/spanel-cron-jail
     fi
+    # The Email addon's renderer: root's, read by the helper only.
+    if [[ -f "$SOURCE_DIR/installer/files/spanel_mailtool.py" ]]; then
+      install -d -m 0755 -o root -g root /usr/local/lib/spanel
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel_mailtool.py" /usr/local/lib/spanel/spanel_mailtool.py
+    fi
     if [[ -f "$SOURCE_DIR/installer/files/spanel_webshells.yar" ]]; then
       install -d -m 0755 -o root -g spanel /etc/spanel/yara
       install -m 0644 -o root -g spanel "$SOURCE_DIR/installer/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
@@ -1619,6 +1624,14 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
     # that refusal exactly the way it hid the memory guard's.
     if [[ -f /etc/clamav/clamd.conf ]]; then
       sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper clamav-tune >/dev/null ||         echo "  (warning: could not raise clamd's scan limits; large uploads stay unscanned)"
+    fi
+    # The Email addon's Exim and Dovecot configuration follows the new helper
+    # (autoresponders, DKIM selectors, per-domain certificates, spam
+    # training, quota warnings). A no-op where the addon is not installed.
+    if [[ -f /etc/exim4/spanel/settings.json ]]; then
+      log "Refreshing the Email addon's configuration"
+      sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper mail-reconfigure >/dev/null || \
+        echo "  (warning: could not rewrite the mail configuration; the previous one stays in force)"
     fi
     # The helper is fresh now, so the clock unit can run without flashing
     # up as a failed unit first.

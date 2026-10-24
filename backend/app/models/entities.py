@@ -753,7 +753,31 @@ class MailDomain(Base):
     # Outgoing mail: "" follows the server's default relay, "direct" sends
     # without one, anything else is the id of a relay.
     relay: Mapped[str] = mapped_column(String(40), default="")
-    # An administrator's own DNS values for it, JSON: {"spf", "dmarc", "records"}.
+    # DKIM with two selectors (mail.py, "DKIM rotation"): mail is signed with
+    # dkim_selector; a rotation first publishes dkim_next_* and only signs with
+    # it once DNS shows it, then keeps dkim_old_* published until it retires.
+    dkim_selector: Mapped[str] = mapped_column(String(63), default="spanel")
+    dkim_next_selector: Mapped[str] = mapped_column(String(63), default="")
+    dkim_next_public: Mapped[str] = mapped_column(Text, default="")
+    dkim_old_selector: Mapped[str] = mapped_column(String(63), default="")
+    dkim_old_public: Mapped[str] = mapped_column(Text, default="")
+    # "" (one key), "publishing" (next key in DNS, not signing yet) or
+    # "retiring" (signing with the new key, the old one still published).
+    dkim_state: Mapped[str] = mapped_column(String(16), default="")
+    dkim_state_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    dkim_rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # The DMARC policy as JSON ({"p", "sp", "pct", "rua", "ruf", "adkim",
+    # "aspf"}); "" is the panel's default record.
+    dmarc_policy: Mapped[str] = mapped_column(Text, default="")
+    # MTA-STS: "" off, "testing", "enforce" or "none" (withdrawing a policy).
+    mta_sts_mode: Mapped[str] = mapped_column(String(10), default="")
+    # The id in _mta-sts.<domain>; changes whenever the policy does.
+    mta_sts_id: Mapped[str] = mapped_column(String(32), default="")
+    # TLS-RPT report addresses, one per line ("" publishes no _smtp._tls record).
+    tls_rpt: Mapped[str] = mapped_column(Text, default="")
+    # The mail hosts served here with their own certificate, comma separated
+    # labels: mail, mta-sts, autoconfig, autodiscover. "" is none.
+    mail_hosts: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -802,6 +826,13 @@ class MailAutoresponder(Base):
     local_part: Mapped[str] = mapped_column(String(64))
     subject: Mapped[str] = mapped_column(String(255), default='')
     body: Mapped[str] = mapped_column(Text, default='')
+    # A Sieve vacation in the mailbox (mail-sync writes it): on between the
+    # two dates (YYYY-MM-DD, "" is open-ended), at most one reply to a sender
+    # every interval_days.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    start_date: Mapped[str] = mapped_column(String(10), default='')
+    end_date: Mapped[str] = mapped_column(String(10), default='')
+    interval_days: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     @property

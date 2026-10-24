@@ -450,6 +450,7 @@ def delete_domain(db: Session, actor: User, domain_id: int) -> str:
     owner = db.query(User).filter(User.id == row.owner_id).first()
     db.query(MailAccount).filter(MailAccount.domain == name).delete(synchronize_session=False)
     db.query(MailForwarder).filter(MailForwarder.domain == name).delete(synchronize_session=False)
+    db.query(MailAutoresponder).filter(MailAutoresponder.domain == name).delete(synchronize_session=False)
     db.delete(row)
     db.commit()
     sync(db)
@@ -470,6 +471,7 @@ def delete_for_owner(db: Session, owner: User) -> list[str]:
         if row.webmail_host:
             shell.privileged("mail-webmail-host-remove", helper_args=[row.domain], check=False, fallback=["true"])
         db.query(MailForwarder).filter(MailForwarder.domain == row.domain).delete(synchronize_session=False)
+        db.query(MailAutoresponder).filter(MailAutoresponder.domain == row.domain).delete(synchronize_session=False)
         db.delete(row)
     db.query(MailAccount).filter(MailAccount.owner_id == owner.id).delete(synchronize_session=False)
     db.flush()
@@ -1332,6 +1334,14 @@ def build_state(db: Session) -> dict:
     state["relay_routes"] = {row.domain: row.relay for row in domains if row.relay == "direct" or row.relay in relay_ids}
     default = _stored().get("default_relay") or ""
     state["default_relay"] = default if default in relay_ids else ""
+    # Switched-on autoresponders of mailboxes; the helper writes each as a
+    # Sieve vacation into the mailbox and removes the others'.
+    boxes = set(state["senders"])
+    state["autoresponders"] = [
+        autoresponder_state(row)
+        for row in db.query(MailAutoresponder).order_by(MailAutoresponder.domain, MailAutoresponder.local_part).all()
+        if row.enabled and row.address in boxes
+    ]
     return state
 
 
@@ -1985,8 +1995,83 @@ def client_settings() -> dict:
             "submission_port": PORTS["submission"], "webmail": webmail_url()}
 
 # --- autoresponders ------------------------------------------------------------------------------
+# A Sieve vacation in the mailbox: mail-sync hands the list to the helper,
+# which renders each one (spanel_mailtool.render_vacation) into the mailbox's
+# home, where Dovecot runs it on delivery (sieve_before2). Only a mailbox can
+# answer: mail to a forwarder never reaches Dovecot.
 
-def create_autoresponder(db: Session, actor: User, domain_id: int, local_part: str, subject: str, body: str) -> MailAutoresponder:
+AUTORESPONDER_SUBJECT_MAX = 255
+AUTORESPONDER_BODY_MAX = 8000
+AUTORESPONDER_DAYS = (1, 30)
+
+
+def _clean_text(value, limit: int, multiline: bool, what: str) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.strip() if not multiline else text.strip("\n").rstrip()
+    if not text:
+        raise MailError(f"The autoresponder needs a {what}.")
+    if len(text) > limit:
+        raise MailError(f"The autoresponder's {what} is at most {limit} characters.")
+    for char in text:
+        code = ord(char)
+        if (char == "\n" and multiline) or char == "\t":
+            continue
+        if code < 32 or code == 127 or 0x80 <= code < 0xA0 or char in "  ":
+            raise MailError(f"The autoresponder's {what} cannot contain control characters.")
+    return text
+
+
+def _clean_date(value, what: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise MailError(f"The {what} date is a day such as 2026-12-24.") from exc
+    if not 1900 <= parsed.year <= 2199:
+        raise MailError(f"The {what} date is a day such as 2026-12-24.")
+    return parsed.isoformat()
+
+
+def normalize_autoresponder(subject, body, start_date="", end_date="", interval_days=1) -> dict:
+    """An autoresponder as typed, checked the way the helper checks it."""
+    start, end = _clean_date(start_date, "start"), _clean_date(end_date, "end")
+    if start and end and end < start:
+        raise MailError("The autoresponder ends before it starts.")
+    try:
+        days = int(interval_days if interval_days not in (None, "") else 1)
+    except (TypeError, ValueError) as exc:
+        raise MailError("Answer the same sender at most once every 1 to 30 days.") from exc
+    if not AUTORESPONDER_DAYS[0] <= days <= AUTORESPONDER_DAYS[1]:
+        raise MailError("Answer the same sender at most once every 1 to 30 days.")
+    return {
+        "subject": _clean_text(subject, AUTORESPONDER_SUBJECT_MAX, False, "subject"),
+        "body": _clean_text(body, AUTORESPONDER_BODY_MAX, True, "message"),
+        "start_date": start,
+        "end_date": end,
+        "interval_days": days,
+    }
+
+
+def autoresponder_state(row: MailAutoresponder) -> dict:
+    """What mail-sync sends the helper for one autoresponder."""
+    return {"address": row.address, "subject": row.subject, "body": row.body, "start": row.start_date or "",
+            "end": row.end_date or "", "days": int(row.interval_days or 1)}
+
+
+def _sync_or_rollback(db: Session) -> None:
+    try:
+        sync(db)
+    except MailError:
+        db.rollback()
+        raise
+    db.commit()
+
+
+def create_autoresponder(db: Session, actor: User, domain_id: int, local_part: str, subject: str, body: str,
+                         *, enabled: bool = True, start_date: str = "", end_date: str = "",
+                         interval_days: int = 1) -> MailAutoresponder:
     _require_active()
     domain = get_domain(db, actor, domain_id)
     if not _is_admin(actor) and getattr(actor, "package", None) is not None:
@@ -2002,27 +2087,35 @@ def create_autoresponder(db: Session, actor: User, domain_id: int, local_part: s
     local = normalize_local(local_part)
     if db.query(MailAutoresponder).filter(MailAutoresponder.domain == domain.domain, MailAutoresponder.local_part == local).first():
         raise MailError("That address already has an autoresponder.", status=409)
-    row = MailAutoresponder(domain=domain.domain, local_part=local, subject=subject, body=body)
+    if not db.query(MailAccount).filter(MailAccount.domain == domain.domain, MailAccount.local_part == local).first():
+        raise MailError("An autoresponder answers the mail of a mailbox: create the mailbox first.")
+    values = normalize_autoresponder(subject, body, start_date, end_date, interval_days)
+    row = MailAutoresponder(domain=domain.domain, local_part=local, enabled=bool(enabled), **values)
     db.add(row)
     db.flush()
-    try:
-        sync(db)
-    except Exception as exc:
-        db.rollback()
-        raise exc
+    _sync_or_rollback(db)
+    db.refresh(row)
     return row
 
-def update_autoresponder(db: Session, actor: User, autoresponder_id: int, subject: str, body: str) -> MailAutoresponder:
+
+def update_autoresponder(db: Session, actor: User, autoresponder_id: int, subject: str, body: str,
+                         *, enabled: bool | None = None, start_date: str | None = None, end_date: str | None = None,
+                         interval_days: int | None = None) -> MailAutoresponder:
     row = get_autoresponder(db, actor, autoresponder_id)
-    row.subject = subject
-    row.body = body
+    values = normalize_autoresponder(
+        subject, body,
+        row.start_date if start_date is None else start_date,
+        row.end_date if end_date is None else end_date,
+        row.interval_days if interval_days is None else interval_days,
+    )
+    for key, value in values.items():
+        setattr(row, key, value)
+    if enabled is not None:
+        row.enabled = bool(enabled)
     db.flush()
-    try:
-        sync(db)
-    except Exception as exc:
-        db.rollback()
-        raise exc
+    _sync_or_rollback(db)
     return row
+
 
 def get_autoresponder(db: Session, actor: User, autoresponder_id: int) -> MailAutoresponder:
     row = db.query(MailAutoresponder).filter(MailAutoresponder.id == autoresponder_id).first()
@@ -2036,24 +2129,33 @@ def delete_autoresponder(db: Session, actor: User, autoresponder_id: int) -> str
     address = row.address
     db.delete(row)
     db.flush()
-    try:
-        sync(db)
-    except Exception as exc:
-        db.rollback()
-        raise exc
+    _sync_or_rollback(db)
     return address
+
 
 def autoresponder_out(db: Session, row: MailAutoresponder, domains: dict[str, MailDomain]) -> dict:
     domain = domains.get(row.domain)
+    today = datetime.now().date().isoformat()
+    active_now = bool(row.enabled) and (not row.start_date or row.start_date <= today) \
+        and (not row.end_date or today <= row.end_date)
     return {
         "id": row.id,
         "address": row.address,
         "domain": row.domain,
+        "domain_id": domain.id if domain else None,
         "local_part": row.local_part,
         "subject": row.subject,
         "body": row.body,
+        "enabled": bool(row.enabled),
+        "start_date": row.start_date or "",
+        "end_date": row.end_date or "",
+        "interval_days": int(row.interval_days or 1),
+        "active_now": active_now,
+        "has_mailbox": db.query(MailAccount).filter(MailAccount.domain == row.domain,
+                                                    MailAccount.local_part == row.local_part).first() is not None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
+
 
 def list_autoresponders(db: Session, actor: User, domain_id: int | None = None, q: str = "", page: int = 1, per_page: int = 50) -> dict:
     query = db.query(MailAutoresponder)
