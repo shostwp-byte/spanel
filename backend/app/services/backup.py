@@ -20,8 +20,8 @@ from app.core.config import settings
 from app.core.secrets import decrypt, encrypt
 from app.core.security import hash_password
 from app.core.permissions import Role
-from app.models.entities import DatabaseAccount, MailAccount, SiteApp, User, Website, WebsiteAlias
-from app.services import mariadb, nginx, site_users, waf, wordpress
+from app.models.entities import DatabaseAccount, MailAccount, RemoteDbHost, SiteApp, User, Website, WebsiteAlias
+from app.services import db_backends, mariadb, nginx, remote_mysql, site_users, waf, wordpress
 from app.services.shell import shell
 
 
@@ -561,7 +561,14 @@ def create_backup(
     }
 
     if db_name:
-        mariadb.export_database(db_name, str(sql_file))
+        from sqlalchemy.orm import object_session
+
+        backend = db_backends.backend_for_db_name(object_session(website), db_name)
+        if backend.is_remote:
+            site_manifest["db_host"] = {
+                "host": backend.host.host, "port": int(backend.host.port or 3306), "name": backend.host.name,
+            }
+        backend.export_database(db_name, str(sql_file))
         if settings.command_dry_run and not sql_file.exists():
             sql_file.write_text(f"-- DRY RUN database dump for {db_name}\n", encoding="utf-8")
     try:
@@ -786,7 +793,7 @@ def create_user_backup(
                 exported_db_ids.add(db_item.id)
                 sql_name = f"{website.domain}.sql"
                 sql_path = tmp_dir / sql_name
-                mariadb.export_database(db_item.db_name, str(sql_path))
+                db_backends.backend_for(db_item).export_database(db_item.db_name, str(sql_path))
                 if settings.command_dry_run and not sql_path.exists():
                     sql_path.write_text(f"-- DRY RUN database dump for {db_item.db_name}\n", encoding="utf-8")
                 sql_files[website.domain] = sql_path
@@ -799,6 +806,8 @@ def create_user_backup(
                     "db_user": db_item.db_user,
                     "db_password": db_password,
                     "sql_member": f"databases/{sql_name}",
+                    # None = the local MariaDB; see _restore_database_host.
+                    "db_host": remote_mysql.backup_descriptor(db_item),
                 }
             manifest["websites"].append(site_entry)
 
@@ -809,7 +818,7 @@ def create_user_backup(
             safe_db_name = re.sub(r"[^A-Za-z0-9._-]", "_", db_item.db_name)
             sql_name = f"extra-{safe_db_name}.sql"
             sql_path = tmp_dir / sql_name
-            mariadb.export_database(db_item.db_name, str(sql_path))
+            db_backends.backend_for(db_item).export_database(db_item.db_name, str(sql_path))
             if settings.command_dry_run and not sql_path.exists():
                 sql_path.write_text(f"-- DRY RUN database dump for {db_item.db_name}\n", encoding="utf-8")
             extra_sql_files[sql_name] = sql_path
@@ -823,6 +832,7 @@ def create_user_backup(
                 "db_password": db_password,
                 "website_domain": website_domain_by_id.get(db_item.website_id) if db_item.website_id else None,
                 "sql_member": f"databases/{sql_name}",
+                "db_host": remote_mysql.backup_descriptor(db_item),
             })
 
         manifest_path = tmp_dir / BACKUP_MANIFEST
@@ -1361,6 +1371,27 @@ def _extract_member_to_file(archive: Path, member_name: str, output_dir: Path) -
         return target
 
 
+def _restore_database_host(db, db_name: str, descriptor) -> tuple[Optional[RemoteDbHost], str]:
+    """Where a database from a user backup is recreated, and a note when that
+    is not where it was.
+
+    - A database the panel already has goes back to the server it is on now:
+      that is where its sites are pointed.
+    - Otherwise the host the manifest recorded, when a host with that address
+      and port is configured here.
+    - Otherwise the local MariaDB, with a note. Restoring somewhere is better
+      than failing the whole account restore over one database, and the note
+      tells the admin to move it (or add the host and restore again).
+
+    Backups taken before hosts were recorded have no db_host and restore
+    locally, as they always did.
+    """
+    current = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
+    if current is not None:
+        return current.db_host, ""
+    return remote_mysql.resolve_restore_host(db, descriptor)
+
+
 def restore_user_backup(
     backup_file: str,
     db,
@@ -1435,6 +1466,7 @@ def restore_user_backup(
     restored_websites = []
     restored_apps = []
     restored_mail = []
+    database_notes: list[str] = []
     site_users.IMPORT_STAGE_BASE.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix="spanel-user-restore-", dir=str(site_users.IMPORT_STAGE_BASE)
@@ -1547,13 +1579,17 @@ def restore_user_backup(
                     ).first()
                     if conflict:
                         raise ValueError(f"Database name already belongs to another website: {db_name}")
-                    mariadb.create_database_credentials(
+                    target_host, note = _restore_database_host(db, db_name, db_info.get("db_host"))
+                    if note:
+                        database_notes.append(f"{db_name}: {note}")
+                    backend = db_backends.backend_for_host(target_host)
+                    backend.create_database_credentials(
                         db_name, db_user, db_password, allow_existing_user=True
                     )
                     sql_member = db_info.get("sql_member") or f"databases/{domain}.sql"
                     sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
                     if sql_path:
-                        mariadb.import_database(db_name, str(sql_path))
+                        backend.import_database(db_name, str(sql_path))
                     db_account = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
                     if db_account is None:
                         db.add(DatabaseAccount(
@@ -1562,12 +1598,14 @@ def restore_user_backup(
                             db_name=db_name,
                             db_user=db_user,
                             db_password=encrypt(db_password),
+                            db_host_id=target_host.id if target_host else None,
                         ))
                     else:
                         db_account.owner_id = website.owner_id
                         db_account.db_name = db_name
                         db_account.db_user = db_user
                         db_account.db_password = encrypt(db_password)
+                        db_account.db_host_id = target_host.id if target_host else None
 
                 if mode in {"full", "files_only"}:
                     result = waf.sync_website_rules(website)
@@ -1611,14 +1649,18 @@ def restore_user_backup(
                 ).first()
                 if conflict:
                     raise ValueError(f"Database name already belongs to another user: {db_name}")
-                mariadb.create_database_credentials(
+                target_host, note = _restore_database_host(db, db_name, extra_db.get("db_host"))
+                if note:
+                    database_notes.append(f"{db_name}: {note}")
+                backend = db_backends.backend_for_host(target_host)
+                backend.create_database_credentials(
                     db_name, db_user, db_password, allow_existing_user=True
                 )
                 sql_member = extra_db.get("sql_member")
                 if sql_member:
                     sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
                     if sql_path:
-                        mariadb.import_database(db_name, str(sql_path))
+                        backend.import_database(db_name, str(sql_path))
                 linked_website_id = None
                 linked_domain = (extra_db.get("website_domain") or "").strip().lower()
                 if linked_domain:
@@ -1633,12 +1675,14 @@ def restore_user_backup(
                         db_name=db_name,
                         db_user=db_user,
                         db_password=encrypt(db_password),
+                        db_host_id=target_host.id if target_host else None,
                     ))
                 else:
                     db_account.owner_id = user.id
                     db_account.website_id = linked_website_id
                     db_account.db_user = db_user
                     db_account.db_password = encrypt(db_password)
+                    db_account.db_host_id = target_host.id if target_host else None
 
         if mode in {"full", "files_only"}:
             restored_apps = _restore_applications(manifest, user, db, archive, tmp_dir)
@@ -1674,6 +1718,7 @@ def restore_user_backup(
         "websites": restored_websites,
         "applications": restored_apps,
         "mailboxes": restored_mail,
+        "database_notes": database_notes,
     }
 
 
@@ -1925,7 +1970,7 @@ def restore_backup(
             with tempfile.TemporaryDirectory(prefix="spanel-site-sql-") as sql_tmp:
                 sql_path = _extract_member_to_file(archive, sql_member, Path(sql_tmp))
                 if sql_path:
-                    mariadb.import_database(db_item.db_name, str(sql_path))
+                    db_backends.backend_for(db_item).import_database(db_item.db_name, str(sql_path))
 
     return str(destination)
 
