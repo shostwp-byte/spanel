@@ -1,7 +1,7 @@
 """Email: autoresponder schedules, DKIM rotation, DMARC, MTA-STS and mail hosts
 
 Revision ID: mail_upgrade
-Revises: 0045_enterprise_audit_watchdog
+Revises: api_hardening
 Create Date: 2026-10-24 09:00:00.000000
 
 An autoresponder gets an on/off switch, a date range and how often one sender
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 
 
 revision: str = "mail_upgrade"
-down_revision: Union[str, None] = "0045_enterprise_audit_watchdog"
+down_revision: Union[str, None] = "api_hardening"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
