@@ -695,52 +695,120 @@ migrate_site_cron_php_binary() {
   local db_path="$APP_DIR/backend/spanel.db"
   [[ -f "$db_path" ]] || return 0
   local py_bin="$APP_DIR/backend/.venv/bin/python"
-  [[ -x "$py_bin" ]] || py_bin="python3"
-  PYTHONPATH="$APP_DIR/backend" SPANEL_DB_PATH="$db_path" "$py_bin" - <<'PY'
-import os
-import subprocess
+  [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
+
+  local backup_dir="/var/backups/spanel/cron-spool-backup"
+  install -d -m 0700 -o root -g root "$backup_dir"
+  local spool_json
+  spool_json="$(mktemp /run/spanel-cron-spool.XXXXXX.json)"
+  chown root:spanel "$spool_json"
+  chmod 0640 "$spool_json"
+
+  # Stage 1 (root, isolated /usr/bin/python3 -I — never imports from $APP_DIR):
+  # Back up and dump legacy /var/spool/cron/crontabs entries to JSON.
+  /usr/bin/python3 -I - "$backup_dir" "$spool_json" <<'PY_DUMP'
+import json
+import shutil
+import sys
 from pathlib import Path
+
+backup_dir = Path(sys.argv[1])
+spool_json = Path(sys.argv[2])
+spool_dir = Path("/var/spool/cron/crontabs")
+payload = {}
+
+if spool_dir.is_dir():
+    for spool in sorted(spool_dir.iterdir()):
+        if not spool.is_file() or spool.name in ("root", "www-data"):
+            continue
+        try:
+            raw_text = spool.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "# spanel:" not in raw_text:
+            continue
+        bak_path = backup_dir / f"{spool.name}.crontab.bak"
+        try:
+            shutil.copy2(spool, bak_path)
+            bak_path.chmod(0o600)
+        except OSError:
+            pass
+        payload[spool.name] = raw_text.splitlines()
+
+spool_json.write_text(json.dumps(payload), encoding="utf-8")
+PY_DUMP
+
+  # Stage 2 (unprivileged spanel account via sudo -u spanel + SPANEL_USE_HELPER=true):
+  # Migrate legacy spool lines and enforce spanel-cron-jail across all sites.
+  local mig_out
+  mig_out="$(sudo -u spanel env \
+    HOME="$APP_DIR" \
+    PYTHONPATH="$APP_DIR/backend" \
+    SPANEL_DB_PATH="$db_path" \
+    SPANEL_USE_HELPER=true \
+    "$py_bin" - "$spool_json" <<'PY_MIGRATE'
+import json
+import sys
+from pathlib import Path
+
+spool_json = Path(sys.argv[1])
+try:
+    spool_map = json.loads(spool_json.read_text(encoding="utf-8")) if spool_json.is_file() else {}
+except Exception as exc:
+    print(f"WARNING: could not read cron spool dump: {exc}", file=sys.stderr)
+    spool_map = {}
 
 try:
     from app.core.database import SessionLocal
     from app.models.entities import Website
     from app.services import cron as cron_service
 
-    # First, if any legacy user spool crontabs exist in /var/spool/cron/crontabs,
-    # migrate their spanel entries into /etc/cron.d/spanel-user-<user> via add_cron
-    spool_dir = Path("/var/spool/cron/crontabs")
     with SessionLocal() as db:
         websites_by_domain = {
             (w.domain or "").lower(): w for w in db.query(Website).all()
         }
-        if spool_dir.is_dir():
-            for spool in sorted(spool_dir.iterdir()):
-                if not spool.is_file() or spool.name in ("root", "www-data"):
+        for username, raw_lines in sorted(spool_map.items()):
+            total_spanel = 0
+            failed_spanel = 0
+            for raw_line in raw_lines:
+                if "# spanel:" not in raw_line:
+                    continue
+                total_spanel += 1
+                parsed = cron_service._parse_cron_line(0, raw_line)
+                dom = raw_line.rsplit("# spanel:", 1)[-1].strip().lower()
+                site = websites_by_domain.get(dom)
+                if not site or not parsed.get("schedule") or not parsed.get("command"):
+                    failed_spanel += 1
+                    print(
+                        f"WARNING: cron migration skipped unresolved line for user={username} domain={dom}",
+                        file=sys.stderr,
+                    )
                     continue
                 try:
-                    raw_lines = spool.read_text(encoding="utf-8", errors="ignore").splitlines()
-                except OSError:
-                    continue
-                migrated_any = False
-                for raw_line in raw_lines:
-                    if "# spanel:" not in raw_line:
-                        continue
-                    parsed = cron_service._parse_cron_line(0, raw_line)
-                    dom = raw_line.rsplit("# spanel:", 1)[-1].strip().lower()
-                    site = websites_by_domain.get(dom)
-                    if site and parsed.get("schedule") and parsed.get("command"):
-                        try:
-                            cron_service.add_cron(site, parsed["schedule"], parsed["command"])
-                            migrated_any = True
-                        except Exception:
-                            pass
-                if migrated_any:
-                    subprocess.run(["crontab", "-r", "-u", spool.name], check=False, capture_output=True)
-        # Enforce full spanel-cron-jail (/bin/sh -c '...') confinement across all websites
+                    cron_service.add_cron(site, parsed["schedule"], parsed["command"])
+                except Exception as exc:
+                    failed_spanel += 1
+                    print(
+                        f"WARNING: cron migration failed for user={username} domain={dom}: {exc}",
+                        file=sys.stderr,
+                    )
+            if total_spanel > 0 and failed_spanel == 0:
+                print(f"MIGRATED_USER_OK:{username}")
         cron_service.enforce_all_cron_confinement(db)
 except Exception as exc:
-    print(f"WARNING: cron confinement migration notice: {exc}")
-PY
+    print(f"WARNING: cron confinement migration notice: {exc}", file=sys.stderr)
+PY_MIGRATE
+  )" || true
+  rm -f "$spool_json"
+
+  # Stage 3 (root): Only remove legacy spool crontab when 100% of # spanel: lines for that user succeeded.
+  local line migrated_user
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^MIGRATED_USER_OK:([a-z_][a-z0-9_-]{0,31})$ ]]; then
+      migrated_user="${BASH_REMATCH[1]}"
+      crontab -r -u "$migrated_user" 2>/dev/null || true
+    fi
+  done <<<"$mig_out"
 }
 
 ensure_terminal_tools() {
@@ -949,8 +1017,7 @@ ExecStart=
 ExecStart=/usr/local/sbin/spanel-api-start
 SupplementaryGroups=www-data spanel-sites
 ProtectHome=false
-ProtectProc=default
-ProcSubset=all
+ProtectProc=invisible
 ReadWritePaths=
 ReadWritePaths=${APP_DIR} /home /var/backups/spanel /etc/nginx/conf.d /etc/nginx/spanel/custom /tmp /var/lib/spanel /home/admin/spanel_backups/da /var/lib/spanel/da-import /var/lib/spanel/import-stage
 SERVICE

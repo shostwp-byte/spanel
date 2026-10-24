@@ -109,7 +109,7 @@ def _validate_redirect_target(target: str, document_root: str | Path, site_root:
         raise ValueError(
             "Cron output can only be redirected to /dev/null or a file inside this website's folder"
         ) from exc
-    return str(candidate)
+    return candidate.as_posix()
 
 
 def _validate_redirection(tokens: list[str], document_root: str | Path, site_root: str | Path) -> str:
@@ -367,23 +367,31 @@ def validate_cron_write_line(cron_user: str, line: str) -> bool:
         return False
     if tokens[4] != "--" or tokens[5] != "/bin/sh" or tokens[6] != "-c" or not tokens[7]:
         return False
-    # Verify <cwd> is inside /home/<user>/
-    home_root = Path(site_users.HOME_ROOT.as_posix()) / user
-    cwd_path = Path(tokens[3])
+    # Verify <cwd> is inside /home/<user>/ (use PurePosixPath so POSIX paths validate on any host OS)
+    from pathlib import PurePosixPath
+
+    home_root = PurePosixPath(site_users.HOME_ROOT.as_posix()) / user
+    cwd_path = PurePosixPath(tokens[3])
     if not cwd_path.is_absolute() or ".." in cwd_path.parts:
         return False
     cwd_posix = cwd_path.as_posix()
     home_posix = home_root.as_posix()
     if cwd_posix != home_posix and not cwd_posix.startswith(home_posix + "/"):
         return False
-    # Ensure the raw string after `-- /bin/sh -c ` is a single-quoted string with no trailing unquoted operators
+    # Ensure the raw string after `-- /bin/sh -c ` is a single-quoted string with no unquoted tokens/operators
     after_sh_c = re.split(r"\s+--\s+/bin/sh\s+-c\s+", body, maxsplit=1)
     if len(after_sh_c) != 2:
         return False
     quoted_arg = after_sh_c[1].strip()
-    if not (quoted_arg.startswith("'") and quoted_arg.endswith("'")):
+    stripped_escapes = quoted_arg.replace("'\"'\"'", "").replace("'\\''", "")
+    if not re.fullmatch(r"'[^']*'", stripped_escapes):
         return False
     return True
+
+
+def _posix_single_quote(value: str) -> str:
+    """Always wrap value in POSIX single quotes using '\\'' for embedded single quotes."""
+    return "'" + (value or "").replace("'", "'\\''") + "'"
 
 
 def _render_jailed_line(cron_user: str, safe_schedule: str, doc_root_str: str, safe_command: str, safe_domain: str) -> str:
@@ -391,7 +399,7 @@ def _render_jailed_line(cron_user: str, safe_schedule: str, doc_root_str: str, s
     if cron_user != "www-data":
         return (
             f"{safe_schedule} root {CRON_JAIL_BIN} {shlex.quote(cron_user)} "
-            f"{shlex.quote(doc_root_str)} -- /bin/sh -c {_escape_percent(shlex.quote(safe_command))} {marker}"
+            f"{shlex.quote(doc_root_str)} -- /bin/sh -c {_escape_percent(_posix_single_quote(safe_command))} {marker}"
         )
     return f"{safe_schedule} cd {shlex.quote(doc_root_str)} && {_escape_percent(safe_command)} {marker}"
 

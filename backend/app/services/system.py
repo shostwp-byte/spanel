@@ -410,6 +410,13 @@ def run_self_healing_check(reason: str = "manual") -> dict:
         else:
             failed_now.append(name)
 
+    # Periodic Cgroups v2 worker classification for newly forked dynamic PHP-FPM children
+    if not settings.command_dry_run:
+        try:
+            shell.privileged("cgroup-classify-workers", check=False, fallback=["true"])
+        except Exception:
+            pass
+
     # Periodic SQLite Hot Backup check (every 6 hours)
     if data.get("auto_db_backup_enabled", True):
         try:

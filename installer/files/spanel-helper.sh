@@ -7381,6 +7381,16 @@ classify_all_tenant_workers() {
   while read -r pid uid uname comm; do
     [[ "$pid" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ ]] || continue
     (( uid >= 1000 && uid < 65000 )) || continue
+    [[ "$uname" == "spanel" ]] && continue
+    limits_file="/etc/spanel/limits/${uname}.env"
+    if [[ ! -f "$limits_file" ]]; then
+      case "$comm" in
+        php-fpm*|php*|lsphp*) ;;
+        *) continue ;;
+      esac
+    fi
+    cg_current="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
+    [[ "$cg_current" == *"spanel-app-"* ]] && continue
     slice_unit="user-${uid}.slice"
     cg_slice="/sys/fs/cgroup/user.slice/${slice_unit}"
     if [[ ! -d "$cg_slice" ]]; then
@@ -7389,7 +7399,6 @@ classify_all_tenant_workers() {
     echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
     cg_scope="${cg_slice}/spanel.scope"
     mkdir -p "$cg_scope" 2>/dev/null || true
-    limits_file="/etc/spanel/limits/${uname}.env"
     if [[ -f "$limits_file" ]]; then
       cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
       mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
@@ -7408,7 +7417,6 @@ classify_all_tenant_workers() {
         echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
       fi
     fi
-    cg_current="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
     [[ "$cg_current" == *"${slice_unit}/spanel.scope"* ]] && continue
     if [[ -w "${cg_scope}/cgroup.procs" ]]; then
       echo "$pid" >"${cg_scope}/cgroup.procs" 2>/dev/null || true
@@ -9596,9 +9604,9 @@ EOF
               rm -f "$tmp_cron"
               deny "cron-write: working directory outside ${resolved_home}: ${line_cwd}"
             fi
-            # Ensure quoted_cmd has no unquoted shell operators outside single quotes
-            stripped_quotes="$(sed -E "s/'\\\\''//g; s/'[^']*'//g" <<<"$quoted_cmd")"
-            if [[ -n "$stripped_quotes" ]]; then
+            # Ensure quoted_cmd has no unquoted shell operators outside single quotes (supports both '\'' and '"'"')
+            stripped_escapes="$(sed -E "s/'\"'\"'//g; s/'\\\\''//g" <<<"$quoted_cmd")"
+            if [[ ! "$stripped_escapes" =~ ^\'[^\']*\'$ ]]; then
               rm -f "$tmp_cron"
               deny "cron-write: unquoted shell tokens outside /bin/sh -c string refused"
             fi
@@ -10270,6 +10278,12 @@ EOF
     if [[ -d "/proc/${target_pid}" ]] && [[ ! -s "/proc/${target_pid}/cmdline" ]] && [[ ! -e "/proc/${target_pid}/exe" ]]; then
       deny "refusing to kill kernel thread: $target_pid"
     fi
+    target_comm="$(tr -d '\0\n' <"/proc/${target_pid}/comm" 2>/dev/null || true)"
+    case "$target_comm" in
+      systemd|systemd-*|init|kthreadd|rcu_*|kworker*|ksoftirqd*|migration*|watchdog*|dbus-daemon|sshd|mariadbd|mysqld|nginx|redis-server|cron|crond|rsyslogd|fail2ban-server|pdns_server|dovecot|exim4|rspamd*|clamd|freshclam|dockerd|containerd*)
+        deny "refusing to kill protected core daemon (${target_comm}): use System Services to manage daemons"
+        ;;
+    esac
     kill -9 "$target_pid"
     ;;
 

@@ -857,8 +857,7 @@ ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
-ProtectProc=default
-ProcSubset=all
+ProtectProc=invisible
 # Mount namespaces only, and only because the panel cannot work without them.
 # (No backticks anywhere in this block: the heredoc below is unquoted so it
 # can carry ${APP_DIR}, which means backticks in prose would run as root.)
