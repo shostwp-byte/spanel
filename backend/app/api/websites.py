@@ -248,7 +248,7 @@ def _hostname_conflicts(db: Session, domain: str, *, exclude_website_id: int | N
         cluster_check = multi_server.check_cluster_conflict(domain=safe_domain)
         if cluster_check.get("conflict"):
             raise HTTPException(
-                status_code=409,
+                status_code=multi_server.conflict_http_status(cluster_check),
                 detail=cluster_check.get("message") or f"Domain '{safe_domain}' already exists on a peer server in the Multi-Server Cluster.",
             )
     return False

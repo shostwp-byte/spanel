@@ -125,6 +125,12 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
         or nginx.vhost_exists(payload.domain)
     ):
         raise HTTPException(status_code=409, detail="Domain already exists")
+    from app.services import multi_server
+
+    cluster_check = multi_server.check_cluster_conflict(domain=payload.domain or "", username=payload.username)
+    if cluster_check.get("conflict"):
+        raise HTTPException(status_code=multi_server.conflict_http_status(cluster_check),
+                            detail=cluster_check.get("message") or "Already exists in the cluster")
 
     package = db.query(UserPackage).filter(UserPackage.id == payload.package_id).first()
     if not package:

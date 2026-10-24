@@ -244,6 +244,15 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
     # contact email (a reseller managing many accounts, for example).
     if db.query(User.id).filter(User.username == payload.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
+    # The same account name on another node of the cluster (when the
+    # cluster's username guard is on): a later transfer between the two
+    # would collide.
+    from app.services import multi_server
+
+    cluster_check = multi_server.check_cluster_conflict(username=payload.username)
+    if cluster_check.get("conflict"):
+        raise HTTPException(status_code=multi_server.conflict_http_status(cluster_check),
+                            detail=cluster_check.get("message") or "Username already exists in the cluster")
     package = _package_for_payload(db, payload.package_id, current_user)
     effective_website_limit = package.website_limit if package else payload.website_limit
     effective_storage_mb = package.storage_limit_mb if package else payload.storage_limit_mb

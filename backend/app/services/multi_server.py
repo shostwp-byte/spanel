@@ -681,8 +681,14 @@ def check_local_conflict(db: Session, domain: str = "", username: str = "", aski
     }
 
 
-def check_cluster_conflict(domain: str = "", username: str = "") -> dict[str, Any]:
-    """Query active peer nodes in the cluster to see if domain or username already exists."""
+def check_cluster_conflict(domain: str = "", username: str = "", *, fail_closed: Optional[bool] = None) -> dict[str, Any]:
+    """Ask the peer nodes whether a domain or username already exists there.
+
+    A peer that cannot be asked used to be skipped silently, so the same
+    domain or account could be created on two nodes while one was down. With
+    conflict_fail_closed on, that answer is a conflict of kind "unreachable"
+    instead (HTTP 503 at the API). The peers are asked in parallel.
+    """
     with _state_lock:
         state = _read_state()
         settings = state.get("settings") or {}
@@ -692,6 +698,8 @@ def check_cluster_conflict(domain: str = "", username: str = "") -> dict[str, An
         check_usr = bool(username and settings.get("check_username_conflict", False))
         if not check_dom and not check_usr:
             return {"conflict": False}
+        if fail_closed is None:
+            fail_closed = bool(settings.get("conflict_fail_closed", False))
         peers = [
             dict(n)
             for n in state.get("nodes", [])
@@ -707,29 +715,55 @@ def check_cluster_conflict(domain: str = "", username: str = "") -> dict[str, An
             "username": username if check_usr else "",
         }
     )
-    for peer in peers:
+
+    def ask(peer: dict[str, Any]) -> tuple[dict[str, Any], Optional[dict[str, Any]], str]:
         try:
             resp, _ = _peer_request(peer, "GET", f"/api/multi-server/peer/check-conflict?{qs}", timeout=4)
-            if check_dom and resp.get("domain_exists"):
-                return {
-                    "conflict": True,
-                    "kind": "domain",
-                    "node_name": peer.get("name"),
-                    "node_url": peer.get("url"),
-                    "message": f"Tên miền '{domain}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
-                }
-            if check_usr and resp.get("username_exists"):
-                return {
-                    "conflict": True,
-                    "kind": "username",
-                    "node_name": peer.get("name"),
-                    "node_url": peer.get("url"),
-                    "message": f"Tài khoản '{username}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
-                }
-        except Exception as exc:
-            logger.debug("Cluster conflict check skipped unreachable peer %s: %s", peer.get("name"), exc)
+            return peer, resp, ""
+        except Exception as exc:  # noqa: BLE001 - reported below
+            return peer, None, str(exc)
 
-    return {"conflict": False}
+    unreachable: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(8, len(peers))) as pool:
+        answers = list(pool.map(ask, peers))
+    for peer, resp, error in answers:
+        if resp is None:
+            logger.warning("Cluster conflict check could not ask %s: %s", peer.get("name"), error)
+            unreachable.append(str(peer.get("name") or peer.get("url")))
+            continue
+        if check_dom and resp.get("domain_exists"):
+            return {
+                "conflict": True,
+                "kind": "domain",
+                "node_name": peer.get("name"),
+                "node_url": peer.get("url"),
+                "message": f"Tên miền '{domain}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
+            }
+        if check_usr and resp.get("username_exists"):
+            return {
+                "conflict": True,
+                "kind": "username",
+                "node_name": peer.get("name"),
+                "node_url": peer.get("url"),
+                "message": f"Tài khoản '{username}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
+            }
+
+    if unreachable and fail_closed:
+        return {
+            "conflict": True,
+            "kind": "unreachable",
+            "nodes": unreachable,
+            "message": (
+                f"Không thể kiểm tra trùng lặp trên máy chủ Peer: {', '.join(unreachable)}. "
+                "Cụm đang ở chế độ an toàn (fail-closed) nên thao tác bị chặn cho tới khi máy chủ đó phản hồi."
+            ),
+        }
+    return {"conflict": False, "unreachable": unreachable}
+
+
+def conflict_http_status(result: dict[str, Any]) -> int:
+    """409 for a real duplicate, 503 when a peer could not be asked (fail-closed)."""
+    return 503 if result.get("kind") == "unreachable" else 409
 
 
 # --- Remote Database Hosts (Remote MySQL / MariaDB Nodes) ---------------------
