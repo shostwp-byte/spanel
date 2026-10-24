@@ -57,25 +57,27 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
 
   async function saveCatchAll(domain) {
     const target = (catchAllDraft[domain.id] ?? domain.catch_all ?? '').trim();
-    const data = await request(`/mail/domains/${domain.id}/catch-all`, {
+    // PUT /mail/domains/{id} answers with the domain.
+    const data = await request(`/mail/domains/${domain.id}`, {
       method: 'PUT',
       body: JSON.stringify({ catch_all: target }),
     }, t('Saving catch-all…'));
-    if (data?.ok) {
+    if (data) {
       setNotice(target ? t('Catch-all set to {target}.', { target }) : t('Catch-all turned off.'));
       setCatchAllDraft(prev => { const next = { ...prev }; delete next[domain.id]; return next; });
       await loadMailInfo();
     }
   }
 
-  async function saveDomainRelay(domainId, relayId) {
-    const data = await request(`/mail/domains/${domainId}/relay`, {
+  async function saveDomainRelay(domain, relayId) {
+    // A relay id ("" for the server default, "direct" for none), answered with the DNS page.
+    const data = await request(`/mail/domains/${domain.id}/relay`, {
       method: 'PUT',
-      body: JSON.stringify({ relay_id: relayId ? Number(relayId) : null }),
+      body: JSON.stringify({ relay: relayId || '' }),
     }, t('Saving relay…'));
-    if (data?.ok) {
+    if (data) {
       setNotice(t('Relay updated.'));
-      applyMailDnsView(domainId, data);
+      applyMailDnsView(domain, data);
     }
   }
 
@@ -708,7 +710,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
       </div>
       {relay && <div className="mail-relay-card">
         <div className="mail-relay-card-head"><Send size={15}/><strong>{t('Outgoing mail')}</strong></div>
-        {isAdmin && <select value={relay.choice} disabled={!!loading} aria-label={t('Outgoing mail')} onChange={e => saveDomainRelay(e.target.value)}>
+        {isAdmin && <select value={relay.choice} disabled={!!loading} aria-label={t('Outgoing mail')} onChange={e => saveDomainRelay(domain, e.target.value)}>
           <option value="">{t('Server default')}</option>
           <option value="direct">{t('Direct, without a relay')}</option>
           {relay.options.map(option => <option key={option.id} value={option.id}>{t('Relay: {name}', { name: option.name })}</option>)}
