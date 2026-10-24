@@ -458,9 +458,12 @@ def run_incoming(db: Session, job_uid: str, passphrase: str, password_hash: str)
     path = upload_path(job.archive_name)
     try:
         _set(db, job, status="running", step="restore", message="Restoring the account")
-        result = backup.restore_user_backup(str(path), db, restore_mode="full", passphrase=passphrase)
-        if result.get("username") != job.username:
-            raise TransferError(f"The archive held {result.get('username')}, not {job.username}.")
+        # The name is checked against the manifest before anything is
+        # written: a peer must not be able to restore over a local account.
+        result = backup.restore_user_backup(
+            str(path), db, restore_mode="full", passphrase=passphrase,
+            expected_username=job.username, require_new_user=True,
+        )
         user = db.query(User).filter(User.username == job.username).first()
         if user is not None and password_hash.startswith("$2"):
             # The panel password comes along; the backup alone would have

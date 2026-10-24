@@ -267,6 +267,7 @@ def test_incoming_restore_keeps_the_password_and_removes_the_archive(db, backup_
 
     def fake_restore(path, db_, *, restore_mode="full", passphrase=None, **kw):
         seen["passphrase"] = passphrase
+        assert kw == {"expected_username": "cltestin", "require_new_user": True}
         db_.add(User(username="cltestin", email="i@cltest.com", hashed_password="generated"))
         db_.commit()
         return {"username": "cltestin", "websites": [{"domain": "in-cltest.com"}]}
@@ -282,6 +283,32 @@ def test_incoming_restore_keeps_the_password_and_removes_the_archive(db, backup_
     assert cluster_transfer.incoming_job(db, "in00000000000001", "aaaaaaaaaaaaaaaa")["status"] == "done"
     with pytest.raises(ValueError):
         cluster_transfer.incoming_job(db, "in00000000000001", "cccccccccccccccc")  # another node's job
+
+
+def test_incoming_archive_naming_another_account_is_refused_before_restoring(db, backup_root):
+    """A peer must not be able to restore over a local account by naming it
+    in the archive while declaring a new username for the job."""
+    import io
+    import json
+    import tarfile
+
+    from app.models.entities import User
+
+    db.add(User(username="cltestvictim", email="v@cltest.com", hashed_password="keep"))
+    db.commit()
+    archive = backup_root / "user-cltestnew-transfer-00cc11dd.tar.gz"
+    manifest = json.dumps({"kind": "spanel_user", "user": {"username": "cltestvictim"}}).encode()
+    with tarfile.open(archive, "w:gz") as tar:
+        info = tarfile.TarInfo(backup.BACKUP_MANIFEST)
+        info.size = len(manifest)
+        tar.addfile(info, io.BytesIO(manifest))
+    backup._write_sha256_sidecar(archive)
+
+    with pytest.raises(ValueError, match="holds cltestvictim, not cltestnew"):
+        backup.restore_user_backup(str(archive), db, expected_username="cltestnew", require_new_user=True)
+    with pytest.raises(ValueError, match="already exists"):
+        backup.restore_user_backup(str(archive), db, expected_username="cltestvictim", require_new_user=True)
+    assert db.query(User).filter_by(username="cltestvictim").one().hashed_password == "keep"
 
 
 def test_claim_takes_over_and_repoints_the_source_addresses(db, pdns, state_file, monkeypatch):
