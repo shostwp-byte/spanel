@@ -80,6 +80,9 @@ def mail_env(db, panel_settings_file, monkeypatch):
     env.helper_calls = []
     monkeypatch.setattr(mail, "active", lambda: True)
     monkeypatch.setattr(dns, "active", lambda: False)
+    # No network: this machine's addresses and name are fixed.
+    monkeypatch.setattr(mail, "server_addresses", lambda: (["192.0.2.10"], []))
+    monkeypatch.setattr(mail, "hostname", lambda: "panel.example.net")
 
     def fake_sync(session):
         state = mail.build_state(session)

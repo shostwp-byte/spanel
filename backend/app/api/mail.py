@@ -86,6 +86,17 @@ class AutoresponderUpdate(BaseModel):
     interval_days: int | None = Field(default=None, ge=1, le=30)
 
 
+class DmarcIn(BaseModel):
+    p: str = Field(max_length=12)
+    sp: str = Field(default="", max_length=12)
+    pct: int = Field(default=100, ge=0, le=100)
+    rua: list[str] = Field(default_factory=list, max_length=mail.DMARC_MAX_REPORT_ADDRESSES)
+    ruf: list[str] = Field(default_factory=list, max_length=mail.DMARC_MAX_REPORT_ADDRESSES)
+    adkim: str = Field(default="r", max_length=1)
+    aspf: str = Field(default="r", max_length=1)
+    fo: str = Field(default="", max_length=8)
+
+
 class DnsRecordIn(BaseModel):
     type: str = Field(min_length=1, max_length=8)
     name: str = Field(default="@", max_length=253)
@@ -240,6 +251,34 @@ def post_cancel_dkim(domain_id: int, request: Request, db: Session = Depends(get
     row = _answer(lambda: mail.get_domain(db, current_user, domain_id))
     _answer(lambda: mail.cancel_dkim_rotation(db, row))
     log_action(db, current_user.id, "mail_dkim_cancel", row.domain, "", request=request)
+    return mail.dns_view(db, row, current_user)
+
+
+@router.get("/domains/{domain_id}/dmarc")
+def get_dmarc(domain_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.get_domain(db, current_user, domain_id))
+    return mail.dmarc_view(row)
+
+
+@router.put("/domains/{domain_id}/dmarc")
+def put_dmarc(domain_id: int, payload: DmarcIn, request: Request, db: Session = Depends(get_db),
+              current_user: User = Depends(get_current_user)):
+    """Save the domain's DMARC policy; its record follows in this server's zone."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_dmarc(db, current_user, domain_id, payload.model_dump()))
+    view = mail.dmarc_view(row)
+    log_action(db, current_user.id, "mail_dmarc", row.domain, view["record"], request=request)
+    return mail.dns_view(db, row, current_user)
+
+
+@router.delete("/domains/{domain_id}/dmarc")
+def delete_dmarc(domain_id: int, request: Request, db: Session = Depends(get_db),
+                 current_user: User = Depends(get_current_user)):
+    """Back to the panel's default DMARC record."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_dmarc(db, current_user, domain_id, None))
+    log_action(db, current_user.id, "mail_dmarc", row.domain, "default", request=request)
     return mail.dns_view(db, row, current_user)
 
 

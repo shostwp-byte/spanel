@@ -39,6 +39,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   const [showCreateForwarder, setShowCreateForwarder] = useState(false);
   const [forwarderForm, setForwarderForm] = useState({ domain_id: '', local_part: '', destinations: '' });
   const [forwarderEdit, setForwarderEdit] = useState(null);
+  const [dmarcForm, setDmarcForm] = useState(null);
 
   useEffect(() => { loadMailInfo(); loadMailboxes(); }, []);
   useEffect(() => { if (mailTab === 'server' || mailTab === 'settings') { loadMailSettings(); loadEximLog(); } }, [mailTab]);
@@ -155,6 +156,16 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     if (data) { setNotice(t('DKIM key rotation cancelled.')); applyMailDnsView(domain, data); }
   }
 
+  async function saveMailDmarc(domain, reset = false) {
+    const f = dmarcForm;
+    const body = reset ? null : {
+      p: f.p, sp: f.sp || '', pct: Number(f.pct ?? 100), adkim: f.adkim || 'r', aspf: f.aspf || 'r', fo: (f.fo || '').trim(),
+      rua: splitAddresses(f.rua || ''), ruf: splitAddresses(f.ruf || ''),
+    };
+    const data = await request(`/mail/domains/${domain.id}/dmarc`, reset ? { method: 'DELETE' } : { method: 'PUT', body: JSON.stringify(body) }, t('Saving...'));
+    if (data) { setNotice(reset ? t('The default DMARC policy is back.') : t('DMARC policy saved.')); applyMailDnsView(domain, data); }
+  }
+
   async function toggleWebmailHost(domain, enabled) {
     if (enabled && !confirm(t("Serve webmail at webmail.{domain}?\n\nIts A record must already point at this server: a Let's Encrypt certificate is issued for it now.", { domain: domain.domain }))) return;
     if (!enabled && !confirm(t("Stop serving webmail at webmail.{domain}? Webmail stays available on the server's own address.", { domain: domain.domain }))) return;
@@ -214,7 +225,9 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function applyMailDnsView(domain, data) {
-    setMailDns({ domain, records: data?.records || [], relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null });
+    setMailDns({ domain, records: data?.records || [], relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null, dmarc: data?.dmarc || null });
+    const policy = data?.dmarc?.policy;
+    setDmarcForm(policy ? { ...policy, rua: (policy.rua || []).join(', '), ruf: (policy.ruf || []).join(', ') } : null);
   }
 
   async function openMailDns(domain) {
@@ -548,7 +561,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function renderMailDns() {
-    const { domain, records, relay, hostedZone, dkim } = mailDns;
+    const { domain, records, relay, hostedZone, dkim, dmarc } = mailDns;
     const statusLabel = { ok: t('Found'), missing: t('Missing'), different: t('Different'), unknown: t('Not checked') };
     const statusClass = { ok: 'ok', missing: 'bad', different: 'warn', unknown: '' };
     const titles = {
@@ -597,6 +610,47 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
             <button className="secondary-light" disabled={!!loading} onClick={() => cancelMailDkim(domain)}><X size={14}/> {t('Cancel')}</button>
           </>}
           {dkim.state === 'retiring' && <button className="secondary-light" disabled={!!loading} onClick={() => advanceMailDkim(domain)}><Trash2 size={14}/> {t('Retire the previous key now')}</button>}
+        </div>
+      </div>}
+      {dmarc && dmarcForm && <div className="mail-relay-card">
+        <div className="mail-relay-card-head"><ShieldCheck size={15}/><strong>{t('DMARC policy')}</strong>{!dmarc.custom && <span className="badge">{t('Default')}</span>}</div>
+        <p className="hint">{t('What receiving servers do with mail that claims to be from {domain} but fails SPF and DKIM, and where they send their reports.', { domain: domain.domain })}</p>
+        <div className="mail-settings-grid">
+          <label className="field"><span className="field-label">{t('Policy (p)')}</span>
+            <select value={dmarcForm.p} onChange={e => setDmarcForm(prev => ({ ...prev, p: e.target.value }))}>
+              <option value="none">{t('none: only report')}</option>
+              <option value="quarantine">{t('quarantine: to the spam folder')}</option>
+              <option value="reject">{t('reject: refuse it')}</option>
+            </select></label>
+          <label className="field"><span className="field-label">{t('Subdomains (sp)')}</span>
+            <select value={dmarcForm.sp || ''} onChange={e => setDmarcForm(prev => ({ ...prev, sp: e.target.value }))}>
+              <option value="">{t('Same as the domain')}</option>
+              <option value="none">none</option>
+              <option value="quarantine">quarantine</option>
+              <option value="reject">reject</option>
+            </select></label>
+          <label className="field"><span className="field-label">{t('Applies to (pct, %)')}</span>
+            <input type="number" min="0" max="100" value={dmarcForm.pct ?? 100} onChange={e => setDmarcForm(prev => ({ ...prev, pct: e.target.value }))} /></label>
+          <label className="field"><span className="field-label">{t('DKIM alignment (adkim)')}</span>
+            <select value={dmarcForm.adkim || 'r'} onChange={e => setDmarcForm(prev => ({ ...prev, adkim: e.target.value }))}>
+              <option value="r">{t('relaxed')}</option><option value="s">{t('strict')}</option>
+            </select></label>
+          <label className="field"><span className="field-label">{t('SPF alignment (aspf)')}</span>
+            <select value={dmarcForm.aspf || 'r'} onChange={e => setDmarcForm(prev => ({ ...prev, aspf: e.target.value }))}>
+              <option value="r">{t('relaxed')}</option><option value="s">{t('strict')}</option>
+            </select></label>
+          <label className="field"><span className="field-label">{t('Failure report options (fo)')}</span>
+            <input value={dmarcForm.fo || ''} placeholder="1:d" spellCheck={false} onChange={e => setDmarcForm(prev => ({ ...prev, fo: e.target.value }))} /></label>
+        </div>
+        <label className="field"><span className="field-label">{t('Aggregate reports to (rua)')}</span>
+          <input value={dmarcForm.rua || ''} placeholder="dmarc@example.com" spellCheck={false} onChange={e => setDmarcForm(prev => ({ ...prev, rua: e.target.value }))} /></label>
+        <label className="field"><span className="field-label">{t('Failure reports to (ruf)')}</span>
+          <input value={dmarcForm.ruf || ''} placeholder={t('optional')} spellCheck={false} onChange={e => setDmarcForm(prev => ({ ...prev, ruf: e.target.value }))} /></label>
+        {renderCopyBlock(t('Record'), dmarc.record)}
+        {(dmarc.external || []).map(item => <p className="hint" key={item.domain}>{t('Reports go to another domain, {target}: it has to allow them with this record.', { target: item.domain })} <code>{item.name} TXT "{item.value}"</code></p>)}
+        <div className="actions">
+          <button className="secondary-light" disabled={!!loading} onClick={() => saveMailDmarc(domain)}><Save size={14}/> {t('Save the DMARC policy')}</button>
+          {dmarc.custom && <button className="secondary-light" disabled={!!loading} onClick={() => saveMailDmarc(domain, true)}><RotateCcw size={14}/> {t('Back to the default')}</button>}
         </div>
       </div>}
       {hostedZone && <div className="info-box dns-managed-box">

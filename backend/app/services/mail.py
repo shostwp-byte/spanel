@@ -859,6 +859,147 @@ _SPF_TOKEN_RE = re.compile(r"^[+~?-]?(?:include|ip4|ip6|a|mx|exists|ptr)(?::[A-Z
 _SPF_ALL = ("~all", "-all", "?all", "+all", "all")
 
 
+# --- DMARC: the domain's policy, as its owner sets it ----------------------------------------
+# Stored as JSON in mail_domains.dmarc_policy; "" is DEFAULT_DMARC. The record
+# is rendered from the stored fields only, so nothing typed reaches DNS as is.
+
+DMARC_POLICIES = ("none", "quarantine", "reject")
+DMARC_ALIGNMENT = ("r", "s")
+DMARC_MAX_REPORT_ADDRESSES = 5
+_DMARC_FO_RE = re.compile(r"^[01ds](?::[01ds]){0,3}$")
+DMARC_DEFAULT_POLICY = {"p": "quarantine", "sp": "", "pct": 100, "rua": [], "ruf": [], "adkim": "r", "aspf": "r",
+                        "fo": ""}
+
+
+def _report_addresses(values, what: str) -> list[str]:
+    if isinstance(values, str):
+        values = re.split(r"[\s,;]+", values)
+    clean: list[str] = []
+    for raw in values or []:
+        text = str(raw or "").strip()
+        if text.lower().startswith("mailto:"):
+            text = text[len("mailto:"):]
+        if not text:
+            continue
+        try:
+            address = normalize_destination(text)
+        except MailError as exc:
+            raise MailError(f"Each {what} address is an email address, such as dmarc@example.com.") from exc
+        if address not in clean:
+            clean.append(address)
+    if len(clean) > DMARC_MAX_REPORT_ADDRESSES:
+        raise MailError(f"At most {DMARC_MAX_REPORT_ADDRESSES} {what} addresses.")
+    return clean
+
+
+def normalize_dmarc(payload: dict) -> dict:
+    """A DMARC policy as the editor sends it, checked field by field."""
+    if not isinstance(payload, dict):
+        raise MailError("A DMARC policy has a p, and may have sp, pct, rua, ruf, adkim, aspf and fo.")
+    policy = str(payload.get("p") or "").strip().lower()
+    if policy not in DMARC_POLICIES:
+        raise MailError("The DMARC policy (p) is none, quarantine or reject.")
+    subdomains = str(payload.get("sp") or "").strip().lower()
+    if subdomains and subdomains not in DMARC_POLICIES:
+        raise MailError("The subdomain policy (sp) is none, quarantine or reject, or empty to follow p.")
+    try:
+        pct = int(payload.get("pct") if payload.get("pct") not in (None, "") else 100)
+    except (TypeError, ValueError) as exc:
+        raise MailError("The percentage (pct) is a whole number from 0 to 100.") from exc
+    if not 0 <= pct <= 100:
+        raise MailError("The percentage (pct) is a whole number from 0 to 100.")
+    alignment = {}
+    for key in ("adkim", "aspf"):
+        value = str(payload.get(key) or "r").strip().lower()
+        if value not in DMARC_ALIGNMENT:
+            raise MailError(f"{key} is r (relaxed) or s (strict).")
+        alignment[key] = value
+    failure = str(payload.get("fo") or "").strip().lower()
+    if failure and not _DMARC_FO_RE.fullmatch(failure):
+        raise MailError("The failure options (fo) are 0, 1, d or s, joined by colons, such as 1:d.")
+    return {"p": policy, "sp": subdomains, "pct": pct, "rua": _report_addresses(payload.get("rua"), "aggregate report"),
+            "ruf": _report_addresses(payload.get("ruf"), "failure report"), **alignment, "fo": failure}
+
+
+def render_dmarc(policy: dict) -> str:
+    """The _dmarc TXT record of a checked policy, tags in RFC 7489's order."""
+    parts = ["v=DMARC1", f"p={policy['p']}"]
+    if policy.get("sp"):
+        parts.append(f"sp={policy['sp']}")
+    if int(policy.get("pct", 100)) != 100:
+        parts.append(f"pct={int(policy['pct'])}")
+    if policy.get("rua"):
+        parts.append("rua=" + ",".join(f"mailto:{address}" for address in policy["rua"]))
+    if policy.get("ruf"):
+        parts.append("ruf=" + ",".join(f"mailto:{address}" for address in policy["ruf"]))
+    parts += [f"adkim={policy.get('adkim') or 'r'}", f"aspf={policy.get('aspf') or 'r'}"]
+    if policy.get("fo"):
+        parts.append(f"fo={policy['fo']}")
+    return "; ".join(parts)
+
+
+def parse_dmarc(text: str) -> dict:
+    """A DMARC record as published -> the editor's fields. Raises MailError for
+    a record that is not DMARC or that the editor could not express."""
+    tags = {}
+    for part in (text or "").split(";"):
+        key, _, value = part.strip().partition("=")
+        if key:
+            tags[key.strip().lower()] = value.strip()
+    if tags.get("v", "").upper() != "DMARC1":
+        raise MailError("That is not a DMARC record.")
+    return normalize_dmarc({
+        "p": tags.get("p"), "sp": tags.get("sp", ""), "pct": tags.get("pct", 100), "adkim": tags.get("adkim", "r"),
+        "aspf": tags.get("aspf", "r"), "fo": tags.get("fo", ""),
+        "rua": [item for item in tags.get("rua", "").split(",") if item.strip()],
+        "ruf": [item for item in tags.get("ruf", "").split(",") if item.strip()],
+    })
+
+
+def dmarc_policy(row: MailDomain) -> dict:
+    """The domain's DMARC policy: what its owner saved, or the default."""
+    try:
+        stored = json.loads(row.dmarc_policy) if row.dmarc_policy else None
+        if isinstance(stored, dict):
+            return normalize_dmarc(stored)
+    except (ValueError, MailError):
+        logger.warning("Stored DMARC policy of %s is unusable; the default applies", row.domain)
+    return dict(DMARC_DEFAULT_POLICY)
+
+
+def dmarc_external_domains(row: MailDomain, policy: dict) -> list[str]:
+    """Report domains outside the mail domain: each must publish
+    <domain>._report._dmarc.<report domain> TXT "v=DMARC1" (RFC 7489 7.1)."""
+    out = []
+    for address in policy.get("rua", []) + policy.get("ruf", []):
+        target = address.rpartition("@")[2]
+        if target != row.domain and not target.endswith("." + row.domain) and target not in out:
+            out.append(target)
+    return out
+
+
+def dmarc_view(row: MailDomain) -> dict:
+    policy = dmarc_policy(row)
+    return {"policy": policy, "record": render_dmarc(policy), "custom": bool(row.dmarc_policy),
+            "external": [{"domain": target, "name": f"{row.domain}._report._dmarc.{target}", "value": "v=DMARC1"}
+                         for target in dmarc_external_domains(row, policy)]}
+
+
+def set_dmarc(db: Session, actor: User, domain_id: int, payload: dict | None) -> MailDomain:
+    """Save the domain's DMARC policy (None goes back to the default) and put
+    the record in its zone here, replacing the one there."""
+    row = get_domain(db, actor, domain_id)
+    row.dmarc_policy = "" if payload is None else json.dumps(normalize_dmarc(payload), sort_keys=True)
+    db.commit()
+    from app.services import dns
+
+    try:
+        publish_dns(db, row, replace=False, force_keys={"dmarc"})
+    except (dns.DnsError, dns.DnsInputError) as exc:
+        logger.warning("DMARC record not published for %s: %s", row.domain, exc)
+    return row
+
+
 def _fqdn(label: str, domain: str) -> str:
     """A record name as written ("@", "mail", "x._domainkey"), made absolute
     within the domain."""
@@ -1028,7 +1169,7 @@ def dns_records(row: MailDomain) -> list[dict]:
         if selector and public:
             records.append({"key": key, "type": "TXT", "name": f"{selector}._domainkey.{domain}",
                             "value": f"v=DKIM1; k=rsa; p={public}"})
-    records.append({"key": "dmarc", "type": "TXT", "name": f"_dmarc.{domain}", "value": DEFAULT_DMARC})
+    records.append({"key": "dmarc", "type": "TXT", "name": f"_dmarc.{domain}", "value": render_dmarc(dmarc_policy(row))})
     if relay:
         for index, item in enumerate(relay.get("dns_records") or []):
             records.append({
@@ -1127,7 +1268,9 @@ def check_dns(row: MailDomain, lookup=None, zone_name: str = "") -> list[dict]:
         elif key == "dmarc":
             txt = lookup(name, "TXT")
             found = None if txt is None else [t for t in txt if t.upper().startswith("V=DMARC1")]
-            ok = bool(found)
+            # Any DMARC record will do until the owner sets a policy; then it
+            # has to be that one.
+            ok = bool(found) and (not row.dmarc_policy or any(_squash(t) == _squash(want) for t in found))
         elif key == "mx":
             found = lookup(name, "MX")
             # mail.<domain>, the server's own name, or any name that points here.
@@ -1184,6 +1327,7 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
         "domain": row.domain,
         "records": records,
         "dkim": dkim_view(row),
+        "dmarc": dmarc_view(row),
         "hosted_zone": zone.name if zone else "",
         "relay": {
             "choice": row.relay or "",
@@ -1196,7 +1340,7 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
     }
 
 
-def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
+def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[str] | frozenset = frozenset()) -> list[str]:
     """Keep the domain's mail records in its zone, when DNS Manager serves it.
 
     DKIM and the relay's records always follow the panel, and so does an SPF
@@ -1255,7 +1399,7 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
                 continue
             if not spf_now or replace or (len(spf_now) == 1 and spf_is_panels(spf_now[0])):
                 changes[(name, rtype)] = (ttl, others + [content])
-        elif not existing or (replace and not same(existing, content, rtype)):
+        elif not existing or ((replace or key in force_keys) and not same(existing, content, rtype)):
             # mx, mail, dmarc, webmail
             changes[(name, rtype)] = (ttl, [content])
     # A name that is a CNAME cannot hold another record. The button says so;
@@ -2206,7 +2350,8 @@ def backup_manifest(db: Session, user: User) -> dict:
     return {
         "domains": [{"domain": row.domain, "catch_all": row.catch_all or "", "relay": row.relay or "",
                      "dkim_selector": row.dkim_selector or DKIM_SELECTOR,
-                     "dkim_keys": _dkim_keys_for_backup(row)}
+                     "dkim_keys": _dkim_keys_for_backup(row),
+                     "dmarc": dmarc_policy(row) if row.dmarc_policy else None}
                     for row in domains],
         "autoresponders": [{"local_part": row.local_part, "domain": row.domain, "subject": row.subject,
                             "body": row.body, "enabled": bool(row.enabled), "start_date": row.start_date or "",
@@ -2255,6 +2400,11 @@ def restore_manifest(db: Session, user: User, section, stage_mail) -> list[str]:
         row.catch_all = normalize_destination(catch_all) if catch_all else ""
         relay = str(entry.get("relay") or "")
         row.relay = relay if relay == "direct" or relay in {item["id"] for item in _relays()} else ""
+        if isinstance(entry.get("dmarc"), dict):
+            try:
+                row.dmarc_policy = json.dumps(normalize_dmarc(entry["dmarc"]), sort_keys=True)
+            except MailError as exc:
+                raise ValueError(f"Invalid DMARC policy for {name} in backup: {exc.message}") from exc
         # The key its DNS publishes comes back with it; without one (an older
         # archive) mail-sync makes a new key and the DNS page shows the record.
         keys = entry.get("dkim_keys") if isinstance(entry.get("dkim_keys"), dict) else {}
