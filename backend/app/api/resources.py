@@ -7,7 +7,7 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.models.entities import DatabaseAccount, User, UserPackage, Website
-from app.services import mariadb, resource_monitor, storage_quota
+from app.services import disk_quota, mariadb, resource_monitor, storage_quota
 from app.services.audit import log_action
 
 router = APIRouter(prefix="/resources", tags=["resources"])
@@ -546,6 +546,36 @@ def get_slow_bottlenecks(
         allowed_user_ids=allowed_ids,
         limit=max(5, min(100, int(limit or 30))),
     )
+
+
+@router.get("/disk-quota")
+def get_disk_quota_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    current = disk_quota.status()
+    # Kernel quota turns up after the remount/reboot that quota-enable asked
+    # for; that is when every account's limit has to be set once.
+    current["accounts_queued"] = disk_quota.reconcile_account_limits(db, current)
+    return current
+
+
+@router.post("/disk-quota/enable")
+def enable_disk_quota(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    try:
+        current = disk_quota.enable()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    current["accounts_queued"] = disk_quota.reconcile_account_limits(db, current)
+    log_action(db, current_user.id, "enable_kernel_disk_quota", current.get("mount") or "/home",
+               detail=f"state={current.get('state')}", request=request)
+    return current
 
 
 @router.get("/domain-traffic")

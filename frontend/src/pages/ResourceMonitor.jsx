@@ -4,6 +4,7 @@ import {
   Lock, Unlock, Network, Pencil, RefreshCw, Search, Server, ShieldAlert,
   Sliders, Sparkles, Users, Wrench, X, Zap, Eye
 } from 'lucide-react';
+import { DiskQuotaCard } from '../components/DiskQuotaCard.jsx';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
@@ -354,6 +355,8 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
           </button>
         </div>
       </div>
+
+      {isAdmin && <DiskQuotaCard request={request} setNotice={setNotice} busy={!!loading} />}
 
       {/* MySQL Slow Query & PHP-FPM Slowlog Bottleneck Inspector */}
       {bottlenecksOpen && (

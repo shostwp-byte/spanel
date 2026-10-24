@@ -195,6 +195,8 @@ def apply_user_cgroup_limits(user: User) -> bool:
         str(max(0, int(getattr(user, "iops_read_max", 0) or 0))),
         str(max(0, int(getattr(user, "iops_write_max", 0) or 0))),
         str(max(0, int(getattr(user, "storage_limit_mb", 0) or 0))),
+        # Enforced by kernel quota (setquota) when quota-enable turned it on.
+        str(max(0, int(getattr(user, "inode_limit", 0) or 0))),
     ]
     try:
         shell.privileged(

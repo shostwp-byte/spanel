@@ -177,6 +177,10 @@ RELEASE_ZIP_URL="${RELEASE_ZIP_URL:-}"             # optional archive URL templa
 SKIP_PULL="${SKIP_PULL:-false}"
 UPDATE_STATE_FILE="${UPDATE_STATE_FILE:-/var/lib/spanel/update-status.json}"
 RELEASE_WORK_DIR="${RELEASE_WORK_DIR:-}"
+# Opt-in: SPANEL_DISK_QUOTA=kernel turns on kernel user quota for the
+# filesystem holding /home (also possible from Resource Monitor). Only fstab
+# is edited; a remount or reboot stays the administrator's call.
+SPANEL_DISK_QUOTA="${SPANEL_DISK_QUOTA:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1619,6 +1623,11 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
     # that refusal exactly the way it hid the memory guard's.
     if [[ -f /etc/clamav/clamd.conf ]]; then
       sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper clamav-tune >/dev/null ||         echo "  (warning: could not raise clamd's scan limits; large uploads stay unscanned)"
+    fi
+    if [[ "$SPANEL_DISK_QUOTA" == "kernel" ]]; then
+      log "Enabling kernel disk quota (SPANEL_DISK_QUOTA=kernel)"
+      sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper quota-enable | sed -n -E 's/^(state|hint|backup)=/  \1: /p' || \
+        echo "  (warning: could not enable kernel disk quota; the panel's own accounting still applies)"
     fi
     # The helper is fresh now, so the clock unit can run without flashing
     # up as a failed unit first.

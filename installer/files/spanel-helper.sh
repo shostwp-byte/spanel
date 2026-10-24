@@ -8067,6 +8067,206 @@ retune_mariadb() {
   echo "Retuned MariaDB: innodb_buffer_pool_size=${MARIADB_INNODB_BUFFER_POOL_SIZE}, max_connections=${MARIADB_MAX_CONNECTIONS}, table_open_cache=${MARIADB_TABLE_OPEN_CACHE}."
 }
 
+# --- disk quota ---------------------------------------------------------------
+# Kernel user quota on the filesystem that holds /home. The panel's own
+# accounting (storage_quota.py) measures what it can see and refuses panel
+# uploads past the limit; it cannot stop PHP or SFTP writing. A kernel quota
+# can, and counts every file the account owns on that filesystem - its sites,
+# and its PHP session/upload directories when /var/lib/php is on the same one.
+#
+# Turning it on installs the quota tools and adds the mount options to
+# /etc/fstab. It never remounts and never reboots: options added to fstab take
+# effect at the administrator's next remount or reboot, and the status says so.
+QUOTA_HOME="/home"
+FSTAB_FILE="/etc/fstab"
+
+quota_mount_field() {
+  findmnt -no "$1" -T "$QUOTA_HOME" 2>/dev/null | head -n1 | tr -d '[:space:]' || true
+}
+
+# Whether a mount option string turns user quota on.
+quota_options_active() {
+  [[ ",$1," =~ ,(usrquota|usrjquota=[^,]+|uquota|uqnoenforce|quota), ]]
+}
+
+quota_wanted_options() {
+  # quota_wanted_options <fstype>: journaled quota on ext4 (no quotacheck after
+  # a crash), plain user quota on xfs.
+  case "$1" in
+    ext4) echo "usrjquota=aquota.user,jqfmt=vfsv1" ;;
+    xfs) echo "usrquota" ;;
+    *) return 1 ;;
+  esac
+}
+
+fstab_quota_options() {
+  # fstab_quota_options <fstab> <mountpoint>: the options column of its entry.
+  awk -v mp="$2" '$1 !~ /^#/ && $2 == mp { print $4; exit }' "$1"
+}
+
+fstab_with_quota_options() {
+  # fstab_with_quota_options <fstab> <mountpoint> <fstype>: the fstab with the
+  # quota options added to that entry, on stdout. Exit 2 when the mount point
+  # has no entry (nothing is guessed), 0 otherwise; idempotent.
+  local fstab="$1" mp="$2" opts
+  opts="$(quota_wanted_options "$3")" || return 1
+  awk -v mp="$mp" -v add="$opts" '
+    BEGIN { found = 0 }
+    $1 !~ /^#/ && $2 == mp && NF >= 4 && !found {
+      found = 1
+      if ("," $4 "," !~ /,(usrquota|usrjquota=[^,]+|uquota|quota),/) {
+        $4 = ($4 == "defaults" ? "defaults," add : $4 "," add)
+        line = $1
+        for (i = 2; i <= NF; i++) line = line "\t" $i
+        print line
+        next
+      }
+    }
+    { print }
+    END { if (!found) exit 2 }
+  ' "$fstab"
+}
+
+quota_state() {
+  # quota_state <fstype> <mountpoint> <options-active:yes|no> <in-fstab:yes|no> <quota-on:yes|no>
+  local fstype="$1" mp="$2" active="$3" fstab="$4" on="$5"
+  case "$fstype" in
+    ext4|xfs) ;;
+    *) echo unsupported; return 0 ;;
+  esac
+  if [[ "$active" == yes ]]; then
+    if [[ "$fstype" == xfs || "$on" == yes ]]; then
+      echo active
+    else
+      echo needs-quotaon
+    fi
+    return 0
+  fi
+  # XFS takes quota options only at mount time, and for / that is the kernel
+  # command line, not fstab.
+  if [[ "$fstype" == xfs && "$mp" == / ]]; then
+    echo kernel-cmdline-required
+  elif [[ "$fstab" == yes ]]; then
+    echo remount-required
+  else
+    echo not-configured
+  fi
+}
+
+quota_status() {
+  local mp fstype device options active=no fstab=no on=no tools=no state hint=""
+  mp="$(quota_mount_field TARGET)"
+  fstype="$(quota_mount_field FSTYPE)"
+  device="$(quota_mount_field SOURCE)"
+  options="$(quota_mount_field OPTIONS)"
+  quota_options_active "$options" && active=yes
+  if [[ -n "$mp" && -f "$FSTAB_FILE" ]] && quota_options_active "$(fstab_quota_options "$FSTAB_FILE" "$mp")"; then
+    fstab=yes
+  fi
+  command -v setquota >/dev/null 2>&1 && tools=yes
+  if [[ "$tools" == yes && "$active" == yes && "$fstype" == ext4 ]]; then
+    [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" == *" is on"* ]] && on=yes
+  fi
+  state="$(quota_state "$fstype" "$mp" "$active" "$fstab" "$on")"
+  case "$state" in
+    active) hint="Kernel quota enforces each account's disk and inode limits on ${mp}." ;;
+    needs-quotaon) hint="Quota options are mounted on ${mp}; enable kernel quota again to build the quota files and switch it on." ;;
+    remount-required) hint="Quota options are in /etc/fstab for ${mp}. Remount it (mount -o remount ${mp}) or reboot, then enable again." ;;
+    kernel-cmdline-required) hint="/ is XFS: add rootflags=uquota to GRUB_CMDLINE_LINUX in /etc/default/grub, run update-grub and reboot." ;;
+    not-configured) hint="Only the panel's own accounting applies; PHP and SFTP can write past the limit." ;;
+    unsupported) hint="Kernel quota needs ext4 or xfs; ${mp:-/home} is on ${fstype:-an unknown filesystem}." ;;
+  esac
+  printf 'mode=%s\n' "$([[ "$state" == active ]] && echo kernel || echo app)"
+  printf 'state=%s\nmount=%s\nfstype=%s\ndevice=%s\ntools=%s\nmounted_options=%s\nfstab_options=%s\nquota_on=%s\nhint=%s\n' \
+    "$state" "$mp" "$fstype" "$device" "$tools" "$active" "$fstab" "$on" "$hint"
+}
+
+quota_enable() {
+  local mp fstype options state backup tmp
+  mp="$(quota_mount_field TARGET)"
+  fstype="$(quota_mount_field FSTYPE)"
+  options="$(quota_mount_field OPTIONS)"
+  [[ -n "$mp" ]] || deny "cannot find the filesystem holding ${QUOTA_HOME}"
+  case "$fstype" in
+    ext4|xfs) ;;
+    *) deny "kernel quota needs ext4 or xfs; ${mp} is ${fstype:-unknown}" ;;
+  esac
+  if ! command -v setquota >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y quota >/dev/null || deny "apt-get could not install the quota tools"
+  fi
+  if ! quota_options_active "$options"; then
+    if [[ "$fstype" == xfs && "$mp" == / ]]; then
+      quota_status
+      return 0
+    fi
+    if ! quota_options_active "$(fstab_quota_options "$FSTAB_FILE" "$mp")"; then
+      tmp="$(mktemp)"
+      local rc=0
+      fstab_with_quota_options "$FSTAB_FILE" "$mp" "$fstype" >"$tmp" || rc=$?
+      if (( rc != 0 )); then
+        rm -f -- "$tmp"
+        (( rc == 2 )) && deny "${mp} has no entry in ${FSTAB_FILE}; add the quota options by hand"
+        deny "could not prepare ${FSTAB_FILE}"
+      fi
+      # Refuse anything findmnt cannot parse: a broken fstab is a server that
+      # does not boot.
+      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]] && ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+        rm -f -- "$tmp"
+        deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+      fi
+      backup="${FSTAB_FILE}.spanel-$(date +%Y%m%d%H%M%S)"
+      cp -p -- "$FSTAB_FILE" "$backup"
+      cat "$tmp" >"$FSTAB_FILE"
+      rm -f -- "$tmp"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      logger -t spanel-helper -- "quota: added user quota options for ${mp} to ${FSTAB_FILE} (backup ${backup})" 2>/dev/null || true
+      echo "backup=${backup}"
+    fi
+    quota_status
+    return 0
+  fi
+  if [[ "$fstype" == ext4 ]]; then
+    # Journaled quota: build the quota file once, then switch it on. -m keeps
+    # the filesystem mounted read-write while it is counted.
+    if [[ ! -f "${mp%/}/aquota.user" ]]; then
+      quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
+    fi
+    if [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
+      quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
+    fi
+  fi
+  quota_status
+}
+
+quota_limits() {
+  # quota_limits <storage_mb> <inode_limit>: "block-soft block-hard inode-soft
+  # inode-hard" for setquota. Blocks are KiB; soft is 95% of hard, so the
+  # account is warned (grace period) before writes start failing. 0 = no limit.
+  local mb="${1:-0}" inodes="${2:-0}" bhard bsoft ihard isoft
+  [[ "$mb" =~ ^[0-9]+$ ]] || mb=0
+  [[ "$inodes" =~ ^[0-9]+$ ]] || inodes=0
+  bhard=$(( mb * 1024 ))
+  bsoft=$(( bhard * 95 / 100 ))
+  ihard="$inodes"
+  isoft=$(( ihard * 95 / 100 ))
+  printf '%s %s %s %s\n' "$bsoft" "$bhard" "$isoft" "$ihard"
+}
+
+apply_kernel_quota() {
+  # apply_kernel_quota <user> <storage_mb> <inode_limit>: no-op unless user
+  # quota is mounted on the filesystem holding /home.
+  local user="$1" mp limits
+  command -v setquota >/dev/null 2>&1 || return 0
+  quota_options_active "$(quota_mount_field OPTIONS)" || return 0
+  mp="$(quota_mount_field TARGET)"
+  [[ -n "$mp" ]] || return 0
+  limits="$(quota_limits "$2" "$3")"
+  # shellcheck disable=SC2086 # four numbers, split on purpose
+  setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
+    echo "warning: setquota failed for ${user} on ${mp}" >&2
+}
+
 # --- clock --------------------------------------------------------------------
 # Cheap VPS hosts routinely block outbound UDP 123, so systemd-timesyncd and
 # chrony never converge and the clock drifts until TOTP logins stop matching.
@@ -9683,13 +9883,14 @@ PY
   user-limits-apply)
     # Apply Linux Cgroups v2 (systemd user-<UID>.slice & spanel-user-<user>.slice),
     # PHP-FPM pool limits, and optional Linux filesystem disk quota for a tenant account.
-    [[ $# -eq 9 || $# -eq 10 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write> [storage_limit_mb]"
+    [[ $# -ge 9 && $# -le 11 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write> [storage_limit_mb] [inode_limit]"
     u_name="$1"
     cpu_pct="$2"; mem_high="$3"; mem_max="$4"; tasks_max="$5"
     io_r="$6"; io_w="$7"; iops_r="$8"; iops_w="$9"
     storage_mb="${10:-0}"
+    inode_limit="${11:-0}"
     require_linux_user "$u_name"
-    for num_arg in "$cpu_pct" "$mem_high" "$mem_max" "$tasks_max" "$io_r" "$io_w" "$iops_r" "$iops_w" "$storage_mb"; do
+    for num_arg in "$cpu_pct" "$mem_high" "$mem_max" "$tasks_max" "$io_r" "$io_w" "$iops_r" "$iops_w" "$storage_mb" "$inode_limit"; do
       [[ "$num_arg" =~ ^[0-9]{1,9}$ ]] || deny "invalid numeric resource limit: $num_arg"
     done
     ensure_panel_user_home "$u_name"
@@ -9710,6 +9911,7 @@ IO_WRITE_MBPS=${io_w}
 IOPS_READ=${iops_r}
 IOPS_WRITE=${iops_w}
 STORAGE_MB=${storage_mb}
+INODE_LIMIT=${inode_limit}
 EOF
     chown root:spanel "/etc/spanel/limits/${u_name}.env"
     chmod 0640 "/etc/spanel/limits/${u_name}.env"
@@ -9778,30 +9980,28 @@ EOF
     done
     reload_php_pool_owners <<<"$user_pool_files"
 
-    # Enforce Linux filesystem disk quota (setquota) when usrquota is mounted on /home or /
-    if command -v setquota >/dev/null 2>&1; then
-      quota_mnt=""
-      if findmnt -no OPTIONS /home 2>/dev/null | grep -qE 'usrj?quota|quota'; then
-        quota_mnt="/home"
-      elif findmnt -no OPTIONS / 2>/dev/null | grep -qE 'usrj?quota|quota'; then
-        quota_mnt="/"
-      fi
-      if [[ -n "$quota_mnt" ]]; then
-        if (( storage_mb > 0 )); then
-          hard_kb=$(( storage_mb * 1024 ))
-          soft_kb=$(( hard_kb * 95 / 100 ))
-          setquota -u "$u_name" "$soft_kb" "$hard_kb" 0 0 "$quota_mnt" >/dev/null 2>&1 || true
-        else
-          setquota -u "$u_name" 0 0 0 0 "$quota_mnt" >/dev/null 2>&1 || true
-        fi
-      fi
-    fi
+    # Disk space and inode limits through kernel quota, when quota-enable has
+    # turned it on for the filesystem holding /home (see quota-status).
+    apply_kernel_quota "$u_name" "$storage_mb" "$inode_limit"
 
     # The account's own PHP-FPM masters already run in the slice. Whatever of
     # this user still runs outside it (cron jobs, a pool left on a distro
     # master) is moved into user-<UID>.slice/spanel.scope.
     classify_all_tenant_workers
     echo "Applied Cgroups v2 & PHP-FPM resource limits for ${u_name} (UID ${u_uid})"
+    ;;
+
+  quota-status)
+    [[ $# -eq 0 ]] || deny "usage: quota-status"
+    quota_status
+    ;;
+
+  quota-enable)
+    # Installs the quota tools and adds user quota to /etc/fstab for the
+    # filesystem holding /home; once that is mounted, builds the quota file
+    # and switches it on. Never remounts or reboots.
+    [[ $# -eq 0 ]] || deny "usage: quota-enable"
+    quota_enable
     ;;
 
   cgroup-classify-workers)
