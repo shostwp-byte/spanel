@@ -2319,6 +2319,58 @@ dns_api_answers() {
   curl -fsS -m 3 -H "X-API-Key: $1" "http://127.0.0.1:${PDNS_API_PORT}/api/v1/servers/localhost" >/dev/null 2>&1
 }
 
+# Zone transfers to secondary nameservers: off unless the panel turned them
+# on (dns-transfers). On, PowerDNS sends NOTIFY for primary zones and answers
+# AXFR only to the addresses a zone's ALLOW-AXFR-FROM lists, loopback else.
+PDNS_TRANSFERS_STATE="/etc/powerdns/spanel-transfers"
+
+dns_transfer_lines() {
+  if [[ "$1" == "on" ]]; then
+    printf '%s\n' "# Zone transfers: only to each zone's ALLOW-AXFR-FROM (set in the panel)." \
+      "disable-axfr=no" "allow-axfr-ips=127.0.0.1/32,::1/128" "primary=yes"
+  else
+    printf '%s\n' "# Authoritative only: no zone transfers." "disable-axfr=yes"
+  fi
+}
+
+dns_transfers() {
+  # dns-transfers <on|off>: rewrite the transfer lines of pdns.conf and
+  # restart PowerDNS; the previous file comes back if it does not start.
+  local state="$1" backup key
+  [[ "$state" == "on" || "$state" == "off" ]] || deny "usage: dns-transfers <on|off>"
+  [[ -f "$PDNS_CONF" ]] || deny "DNS Manager is not installed"
+  backup="$(mktemp)"
+  cp -a "$PDNS_CONF" "$backup"
+  python3 - "$PDNS_CONF" <<'PY' || { rm -f "$backup"; deny "could not rewrite ${PDNS_CONF}"; }
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    lines = handle.read().splitlines()
+drop = ("disable-axfr=", "allow-axfr-ips=", "primary=", "master=", "# Zone transfers:", "# Authoritative only:")
+kept = [line for line in lines if not line.startswith(drop)]
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(kept) + "\n")
+PY
+  dns_transfer_lines "$state" >>"$PDNS_CONF"
+  if ! systemctl restart pdns 2>/dev/null; then
+    cp -a "$backup" "$PDNS_CONF"
+    rm -f "$backup"
+    systemctl restart pdns 2>/dev/null || true
+    deny "PowerDNS did not start with zone transfers ${state}; the previous configuration is back"
+  fi
+  rm -f "$backup"
+  printf '%s\n' "$state" >"$PDNS_TRANSFERS_STATE"
+  key="$(tr -d '[:space:]' <"$PDNS_API_KEY_FILE" 2>/dev/null || true)"
+  local waited=0
+  while (( waited < 20 )); do
+    dns_api_answers "$key" && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "Zone transfers ${state}."
+}
+
 install_dns() {
   export DEBIAN_FRONTEND=noninteractive
   local others
@@ -2412,9 +2464,8 @@ webserver=yes
 webserver-address=127.0.0.1
 webserver-port=${PDNS_API_PORT}
 webserver-allow-from=127.0.0.1/32
-# Authoritative only: no zone transfers and no version string.
-disable-axfr=yes
 version-string=anonymous
+$(dns_transfer_lines "$(cat "$PDNS_TRANSFERS_STATE" 2>/dev/null || echo off)")
 EOF
   chown root:pdns "$PDNS_CONF"
   chmod 0640 "$PDNS_CONF"
@@ -2506,6 +2557,15 @@ MAIL_SIEVE_DIR="/etc/dovecot/spanel-sieve"
 MAIL_SETTINGS_FILE="/etc/exim4/spanel/settings.json"
 MAIL_UNBOUND_PORT="5335"
 MAIL_UNBOUND_CONF="/etc/unbound/unbound.conf.d/spanel-mail.conf"
+# Renders and checks what the Email commands below write (installer/files/
+# spanel_mailtool.py, installed root-owned by install.sh and update.sh).
+MAIL_TOOL_DIR="/usr/local/lib/spanel"
+MAIL_TOOL="${MAIL_TOOL_DIR}/spanel_mailtool.py"
+# A mailbox's autoresponder, written by mail-sync into the mailbox's home.
+MAIL_VACATION_SCRIPT="spanel-vacation.sieve"
+# Messages moved in and out of Junk wait here for Rspamd to learn them.
+MAIL_LEARN_SPOOL="/var/spool/spanel-learn"
+MAIL_QUOTA_WARNING="${MAIL_TOOL_DIR}/mail-quota-warning"
 
 mail_port_taken() {
   # "<port> (<program>)" for each mail port some other program already holds.
@@ -2552,37 +2612,51 @@ mail_write_tls_script() {
   cat >"$MAIL_TLS_SCRIPT" <<'SCRIPT'
 #!/usr/bin/env bash
 # Installed by SPanel (Email addon). Copies the panel's certificate to where
-# Exim, Dovecot and the webmail port read it, and reloads them when it changed.
+# Exim, Dovecot and the webmail port read it, then the certificates of the
+# mail domains' own hosts (mail.<domain>, answered by SNI), and reloads what
+# needs it when anything changed. Also certbot's deploy hook for those.
 set -euo pipefail
 env_file="/opt/spanel/backend/.env"
 tls_dir="/etc/spanel-mail-tls"
 value() { sed -nE "s/^$1=//p" "$env_file" 2>/dev/null | tail -n1 | tr -d '"'; }
+reload=no
+status=0
 cert="$(value PANEL_SSL_CERT)"
 key="$(value PANEL_SSL_KEY)"
 if [[ "$cert" != /* || "$key" != /* || ! -f "$cert" || ! -f "$key" ]]; then
   echo "spanel-mail-tls: the panel has no certificate configured" >&2
-  exit 1
+  status=1
+elif cmp -s "$cert" "$tls_dir/fullchain.pem" && cmp -s "$key" "$tls_dir/privkey.pem"; then
+  :
+else
+  # The panel replaces the certificate and then the key. Caught between the
+  # two, the pair does not match: wait for the key rather than break TLS.
+  cert_pub="$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null || true)"
+  key_pub="$(openssl pkey -in "$key" -pubout 2>/dev/null || true)"
+  if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
+    echo "spanel-mail-tls: certificate and key do not match yet; leaving the current pair" >&2
+  else
+    install -d -o root -g Debian-exim -m 0750 "$tls_dir"
+    install -m 0640 -o root -g Debian-exim "$cert" "$tls_dir/fullchain.pem.new"
+    install -m 0640 -o root -g Debian-exim "$key" "$tls_dir/privkey.pem.new"
+    mv -f "$tls_dir/fullchain.pem.new" "$tls_dir/fullchain.pem"
+    mv -f "$tls_dir/privkey.pem.new" "$tls_dir/privkey.pem"
+    echo "spanel-mail-tls: now using ${cert}"
+    reload=yes
+  fi
 fi
-if cmp -s "$cert" "$tls_dir/fullchain.pem" && cmp -s "$key" "$tls_dir/privkey.pem"; then
-  exit 0
+# The mail domains' own certificates (mail-hosts-apply registers them).
+if [[ -f /etc/exim4/spanel/tls_hosts && -f /usr/local/lib/spanel/spanel_mailtool.py ]]; then
+  sni="$(python3 -I /usr/local/lib/spanel/spanel_mailtool.py sni-apply /etc/exim4/spanel/tls_hosts \
+    /etc/letsencrypt/live "$tls_dir" /etc/exim4/spanel /etc/dovecot/spanel/sni.conf || echo failed)"
+  if [[ "$sni" == "changed" ]]; then reload=yes; fi
 fi
-# The panel replaces the certificate and then the key. Caught between the two,
-# the pair does not match: wait for the key rather than break TLS.
-cert_pub="$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null || true)"
-key_pub="$(openssl pkey -in "$key" -pubout 2>/dev/null || true)"
-if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
-  echo "spanel-mail-tls: certificate and key do not match yet; leaving the current pair" >&2
-  exit 0
-fi
-install -d -o root -g Debian-exim -m 0750 "$tls_dir"
-install -m 0640 -o root -g Debian-exim "$cert" "$tls_dir/fullchain.pem.new"
-install -m 0640 -o root -g Debian-exim "$key" "$tls_dir/privkey.pem.new"
-mv -f "$tls_dir/fullchain.pem.new" "$tls_dir/fullchain.pem"
-mv -f "$tls_dir/privkey.pem.new" "$tls_dir/privkey.pem"
 # Exim reads the files for each connection; Dovecot and nginx need a reload.
-if systemctl is-active --quiet dovecot; then systemctl reload dovecot || true; fi
-if systemctl is-active --quiet nginx && nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
-echo "spanel-mail-tls: now using ${cert}"
+if [[ "$reload" == "yes" ]]; then
+  if systemctl is-active --quiet dovecot; then systemctl reload dovecot || true; fi
+  if systemctl is-active --quiet nginx && nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
+fi
+exit "$status"
 SCRIPT
   chmod 0755 "$MAIL_TLS_SCRIPT"
 
@@ -2647,11 +2721,12 @@ mail_write_exim_conf() {
   # mailboxes, forwarders and routes exist is in the maps mail-sync writes.
   local tmp
   tmp="$(mktemp "${MAIL_EXIM_CONF}.XXXXXX")"
-  python3 - "$MAIL_SETTINGS_FILE" "$MAIL_EXIM_DIR" "$MAIL_TLS_DIR" "$tmp" <<'PY' || { rm -f "$tmp"; deny "could not write the Exim configuration"; }
+  [[ -f "$MAIL_TOOL" ]] || deny "${MAIL_TOOL} is missing - run the SPanel update again"
+  python3 - "$MAIL_SETTINGS_FILE" "$MAIL_EXIM_DIR" "$MAIL_TLS_DIR" "$tmp" "$MAIL_TOOL_DIR" <<'PY' || { rm -f "$tmp"; deny "could not write the Exim configuration"; }
 import json
 import sys
 
-settings_path, M, tls_dir, out_path = sys.argv[1:5]
+settings_path, M, tls_dir, out_path, tool_dir = sys.argv[1:6]
 try:
     with open(settings_path, encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -2678,8 +2753,11 @@ spam = raw.get("spam_enabled", True) is not False
 # The domain a message is sent for: the one it is DKIM-signed for, else the
 # envelope sender's. The relay is chosen by it.
 SEND = "${if def:acl_m_dkim{$acl_m_dkim}{${lc:$sender_address_domain}}}"
-DKIM = r"""  dkim_domain = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{$value}{}}
-  dkim_selector = spanel
+# dkim_domains maps a domain to its signing key's file (dkim/<value>.pem),
+# dkim_selectors to the selector that key is published under: the two change
+# together when a DKIM rotation switches keys (mail-sync).
+DKIM = r"""  dkim_domain = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{$acl_m_dkim}{}}
+  dkim_selector = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_selectors}{$value}{spanel}}
   dkim_private_key = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{@@M@@/dkim/$value.pem}{0}}
   dkim_canon = relaxed
   dkim_strict = false
@@ -2714,8 +2792,11 @@ spamd_address = 127.0.0.1 11333 variant=rspamd
 daemon_smtp_ports = 25 : 465 : 587
 tls_on_connect_ports = 465
 tls_advertise_hosts = *
-tls_certificate = @@TLS@@/fullchain.pem
-tls_privatekey = @@TLS@@/privkey.pem
+# A client that asks for mail.<domain> by SNI gets that domain's own
+# certificate (tls_certs and tls_keys, written by spanel-mail-tls); anyone
+# else the panel's. A lookup, never a path built from what the client sent.
+tls_certificate = ${lookup{${lc:$tls_in_sni}}lsearch{@@M@@/tls_certs}{$value}{@@TLS@@/fullchain.pem}}
+tls_privatekey = ${lookup{${lc:$tls_in_sni}}lsearch{@@M@@/tls_keys}{$value}{@@TLS@@/privkey.pem}}
 
 never_users = root
 host_lookup =
@@ -2775,6 +2856,7 @@ acl_check_rcpt:
   accept
 
 acl_check_data:
+@@HOLD@@
   # The From: address must be on one of the account's domains too; a message
   # that passes is DKIM-signed for that domain on its way out.
   deny    message = The From address is not one of your mail domains
@@ -2966,26 +3048,13 @@ relay_login:
   client_send = <; ; @@USER@@ ; @@PASS@@
 """
 
-auth_block = ""
-if auth_rate:
-    auth_block = (
-        "\n  deny    message = Sending limit reached: at most %d recipients an hour for each mailbox\n"
-        "          authenticated = *\n"
-        "          ratelimit = %d / 1h / per_rcpt / $authenticated_id\n" % (auth_rate, auth_rate)
-    )
-if domain_rate:
-    auth_block += (
-        "\n  deny    message = Domain sending limit reached for ${lc:$sender_address_domain}\n"
-        "          authenticated = *\n"
-        "          ratelimit = ${lookup{${lc:$sender_address_domain}}lsearch*{/etc/exim4/spanel_ratelimits}{$value}{%d}} / 1h / per_rcpt / dom:${lc:$sender_address_domain}\n" % domain_rate
-    )
-local_block = ""
-if local_rate:
-    local_block = (
-        "  deny    message = Sending limit reached: at most %d messages an hour\n"
-        "          !condition = ${if eq{$sender_ident}{root}}\n"
-        "          ratelimit = %d / 1h / per_mail / $sender_ident\n" % (local_rate, local_rate)
-    )
+# The sending limits, refusing or (auto-hold) freezing: the mail tool's.
+sys.path.insert(0, tool_dir)
+import spanel_mailtool  # noqa: E402
+
+rate_acls = spanel_mailtool.render_rate_acls(auth_rate, local_rate, domain_rate,
+                                             raw.get("auto_hold_on_rate_exceed", True) is not False)
+auth_block, local_block, hold_block = rate_acls["rcpt"], rate_acls["not_smtp"], rate_acls["data"]
 spam_block = ""
 if spam:
     spam_block = r"""
@@ -3007,6 +3076,7 @@ if spam:
 """
 
 conf = (conf.replace("@@AUTHRATE@@", auth_block)
+            .replace("@@HOLD@@", hold_block)
             .replace("@@LOCALRATE@@", local_block)
             .replace("@@SPAM@@", spam_block)
             .replace("@@DKIM@@", DKIM)
@@ -3035,8 +3105,9 @@ mail_ensure_maps() {
   install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR" "$MAIL_EXIM_DIR/dkim"
   install -d -o root -g dovecot -m 0750 "$MAIL_DOVECOT_DIR"
   local list
-  for list in domains mailboxes aliases catchall senders local_senders dkim_domains \
-      relay_routes relay_hosts relay_transports relay_auth relay_credentials ratelimits; do
+  for list in domains mailboxes aliases catchall senders local_senders dkim_domains dkim_selectors \
+      relay_routes relay_hosts relay_transports relay_auth relay_credentials ratelimits \
+      tls_hosts tls_certs tls_keys; do
     [[ -f "$MAIL_EXIM_DIR/$list" ]] || install -m 0640 -o root -g Debian-exim /dev/null "$MAIL_EXIM_DIR/$list"
   done
   [[ -f /etc/exim4/spanel_ratelimits ]] || install -m 0640 -o root -g Debian-exim /dev/null /etc/exim4/spanel_ratelimits
@@ -3200,11 +3271,41 @@ plugin {
   quota_grace = 10%%
   # Mail the spam filter marked goes to Junk, before anything of the mailbox's own.
   sieve_before = ${MAIL_SIEVE_DIR}/spam-to-junk.sieve
+  # Then the mailbox's autoresponder, which mail-sync writes into its home
+  # from the panel's list; a mailbox without one has no such file.
+  sieve_before2 = ~/${MAIL_VACATION_SCRIPT}
+
+  # Spam training: moved into Junk is spam, moved out of it (not to Trash) ham.
+  sieve_plugins = sieve_imapsieve sieve_extprograms
+  sieve_global_extensions = +vnd.dovecot.pipe +vnd.dovecot.environment
+  sieve_pipe_bin_dir = ${MAIL_SIEVE_DIR}/bin
+  imapsieve_mailbox1_name = Junk
+  imapsieve_mailbox1_causes = COPY APPEND
+  imapsieve_mailbox1_before = file:${MAIL_SIEVE_DIR}/learn-spam.sieve
+  imapsieve_mailbox2_name = *
+  imapsieve_mailbox2_from = Junk
+  imapsieve_mailbox2_causes = COPY
+  imapsieve_mailbox2_before = file:${MAIL_SIEVE_DIR}/learn-ham.sieve
+
+  # The mailbox is told when it is filling up.
+  quota_warning = storage=95%% quota-warning 95 %u
+  quota_warning2 = storage=80%% quota-warning 80 %u
 }
 
 protocol imap {
-  mail_plugins = \$mail_plugins imap_quota
+  mail_plugins = \$mail_plugins imap_quota imap_sieve
   mail_max_userip_connections = 20
+}
+
+# Run as user dovecot. Every mailbox's processes run as its owner, so the
+# socket is open to all; the script checks what it is asked and warns a
+# mailbox at most once a day per level.
+service quota-warning {
+  executable = script ${MAIL_QUOTA_WARNING}
+  user = dovecot
+  unix_listener quota-warning {
+    mode = 0666
+  }
 }
 protocol lmtp {
   postmaster_address = postmaster@%d
@@ -3243,6 +3344,10 @@ service pop3-login {
     ssl = yes
   }
 }
+
+# The certificate of each mail domain's own host (mail.<domain>), by SNI;
+# written by spanel-mail-tls.
+!include_try ${MAIL_DOVECOT_DIR}/sni.conf
 EOF
   chmod 0644 "$tmp"
   if ! doveconf -c "$tmp" -n >/dev/null 2>>"$MAIL_INSTALL_LOG"; then
@@ -3438,7 +3543,9 @@ install_mail() {
 
   mail_write_exim_conf
   mail_write_sieve
+  mail_write_quota_warning
   mail_write_dovecot_conf
+  mail_write_learn_service
   mail_write_unbound_conf
   mail_write_rspamd_conf
   mail_install_webmail
@@ -3488,6 +3595,7 @@ remove_mail() {
   systemctl disable --now exim4 >/dev/null 2>&1 || true
   systemctl disable --now dovecot >/dev/null 2>&1 || true
   systemctl disable --now spanel-mail-tls.path >/dev/null 2>&1 || true
+  systemctl disable --now spanel-mail-learn.timer >/dev/null 2>&1 || true
   for conf in /etc/nginx/conf.d/00-spanel-webmail*.conf; do
     [[ -f "$conf" ]] || continue
     mv -f "$conf" "${conf}.off"
@@ -3532,26 +3640,36 @@ mail_sync() {
   #    "forwarders": [{"address", "to": [...]}],
   #    "senders": {mailbox: [domains it may send as]},
   #    "local_senders": {linux user: [domains its PHP mail is signed for]},
-  #    "relay_routes": {domain: relay id or "direct"}, "default_relay": id}
+  #    "relay_routes": {domain: relay id or "direct"}, "default_relay": id,
+  #    "autoresponders": [{"address", "subject", "body", "start", "end", "days"}]}
   # Every field is checked again here and nothing is written unless all of it
   # passes. Writes what Exim and Dovecot read, makes missing mail directories
-  # and DKIM keys, and prints each domain's DKIM public key. Neither service
+  # and DKIM keys, writes each mailbox's autoresponder (a Sieve vacation in
+  # its home), and prints each domain's DKIM public key. Neither service
   # needs a reload: both notice a changed file on the next lookup.
   [[ -f "$MAIL_EXIM_CONF" ]] || deny "the Email addon is not installed"
   local payload status=0
+  # The maps below name each domain's DKIM key by file and selector; an Exim
+  # configuration from before that would sign with the wrong domain.
+  if ! grep -q 'dkim_selectors' "$MAIL_EXIM_CONF"; then
+    mail_ensure_maps
+    mail_write_exim_conf
+    mail_exim_reload || true
+  fi
   payload="$(mktemp)"
   head -c 8000000 >"$payload"
-  python3 - "$payload" "$MAIL_EXIM_DIR" "$MAIL_DOVECOT_DIR" <<'PY' || status=$?
+  python3 - "$payload" "$MAIL_EXIM_DIR" "$MAIL_DOVECOT_DIR" "$MAIL_TOOL_DIR" "$MAIL_VACATION_SCRIPT" <<'PY' || status=$?
 import base64
 import grp
 import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 
-payload_path, exim_dir, dovecot_dir = sys.argv[1:4]
+payload_path, exim_dir, dovecot_dir, tool_dir, vacation_name = sys.argv[1:6]
 
 DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 LOCAL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
@@ -3611,7 +3729,13 @@ def domain_list(values, owner):
     return clean
 
 
-domains, catchall = [], {}
+sys.path.insert(0, tool_dir)
+try:
+    import spanel_mailtool
+except ImportError:
+    fail(f"{tool_dir}/spanel_mailtool.py is missing - run the SPanel update again")
+
+domains, catchall, selectors = [], {}, {}
 for item in data.get("domains") or []:
     name = str((item or {}).get("domain") or "").strip().lower()
     if not DOMAIN_RE.fullmatch(name):
@@ -3622,6 +3746,12 @@ for item in data.get("domains") or []:
     target = str(item.get("catch_all") or "").strip()
     if target:
         catchall[name] = remote(target)
+    # The selector its mail is signed with; "spanel" is the key every domain
+    # had before DKIM rotation.
+    try:
+        selectors[name] = spanel_mailtool.check_selector(item.get("dkim_selector") or "spanel")
+    except spanel_mailtool.ToolError as exc:
+        fail(str(exc))
 domain_set = set(domains)
 
 boxes, seen = [], set()
@@ -3687,6 +3817,17 @@ if default_relay:
         fail(f"invalid default relay {default_relay!r}")
     routes.append(f"*: {default_relay}")
 
+# Autoresponders, rendered (and checked again) by the mail tool.
+vacations = {}
+if data.get("autoresponders"):
+    try:
+        vacations = spanel_mailtool.vacation_scripts(data.get("autoresponders"))
+    except spanel_mailtool.ToolError as exc:
+        fail(str(exc))
+    for address in vacations:
+        if address not in seen:
+            fail(f"autoresponder for {address}, which is not a mailbox")
+
 exim_gid = grp.getgrnam("Debian-exim").gr_gid
 dovecot_gid = grp.getgrnam("dovecot").gr_gid
 spanel_gid = grp.getgrnam("spanel").gr_gid
@@ -3710,6 +3851,47 @@ def open_dir(parent_fd, name, uid, gid, mode):
     return fd
 
 
+def put_vacation(box_fd, box):
+    """The mailbox's autoresponder script, or none. The mailbox directory is
+    its owner's, who could plant a link or a FIFO under either name: nothing
+    is followed or read that is not a plain file, and a failure is that
+    mailbox's alone - it never stops the sync of everyone else."""
+    script = vacations.get(box["address"])
+    try:
+        if script is None:
+            for name in (vacation_name, vacation_name[:-len(".sieve")] + ".svbin"):
+                try:
+                    os.unlink(name, dir_fd=box_fd)
+                except FileNotFoundError:
+                    pass
+            return
+        wanted = script.encode()
+        try:
+            fd = os.open(vacation_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=box_fd)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode) and os.read(fd, len(wanted) + 1) == wanted:
+                    return
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        tmp = "." + vacation_name + ".new"
+        try:
+            os.unlink(tmp, dir_fd=box_fd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=box_fd)
+        try:
+            os.fchown(fd, box["uid"], spanel_gid)
+            os.fchmod(fd, 0o640)
+            os.write(fd, wanted)
+        finally:
+            os.close(fd)
+        os.replace(tmp, vacation_name, src_dir_fd=box_fd, dst_dir_fd=box_fd)
+    except OSError as exc:
+        print(f"spanel-helper: mail-sync: autoresponder of {box['address']} not written: {exc}", file=sys.stderr)
+
+
 for box in boxes:
     # /home/<user> is root's (the SFTP chroot); mail/ and mail/<domain>/ are
     # root's too, so the customer cannot rearrange them. From the mailbox down
@@ -3724,13 +3906,18 @@ for box in boxes:
         fds.append(open_dir(fds[-1], "Maildir", box["uid"], spanel_gid, 0o2750))
         for part in ("cur", "new", "tmp"):
             os.close(open_dir(fds[-1], part, box["uid"], spanel_gid, 0o2750))
+        put_vacation(fds[3], box)
     finally:
         for fd in reversed(fds):
             os.close(fd)
 
 dkim = {}
 for domain in domains:
-    key_path = os.path.join(exim_dir, "dkim", f"{domain}.pem")
+    # "spanel" is dkim/<domain>.pem, as before rotation; another selector's
+    # key is dkim/<selector>/<domain>.pem.
+    key_path = os.path.join(exim_dir, "dkim", spanel_mailtool.dkim_key_name(domain, selectors[domain]) + ".pem")
+    os.makedirs(os.path.dirname(key_path), mode=0o750, exist_ok=True)
+    os.chown(os.path.dirname(key_path), 0, exim_gid)
     if not os.path.exists(key_path):
         fd = os.open(key_path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
         os.fchown(fd, 0, exim_gid)
@@ -3774,7 +3961,9 @@ write(E("aliases"), [f"{a}: {', '.join(t)}" for a, t in sorted(aliases.items())]
 write(E("catchall"), [f"{d}: {t}" for d, t in sorted(catchall.items())], exim_gid)
 write(E("senders"), [f"{a}: {' : '.join(d)}" for a, d in sorted(senders.items()) if d], exim_gid)
 write(E("local_senders"), [f"{u}: {' : '.join(d)}" for u, d in sorted(local_senders.items()) if d], exim_gid)
-write(E("dkim_domains"), [f"{d}: {d}" for d in sorted(dkim)], exim_gid)
+dkim_domain_lines, dkim_selector_lines = spanel_mailtool.dkim_maps({d: selectors[d] for d in dkim})
+write(E("dkim_domains"), dkim_domain_lines, exim_gid)
+write(E("dkim_selectors"), dkim_selector_lines, exim_gid)
 write(E("relay_routes"), sorted(routes), exim_gid)
 
 users, denied = [], []
@@ -3798,7 +3987,8 @@ for line in denied:
     if address not in previously_denied:
         subprocess.run(["doveadm", "kick", address], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
-print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim}))
+print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim,
+                  "autoresponders": len(vacations)}))
 PY
   rm -f "$payload"
   [[ $status -eq 0 ]] || exit "$status"
@@ -3818,10 +4008,84 @@ if header :contains "X-Spam-Status" "Yes" {
 }
 SIEVE
   chmod 0644 "$MAIL_SIEVE_DIR/spam-to-junk.sieve"
+  # Spam training (IMAPSieve): a message moved into Junk is learnt as spam,
+  # one moved out of it (anywhere but Trash) as ham. The pipe programs run as
+  # the mailbox's owner and only queue the message for spanel-mail-learn.
+  cat >"$MAIL_SIEVE_DIR/learn-spam.sieve" <<'SIEVE'
+# Managed by SPanel (Email addon). Moved into Junk: Rspamd learns it as spam.
+require ["vnd.dovecot.pipe", "copy", "imapsieve"];
+pipe :copy "spanel-learn-spam";
+SIEVE
+  cat >"$MAIL_SIEVE_DIR/learn-ham.sieve" <<'SIEVE'
+# Managed by SPanel (Email addon). Moved out of Junk: Rspamd learns it as ham,
+# unless it went to Trash.
+require ["vnd.dovecot.pipe", "copy", "imapsieve", "environment", "variables"];
+if environment :matches "imap.mailbox" "*" {
+  set "mailbox" "${1}";
+}
+if string "${mailbox}" "Trash" {
+  stop;
+}
+pipe :copy "spanel-learn-ham";
+SIEVE
+  install -d -o root -g root -m 0755 "$MAIL_SIEVE_DIR/bin"
+  local kind
+  for kind in spam ham; do
+    printf '#!/bin/sh\n# Managed by SPanel (Email addon). Runs as the mailbox owner: queues the message.\nexec /usr/bin/python3 -I %s learn-enqueue %s\n' \
+      "$MAIL_TOOL" "$kind" >"$MAIL_SIEVE_DIR/bin/spanel-learn-${kind}"
+    chmod 0755 "$MAIL_SIEVE_DIR/bin/spanel-learn-${kind}"
+  done
+  chmod 0644 "$MAIL_SIEVE_DIR"/learn-spam.sieve "$MAIL_SIEVE_DIR"/learn-ham.sieve
   # Compiled here, as root: the mailbox owners could not write the result.
   sievec "$MAIL_SIEVE_DIR/spam-to-junk.sieve" >>"$MAIL_INSTALL_LOG" 2>&1 \
     || deny "could not compile the spam Sieve script (see ${MAIL_INSTALL_LOG})"
   chmod 0644 "$MAIL_SIEVE_DIR"/spam-to-junk.svbin
+  # The learn scripts need the pipe extension, which only the IMAPSieve
+  # configuration enables: Dovecot compiles them itself when first used.
+  rm -f "$MAIL_SIEVE_DIR"/learn-spam.svbin "$MAIL_SIEVE_DIR"/learn-ham.svbin
+}
+
+mail_write_learn_service() {
+  # The spool mailbox owners queue messages into (they can add files but not
+  # list or read anyone else's), and the root service that hands them to
+  # Rspamd's controller with its key.
+  install -d -o root -g root -m 1733 "$MAIL_LEARN_SPOOL"
+  cat >/etc/systemd/system/spanel-mail-learn.service <<UNIT
+[Unit]
+Description=SPanel: hand messages moved in and out of Junk to Rspamd
+After=rspamd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I ${MAIL_TOOL} learn-process ${MAIL_LEARN_SPOOL} ${MAIL_RSPAMD_KEY_FILE}
+UNIT
+  # Every minute rather than on a change of the directory: a file a mailbox
+  # owner leaves there must not make the service run back to back.
+  cat >/etc/systemd/system/spanel-mail-learn.timer <<UNIT
+[Unit]
+Description=SPanel: hand the spam-training queue to Rspamd every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  rm -f /etc/systemd/system/spanel-mail-learn.path
+  systemctl daemon-reload
+  systemctl enable --now spanel-mail-learn.timer >/dev/null 2>&1 || true
+}
+
+mail_write_quota_warning() {
+  # Dovecot runs this as user dovecot when a mailbox crosses 80% or 95% of its
+  # quota; the mail tool checks the mailbox exists and mails it once a day.
+  install -d -o root -g root -m 0755 "$MAIL_TOOL_DIR"
+  printf '#!/bin/sh\n# Managed by SPanel (Email addon): warns a mailbox that is filling up.\nexec /usr/bin/python3 -I %s quota-warning "$@"\n' \
+    "$MAIL_TOOL" >"$MAIL_QUOTA_WARNING"
+  chmod 0755 "$MAIL_QUOTA_WARNING"
+  install -d -o dovecot -g dovecot -m 0750 /var/lib/spanel-mail /var/lib/spanel-mail/quota-warnings
 }
 
 mail_rspamd_group() {
@@ -4316,15 +4580,57 @@ PY
   echo "Mail settings applied."
 }
 
+mail_reconfigure() {
+  # An update brought a newer helper: Exim's and Dovecot's configuration and
+  # the Sieve scripts are written again from what is saved, so a server
+  # installed before a feature gets it without reinstalling the addon.
+  # Nothing to do where the addon was never installed.
+  if [[ ! -f "$MAIL_EXIM_CONF" ]] || ! grep -qF "$MAIL_MARKER" "$MAIL_EXIM_CONF"; then
+    echo "The Email addon is not installed; nothing to reconfigure."
+    return 0
+  fi
+  mail_ensure_maps
+  mail_write_tls_script
+  "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
+  mail_write_exim_conf
+  mail_write_sieve
+  mail_write_quota_warning
+  mail_write_dovecot_conf
+  mail_write_learn_service
+  if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
+  if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
+  echo "Mail configuration rewritten."
+}
+
+require_dkim_selector() {
+  [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || deny "invalid DKIM selector: $1"
+}
+
+mail_dkim_key() {
+  # The key file of a domain's selector: "spanel" is dkim/<domain>.pem, the
+  # key every domain had before rotation; any other is dkim/<selector>/<domain>.pem.
+  if [[ "$2" == "spanel" ]]; then
+    printf '%s/dkim/%s.pem' "$MAIL_EXIM_DIR" "$1"
+  else
+    printf '%s/dkim/%s/%s.pem' "$MAIL_EXIM_DIR" "$2" "$1"
+  fi
+}
+
+mail_dkim_active_selector() {
+  awk -F': ' -v d="$1" '$1 == d { print $2; exit }' "$MAIL_EXIM_DIR/dkim_selectors" 2>/dev/null || true
+}
+
 mail_dkim() {
-  # The domain's DKIM public key (base64, one line) for its DNS record, making
-  # the key pair first when there is none - or always, with "rotate".
-  local domain="$1" mode="${2:-}" key tmp
+  # The DKIM public key (base64, one line) of a domain's selector for its DNS
+  # record, making the key pair first when there is none. A rotation makes
+  # the next selector's key this way, long before Exim signs with it.
+  local domain="$1" selector="${2:-spanel}" key tmp
   require_domain "$domain"
-  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim"
-  key="$MAIL_EXIM_DIR/dkim/${domain}.pem"
-  if [[ ! -f "$key" || "$mode" == "rotate" ]]; then
-    tmp="$(mktemp "$MAIL_EXIM_DIR/dkim/.${domain}.XXXXXX")"
+  require_dkim_selector "$selector"
+  key="$(mail_dkim_key "$domain" "$selector")"
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim" "$(dirname "$key")"
+  if [[ ! -f "$key" ]]; then
+    tmp="$(mktemp "$(dirname "$key")/.${domain}.XXXXXX")"
     chown root:Debian-exim "$tmp"
     chmod 0640 "$tmp"
     openssl genrsa -out "$tmp" 2048 >/dev/null 2>&1 || { rm -f "$tmp"; deny "could not create a DKIM key for ${domain}"; }
@@ -4332,6 +4638,79 @@ mail_dkim() {
     chmod 0640 "$tmp"
     mv -f "$tmp" "$key"
   fi
+  openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | base64 -w0
+  echo
+}
+
+mail_dkim_drop() {
+  # A retired (or abandoned) selector's key goes. Never the one Exim signs with.
+  local domain="$1" selector="$2" key
+  require_domain "$domain"
+  require_dkim_selector "$selector"
+  if [[ "$(mail_dkim_active_selector "$domain")" == "$selector" ]] \
+     || { [[ "$selector" == "spanel" ]] && [[ -z "$(mail_dkim_active_selector "$domain")" ]]; }; then
+    deny "${selector} is the key ${domain} is signed with"
+  fi
+  key="$(mail_dkim_key "$domain" "$selector")"
+  rm -f -- "$key"
+  # A selector's own directory goes once empty; never dkim/ itself.
+  if [[ "$selector" != "spanel" ]]; then rmdir -- "$(dirname "$key")" 2>/dev/null || true; fi
+  echo "removed DKIM key ${selector} of ${domain}"
+}
+
+mail_dkim_export() {
+  # Every DKIM key of a domain, for its owner's backup: {"selector": "PEM"}.
+  local domain="$1"
+  require_domain "$domain"
+  python3 - "$MAIL_EXIM_DIR/dkim" "$domain" <<'PY'
+import json
+import os
+import re
+import sys
+
+base, domain = sys.argv[1:3]
+SELECTOR_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+keys = {}
+candidates = [("spanel", os.path.join(base, f"{domain}.pem"))]
+try:
+    names = sorted(os.listdir(base))
+except OSError:
+    names = []
+for name in names:
+    if SELECTOR_RE.fullmatch(name) and os.path.isdir(os.path.join(base, name)):
+        candidates.append((name, os.path.join(base, name, f"{domain}.pem")))
+for selector, path in candidates:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        continue
+    with os.fdopen(fd, encoding="ascii", errors="replace") as handle:
+        text = handle.read(20000)
+    if "PRIVATE KEY-----" in text:
+        keys[selector] = text
+print(json.dumps(keys))
+PY
+}
+
+mail_dkim_import() {
+  # A DKIM private key from a backup, PEM on stdin, for a domain's selector:
+  # checked to be an RSA key of 1024 to 4096 bits, then put in place and its
+  # public key printed, as mail-dkim does.
+  local domain="$1" selector="$2" key tmp bits
+  require_domain "$domain"
+  require_dkim_selector "$selector"
+  key="$(mail_dkim_key "$domain" "$selector")"
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim" "$(dirname "$key")"
+  tmp="$(mktemp "$(dirname "$key")/.${domain}.XXXXXX")"
+  chown root:Debian-exim "$tmp"
+  chmod 0640 "$tmp"
+  head -c 16384 >"$tmp"
+  bits="$(openssl rsa -in "$tmp" -noout -text 2>/dev/null | sed -nE 's/^Private-Key: \(([0-9]+) bit.*/\1/p' | head -n1 || true)"
+  if [[ ! "$bits" =~ ^[0-9]+$ ]] || (( bits < 1024 || bits > 4096 )) || ! openssl rsa -in "$tmp" -check -noout >/dev/null 2>&1; then
+    rm -f "$tmp"
+    deny "not an RSA private key of 1024 to 4096 bits"
+  fi
+  mv -f "$tmp" "$key"
   openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | base64 -w0
   echo
 }
@@ -4344,6 +4723,51 @@ mail_log_tail() {
 
 mail_queue_count() {
   exim4 -bpc 2>/dev/null || echo 0
+}
+
+require_queue_id() {
+  # Exim's message ids: the 4.97+ form (Ubuntu 24.04) and the older one.
+  [[ "$1" =~ ^[0-9A-Za-z]{6}-([0-9A-Za-z]{11}-[0-9A-Za-z]{4}|[0-9A-Za-z]{6}-[0-9A-Za-z]{2})$ ]] \
+    || deny "invalid message id: $1"
+}
+
+mail_queue_list() {
+  # The queue as `exim -bp` prints it, at most 4 MB of it; the panel parses it.
+  exim4 -bp 2>/dev/null | head -c 4000000 || true
+}
+
+mail_queue_show() {
+  # One message's envelope and headers (exim -Mvh), never its body.
+  require_queue_id "$1"
+  exim4 -Mvh "$1" 2>/dev/null | head -c 200000 || deny "no message ${1} in the queue"
+}
+
+mail_queue_action() {
+  # retry | freeze | thaw | delete, for up to 100 messages.
+  local action="$1" id flag
+  shift
+  [[ $# -ge 1 && $# -le 100 ]] || deny "usage: mail-queue-action <retry|freeze|thaw|delete> <id>..."
+  for id in "$@"; do require_queue_id "$id"; done
+  case "$action" in
+    freeze) flag=-Mf ;;
+    thaw) flag=-Mt ;;
+    delete) flag=-Mrm ;;
+    retry)
+      # A delivery can take minutes: in the background, as exim4 -qf does.
+      setsid timeout 600 exim4 -M "$@" >/dev/null 2>&1 < /dev/null &
+      echo "retrying $# message(s)"
+      return 0
+      ;;
+    *) deny "invalid queue action: $action" ;;
+  esac
+  # Exim says per message what it did (or that the message is gone).
+  exim4 "$flag" "$@" 2>&1 | head -c 20000 || true
+}
+
+mail_queue_retry_all() {
+  # Every message, frozen ones included, tried again now.
+  setsid timeout 1800 exim4 -qff >/dev/null 2>&1 < /dev/null &
+  echo "retrying the whole queue"
 }
 
 mail_rspamd_log() {
@@ -4365,7 +4789,7 @@ mail_purge_domain() {
   elif [[ -d "$dir" ]]; then
     rm -rf --one-file-system -- "$dir"
   fi
-  rm -f -- "$MAIL_EXIM_DIR/dkim/${domain}.pem"
+  rm -f -- "$MAIL_EXIM_DIR/dkim/${domain}.pem" "$MAIL_EXIM_DIR"/dkim/*/"${domain}.pem"
   echo "mail data removed: ${domain}"
 }
 
@@ -4552,6 +4976,127 @@ mail_webmail_hosts() {
     domain="${conf#/etc/nginx/conf.d/00-spanel-webmail-}"
     printf '%s\n' "${domain%.conf}"
   done
+}
+
+# ---- A mail domain's own hosts: mail., mta-sts., autoconfig., autodiscover. ----
+# One Let's Encrypt certificate named mail.<domain> covers the hosts the panel
+# turned on (the same webroot flow as webmail.<domain>). nginx serves them;
+# Exim and Dovecot answer mail.<domain> with it by SNI (tls_hosts, read by
+# spanel-mail-tls, which certbot also runs on every renewal).
+MAIL_HOSTS_DOCS="/var/www/spanel-mailhosts"
+MAIL_TLS_HOSTS="${MAIL_EXIM_DIR}/tls_hosts"
+
+mail_hosts_conf() {
+  printf '/etc/nginx/conf.d/00-spanel-mailhosts-%s.conf' "$1"
+}
+
+mail_cert_covers() {
+  # Whether the live certificate <name> covers every host in the comma list.
+  local cert="/etc/letsencrypt/live/$1/fullchain.pem" host answer
+  [[ -f "$cert" ]] || return 1
+  for host in ${2//,/ }; do
+    answer="$(openssl x509 -in "$cert" -noout -checkhost "$host" 2>/dev/null || true)"
+    [[ "$answer" == *"does match"* ]] || return 1
+  done
+}
+
+mail_hosts_register() {
+  # "<host>: <certificate name>" in tls_hosts, or the host taken out ("" name).
+  local host="$1" name="$2" tmp
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR"
+  [[ -f "$MAIL_TLS_HOSTS" ]] || install -m 0640 -o root -g Debian-exim /dev/null "$MAIL_TLS_HOSTS"
+  tmp="$(mktemp "${MAIL_TLS_HOSTS}.XXXXXX")"
+  awk -F': ' -v h="$host" '$1 != h' "$MAIL_TLS_HOSTS" >"$tmp" || true
+  [[ -z "$name" ]] || printf '%s: %s\n' "$host" "$name" >>"$tmp"
+  chown root:Debian-exim "$tmp"
+  chmod 0640 "$tmp"
+  mv -f "$tmp" "$MAIL_TLS_HOSTS"
+}
+
+mail_hosts_apply() {
+  # A mail domain's hosts, as JSON on stdin (checked by the mail tool):
+  #   {"domain", "hosts": ["mail", "mta-sts", "autoconfig", "autodiscover"], "email",
+  #    "mta_sts": {"mode": "testing"|"enforce"|"none", "max_age"} or null}
+  # Issues (or extends) the certificate, writes what the hosts serve and the
+  # nginx server blocks, and registers mail.<domain> for SNI. Prints the
+  # names served.
+  [[ -f "$WEBMAIL_NGINX" ]] || deny "the Email addon is not installed"
+  [[ -f "$MAIL_TOOL" ]] || deny "${MAIL_TOOL} is missing - run the SPanel update again"
+  local payload domain cert_name email names conf docs tmp host rc=0 had_tls=no
+  local -a args
+  payload="$(mktemp)"
+  head -c 200000 >"$payload"
+  # The tool's own sentence says what is wrong with the request.
+  read -r domain cert_name email names < <(python3 -I "$MAIL_TOOL" mail-hosts-fields <"$payload") \
+    || { rm -f "$payload"; exit 1; }
+  require_domain "$domain"
+  conf="$(mail_hosts_conf "$domain")"
+  docs="${MAIL_HOSTS_DOCS}/${domain}"
+  install -d -o root -g spanel -m 0755 /var/www/spanel-acme/.well-known/acme-challenge
+  install -d -o root -g root -m 0755 "$MAIL_HOSTS_DOCS" "$docs"
+  [[ -f "$conf" ]] && grep -q 'listen 443 ssl' "$conf" && had_tls=yes
+  tmp="$(mktemp)"
+  if ! mail_cert_covers "$cert_name" "$names"; then
+    # Port 80 for the challenge first, for every name.
+    python3 -I "$MAIL_TOOL" mailhosts-nginx "$docs" http <"$payload" >"$tmp" || { rm -f "$payload" "$tmp"; deny "could not write the mail hosts' server block"; }
+    [[ "$had_tls" == "yes" ]] && cp -a "$conf" "${conf}.previous"
+    install -m 0644 "$tmp" "$conf"
+    nginx_ipv6_apply >/dev/null 2>&1 || true
+    if ! nginx -t >/dev/null 2>&1; then
+      if [[ "$had_tls" == "yes" ]]; then mv -f "${conf}.previous" "$conf"; else rm -f "$conf"; fi
+      rm -f "$payload" "$tmp"
+      deny "nginx refused the server block for the mail hosts of ${domain}"
+    fi
+    systemctl reload nginx
+    args=(certonly --webroot -w /var/www/spanel-acme --cert-name "$cert_name" --expand
+          --non-interactive --agree-tos --keep-until-expiring --deploy-hook "$MAIL_TLS_SCRIPT")
+    for host in ${names//,/ }; do args+=(-d "$host"); done
+    if [[ "$email" != "-" ]]; then
+      require_email "$email"
+      args+=(--email "$email")
+    else
+      args+=(--register-unsafely-without-email)
+    fi
+    certbot "${args[@]}" >>"$MAIL_INSTALL_LOG" 2>&1 || rc=$?
+    if ! mail_cert_covers "$cert_name" "$names"; then
+      if [[ "$had_tls" == "yes" ]]; then mv -f "${conf}.previous" "$conf"; else rm -f "$conf"; fi
+      nginx -t >/dev/null 2>&1 && systemctl reload nginx
+      rm -f "$payload" "$tmp"
+      deny "no certificate for ${names//,/, } (certbot exited ${rc}) - point each of them at this server first"
+    fi
+    rm -f "${conf}.previous"
+  fi
+  # What the hosts serve: the MTA-STS policy, autoconfig and autodiscover.
+  python3 -I "$MAIL_TOOL" mailhost-docs "$docs" <"$payload" >/dev/null || { rm -f "$payload" "$tmp"; exit 1; }
+  python3 -I "$MAIL_TOOL" mailhosts-nginx "$docs" https <"$payload" >"$tmp" || { rm -f "$payload" "$tmp"; deny "could not write the mail hosts' server block"; }
+  cp -a "$conf" "${conf}.previous" 2>/dev/null || true
+  install -m 0644 "$tmp" "$conf"
+  rm -f "$payload" "$tmp"
+  nginx_ipv6_apply >/dev/null 2>&1 || true
+  if ! nginx -t >/dev/null 2>&1; then
+    if [[ -f "${conf}.previous" ]]; then mv -f "${conf}.previous" "$conf"; else rm -f "$conf"; fi
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+    deny "nginx refused the server block for the mail hosts of ${domain}"
+  fi
+  rm -f "${conf}.previous"
+  systemctl reload nginx
+  mail_hosts_register "mail.${domain}" "$cert_name"
+  "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
+  printf '%s\n' "${names//,/ }"
+}
+
+mail_hosts_remove() {
+  # The hosts of a mail domain stop being served; their certificate goes.
+  local domain="$1"
+  require_domain "$domain"
+  rm -f "$(mail_hosts_conf "$domain")" "$(mail_hosts_conf "$domain").previous"
+  rm -rf --one-file-system -- "${MAIL_HOSTS_DOCS:?}/${domain}"
+  if [[ -f "$MAIL_TLS_HOSTS" ]]; then mail_hosts_register "mail.${domain}" ""; fi
+  certbot delete --non-interactive --cert-name "mail.${domain}" >>"$MAIL_INSTALL_LOG" 2>&1 || true
+  rm -rf --one-file-system -- "${MAIL_TLS_DIR:?}/mail.${domain}"
+  "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
+  if nginx -t >/dev/null 2>&1; then systemctl reload nginx; fi
+  echo "mail hosts of ${domain} removed"
 }
 
 fail2ban_status() {
@@ -9415,6 +9960,11 @@ case "$cmd" in
     dns_status
     ;;
 
+  dns-transfers)
+    [[ $# -eq 1 ]] || deny "usage: dns-transfers <on|off>"
+    dns_transfers "$1"
+    ;;
+
   # ---- Email (Exim + Dovecot + webmail, optional) -------------------------
   mail-install)
     [[ $# -eq 1 ]] || deny "usage: mail-install <mail-hostname>"
@@ -9461,15 +10011,44 @@ case "$cmd" in
     mail_webmail_hosts
     ;;
 
+  mail-hosts-apply)
+    [[ $# -eq 0 ]] || deny "usage: mail-hosts-apply < hosts.json"
+    mail_hosts_apply
+    ;;
+
+  mail-hosts-remove)
+    [[ $# -eq 1 ]] || deny "usage: mail-hosts-remove <domain>"
+    mail_hosts_remove "$1"
+    ;;
+
   mail-configure)
     [[ $# -eq 0 ]] || deny "usage: mail-configure < settings.json"
     mail_configure
     ;;
 
+  mail-reconfigure)
+    [[ $# -eq 0 ]] || deny "usage: mail-reconfigure"
+    mail_reconfigure
+    ;;
+
   mail-dkim)
-    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: mail-dkim <domain> [rotate]"
-    [[ $# -eq 1 || "$2" == "rotate" ]] || deny "usage: mail-dkim <domain> [rotate]"
-    mail_dkim "$1" "${2:-}"
+    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: mail-dkim <domain> [selector]"
+    mail_dkim "$1" "${2:-spanel}"
+    ;;
+
+  mail-dkim-drop)
+    [[ $# -eq 2 ]] || deny "usage: mail-dkim-drop <domain> <selector>"
+    mail_dkim_drop "$1" "$2"
+    ;;
+
+  mail-dkim-export)
+    [[ $# -eq 1 ]] || deny "usage: mail-dkim-export <domain>"
+    mail_dkim_export "$1"
+    ;;
+
+  mail-dkim-import)
+    [[ $# -eq 2 ]] || deny "usage: mail-dkim-import <domain> <selector> < key.pem"
+    mail_dkim_import "$1" "$2"
     ;;
 
   mail-log)
@@ -9480,6 +10059,26 @@ case "$cmd" in
   mail-queue)
     [[ $# -eq 0 ]] || deny "usage: mail-queue"
     mail_queue_count
+    ;;
+
+  mail-queue-list)
+    [[ $# -eq 0 ]] || deny "usage: mail-queue-list"
+    mail_queue_list
+    ;;
+
+  mail-queue-show)
+    [[ $# -eq 1 ]] || deny "usage: mail-queue-show <id>"
+    mail_queue_show "$1"
+    ;;
+
+  mail-queue-action)
+    [[ $# -ge 2 ]] || deny "usage: mail-queue-action <retry|freeze|thaw|delete> <id>..."
+    mail_queue_action "$@"
+    ;;
+
+  mail-queue-retry-all)
+    [[ $# -eq 0 ]] || deny "usage: mail-queue-retry-all"
+    mail_queue_retry_all
     ;;
 
   mail-rspamd-log)

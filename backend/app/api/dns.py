@@ -44,6 +44,18 @@ class SettingsIn(BaseModel):
     auto_zone: bool = True
     # Records for new zones; None keeps the one saved (an older page sends none).
     template: str | None = Field(default=None, max_length=10000)
+    # A package's own records for new zones, by package id; None keeps them.
+    package_templates: dict[str, str] | None = Field(default=None, max_length=200)
+
+
+class ZoneFileIn(BaseModel):
+    text: str = Field(max_length=dns.MAX_IMPORT_BYTES)
+    mode: str = Field(default="merge", pattern="^(merge|replace)$")
+
+
+class SecondariesIn(BaseModel):
+    also_notify: list[str] = Field(default_factory=list, max_length=dns.MAX_SECONDARIES)
+    allow_axfr: list[str] = Field(default_factory=list, max_length=dns.MAX_SECONDARIES)
 
 
 def _answer(action):
@@ -156,6 +168,53 @@ def restore_zone_defaults(zone: str, request: Request, db: Session = Depends(get
     return {"zone": name, "records": _answer(lambda: dns.zone_records(db, name)), "message": "The panel's records are back."}
 
 
+@router.get("/zones/{zone}/export")
+def export_zone(zone: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """The zone as a BIND zone file."""
+    name = _answer(lambda: dns.may_edit(db, current_user, zone))
+    return {"zone": name, "filename": f"{name}.zone", "text": _answer(lambda: dns.export_zone(name))}
+
+
+@router.post("/zones/{zone}/import/preview")
+def preview_zone_import(zone: str, payload: ZoneFileIn, db: Session = Depends(get_db),
+                        current_user: User = Depends(get_current_user)):
+    """What importing a zone file would write, refuse and leave out."""
+    name = _answer(lambda: dns.may_edit(db, current_user, zone))
+    admin = is_admin_role(current_user.role)
+    return _answer(lambda: dns.preview_import(name, payload.text, payload.mode, admin=admin))
+
+
+@router.post("/zones/{zone}/import")
+def import_zone(zone: str, payload: ZoneFileIn, request: Request, db: Session = Depends(get_db),
+                current_user: User = Depends(get_current_user)):
+    name = _answer(lambda: dns.may_edit(db, current_user, zone))
+    admin = is_admin_role(current_user.role)
+    summary = _answer(lambda: dns.import_zone(name, payload.text, payload.mode, admin=admin))
+    log_action(db, current_user.id, "dns_import_zone", name, f"{payload.mode}: {summary['records']} record(s)",
+               request=request)
+    return {"zone": name, **summary, "records": _answer(lambda: dns.zone_records(db, name)),
+            "message": "Zone file imported."}
+
+
+@router.get("/zones/{zone}/secondaries")
+def get_secondaries(zone: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    name = _answer(lambda: dns.may_edit(db, current_user, zone))
+    return _answer(lambda: dns.secondary_view(name))
+
+
+@router.put("/zones/{zone}/secondaries")
+def put_secondaries(zone: str, payload: SecondariesIn, request: Request, db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_user)):
+    """Secondary nameservers of a zone: who may transfer it and who is notified."""
+    ensure_role(current_user.role, Role.admin)
+    name = _answer(lambda: dns.may_edit(db, current_user, zone))
+    view = _answer(lambda: dns.set_secondaries(name, payload.also_notify, payload.allow_axfr))
+    log_action(db, current_user.id, "dns_secondaries", name,
+               f"notify={','.join(view['also_notify'])} axfr={','.join(view['allow_axfr'])}", request=request)
+    return view
+
+
 @router.post("/zones/{zone}/records")
 def add_record(zone: str, payload: RecordIn, request: Request, db: Session = Depends(get_db),
                current_user: User = Depends(get_current_user)):
@@ -198,7 +257,7 @@ def save_settings(payload: SettingsIn, request: Request, db: Session = Depends(g
     ensure_role(current_user.role, Role.admin)
     before = dns.settings()["nameservers"]
     saved = _answer(lambda: dns.save_settings(payload.nameservers, payload.zone_ip, payload.ttl, payload.auto_zone,
-                                              payload.template))
+                                              payload.template, payload.package_templates))
     log_action(db, current_user.id, "dns_settings", ", ".join(saved["nameservers"]), request=request)
     # New nameservers go into the NS and SOA records of every zone.
     if saved["nameservers"] != before:

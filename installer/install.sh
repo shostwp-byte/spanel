@@ -695,6 +695,11 @@ install_privileged_helper() {
   if [[ -f "${SCRIPT_DIR}/files/spanel-cron-jail.sh" ]]; then
     install -m 0755 -o root -g root "${SCRIPT_DIR}/files/spanel-cron-jail.sh" /usr/local/bin/spanel-cron-jail
   fi
+  # The Email addon's renderer: root's, read by the helper only.
+  if [[ -f "${SCRIPT_DIR}/files/spanel_mailtool.py" ]]; then
+    install -d -m 0755 -o root -g root /usr/local/lib/spanel
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel_mailtool.py" /usr/local/lib/spanel/spanel_mailtool.py
+  fi
   if [[ -f "${SCRIPT_DIR}/files/spanel_webshells.yar" ]]; then
     install -d -m 0755 -o root -g spanel /etc/spanel/yara
     install -m 0644 -o root -g spanel "${SCRIPT_DIR}/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar

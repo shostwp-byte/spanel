@@ -86,6 +86,8 @@ def _sync_dns_zones() -> None:
         with SessionLocal() as db:
             dns.sync_quietly(db)
             mail.sync_quietly(db)
+        # DKIM rotations move along in the background from here on.
+        mail.start_maintenance_daemon()
 
     threading.Thread(target=run, name="spanel-dns-sync", daemon=True).start()
 
