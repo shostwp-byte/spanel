@@ -1995,8 +1995,6 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # This file is the list of what the helper needs from the sandbox. The jail was
 # added without adding its requirement here, which is how it shipped broken.
 RestrictNamespaces=mnt
-ProtectProc=default
-ProcSubset=all
 SERVICE
 systemctl daemon-reload
 systemctl restart spanel-api

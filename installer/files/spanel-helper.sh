@@ -10290,6 +10290,16 @@ EOF
     if [[ -d "/proc/${target_pid}" ]] && [[ ! -s "/proc/${target_pid}/cmdline" ]] && [[ ! -e "/proc/${target_pid}/exe" ]]; then
       deny "refusing to kill kernel thread: $target_pid"
     fi
+    # Only hosting accounts' processes: anything owned by root or a system
+    # account is a service, and those are restarted from System Services.
+    target_uid="$(awk '$1=="Uid:"{print $2; exit}' "/proc/${target_pid}/status" 2>/dev/null || true)"
+    [[ "$target_uid" =~ ^[0-9]+$ ]] || deny "No such process: $target_pid"
+    if (( target_uid < 1000 || target_uid >= 65000 )); then
+      deny "refusing to kill process of system account (uid ${target_uid}): $target_pid"
+    fi
+    if [[ "$(getent passwd "$target_uid" | cut -d: -f1)" == "spanel" ]]; then
+      deny "refusing to kill SPanel process: $target_pid"
+    fi
     target_comm="$(tr -d '\0\n' <"/proc/${target_pid}/comm" 2>/dev/null || true)"
     case "$target_comm" in
       systemd|systemd-*|init|kthreadd|rcu_*|kworker*|ksoftirqd*|migration*|watchdog*|dbus-daemon|sshd|mariadbd|mysqld|nginx|redis-server|cron|crond|rsyslogd|fail2ban-server|pdns_server|dovecot|exim4|rspamd*|clamd|freshclam|dockerd|containerd*)
