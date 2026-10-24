@@ -558,268 +558,94 @@ def ping_all_peer_nodes() -> list[dict[str, Any]]:
 
 
 # --- Multi-Server DNS Zone Synchronization ------------------------------------
+# The mechanics (outbox, origins, serials, reconcile) are in cluster_dns; these
+# are the entry points dns.py and the API have always called.
 
-def _collect_zones_payload(db: Session, zone_name: Optional[str] = None, action: str = "upsert") -> list[dict[str, Any]]:
-    cfg = dns.settings()
-    nameservers = cfg.get("nameservers") or []
-    default_ttl = int(cfg.get("ttl") or 3600)
+def append_sync_log(action: str, target: str, status: str, detail: str) -> None:
+    with _state_lock:
+        state = _read_state()
+        _append_log(state, action, target, status, detail)
+        _write_state(state)
 
-    if action == "delete" and zone_name:
-        return [{"zone": dns.normalize_zone(zone_name), "action": "delete", "records": [], "nameservers": nameservers, "ttl": default_ttl}]
 
-    if zone_name:
-        normalized = dns.normalize_zone(zone_name)
-        zone_names = [normalized]
-    else:
-        zone_names = [row.name for row in db.query(DnsZone).order_by(DnsZone.name).all()]
-
-    payload_items: list[dict[str, Any]] = []
-    for zname in zone_names:
-        try:
-            recs = dns.records(zname)
-            payload_items.append(
-                {
-                    "zone": zname,
-                    "action": "upsert",
-                    "nameservers": nameservers,
-                    "ttl": default_ttl,
-                    "records": recs,
-                }
-            )
-        except Exception as exc:
-            logger.warning("Could not read local DNS zone %s for cluster sync: %s", zname, exc)
-    return payload_items
+def record_node_sync(node_id: str, *, ok: bool, error: str = "") -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _state_lock:
+        state = _read_state()
+        node = next((n for n in state.get("nodes", []) if n.get("id") == node_id), None)
+        if not node:
+            return
+        if ok:
+            node["last_sync_at"] = now_iso
+            node["last_seen_at"] = now_iso
+            node["last_sync_error"] = ""
+        else:
+            node["last_sync_error"] = (error or "")[:500]
+        _write_state(state)
 
 
 def sync_dns_to_peers(db: Session, zone_name: Optional[str] = None, action: str = "upsert") -> dict[str, Any]:
-    """Push local DNS zones & records to all active DNS peer nodes in the cluster."""
+    """Queue one zone (or every zone this node is master of) for the DNS peers
+    and deliver it now. What a peer does not take stays queued and is retried."""
+    from app.services import cluster_dns
+
     with _state_lock:
         state = _read_state()
-        cluster_settings = state.get("settings") or {}
-        if not cluster_settings.get("enabled", True):
+        if not (state.get("settings") or {}).get("enabled", True):
             return {"synced_nodes": 0, "failed_nodes": 0, "zones_count": 0, "details": [], "message": "Multi-Server Cluster đang tắt."}
-        active_peers = [
-            dict(n)
-            for n in state.get("nodes", [])
-            if n.get("enabled", True) and n.get("sync_dns", True)
-        ]
-        source_node = cluster_settings.get("node_name") or _default_hostname()
-
-    if not active_peers:
+    peers = cluster_dns._sync_peers()
+    if not peers:
         return {"synced_nodes": 0, "failed_nodes": 0, "zones_count": 0, "details": [], "message": "Chưa có máy chủ Peer nào bật đồng bộ DNS."}
-
-    zones_payload = _collect_zones_payload(db, zone_name=zone_name, action=action)
-    if not zones_payload:
-        return {"synced_nodes": 0, "failed_nodes": 0, "zones_count": 0, "details": [], "message": "Không có DNS Zone nào cần đồng bộ."}
-
-    synced_nodes = 0
-    failed_nodes = 0
-    details = []
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    for peer in active_peers:
-        try:
-            resp, latency_ms = _peer_request(
-                peer,
-                "POST",
-                "/api/multi-server/peer/dns-sync",
-                payload={"source_node": source_node, "zones": zones_payload},
-                timeout=15,
-            )
-            synced_nodes += 1
-            details.append(
-                {
-                    "node_id": peer["id"],
-                    "node_name": peer["name"],
-                    "status": "success",
-                    "latency_ms": latency_ms,
-                    "zones_applied": resp.get("applied", len(zones_payload)),
-                }
-            )
-            with _state_lock:
-                st = _read_state()
-                target_n = next((n for n in st.get("nodes", []) if n.get("id") == peer["id"]), None)
-                if target_n:
-                    target_n["status"] = "online"
-                    target_n["latency_ms"] = latency_ms
-                    target_n["last_seen_at"] = now_iso
-                    target_n["last_sync_at"] = now_iso
-                    target_n["last_error"] = ""
-                _write_state(st)
-        except Exception as exc:
-            failed_nodes += 1
-            err_msg = str(exc)
-            details.append(
-                {
-                    "node_id": peer["id"],
-                    "node_name": peer["name"],
-                    "status": "failed",
-                    "error": err_msg,
-                }
-            )
-            with _state_lock:
-                st = _read_state()
-                target_n = next((n for n in st.get("nodes", []) if n.get("id") == peer["id"]), None)
-                if target_n:
-                    target_n["last_error"] = err_msg
-                _write_state(st)
-
-    with _state_lock:
-        st = _read_state()
-        target_label = zone_name or f"{len(zones_payload)} zones"
-        _append_log(
-            st,
-            f"dns_sync_{action}",
-            target_label,
-            "success" if failed_nodes == 0 else "warn",
-            f"Đồng bộ {len(zones_payload)} DNS zone tới {synced_nodes}/{len(active_peers)} máy chủ Peer.",
-        )
-        _write_state(st)
-
+    if action == "delete" and zone_name:
+        cluster_dns.note_local_change(db, zone_name, "delete")
+        zones_count = 1
+    else:
+        queued = cluster_dns.queue_all(db, zone_name)
+        zones_count = queued // max(1, len(peers))
+    result = cluster_dns.process_outbox(db)
+    failed = sum(1 for d in result.get("details", []) if d.get("errors"))
+    synced = len(peers) - failed
+    message = (
+        f"Đã đồng bộ {zones_count} DNS zone sang {synced}/{len(peers)} máy chủ Peer."
+        + (f" {result['retrying']} zone sẽ được thử lại tự động." if result.get("retrying") else "")
+        + (f" {result['conflicts']} zone bị từ chối do xung đột quyền sở hữu." if result.get("conflicts") else "")
+    )
     return {
-        "synced_nodes": synced_nodes,
-        "failed_nodes": failed_nodes,
-        "zones_count": len(zones_payload),
-        "details": details,
-        "message": f"Đã đồng bộ {len(zones_payload)} DNS zone sang {synced_nodes}/{len(active_peers)} máy chủ Peer.",
+        "synced_nodes": synced,
+        "failed_nodes": failed,
+        "zones_count": zones_count,
+        "details": result.get("details", []),
+        "dnssec_skipped": sorted(set(result.get("dnssec_skipped") or [])),
+        "message": message,
     }
 
 
 def trigger_background_zone_sync(zone_name: str, action: str = "upsert") -> None:
-    """Non-blocking background DNS zone push to cluster peers when a local zone changes."""
-    with _state_lock:
-        state = _read_state()
+    """A local zone changed (called from dns.py). Records that this node is the
+    zone's master and queues it for the peers in the durable outbox; the
+    cluster worker delivers it. Never raises: DNS editing must not fail
+    because of the cluster."""
+    try:
+        with _state_lock:
+            state = _read_state()
         settings = state.get("settings") or {}
-        if not (settings.get("enabled", True) and settings.get("auto_dns_sync", True)):
-            return
-        has_peers = any(n.get("enabled", True) and n.get("sync_dns", True) for n in state.get("nodes", []))
-    if not has_peers:
-        return
-
-    def _worker() -> None:
+        push = bool(settings.get("enabled", True) and settings.get("auto_dns_sync", True))
         from app.core.database import SessionLocal
+        from app.services import cluster_dns, cluster_worker
 
-        try:
-            with SessionLocal() as db:
-                sync_dns_to_peers(db, zone_name=zone_name, action=action)
-        except Exception as exc:
-            logger.warning("Background cluster DNS sync failed for %s: %s", zone_name, exc)
-
-    threading.Thread(target=_worker, name=f"spanel-cluster-dns-{zone_name}", daemon=True).start()
+        with SessionLocal() as db:
+            queued = cluster_dns.note_local_change(db, zone_name, action, push=push)
+        if queued:
+            cluster_worker.kick()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        logger.warning("Could not queue cluster DNS sync for %s: %s", zone_name, exc)
 
 
 def apply_incoming_dns_sync(db: Session, zones_payload: list[dict[str, Any]], source_node: str = "", source_uid: str = "") -> dict[str, Any]:
-    """Receive DNS zones & records from a peer SPanel node and apply them to local PowerDNS."""
-    if not dns.active():
-        raise ValueError("Add-on DNS Manager (PowerDNS) chưa được cài đặt hoặc bật trên máy chủ Peer này.")
+    """Receive DNS zones from a peer node (see cluster_dns.apply_incoming for the rules)."""
+    from app.services import cluster_dns
 
-    applied = 0
-    deleted = 0
-    errors: list[str] = []
-
-    for item in zones_payload or []:
-        if not isinstance(item, dict):
-            continue
-        raw_zone = str(item.get("zone") or "").strip()
-        action = str(item.get("action") or "upsert").strip().lower()
-        if not raw_zone:
-            continue
-        try:
-            zone = dns.normalize_zone(raw_zone)
-            if action == "delete":
-                dns.delete_zone(db, zone, sync_cluster=False)
-                deleted += 1
-                continue
-
-            local_cfg = dns.settings()
-            nameservers = [
-                str(ns).strip().lower().rstrip(".")
-                for ns in (item.get("nameservers") or local_cfg.get("nameservers") or [])
-                if str(ns).strip()
-            ]
-            if len(nameservers) < 2:
-                nameservers = local_cfg.get("nameservers") or [f"ns1.{zone}", f"ns2.{zone}"]
-
-            ttl = int(item.get("ttl") or local_cfg.get("ttl") or dns.DEFAULT_TTL)
-            apex = dns._absolute(zone)
-            rrsets = [
-                {
-                    "name": apex,
-                    "type": "SOA",
-                    "ttl": ttl,
-                    "records": [
-                        {
-                            "content": f"{dns._absolute(nameservers[0])} hostmaster.{apex} 1 10800 3600 604800 3600",
-                            "disabled": False,
-                        }
-                    ],
-                },
-                {
-                    "name": apex,
-                    "type": "NS",
-                    "ttl": ttl,
-                    "records": [{"content": dns._absolute(ns), "disabled": False} for ns in nameservers],
-                },
-            ]
-
-            grouped: dict[tuple[str, str], tuple[int, list[str]]] = {}
-            for rec in item.get("records") or []:
-                if not isinstance(rec, dict):
-                    continue
-                name, rtype, rec_ttl, content = dns.to_pdns(zone, rec)
-                if rtype == "NS" and name == apex:
-                    continue
-                _, existing_contents = grouped.get((name, rtype), (rec_ttl, []))
-                if content not in existing_contents:
-                    existing_contents.append(content)
-                grouped[(name, rtype)] = (rec_ttl, existing_contents)
-
-            for (name, rtype), (rec_ttl, contents) in grouped.items():
-                rrsets.append(
-                    {
-                        "name": name,
-                        "type": rtype,
-                        "ttl": rec_ttl,
-                        "records": [{"content": c, "disabled": False} for c in contents],
-                    }
-                )
-
-            # Recreate or replace zone in PowerDNS
-            try:
-                dns._request("DELETE", f"/zones/{apex}")
-            except dns.DnsError as exc:
-                if exc.status != 404:
-                    raise
-            dns._request(
-                "POST",
-                "/zones",
-                {
-                    "name": apex,
-                    "kind": "Native",
-                    "soa_edit_api": dns.SOA_EDIT_API,
-                    "nameservers": [],
-                    "rrsets": rrsets,
-                },
-            )
-            if not db.query(DnsZone).filter(DnsZone.name == zone).first():
-                db.add(DnsZone(name=zone, owner_id=None))
-                db.commit()
-            applied += 1
-        except Exception as exc:
-            errors.append(f"{raw_zone}: {exc}")
-
-    with _state_lock:
-        state = _read_state()
-        _append_log(
-            state,
-            "receive_dns_sync",
-            source_node or "peer",
-            "success" if not errors else "warn",
-            f"Nhận đồng bộ từ {source_node or 'Peer'}: cập nhật {applied} zone, xóa {deleted} zone.",
-        )
-        _write_state(state)
-
-    return {"applied": applied, "deleted": deleted, "errors": errors}
+    return cluster_dns.apply_incoming(db, zones_payload, source_uid=source_uid, source_name=source_node)
 
 
 # --- Cross-Server Domain & Username Conflict Check ----------------------------
@@ -837,7 +663,12 @@ def check_local_conflict(db: Session, domain: str = "", username: str = "", aski
         elif db.query(WebsiteAlias).filter(WebsiteAlias.domain.in_(list(candidates))).first():
             domain_exists = True
         elif db.query(DnsZone).filter(DnsZone.name == domain_clean).first():
-            domain_exists = True
+            # A zone here that is only our copy of the asking node's own zone
+            # is not a conflict with it.
+            from app.services import cluster_dns
+
+            row = cluster_dns.origin_row(db, domain_clean)
+            domain_exists = not (asking_node and row is not None and row.origin_uid == asking_node)
 
     if username_clean:
         if db.query(User).filter(User.username == username_clean).first():

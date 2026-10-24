@@ -11,7 +11,7 @@ from app.api.provisioning import _get_provisioning_token
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role
 from app.models.entities import ApiToken, User
-from app.services import cluster_peer, multi_server
+from app.services import cluster_dns, cluster_peer, cluster_worker, multi_server
 from app.services.audit import log_action
 from app.services.provisioning import create_api_token
 
@@ -295,9 +295,49 @@ def sync_cluster_dns(
     current_user: User = Depends(get_current_user),
 ):
     ensure_role(current_user.role, Role.admin)
-    result = multi_server.sync_dns_to_peers(db, zone_name=payload.zone, action="upsert")
+    try:
+        result = multi_server.sync_dns_to_peers(db, zone_name=payload.zone, action="upsert")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     log_action(db, current_user.id, "multi_server_dns_sync", payload.zone or "all_zones", request=request)
     return result
+
+
+@router.get("/dns-sync/status")
+def dns_sync_status(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """The DNS outbox (what is waiting, retrying or refused) and the replicas held here."""
+    ensure_role(current_user.role, Role.admin)
+    return cluster_dns.status(db)
+
+
+@router.post("/dns-sync/reconcile")
+def dns_sync_reconcile(request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    result = cluster_dns.reconcile(db)
+    cluster_worker.kick()
+    log_action(db, current_user.id, "multi_server_dns_reconcile", f"{result.get('queued', 0)} queued", request=request)
+    return result
+
+
+@router.post("/dns-sync/outbox/{row_id}/retry")
+def dns_sync_retry(row_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    try:
+        cluster_dns.retry_row(db, row_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    cluster_worker.kick()
+    return {"ok": True}
+
+
+@router.delete("/dns-sync/outbox/{row_id}")
+def dns_sync_discard(row_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    try:
+        cluster_dns.discard_row(db, row_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 # ── Remote Database Hosts (Remote MySQL / MariaDB) ───────────────────────
@@ -394,3 +434,12 @@ def peer_receive_dns_sync(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/peer/dns-inventory")
+def peer_dns_inventory(
+    db: Session = Depends(get_db),
+    node_uid: str = Depends(peer_auth(cluster_peer.SCOPE_READ)),
+):
+    """The asking node's zones held here, with the serial last applied (for its reconcile)."""
+    return {"zones": cluster_dns.inventory_for(db, node_uid)}

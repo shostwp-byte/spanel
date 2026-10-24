@@ -436,6 +436,76 @@ class ApiToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class ClusterZoneOrigin(Base):
+    """Which cluster node a DNS zone on this server belongs to.
+
+    origin_uid NULL: the zone was made here and this server is its master; a
+    peer may never overwrite or delete it. Otherwise it is a replica pushed by
+    that node, and only that node may change it. No row: a zone from before
+    the cluster tracked origins (see cluster_dns.apply_incoming).
+    """
+
+    __tablename__ = "cluster_zone_origins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    zone: Mapped[str] = mapped_column(String(253), unique=True, index=True)
+    origin_uid: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    origin_name: Mapped[str] = mapped_column(String(120), default="")
+    origin_owner: Mapped[str] = mapped_column(String(64), default="")
+    # The origin's SOA serial of the last snapshot applied, and its content hash.
+    source_serial: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ClusterDnsOutbox(Base):
+    """A zone change still to be delivered to one peer. One row per (peer,
+    zone): later changes fold into it, since what is sent is always the zone
+    as it is at sending time."""
+
+    __tablename__ = "cluster_dns_outbox"
+    __table_args__ = (UniqueConstraint("node_id", "zone", name="uq_cluster_dns_outbox_node_zone"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    zone: Mapped[str] = mapped_column(String(253), index=True)
+    action: Mapped[str] = mapped_column(String(16), default="upsert")
+    # pending | conflict | failed (gave up after the retry budget)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ClusterTransferJob(Base):
+    """An account moved between two SPanel nodes, seen from either end:
+    direction 'out' on the node it leaves, 'in' on the node it arrives at."""
+
+    __tablename__ = "cluster_transfer_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    job_uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    direction: Mapped[str] = mapped_column(String(8), default="out")
+    username: Mapped[str] = mapped_column(String(64), index=True)
+    node_id: Mapped[str] = mapped_column(String(40), default="")
+    node_name: Mapped[str] = mapped_column(String(120), default="")
+    # queued | running | done | failed
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    step: Mapped[str] = mapped_column(String(32), default="queued")
+    message: Mapped[str] = mapped_column(Text, default="")
+    options: Mapped[str] = mapped_column(Text, default="{}")
+    archive_name: Mapped[str] = mapped_column(String(255), default="")
+    archive_sha256: Mapped[str] = mapped_column(String(64), default="")
+    archive_size: Mapped[int] = mapped_column(Integer, default=0)
+    remote_job_uid: Mapped[str] = mapped_column(String(32), default="")
+    created_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class McpToken(Base):
     """A personal token an AI assistant uses to reach the panel over MCP.
 
