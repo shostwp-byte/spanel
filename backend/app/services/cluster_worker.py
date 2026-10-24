@@ -1,7 +1,8 @@
 """The cluster's background work, in the API process.
 
 One daemon thread, started from main.py like the resource monitor: it
-delivers the DNS outbox (at once when kick() is called after a zone change,
+pings every node at the health interval (status, latency, load, an alert
+when one goes down), delivers the DNS outbox (at once when kick() is called after a zone change,
 otherwise every LOOP_SECONDS for retries and for rows other processes
 queued), and reconciles every peer's copy of our zones at the configured
 interval. Everything it does is idempotent and driven by rows in the
@@ -55,6 +56,12 @@ def run_once(now: float | None = None) -> dict:
     done: dict = {}
     if not settings.get("enabled", True) or not info["has_nodes"]:
         return done
+    if _due("health", float(settings.get("health_interval_sec") or 60), now):
+        from app.services import multi_server
+
+        # Status, latency and load of every node, and an alert when one
+        # stops answering (multi_server.apply_health_result).
+        done["health"] = len(multi_server.ping_all_peer_nodes(enabled_only=True))
     with SessionLocal() as db:
         done["outbox"] = cluster_dns.process_outbox(db)
         if settings.get("auto_dns_sync", True) and _due("reconcile", float(settings.get("reconcile_interval_sec") or 900), now):

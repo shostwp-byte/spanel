@@ -495,6 +495,55 @@ def delete_peer_node(node_id: str) -> None:
         _write_state(state)
 
 
+DOWN_AFTER_FAILURES = 2
+_HEALTH_HISTORY = 30
+_REMOTE_INFO_KEYS = (
+    "node_uid", "hostname", "version", "cpu_percent", "ram_percent", "disk_percent", "cpu_cores", "load_1",
+    "ram_available_bytes", "disk_free_bytes", "backup_free_bytes", "websites_count", "users_count",
+    "dns_zones_count", "dns_active", "tls_fingerprint",
+)
+
+
+def apply_health_result(node: dict[str, Any], *, ok: bool, latency_ms: Optional[int], error: str,
+                        remote_data: Optional[dict[str, Any]], now_iso: str) -> Optional[str]:
+    """Record one health check on a node. Returns "down" or "up" when the node
+    just crossed into or out of the alerted state, else None.
+
+    A node is reported down after DOWN_AFTER_FAILURES failed checks in a row
+    (one failure is often a restart), once, and reported back when it answers
+    again after that.
+    """
+    node["last_checked_at"] = now_iso
+    node["latency_ms"] = latency_ms
+    history = list(node.get("health_history") or [])
+    history.append({"at": now_iso, "ok": ok, "latency_ms": latency_ms})
+    node["health_history"] = history[-_HEALTH_HISTORY:]
+    event = None
+    if ok:
+        node["status"] = "online"
+        node["last_error"] = ""
+        node["last_seen_at"] = now_iso
+        node["consecutive_failures"] = 0
+        data = remote_data or {}
+        info = {key: data.get(key) for key in _REMOTE_INFO_KEYS}
+        info["node_name"] = data.get("node_name") or data.get("hostname") or ""
+        info["hostname"] = info["hostname"] or ""
+        info["version"] = info["version"] or ""
+        info["ipv4_addresses"] = data.get("ipv4_addresses") or []
+        node["remote_info"] = info
+        if node.get("down_alerted"):
+            node["down_alerted"] = False
+            event = "up"
+    else:
+        node["status"] = "offline"
+        node["last_error"] = error
+        node["consecutive_failures"] = int(node.get("consecutive_failures") or 0) + 1
+        if node["consecutive_failures"] >= DOWN_AFTER_FAILURES and not node.get("down_alerted"):
+            node["down_alerted"] = True
+            event = "down"
+    return event
+
+
 def ping_peer_node(node_id: str) -> dict[str, Any]:
     with _state_lock:
         state = _read_state()
@@ -505,45 +554,39 @@ def ping_peer_node(node_id: str) -> dict[str, Any]:
 
     try:
         remote_data, latency_ms = _peer_request(node_copy, "GET", "/api/multi-server/peer/ping", timeout=7)
-        status = "online"
-        last_error = ""
+        ok, last_error = True, ""
     except Exception as exc:
-        remote_data = {}
-        latency_ms = None
-        status = "offline"
-        last_error = str(exc)
+        remote_data, latency_ms = {}, None
+        ok, last_error = False, str(exc)
 
     with _state_lock:
         state = _read_state()
         node = next((n for n in state.get("nodes", []) if n.get("id") == node_id), None)
         if not node:
             raise ValueError("Không tìm thấy máy chủ Peer này.")
-        node["status"] = status
-        node["latency_ms"] = latency_ms
-        node["last_error"] = last_error
-        if status == "online":
-            node["last_seen_at"] = datetime.now(timezone.utc).isoformat()
-            node["remote_info"] = {
-                "node_name": remote_data.get("node_name") or remote_data.get("hostname") or "",
-                "hostname": remote_data.get("hostname") or "",
-                "version": remote_data.get("version") or "",
-                "cpu_percent": remote_data.get("cpu_percent"),
-                "ram_percent": remote_data.get("ram_percent"),
-                "disk_percent": remote_data.get("disk_percent"),
-                "websites_count": remote_data.get("websites_count"),
-                "users_count": remote_data.get("users_count"),
-                "dns_zones_count": remote_data.get("dns_zones_count"),
-                "dns_active": remote_data.get("dns_active"),
-                "ipv4_addresses": remote_data.get("ipv4_addresses") or [],
-            }
+        event = apply_health_result(node, ok=ok, latency_ms=latency_ms, error=last_error, remote_data=remote_data,
+                                    now_iso=datetime.now(timezone.utc).isoformat())
+        if event:
+            _append_log(state, "node_down" if event == "down" else "node_up",
+                        f"{node.get('name')} ({node.get('url')})", "warn" if event == "down" else "success",
+                        f"Máy chủ Peer không phản hồi: {last_error}" if event == "down" else "Máy chủ Peer đã trực tuyến lại.")
         _write_state(state)
-        return _sanitize_node(node)
+        result = _sanitize_node(node)
+    if event:
+        from app.services import notifications
+
+        notifications.notify_in_background("cluster_node_down", {
+            "node": node_copy.get("name"), "url": node_copy.get("url"), "error": last_error,
+            "failures": result.get("consecutive_failures"), "recovered": event == "up",
+        }, admins=True)
+    return result
 
 
-def ping_all_peer_nodes() -> list[dict[str, Any]]:
+def ping_all_peer_nodes(enabled_only: bool = False) -> list[dict[str, Any]]:
     with _state_lock:
         state = _read_state()
-        node_ids = [n.get("id") for n in state.get("nodes", []) if n.get("id")]
+        node_ids = [n.get("id") for n in state.get("nodes", [])
+                    if n.get("id") and (n.get("enabled", True) or not enabled_only)]
     if not node_ids:
         return []
     results = []
