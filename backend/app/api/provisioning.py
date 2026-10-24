@@ -258,6 +258,38 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
     return account_to_dict(account, db)
 
 
+# Declared before /accounts/{external_id}: Starlette matches routes in order,
+# and "usage" is a perfectly good external_id to the route below, so the bulk
+# usage call WHMCS's UsageUpdate makes used to be answered "Account not found".
+@router.get("/accounts/usage", response_model=List[ProvisioningUsageOut])
+def get_all_usage(request: Request, db: Session = Depends(get_db)):
+    token = _get_provisioning_token(request, db)
+    _require_scope(token, "provisioning:read")
+
+    results = []
+    accounts = db.query(ProvisioningAccount).all()
+    for account in accounts:
+        if not account.user:
+            continue
+        user = account.user
+        summary = storage_quota.storage_usage_summary(db, user, use_cache=True)
+        website_count = db.query(Website).filter(Website.owner_id == user.id).count()
+        database_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).count()
+
+        # NOTE: bandwidth tracking not yet implemented in backend models, returning 0
+        results.append({
+            "external_id": account.external_id,
+            "storage_used_bytes": summary["storage_used_bytes"],
+            "storage_limit_bytes": summary["storage_limit_bytes"],
+            "storage_percent": summary["storage_percent"],
+            "website_count": website_count,
+            "database_count": database_count,
+            "bandwidth_used_bytes": 0,
+            "bandwidth_limit_bytes": 0,
+        })
+    return results
+
+
 @router.get("/accounts/{external_id}", response_model=ProvisioningAccountOut)
 def get_account(external_id: str, request: Request, db: Session = Depends(get_db)):
     token = _get_provisioning_token(request, db)
@@ -378,36 +410,6 @@ def change_package(external_id: str, payload: ProvisioningPackageChange, request
     db.commit()
     log_action(db, None, "provisioning_change_package", external_id, detail=str(package.id), request=request)
     return {"ok": True, "package_id": package.id}
-
-
-
-@router.get("/accounts/usage", response_model=List[ProvisioningUsageOut])
-def get_all_usage(request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:read")
-    
-    results = []
-    accounts = db.query(ProvisioningAccount).all()
-    for account in accounts:
-        if not account.user:
-            continue
-        user = account.user
-        summary = storage_quota.storage_usage_summary(db, user, use_cache=True)
-        website_count = db.query(Website).filter(Website.owner_id == user.id).count()
-        database_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).count()
-        
-        # NOTE: bandwidth tracking not yet implemented in backend models, returning 0
-        results.append({
-            "external_id": account.external_id,
-            "storage_used_bytes": summary["storage_used_bytes"],
-            "storage_limit_bytes": summary["storage_limit_bytes"],
-            "storage_percent": summary["storage_percent"],
-            "website_count": website_count,
-            "database_count": database_count,
-            "bandwidth_used_bytes": 0,
-            "bandwidth_limit_bytes": 0,
-        })
-    return results
 
 
 @router.get("/accounts/{external_id}/usage", response_model=ProvisioningUsageOut)

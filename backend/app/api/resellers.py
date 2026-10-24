@@ -255,6 +255,20 @@ def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session 
     db.refresh(webhook)
     return _webhook_to_out(webhook)
 
+
+# Declared before /webhooks/{webhook_id}: routes match in order and
+# "deliveries" fits that path too, so clearing the history used to fail
+# validation on webhook_id (422) and never reach this handler.
+@router.delete("/webhooks/deliveries")
+def clear_webhook_deliveries(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.reseller)
+    removed = webhooks_service.clear_deliveries(
+        user_id=current_user.id,
+        is_admin=is_admin_role(current_user.role),
+    )
+    return {"ok": True, "removed": removed, "message": f"Đã xóa {removed} bản ghi lịch sử Webhook."}
+
+
 @router.delete("/webhooks/{webhook_id}")
 def delete_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
@@ -324,16 +338,6 @@ def replay_webhook_delivery(delivery_id: str, db: Session = Depends(get_db), cur
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return delivery
-
-
-@router.delete("/webhooks/deliveries")
-def clear_webhook_deliveries(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
-    removed = webhooks_service.clear_deliveries(
-        user_id=current_user.id,
-        is_admin=is_admin_role(current_user.role),
-    )
-    return {"ok": True, "removed": removed, "message": f"Đã xóa {removed} bản ghi lịch sử Webhook."}
 
 
 @router.get("/whmcs-diagnostic")

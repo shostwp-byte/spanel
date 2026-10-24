@@ -205,19 +205,26 @@ def replay_delivery(
 
 
 def dispatch_webhook(db: Session, user_id: Optional[int], action: str, target: str, detail: str = "") -> None:
-    if not user_id:
-        return
-
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        return
+    # No acting user means the panel itself or a billing system did it: every
+    # provisioning call is logged that way. Those events used to be dropped
+    # here, so a billing integration never heard about the accounts it created.
+    # They go to administrators' endpoints, the only owners who can see them.
+    user = None
+    if user_id:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            return
 
     # Find endpoints for the user, their reseller, and any admin endpoints
-    endpoint_users = {user.id}
-    if user.reseller_id:
-        endpoint_users.add(user.reseller_id)
+    endpoint_users = set()
+    if user is not None:
+        endpoint_users.add(user.id)
+        if user.reseller_id:
+            endpoint_users.add(user.reseller_id)
     for admin_row in db.query(User).filter(User.role == "admin").all():
         endpoint_users.add(admin_row.id)
+    if not endpoint_users:
+        return
 
     endpoints = (
         db.query(WebhookEndpoint)
@@ -233,8 +240,8 @@ def dispatch_webhook(db: Session, user_id: Optional[int], action: str, target: s
 
     payload = {
         "event": action,
-        "user_id": user.id,
-        "username": user.username,
+        "user_id": user.id if user is not None else None,
+        "username": user.username if user is not None else "",
         "target": target,
         "detail": detail,
         "timestamp": datetime.now(timezone.utc).isoformat(),
