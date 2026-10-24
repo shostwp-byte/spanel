@@ -1162,7 +1162,7 @@ NGINX
   host="${PANEL_DOMAIN:-$SERVER_IP}"
   [[ -n "$host" ]] || host="$(detect_server_ip)"
   sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${api_scheme}://127.0.0.1:${PANEL_PORT}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
-  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
+  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php /etc/phpmyadmin/conf.d/spanel-remote-servers.php 2>/dev/null || true
   sed -i -E "/PmaAbsoluteUri/s#'https?://[^']+/phpmyadmin/'#'${tools_scheme}://${host}/phpmyadmin/'#" /etc/phpmyadmin/conf.d/spanel-signon.php 2>/dev/null || true
 }
 
@@ -1202,73 +1202,9 @@ setup_phpmyadmin_sso() {
 \$cfg['PmaAbsoluteUri'] = '${pma_scheme}://${pma_host}/phpmyadmin/';
 PHP
 
-  cat >/usr/share/phpmyadmin/spanel-signon.php <<'PHP'
-<?php
-declare(strict_types=1);
-
-session_save_path('/var/lib/php/sessions');
-ini_set('session.use_cookies', 'true');
-session_set_cookie_params([
-    'lifetime' => 0,
-    'path' => '/',
-    'domain' => '',
-    'secure' => __SPANEL_PMA_COOKIE_SECURE__,
-    'httponly' => true,
-    'samesite' => 'Lax',
-]);
-session_name('SPanelPmaSignon');
-if (!session_start()) {
-    http_response_code(500);
-    exit('Cannot start signon session');
-}
-
-$token = $_GET['spanel_sso'] ?? '';
-if (!preg_match('/^[A-Za-z0-9_-]{20,}$/', $token)) {
-    http_response_code(403);
-    exit('Invalid token');
-}
-
-$apiUrl = '__SPANEL_API_BASE__' . rawurlencode($token);
-$ch = curl_init($apiUrl);
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => 5,
-    CURLOPT_SSL_VERIFYPEER => false,
-    CURLOPT_SSL_VERIFYHOST => false,
-    CURLOPT_HTTPHEADER => ['Accept: application/json'],
-]);
-$response = curl_exec($ch);
-$status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-curl_close($ch);
-
-if ($status !== 200 || !$response) {
-    http_response_code(403);
-    exit('Expired token');
-}
-
-$data = json_decode($response, true);
-if (!is_array($data) || empty($data['db_user']) || empty($data['db_password'])) {
-    http_response_code(403);
-    exit('Invalid signon data');
-}
-
-session_regenerate_id(true);
-$_SESSION = [];
-$_SESSION['PMA_single_signon_user'] = $data['db_user'];
-$_SESSION['PMA_single_signon_password'] = $data['db_password'];
-$_SESSION['PMA_single_signon_host'] = 'localhost';
-$_SESSION['PMA_single_signon_port'] = '';
-$_SESSION['PMA_single_signon_cfgupdate'] = [
-    'only_db' => $data['db_name'] ?? '',
-];
-$_SESSION['PMA_single_signon_HMAC_secret'] = bin2hex(random_bytes(16));
-session_write_close();
-
-header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-header('Pragma: no-cache');
-header('Location: /phpmyadmin/index.php?server=1');
-exit;
-PHP
+  # Picks the phpMyAdmin server (local MariaDB or a remote MySQL host) from
+  # the SSO token; update.sh installs the same file.
+  install -m 0644 -o root -g root "${SCRIPT_DIR}/files/phpmyadmin-spanel-signon.php" /usr/share/phpmyadmin/spanel-signon.php
 
   local api_scheme="http"
   if [[ "$ENABLE_SSL" == "yes" ]]; then

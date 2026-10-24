@@ -5,6 +5,7 @@ import {
   Server, ShieldCheck, Trash2, Wifi, Zap
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
+import { RemoteDbHostsPanel } from '../components/RemoteDbHosts.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
@@ -37,18 +38,6 @@ export function MultiServerPage({ request, isAdmin }) {
 
   // Local token generator state
   const [generatedClusterToken, setGeneratedClusterToken] = useState('');
-
-  // Remote DB form state
-  const [showDbForm, setShowDbForm] = useState(false);
-  const [dbForm, setDbForm] = useState({
-    name: '',
-    host: '',
-    port: 3306,
-    admin_user: 'root',
-    admin_password: '',
-    use_tls: false,
-    enabled: true,
-  });
 
   useEffect(() => {
     if (isAdmin) {
@@ -199,60 +188,6 @@ export function MultiServerPage({ request, isAdmin }) {
         body: JSON.stringify({ zone: null }),
       },
       'Đang đồng bộ toàn bộ DNS Zones sang các máy chủ Peer...'
-    );
-    if (res) {
-      await loadClusterStatus(true);
-    }
-  }
-
-  async function submitRemoteDbForm(e) {
-    e.preventDefault();
-    if (!dbForm.name.trim() || !dbForm.host.trim()) {
-      setError('Vui lòng nhập tên gợi nhớ và IP/Hostname của máy chủ Database.');
-      return;
-    }
-    const res = await request(
-      '/multi-server/remote-db',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...dbForm,
-          port: Number(dbForm.port || 3306),
-        }),
-      },
-      'Đang kết nối và kiểm tra Remote MySQL/MariaDB...'
-    );
-    if (res) {
-      setShowDbForm(false);
-      setDbForm({
-        name: '',
-        host: '',
-        port: 3306,
-        admin_user: 'root',
-        admin_password: '',
-        use_tls: false,
-        enabled: true,
-      });
-      await loadClusterStatus(true);
-    }
-  }
-
-  async function testRemoteDb(host) {
-    const res = await request(
-      `/multi-server/remote-db/${host.id}/test`,
-      { method: 'POST' },
-      `Đang kiểm tra kết nối MySQL tới ${host.name}...`
-    );
-    await loadClusterStatus(true);
-    if (res?.message) setNotice(res.message);
-  }
-
-  async function removeRemoteDb(host) {
-    if (!confirm(`Xóa máy chủ Remote Database "${host.name}" (${host.host}:${host.port})?`)) return;
-    const res = await request(
-      `/multi-server/remote-db/${host.id}`,
-      { method: 'DELETE' },
-      `Đang xóa ${host.name}...`
     );
     if (res) {
       await loadClusterStatus(true);
@@ -830,202 +765,7 @@ export function MultiServerPage({ request, isAdmin }) {
 
       {/* TAB 2: REMOTE DATABASE NODES */}
       {activeTab === 'remote_db' && (
-        <div className="pkg-card" style={{ padding: '20px 22px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
-            <div>
-              <h3 style={{ margin: 0, fontSize: '1.02rem', fontWeight: 700, color: 'var(--text-main)' }}>
-                Cấu hình Máy chủ Cơ sở dữ liệu Tách rời (Remote MySQL / MariaDB Hosts)
-              </h3>
-              <p style={{ margin: '3px 0 0', fontSize: '0.81rem', color: 'var(--text-muted)' }}>
-                Kết nối và giám sát các máy chủ MySQL / MariaDB chuyên dụng bên ngoài để giảm tải cho Web Server chính.
-              </p>
-            </div>
-            <button type="button" onClick={() => setShowDbForm((v) => !v)}>
-              <Plus size={15} /> Thêm Remote Database Node
-            </button>
-          </div>
-
-          {showDbForm && (
-            <form
-              onSubmit={submitRemoteDbForm}
-              style={{
-                padding: '16px',
-                borderRadius: '10px',
-                background: 'var(--surface-2)',
-                border: '1px solid var(--border-subtle)',
-                marginBottom: '18px',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '14px',
-              }}
-            >
-              <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
-                Thêm máy chủ MySQL / MariaDB từ xa
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' }}>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Tên gợi nhớ Node DB
-                  </span>
-                  <input
-                    value={dbForm.name}
-                    onChange={(e) => setDbForm({ ...dbForm, name: e.target.value })}
-                    placeholder="VD: MariaDB Cluster Node 01"
-                    required
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Địa chỉ IP hoặc Hostname
-                  </span>
-                  <input
-                    value={dbForm.host}
-                    onChange={(e) => setDbForm({ ...dbForm, host: e.target.value })}
-                    placeholder="10.0.0.25 hoặc db1.yourdomain.com"
-                    required
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Cổng (Port)
-                  </span>
-                  <input
-                    type="number"
-                    min="1"
-                    max="65535"
-                    value={dbForm.port}
-                    onChange={(e) => setDbForm({ ...dbForm, port: e.target.value })}
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Tài khoản Quản trị DB
-                  </span>
-                  <input
-                    value={dbForm.admin_user}
-                    onChange={(e) => setDbForm({ ...dbForm, admin_user: e.target.value })}
-                    placeholder="root / spanel_admin"
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Mật khẩu Quản trị DB
-                  </span>
-                  <input
-                    type="password"
-                    value={dbForm.admin_password}
-                    onChange={(e) => setDbForm({ ...dbForm, admin_password: e.target.value })}
-                    placeholder="••••••••••••"
-                  />
-                </label>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
-                <label className="check-line" style={{ margin: 0 }}>
-                  <input
-                    type="checkbox"
-                    checked={!!dbForm.use_tls}
-                    onChange={(e) => setDbForm({ ...dbForm, use_tls: e.target.checked })}
-                  />
-                  <span>Sử dụng kết nối mã hóa SSL/TLS</span>
-                </label>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button type="button" className="secondary-light" onClick={() => setShowDbForm(false)}>
-                    Hủy
-                  </button>
-                  <button type="submit" disabled={!!loading}>
-                    <Check size={15} /> Lưu & Kiểm tra kết nối
-                  </button>
-                </div>
-              </div>
-            </form>
-          )}
-
-          <div className="pkg-table-wrap">
-            <table className="pkg-clean-table">
-              <thead>
-                <tr>
-                  <th>Tên Node Database</th>
-                  <th>Địa chỉ & Cổng</th>
-                  <th>Phiên bản MySQL / MariaDB</th>
-                  <th>Trạng thái & Độ trễ</th>
-                  <th>Kiểm tra gần nhất</th>
-                  <th style={{ textAlign: 'right' }}>Thao tác</th>
-                </tr>
-              </thead>
-              <tbody>
-                {remoteDbs.map((host) => {
-                  const isOnline = host.status === 'online';
-                  return (
-                    <tr key={host.id}>
-                      <td>
-                        <strong style={{ color: 'var(--text-main)' }}>{host.name}</strong>
-                        <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
-                          User: <code>{host.admin_user}</code> {host.use_tls ? '• TLS' : ''}
-                        </div>
-                      </td>
-                      <td>
-                        <code>{host.host}:{host.port}</code>
-                      </td>
-                      <td>
-                        <code style={{ fontSize: '0.78rem', color: 'var(--accent-primary)' }}>
-                          {host.server_version || '—'}
-                        </code>
-                      </td>
-                      <td>
-                        <span style={{
-                          padding: '3px 9px',
-                          borderRadius: '999px',
-                          fontSize: '0.74rem',
-                          fontWeight: 700,
-                          background: isOnline ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)',
-                          color: isOnline ? '#10b981' : '#ef4444',
-                        }}>
-                          {isOnline ? `Online (${host.latency_ms ?? 1}ms)` : 'Offline / Lỗi kết nối'}
-                        </span>
-                      </td>
-                      <td style={{ fontSize: '0.79rem', color: 'var(--text-muted)' }}>
-                        {host.last_checked_at ? new Date(host.last_checked_at).toLocaleString() : '—'}
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <div style={{ display: 'inline-flex', gap: '6px' }}>
-                          <button
-                            type="button"
-                            className="secondary-light"
-                            style={{ padding: '6px 10px', fontSize: '0.77rem' }}
-                            disabled={!!loading}
-                            onClick={() => testRemoteDb(host)}
-                          >
-                            <Wifi size={13} /> Kiểm tra
-                          </button>
-                          <button
-                            type="button"
-                            className="danger"
-                            style={{ padding: '6px 10px' }}
-                            disabled={!!loading}
-                            onClick={() => removeRemoteDb(host)}
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {remoteDbs.length === 0 && (
-                  <tr>
-                    <td colSpan="6">
-                      <EmptyState
-                        icon={Database}
-                        title="Chưa cấu hình Remote Database Node nào"
-                        subtitle="Mặc định SPanel sử dụng MariaDB nội bộ trên máy chủ. Bạn có thể thêm máy chủ MySQL/MariaDB rời khi cần mở rộng tầng cơ sở dữ liệu."
-                      />
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <RemoteDbHostsPanel request={request} hosts={remoteDbs} loading={loading} onChanged={() => loadClusterStatus(true)} />
       )}
 
       {/* TAB 3: SYNC LOGS */}

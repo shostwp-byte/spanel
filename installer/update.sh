@@ -583,7 +583,7 @@ server {
 }
 NGINX
   sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${api_scheme}://127.0.0.1:${panel_port}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
-  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
+  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php /etc/phpmyadmin/conf.d/spanel-remote-servers.php 2>/dev/null || true
   [[ -n "$host" ]] && sed -i -E "/PmaAbsoluteUri/s#'https?://[^']+/phpmyadmin/'#'${tools_scheme}://${host}/phpmyadmin/'#" /etc/phpmyadmin/conf.d/spanel-signon.php 2>/dev/null || true
 }
 
@@ -1223,6 +1223,15 @@ SERVICE
     if [[ -n "$(env_get PANEL_SSL_CERT)" && -n "$(env_get PANEL_SSL_KEY)" ]]; then
       scheme="https"
     fi
+    # Older copies always opened server 1 and forced host=localhost, so a
+    # database on a remote MySQL host could not be opened. Same file and
+    # placeholders as install.sh; re-running it is harmless.
+    if [[ -f "$SOURCE_DIR/installer/files/phpmyadmin-spanel-signon.php" ]]; then
+      local pma_cookie_secure="false"
+      [[ "$scheme" == "https" ]] && pma_cookie_secure="true"
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/phpmyadmin-spanel-signon.php" /usr/share/phpmyadmin/spanel-signon.php
+      sed -i "s#__SPANEL_API_BASE__#${scheme}://127.0.0.1:${panel_port}/api/databases/phpmyadmin-sso/#; s#__SPANEL_PMA_COOKIE_SECURE__#${pma_cookie_secure}#" /usr/share/phpmyadmin/spanel-signon.php
+    fi
     sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${scheme}://127.0.0.1:${panel_port}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php || true
   fi
 }
@@ -1757,6 +1766,14 @@ if id -u spanel >/dev/null 2>&1; then
     "from app.core.database import run_migrations; run_migrations()"
 else
   python -c "from app.core.database import run_migrations; run_migrations()"
+fi
+# Remote MySQL hosts now live in the panel database (moved out of
+# multi-server.json by the migration above); give phpMyAdmin the list.
+if id -u spanel >/dev/null 2>&1 && [[ -d /etc/phpmyadmin/conf.d ]]; then
+  log "Refreshing phpMyAdmin remote MySQL servers"
+  sudo -u spanel env HOME="$APP_DIR" SPANEL_USE_HELPER=true "$APP_DIR/backend/.venv/bin/python" -c \
+    "from app.core.database import SessionLocal; from app.services import remote_mysql; s = SessionLocal(); ok = remote_mysql.sync_phpmyadmin_servers(s); s.close(); raise SystemExit(0 if ok else 1)" || \
+    echo "  (warning: could not refresh phpMyAdmin's remote server list; saving a host in the panel retries)"
 fi
 systemctl enable --now spanel-backup-scheduler.timer >/dev/null 2>&1 || true
 systemctl enable --now spanel-malware-scheduler.timer >/dev/null 2>&1 || true

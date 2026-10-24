@@ -31,7 +31,7 @@ from app.schemas.schemas import (
     WebsiteWordPressInstall,
     WildcardSslRequest,
 )
-from app.services import addons, cloudflare, cron, dns, file_manager, mariadb, nginx, site_apps, site_users, ssl, storage_quota, teardown, waf, wordpress
+from app.services import addons, cloudflare, cron, db_backends, dns, file_manager, mariadb, nginx, site_apps, site_users, ssl, storage_quota, teardown, waf, wordpress
 from app.services.audit import log_action
 
 _PLACEHOLDER_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "nginx"
@@ -1108,7 +1108,7 @@ def delete_website(website_id: int, request: Request, delete_files: bool = True,
     domain = website.domain
     db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
     if delete_database and db_item:
-        mariadb.drop_database(db_item.db_name, db_item.db_user)
+        db_backends.backend_for(db_item).drop_database(db_item.db_name, db_item.db_user)
     db.query(WebsiteAlias).filter(WebsiteAlias.website_id == website.id).delete(synchronize_session=False)
     nginx.delete_wordpress_vhost(website.domain)
     # The vhost is gone, so nothing reads the certificate or the rule file any

@@ -55,16 +55,6 @@ class IncomingDnsSyncIn(BaseModel):
     zones: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class RemoteDbHostIn(BaseModel):
-    name: str = Field(..., max_length=80)
-    host: str = Field(..., max_length=255)
-    port: int = Field(default=3306, ge=1, le=65535)
-    admin_user: str = Field(default="root", max_length=64)
-    admin_password: str = Field(default="", max_length=255)
-    use_tls: bool = False
-    enabled: bool = True
-
-
 class LocalTokenCreateIn(BaseModel):
     name: str = Field(default="SPanel Cluster Peer", max_length=80)
     allowed_ips: str = Field(default="", max_length=255)
@@ -221,66 +211,7 @@ def sync_cluster_dns(
     return result
 
 
-# ── Remote Database Hosts (Remote MySQL / MariaDB) ───────────────────────
-
-@router.post("/remote-db")
-def create_remote_db_host(
-    payload: RemoteDbHostIn,
-    request: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    ensure_role(current_user.role, Role.admin)
-    try:
-        host = multi_server.add_remote_db_host(payload.model_dump())
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    log_action(db, current_user.id, "multi_server_add_remote_db", f"{host.get('host')}:{host.get('port')}", request=request)
-    return {
-        "host": host,
-        "message": (
-            f"Đã thêm và kết nối thành công tới Remote Database {host.get('name')} ({host.get('latency_ms')}ms)!"
-            if host.get("status") == "online"
-            else f"Đã lưu {host.get('name')}, nhưng chưa kết nối được tới cổng {host.get('port')}: {host.get('last_error')}"
-        ),
-    }
-
-
-@router.post("/remote-db/{host_id}/test")
-def test_remote_db(
-    host_id: str,
-    current_user: User = Depends(get_current_user),
-):
-    ensure_role(current_user.role, Role.admin)
-    try:
-        host = multi_server.test_remote_db_host(host_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if host.get("status") != "online":
-        raise HTTPException(
-            status_code=502,
-            detail=host.get("last_error") or f"Không thể kết nối tới {host.get('host')}:{host.get('port')}",
-        )
-    return {
-        "host": host,
-        "message": f"Kết nối MySQL/MariaDB tới {host.get('name')} thành công ({host.get('latency_ms')}ms • {host.get('server_version')}).",
-    }
-
-
-@router.delete("/remote-db/{host_id}")
-def remove_remote_db(
-    host_id: str,
-    request: Request,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    ensure_role(current_user.role, Role.admin)
-    try:
-        multi_server.delete_remote_db_host(host_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    log_action(db, current_user.id, "multi_server_remove_remote_db", host_id, request=request)
-    return {"ok": True, "message": "Đã xóa máy chủ Remote Database."}
+# Remote database hosts: app.api.remote_mysql (same /multi-server/remote-db URLs).
 
 
 # ── Peer-to-Peer Cluster Endpoints (Bearer Token Authenticated) ──────────

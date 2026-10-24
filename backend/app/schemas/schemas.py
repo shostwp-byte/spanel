@@ -897,7 +897,8 @@ class DatabaseCreate(BaseModel):
     db_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     db_user: Optional[str] = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     db_password: Optional[str] = Field(default=None, min_length=12, max_length=128)
-    remote_db_host_id: Optional[str] = Field(default=None, max_length=64)
+    # A RemoteDbHost id; None creates the database on the local MariaDB.
+    db_host_id: Optional[int] = Field(default=None, ge=1)
 
     @field_validator("db_name", mode="before")
     @classmethod
@@ -1072,6 +1073,9 @@ class DatabaseOut(BaseModel):
     size_bytes: int = 0
     write_locked: bool = False
     write_locked_reason: Optional[str] = None
+    db_host_id: Optional[int] = None
+    db_host_name: str = "localhost"
+    db_host_address: str = "localhost"
 
     class Config:
         from_attributes = True

@@ -14,9 +14,10 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.core.secrets import decrypt, encrypt
-from app.models.entities import DatabaseAccount, User, Website
+from app.models.entities import DatabaseAccount, RemoteDbHost, User, Website
 from app.schemas.schemas import DatabaseCreate, DatabaseCreatedOut, DatabaseOut, DatabasePasswordUpdate
-from app.services import mariadb, multi_server, panel_urls, resource_monitor, storage_quota
+from app.services import db_backends, mariadb, panel_urls, remote_mysql, resource_monitor, storage_quota
+from app.services.remote_mysql import RemoteDatabaseError
 from app.services.audit import log_action
 from app.services.sso_tokens import consume_phpmyadmin_token, create_phpmyadmin_token
 
@@ -73,6 +74,14 @@ def list_databases(
     return rows
 
 
+@router.get("/hosts")
+def list_database_hosts(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Where a new database can be created: the local MariaDB, then every
+    enabled remote host. Names and addresses only."""
+    return {"hosts": [{"id": None, "name": "localhost", "address": "localhost", "status": "online"}]
+            + remote_mysql.host_choices(db)}
+
+
 @router.post("", response_model=DatabaseCreatedOut)
 def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if not is_admin_role(current_user.role):
@@ -105,20 +114,22 @@ def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), curr
     if db.query(DatabaseAccount).filter(DatabaseAccount.db_user == db_user).first():
         raise HTTPException(status_code=409, detail="Database user already exists")
 
-    if getattr(payload, "remote_db_host_id", None):
-        raise HTTPException(
-            status_code=501,
-            detail="Remote MySQL provisioning is disabled until full database lifecycle tracking (backup, restore, quota, and deletion) is enabled.",
-        )
+    host = None
+    if payload.db_host_id is not None:
+        host = db.query(RemoteDbHost).filter(RemoteDbHost.id == payload.db_host_id).first()
+        if host is None or not host.enabled:
+            raise HTTPException(status_code=404, detail="Remote database host not found or disabled")
 
     try:
-        mariadb.create_database_credentials(db_name, db_user, db_password)
+        db_backends.backend_for_host(host).create_database_credentials(db_name, db_user, db_password)
     except HTTPException:
         raise
     except ValueError as exc:
         # A reserved account, or one that already exists in MariaDB without
         # spanel knowing about it. Both are the caller's mistake, not a fault.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to create MariaDB database/user")
         raise HTTPException(status_code=500, detail=f"MariaDB error: {exc}") from exc
@@ -128,6 +139,7 @@ def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), curr
         db_name=db_name,
         db_user=db_user,
         db_password=encrypt(db_password),
+        db_host_id=host.id if host else None,
     )
     db.add(item)
     db.commit()
@@ -145,6 +157,9 @@ def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), curr
         db_name=item.db_name,
         db_user=item.db_user,
         db_password=db_password,
+        db_host_id=item.db_host_id,
+        db_host_name=item.db_host_name,
+        db_host_address=item.db_host_address,
     )
 
 
@@ -152,7 +167,9 @@ def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), curr
 def delete_database_record(database_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     item = get_accessible_database(database_id, db, current_user)
     try:
-        mariadb.drop_database(item.db_name, item.db_user)
+        db_backends.backend_for(item).drop_database(item.db_name, item.db_user)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to delete MariaDB database/user")
         raise HTTPException(status_code=500, detail=f"MariaDB error: {exc}") from exc
@@ -174,9 +191,15 @@ def download_database(database_id: int, db: Session = Depends(get_db), current_u
         temp_file = NamedTemporaryFile(prefix=f"{item.db_name}-", suffix=".sql", delete=False)
         temp_file.close()
         temp_path = Path(temp_file.name)
-        mariadb.export_database(item.db_name, str(temp_path))
+        db_backends.backend_for(item).export_database(item.db_name, str(temp_path))
     except ValueError as exc:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RemoteDatabaseError as exc:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return FileResponse(
         temp_path,
         filename=f"{item.db_name}.sql",
@@ -216,7 +239,10 @@ def create_phpmyadmin_sso(database_id: int, request: Request, db: Session = Depe
             status_code=500,
             detail="Failed to access stored database password; please re-save the password in panel settings",
         )
-    token = create_phpmyadmin_token(item.db_user, db_password, item.db_name)
+    token = create_phpmyadmin_token(
+        item.db_user, db_password, item.db_name,
+        server=remote_mysql.phpmyadmin_server_index(db, item.db_host),
+    )
     log_action(
         db,
         current_user.id,
@@ -230,7 +256,10 @@ def create_phpmyadmin_sso(database_id: int, request: Request, db: Session = Depe
 @router.post("/{database_id}/password")
 def change_database_password(database_id: int, payload: DatabasePasswordUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     item = get_accessible_database(database_id, db, current_user)
-    mariadb.change_database_password(item.db_user, payload.password)
+    try:
+        db_backends.backend_for(item).change_password(item.db_user, payload.password)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     item.db_password = encrypt(payload.password)
     db.commit()
     return {"ok": True, "db_user": item.db_user}

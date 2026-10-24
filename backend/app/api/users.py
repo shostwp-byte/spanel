@@ -23,7 +23,7 @@ from app.schemas.schemas import (
     UserUpdate,
 )
 from app.services.audit import log_action
-from app.services import demo_mode, mail, mariadb, nginx, site_users, ssl, storage_quota, teardown, waf, wordpress, notifications, panel_settings
+from app.services import db_backends, demo_mode, mail, nginx, site_users, ssl, storage_quota, teardown, waf, wordpress, notifications, panel_settings
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -226,7 +226,7 @@ def _remove_user_from_backup_schedules(db: Session, user_id: int) -> None:
 def _delete_owned_website(db: Session, website: Website) -> None:
     db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
     if db_item:
-        mariadb.drop_database(db_item.db_name, db_item.db_user)
+        db_backends.backend_for(db_item).drop_database(db_item.db_name, db_item.db_user)
     nginx.delete_wordpress_vhost(website.domain)
     # Deleting the owner deletes the site, so its certificate goes too - left
     # behind it would keep certbot renewing a name this server no longer serves.
@@ -748,6 +748,7 @@ def suspend_user(user_id: int, request: Request, db: Session = Depends(get_db), 
     # site user above does not touch them. A suspended customer with a working
     # SFTP sub-account still has write access to the sites just disabled.
     teardown.set_owner_sftp_accounts_locked(db, user.id, True)
+    teardown.set_owner_databases_locked(db, user.id, True)
 
     db.commit()
     log_action(db, current_user.id, "suspend_user", user.username, request=request)
@@ -790,6 +791,7 @@ def unsuspend_user(user_id: int, request: Request, db: Session = Depends(get_db)
                 pass
 
     teardown.set_owner_sftp_accounts_locked(db, user.id, False)
+    teardown.set_owner_databases_locked(db, user.id, False)
 
     db.commit()
     log_action(db, current_user.id, "unsuspend_user", user.username, request=request)

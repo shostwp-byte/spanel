@@ -338,10 +338,108 @@ server {
 }
 NGINX
   sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${api_scheme}://127.0.0.1:${port}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
-  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
+  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php /etc/phpmyadmin/conf.d/spanel-remote-servers.php 2>/dev/null || true
   [[ -n "$host" ]] && sed -i -E "/PmaAbsoluteUri/s#'https?://[^']+/phpmyadmin/'#'${tools_scheme}://${host}/phpmyadmin/'#" /etc/phpmyadmin/conf.d/spanel-signon.php 2>/dev/null || true
   nginx -t
   systemctl reload nginx || true
+}
+
+# phpMyAdmin servers 2..99 are the panel's remote MySQL hosts (server 1 is the
+# local MariaDB, configured by spanel-signon.php). The panel sends the list as
+# INDEX,HOST,PORT,TLS,CA tuples; nothing free-form reaches the PHP file.
+PMA_CONF_DIR="/etc/phpmyadmin/conf.d"
+PMA_REMOTE_SERVERS_CONF="${PMA_CONF_DIR}/spanel-remote-servers.php"
+PMA_REMOTE_CA_DIR="/etc/phpmyadmin/spanel-remote-ca"
+PMA_REMOTE_SPEC_RE='^([0-9]{1,2}),([A-Za-z0-9][A-Za-z0-9.:-]{0,252}),([0-9]{1,5}),([01]),([01])$'
+
+write_phpmyadmin_remote_ca() {
+  # CA bundle for one remote host, PEM on stdin. Only what openssl parses as
+  # certificates is written back out, so nothing else sent here reaches disk.
+  local index="$1" payload out
+  [[ -d "$PMA_CONF_DIR" ]] || deny "phpMyAdmin is not installed"
+  payload="$(mktemp)"
+  head -c 65536 >"$payload"
+  install -d -o root -g www-data -m 0750 "$PMA_REMOTE_CA_DIR"
+  out="$(mktemp "${PMA_REMOTE_CA_DIR}/.ca-${index}.XXXXXX")"
+  if ! openssl crl2pkcs7 -nocrl -certfile "$payload" 2>/dev/null | openssl pkcs7 -print_certs -out "$out" 2>/dev/null \
+      || ! grep -q -- "-----BEGIN CERTIFICATE-----" "$out"; then
+    rm -f "$payload" "$out"
+    deny "phpmyadmin-remote-ca: stdin is not a PEM certificate"
+  fi
+  rm -f "$payload"
+  chown root:www-data "$out"
+  chmod 0640 "$out"
+  mv -f "$out" "${PMA_REMOTE_CA_DIR}/${index}.pem"
+}
+
+write_phpmyadmin_remote_servers() {
+  local spec index host port tls ca secure tmp name f
+  local -a keep=()
+  if [[ ! -d "$PMA_CONF_DIR" ]]; then
+    echo "phpMyAdmin is not installed; nothing to configure"
+    return 0
+  fi
+  secure="false"
+  grep -Eq "'secure' => true" "${PMA_CONF_DIR}/spanel-signon.php" 2>/dev/null && secure="true"
+  tmp="$(mktemp "${PMA_CONF_DIR}/.spanel-remote-servers.XXXXXX")"
+  printf '%s\n' "<?php" "// Managed by SPanel (spanel-helper phpmyadmin-remote-servers): the panel's" \
+    "// remote MySQL hosts. Server 1 is the local MariaDB. Do not edit." >"$tmp"
+  for spec in "$@"; do
+    if [[ ! "$spec" =~ $PMA_REMOTE_SPEC_RE ]]; then
+      rm -f "$tmp"; deny "phpmyadmin-remote-servers: invalid server spec"
+    fi
+    # Decimal, so "08" can neither become a bad PHP octal literal nor miss 8.pem.
+    index="$((10#${BASH_REMATCH[1]}))"; host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
+    tls="${BASH_REMATCH[4]}"; ca="${BASH_REMATCH[5]}"
+    if (( 10#$index < 2 || 10#$index > 99 || 10#$port < 1 || 10#$port > 65535 )); then
+      rm -f "$tmp"; deny "phpmyadmin-remote-servers: index or port out of range"
+    fi
+    cat >>"$tmp" <<PHP
+\$cfg['Servers'][${index}] = [
+    'verbose' => 'Remote MySQL ${host}:${port}',
+    'host' => '${host}',
+    'port' => '${port}',
+    'auth_type' => 'signon',
+    'SignonSession' => 'SPanelPmaSignon',
+    'SignonURL' => '/phpmyadmin/spanel-signon.php',
+    'SignonCookieParams' => [
+        'lifetime' => 0,
+        'path' => '/',
+        'domain' => '',
+        'secure' => ${secure},
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ],
+    'AllowNoPassword' => false,
+PHP
+    if [[ "$tls" == "1" ]]; then
+      printf '%s\n' "    'ssl' => true," "    'ssl_verify' => true," >>"$tmp"
+      if [[ "$ca" == "1" ]]; then
+        if [[ ! -f "${PMA_REMOTE_CA_DIR}/${index}.pem" ]]; then
+          rm -f "$tmp"; deny "phpmyadmin-remote-servers: no CA for server ${index}; send it with phpmyadmin-remote-ca first"
+        fi
+        printf '%s\n' "    'ssl_ca' => '${PMA_REMOTE_CA_DIR}/${index}.pem'," >>"$tmp"
+        keep+=("${index}.pem")
+      else
+        printf '%s\n' "    'ssl_ca_path' => '/etc/ssl/certs'," >>"$tmp"
+      fi
+    fi
+    printf '%s\n' "];" >>"$tmp"
+  done
+  if command -v php >/dev/null 2>&1 && ! php -l "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; deny "phpmyadmin-remote-servers: generated config does not parse"
+  fi
+  chown root:www-data "$tmp"
+  chmod 0640 "$tmp"
+  mv -f "$tmp" "$PMA_REMOTE_SERVERS_CONF"
+  if [[ -d "$PMA_REMOTE_CA_DIR" ]]; then
+    for f in "$PMA_REMOTE_CA_DIR"/*.pem; do
+      [[ -e "$f" ]] || continue
+      name="$(basename -- "$f")"
+      [[ " ${keep[*]:-} " == *" ${name} "* ]] || rm -f -- "$f"
+    done
+  fi
+  echo "phpMyAdmin remote servers: $#"
 }
 
 configure_unattended_upgrades() {
@@ -10046,6 +10144,19 @@ EOF
         [[ "$sz" =~ ^[0-9]+$ ]] && printf '%s\t%s\n' "$sz" "$db_base"
       done
     fi
+    ;;
+
+  phpmyadmin-remote-ca)
+    # CA certificate (PEM on stdin) for phpMyAdmin server <index>, a remote MySQL host.
+    [[ $# -eq 1 && "$1" =~ ^[0-9]{1,2}$ ]] || deny "usage: phpmyadmin-remote-ca <server-index>"
+    (( 10#$1 >= 2 && 10#$1 <= 99 )) || deny "phpmyadmin-remote-ca: server index out of range"
+    write_phpmyadmin_remote_ca "$((10#$1))"
+    ;;
+
+  phpmyadmin-remote-servers)
+    # The full list of remote MySQL hosts phpMyAdmin offers, INDEX,HOST,PORT,TLS,CA each.
+    [[ $# -le 98 ]] || deny "usage: phpmyadmin-remote-servers [INDEX,HOST,PORT,TLS,CA ...]"
+    write_phpmyadmin_remote_servers "$@"
     ;;
 
   panel-user-password)

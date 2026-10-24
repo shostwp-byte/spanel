@@ -298,10 +298,14 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
           password: data.generated_password,
         });
       }
+      // A database whose remote host is not configured here was put on the
+      // local MariaDB instead; say so rather than leave it to be discovered.
+      const dbNotes = (data.database_notes || []).join('; ');
       setNotice(t('restoredUserBackupSummary', {
         username: data.username,
         count: data.websites?.length || 0,
-      }) + ` (Chế độ: ${modeLabels[userRestoreMode] || userRestoreMode})`);
+      }) + ` (Chế độ: ${modeLabels[userRestoreMode] || userRestoreMode})`
+        + (dbNotes ? ` ${t('Database host changed during restore:')} ${dbNotes}` : ''));
     } catch (err) {
       setError(err.message);
     } finally {

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.security import hash_password
 from app.models.entities import ApiToken, DatabaseAccount, ProvisioningAccount, User, Website
 from app.services import backup as backup_service, teardown
-from app.services import mariadb, nginx, site_users, ssl, storage_quota, waf, wordpress
+from app.services import db_backends, nginx, site_users, ssl, storage_quota, waf, wordpress
 
 
 def hash_token(raw: str) -> str:
@@ -128,6 +128,8 @@ def suspend_account(db: Session, account: ProvisioningAccount, reason: str = "")
                 site_users.lock_linux_user(website.linux_user)
             except Exception:
                 pass
+    for owner_id in owner_ids:
+        teardown.set_owner_databases_locked(db, owner_id, True)
 
     account.status = "suspended"
     account.last_action = "suspend"
@@ -176,6 +178,8 @@ def unsuspend_account(db: Session, account: ProvisioningAccount) -> None:
                 site_users.unlock_linux_user(website.linux_user)
             except Exception:
                 pass
+    for owner_id in owner_ids:
+        teardown.set_owner_databases_locked(db, owner_id, False)
 
     account.status = "active"
     account.last_action = "unsuspend"
@@ -209,7 +213,7 @@ def terminate_account(db: Session, account: ProvisioningAccount, backup: bool = 
         for website in websites:
             db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
             if db_item:
-                mariadb.drop_database(db_item.db_name, db_item.db_user)
+                db_backends.backend_for(db_item).drop_database(db_item.db_name, db_item.db_user)
                 db.delete(db_item)
             nginx.delete_wordpress_vhost(website.domain)
             # Terminating an account is a real deletion, not a suspension: the
