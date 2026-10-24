@@ -27,6 +27,9 @@ export const DEFAULT_PKG_STATE = {
   database_limit: 5,
   mysql_storage_limit_mb: 2048,
   mysql_max_db_size_mb: 1024,
+  mysql_max_queries_per_hour: 0,
+  mysql_max_updates_per_hour: 0,
+  mysql_max_connections_per_hour: 0,
   mail_accounts_limit: 10,
   email_forwarders_limit: 20,
   autoresponders_limit: 10,
@@ -148,6 +151,7 @@ export function PackagesPage({ mode = 'users' }) {
       'alias_limit', 'domain_pointers_limit', 'inode_limit', 'sftp_accounts_limit',
       'ftp_accounts_limit', 'backup_retention_days', 'ips_limit', 'reseller_user_limit',
       'database_limit', 'mysql_storage_limit_mb', 'mysql_max_db_size_mb',
+      'mysql_max_queries_per_hour', 'mysql_max_updates_per_hour', 'mysql_max_connections_per_hour',
       'mail_accounts_limit', 'email_forwarders_limit', 'autoresponders_limit', 'mailing_lists_limit',
       'node_apps_limit', 'node_app_memory_mb',
       'cpu_quota_percent', 'tasks_max', 'memory_high_mb', 'memory_max_mb',
@@ -722,6 +726,27 @@ export function PackagesPage({ mode = 'users' }) {
                   field: 'mysql_storage_limit_mb',
                   unit: 'MB',
                   defaultFallback: 2048,
+                  zeroIsUnlimited: true,
+                })}
+                {renderQuotaRow({
+                  label: t('MySQL Queries per Hour'),
+                  field: 'mysql_max_queries_per_hour',
+                  unit: 'Queries',
+                  defaultFallback: 0,
+                  zeroIsUnlimited: true,
+                })}
+                {renderQuotaRow({
+                  label: t('MySQL Updates per Hour'),
+                  field: 'mysql_max_updates_per_hour',
+                  unit: 'Updates',
+                  defaultFallback: 0,
+                  zeroIsUnlimited: true,
+                })}
+                {renderQuotaRow({
+                  label: t('MySQL Connections per Hour'),
+                  field: 'mysql_max_connections_per_hour',
+                  unit: 'Conns',
+                  defaultFallback: 0,
                   zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({

@@ -177,6 +177,10 @@ RELEASE_ZIP_URL="${RELEASE_ZIP_URL:-}"             # optional archive URL templa
 SKIP_PULL="${SKIP_PULL:-false}"
 UPDATE_STATE_FILE="${UPDATE_STATE_FILE:-/var/lib/spanel/update-status.json}"
 RELEASE_WORK_DIR="${RELEASE_WORK_DIR:-}"
+# Opt-in: SPANEL_DISK_QUOTA=kernel turns on kernel user quota for the
+# filesystem holding /home (also possible from Resource Monitor). Only fstab
+# is edited; a remount or reboot stays the administrator's call.
+SPANEL_DISK_QUOTA="${SPANEL_DISK_QUOTA:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1620,6 +1624,11 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
     if [[ -f /etc/clamav/clamd.conf ]]; then
       sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper clamav-tune >/dev/null ||         echo "  (warning: could not raise clamd's scan limits; large uploads stay unscanned)"
     fi
+    if [[ "$SPANEL_DISK_QUOTA" == "kernel" ]]; then
+      log "Enabling kernel disk quota (SPANEL_DISK_QUOTA=kernel)"
+      sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper quota-enable | sed -n -E 's/^(state|hint|backup)=/  \1: /p' || \
+        echo "  (warning: could not enable kernel disk quota; the panel's own accounting still applies)"
+    fi
     # The helper is fresh now, so the clock unit can run without flashing
     # up as a failed unit first.
     systemctl reset-failed spanel-timesync.service >/dev/null 2>&1 || true
@@ -1758,7 +1767,19 @@ SITE_REFRESH_INPUTS=(
   "$SOURCE_DIR/backend/app/services"
   "$SOURCE_DIR/backend/app/templates"
 )
-if ! step_inputs_changed site-refresh "${SITE_REFRESH_INPUTS[@]}"; then
+# The site refresh is also what moves sites onto their account's own PHP-FPM
+# master (spanel-php<ver>-fpm@<user>, inside user-<uid>.slice): each
+# ensure_site_runtime writes the pool there and starts that master next to the
+# distro one, rewrite_vhost then points nginx at whichever master serves the
+# site, and nginx reloads once at the end. A site whose account master does not
+# start stays on php<ver>-fpm and is logged. While any pool is still on a
+# distro master the refresh runs on every update, so those sites keep being
+# retried; afterwards php-fpm-legacy-prune retires the distro copies nginx no
+# longer names. Zero downtime: the old pool serves until nginx has switched.
+legacy_php_pools_left() {
+  compgen -G '/etc/php/*/fpm/pool.d/spanel-*.conf' >/dev/null
+}
+if ! step_inputs_changed site-refresh "${SITE_REFRESH_INPUTS[@]}" && ! legacy_php_pools_left; then
   log "Managed site config unchanged since last update; skipping the per-site refresh"
 elif id -u spanel >/dev/null 2>&1; then
   log "Refreshing managed site configuration"
@@ -1827,6 +1848,14 @@ with SessionLocal() as db:
         print(f"WARNING: could not refresh HTTP flood zones: {exc}")
 PY
   step_mark_done site-refresh "${SITE_REFRESH_INPUTS[@]}"
+  if legacy_php_pools_left; then
+    log "Retiring PHP-FPM pools that moved to per-account masters"
+    sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper php-fpm-legacy-prune | sed 's/^/  /' || \
+      log "WARNING: could not retire the moved PHP-FPM pools; the boot retune will"
+    if legacy_php_pools_left; then
+      log "Some PHP-FPM pools are still served by the distro php-fpm (their account master did not start or no site uses them); see journalctl -u 'spanel-php*-fpm@*'"
+    fi
+  fi
 fi
 
 # Clear what deleted websites left on disk. A Let's Encrypt renewal config for a
@@ -1937,6 +1966,9 @@ for php_ini_dir in /etc/php/*/; do
       phpenmod -v "$php_ver" "$mod" 2>/dev/null || true
     done
     systemctl reload "php${php_ver}-fpm" 2>/dev/null || true
+    # The per-account masters read the same conf.d (a glob only matches
+    # loaded, i.e. running, instances).
+    systemctl reload "spanel-php${php_ver}-fpm@*.service" 2>/dev/null || true
   fi
 done
 

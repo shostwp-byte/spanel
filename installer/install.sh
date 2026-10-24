@@ -75,6 +75,12 @@ PHP_DEFAULT="${PHP_DEFAULT:-8.4}"
 PHP_VERSIONS="${PHP_VERSIONS:-8.3 8.4}"
 APP_DIR="${APP_DIR:-/opt/spanel}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/spanel}"
+# Opt-in: SPANEL_DISK_QUOTA=kernel turns on kernel user quota (disk space and
+# inodes per account) for the filesystem holding /home. The installer only
+# edits /etc/fstab; when the options are not mounted yet it says a remount or
+# reboot is needed and does neither itself. Without it the panel's own
+# accounting applies, which PHP and SFTP can write past.
+SPANEL_DISK_QUOTA="${SPANEL_DISK_QUOTA:-}"
 ADMIN_PASSWORD=""
 
 # `dpkg -s` exits 0 for a package that was removed but kept its config files
@@ -1619,6 +1625,12 @@ main() {
   # usually not installed yet and install_clamav_engine tunes it when it is.
   if [[ -f /etc/clamav/clamd.conf ]]; then
     sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper clamav-tune >/dev/null ||       log "  (warning: could not raise clamd's scan limits; large uploads stay unscanned)"
+  fi
+
+  if [[ "$SPANEL_DISK_QUOTA" == "kernel" ]]; then
+    log "Enabling kernel disk quota (SPANEL_DISK_QUOTA=kernel)"
+    sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper quota-enable | sed -n -E 's/^(state|hint|backup)=/  \1: /p' || \
+      log "  (warning: could not enable kernel disk quota; the panel's own accounting still applies)"
   fi
 
   log "Configuring SSL"

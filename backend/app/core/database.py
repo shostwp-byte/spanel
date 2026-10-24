@@ -102,6 +102,9 @@ def _ensure_resource_limit_columns() -> None:
             ("tasks_max", "INTEGER NOT NULL DEFAULT 512"),
             ("mysql_storage_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_db_size_mb", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_queries_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_updates_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_connections_per_hour", "INTEGER NOT NULL DEFAULT 0"),
         ],
         "users": [
             ("bandwidth_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
@@ -117,6 +120,9 @@ def _ensure_resource_limit_columns() -> None:
             ("tasks_max", "INTEGER NOT NULL DEFAULT 512"),
             ("mysql_storage_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_db_size_mb", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_queries_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_updates_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_connections_per_hour", "INTEGER NOT NULL DEFAULT 0"),
         ],
         "database_accounts": [
             ("size_bytes", "INTEGER NOT NULL DEFAULT 0"),

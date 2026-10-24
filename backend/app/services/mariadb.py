@@ -324,6 +324,61 @@ def enforce_db_user_resource_limits(
 
 
 
+MAX_HOURLY_LIMIT = 1_000_000_000
+
+
+def _hourly_value(value) -> int:
+    """0 (or less, or junk) is "no limit", which is also MariaDB's 0."""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(MAX_HOURLY_LIMIT, number))
+
+
+def hourly_limits_sql(
+    db_user: str,
+    max_queries_per_hour: int = 0,
+    max_updates_per_hour: int = 0,
+    max_connections_per_hour: int = 0,
+) -> str:
+    """ALTER USER setting the three per-hour resource limits of one account.
+
+    All three are always set, so lowering a package to "no limit" lifts a
+    limit set earlier instead of leaving it behind. MAX_USER_CONNECTIONS and
+    MAX_STATEMENT_TIME (enforce_db_user_resource_limits) are left as they are.
+    """
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    return (
+        f"ALTER USER {_quote_sql_string(safe_user)}@'localhost' WITH"
+        f" MAX_QUERIES_PER_HOUR {_hourly_value(max_queries_per_hour)}"
+        f" MAX_UPDATES_PER_HOUR {_hourly_value(max_updates_per_hour)}"
+        f" MAX_CONNECTIONS_PER_HOUR {_hourly_value(max_connections_per_hour)};\n"
+    )
+
+
+def owner_hourly_limits(owner) -> tuple[int, int, int]:
+    """The hourly limits a panel user's package gave them."""
+    return (
+        _hourly_value(getattr(owner, "mysql_max_queries_per_hour", 0)),
+        _hourly_value(getattr(owner, "mysql_max_updates_per_hour", 0)),
+        _hourly_value(getattr(owner, "mysql_max_connections_per_hour", 0)),
+    )
+
+
+def enforce_db_user_hourly_limits(
+    db_user: str,
+    max_queries_per_hour: int = 0,
+    max_updates_per_hour: int = 0,
+    max_connections_per_hour: int = 0,
+) -> bool:
+    sql = hourly_limits_sql(db_user, max_queries_per_hour, max_updates_per_hour, max_connections_per_hour)
+    if settings.command_dry_run:
+        return True
+    return _run_sql(sql, check=False).returncode == 0
+
+
 def ensure_mysql_governor_settings() -> None:
     """Enable MariaDB userstat=1 (per-user CPU/row statistics) and InnoDB Buffer Pool scan resistance
     (innodb_old_blocks_time=1000, innodb_old_blocks_pct=37) so a scraped site cannot evict other users' hot RAM cache."""

@@ -240,6 +240,9 @@ class UserPackageCreate(BaseModel):
     tasks_max: int = Field(default=512, ge=-1, le=1000000)
     mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: int = Field(default=0, ge=-1, le=1000000000)
 
     @field_validator("personal_dns_mode", mode="before")
     @classmethod
@@ -312,6 +315,9 @@ class UserPackageUpdate(BaseModel):
     tasks_max: Optional[int] = Field(default=None, ge=-1, le=1000000)
     mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
     mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
 
     @field_validator("personal_dns_mode", mode="before")
     @classmethod
@@ -405,6 +411,9 @@ class UserPackageOut(BaseModel):
     tasks_max: int = 512
     mysql_storage_limit_mb: int = 0
     mysql_max_db_size_mb: int = 0
+    mysql_max_queries_per_hour: int = 0
+    mysql_max_updates_per_hour: int = 0
+    mysql_max_connections_per_hour: int = 0
 
     owner_id: Optional[int] = None
     created_at: Optional[datetime] = None
@@ -442,6 +451,9 @@ class UserCreate(BaseModel):
     tasks_max: int = Field(default=512, ge=-1, le=1000000)
     mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: int = Field(default=0, ge=-1, le=1000000000)
     terminal_enabled: Optional[bool] = None
 
     @field_validator("role", mode="before")
@@ -518,6 +530,9 @@ class UserUpdate(BaseModel):
     tasks_max: Optional[int] = Field(default=None, ge=-1, le=1000000)
     mysql_storage_limit_mb: Optional[int] = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: Optional[int] = Field(default=0, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
 
 
 class UserPasswordUpdate(BaseModel):
