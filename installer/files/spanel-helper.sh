@@ -3853,7 +3853,7 @@ mail_dkim_key() {
 }
 
 mail_dkim_active_selector() {
-  awk -F': ' -v d="$1" '$1 == d { print $2; exit }' "$MAIL_EXIM_DIR/dkim_selectors" 2>/dev/null
+  awk -F': ' -v d="$1" '$1 == d { print $2; exit }' "$MAIL_EXIM_DIR/dkim_selectors" 2>/dev/null || true
 }
 
 mail_dkim() {
@@ -3889,7 +3889,8 @@ mail_dkim_drop() {
   fi
   key="$(mail_dkim_key "$domain" "$selector")"
   rm -f -- "$key"
-  rmdir -- "$(dirname "$key")" 2>/dev/null || true
+  # A selector's own directory goes once empty; never dkim/ itself.
+  if [[ "$selector" != "spanel" ]]; then rmdir -- "$(dirname "$key")" 2>/dev/null || true; fi
   echo "removed DKIM key ${selector} of ${domain}"
 }
 
@@ -3940,7 +3941,7 @@ mail_dkim_import() {
   chown root:Debian-exim "$tmp"
   chmod 0640 "$tmp"
   head -c 16384 >"$tmp"
-  bits="$(openssl rsa -in "$tmp" -noout -text 2>/dev/null | sed -nE 's/^Private-Key: \(([0-9]+) bit.*/\1/p' | head -n1)"
+  bits="$(openssl rsa -in "$tmp" -noout -text 2>/dev/null | sed -nE 's/^Private-Key: \(([0-9]+) bit.*/\1/p' | head -n1 || true)"
   if [[ ! "$bits" =~ ^[0-9]+$ ]] || (( bits < 1024 || bits > 4096 )) || ! openssl rsa -in "$tmp" -check -noout >/dev/null 2>&1; then
     rm -f "$tmp"
     deny "not an RSA private key of 1024 to 4096 bits"
@@ -4227,10 +4228,11 @@ mail_hosts_conf() {
 
 mail_cert_covers() {
   # Whether the live certificate <name> covers every host in the comma list.
-  local cert="/etc/letsencrypt/live/$1/fullchain.pem" host
+  local cert="/etc/letsencrypt/live/$1/fullchain.pem" host answer
   [[ -f "$cert" ]] || return 1
   for host in ${2//,/ }; do
-    openssl x509 -in "$cert" -noout -checkhost "$host" 2>/dev/null | grep -q 'does match' || return 1
+    answer="$(openssl x509 -in "$cert" -noout -checkhost "$host" 2>/dev/null || true)"
+    [[ "$answer" == *"does match"* ]] || return 1
   done
 }
 
