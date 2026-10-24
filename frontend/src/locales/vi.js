@@ -1337,6 +1337,7 @@ export const vi = {
   "Signature key (DKIM)": "Khoá chữ ký (DKIM)",
   "Signed in with a passkey.": "Đã đăng nhập bằng passkey.",
   "Signing out of a demo account ends only that visitor's session, not everyone else's.": "Đăng xuất khỏi tài khoản demo chỉ kết thúc phiên của người đó, không đăng xuất những người khác.",
+  "Since v1.0.7 the Git webhook URL has changed and every push must be signed. A webhook set up before then is rejected: paste the new URL and the Webhook Secret into GitHub/GitLab again.": "Từ v1.0.7, URL webhook Git đã đổi và mọi lần push phải có chữ ký. Webhook cài trước đó sẽ bị từ chối: dán lại URL mới và Webhook Secret vào GitHub/GitLab.",
   "Site limit": "Giới hạn site",
   "Site title": "Tiêu đề site",
   "Size": "Dung lượng",
