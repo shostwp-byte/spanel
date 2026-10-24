@@ -745,6 +745,7 @@ def suspend_user(user_id: int, request: Request, db: Session = Depends(get_db), 
     # site user above does not touch them. A suspended customer with a working
     # SFTP sub-account still has write access to the sites just disabled.
     teardown.set_owner_sftp_accounts_locked(db, user.id, True)
+    teardown.set_owner_databases_locked(db, user.id, True)
 
     db.commit()
     log_action(db, current_user.id, "suspend_user", user.username, request=request)
@@ -787,6 +788,7 @@ def unsuspend_user(user_id: int, request: Request, db: Session = Depends(get_db)
                 pass
 
     teardown.set_owner_sftp_accounts_locked(db, user.id, False)
+    teardown.set_owner_databases_locked(db, user.id, False)
 
     db.commit()
     log_action(db, current_user.id, "unsuspend_user", user.username, request=request)

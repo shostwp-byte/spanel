@@ -157,6 +157,19 @@ def set_owner_sftp_accounts_locked(db, owner_id: int, locked: bool) -> list[str]
     return touched
 
 
+def set_owner_databases_locked(db, owner_id: int, locked: bool) -> list[str]:
+    """Suspending a panel account has to reach its databases too.
+
+    The sites are taken offline, but a database account keeps working with
+    the credentials in their config files - from a script, a cron job or a
+    client on a host it may connect from. ACCOUNT LOCK on every one of the
+    owner's accounts, on whichever server it lives. Returns the accounts that
+    could not be changed; the suspension itself goes ahead.
+    """
+    rows = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == owner_id).all()
+    return db_backends.set_accounts_locked(rows, locked)
+
+
 def purge_owner_passkeys(db, owner_id: int) -> list[str]:
     """Passkeys are rows and nothing else - no Linux user, no files.
 

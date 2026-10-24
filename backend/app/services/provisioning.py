@@ -128,6 +128,8 @@ def suspend_account(db: Session, account: ProvisioningAccount, reason: str = "")
                 site_users.lock_linux_user(website.linux_user)
             except Exception:
                 pass
+    for owner_id in owner_ids:
+        teardown.set_owner_databases_locked(db, owner_id, True)
 
     account.status = "suspended"
     account.last_action = "suspend"
@@ -176,6 +178,8 @@ def unsuspend_account(db: Session, account: ProvisioningAccount) -> None:
                 site_users.unlock_linux_user(website.linux_user)
             except Exception:
                 pass
+    for owner_id in owner_ids:
+        teardown.set_owner_databases_locked(db, owner_id, False)
 
     account.status = "active"
     account.last_action = "unsuspend"
