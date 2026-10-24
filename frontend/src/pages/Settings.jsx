@@ -42,6 +42,11 @@ const INTEGRATION_PLATFORMS = [
 const WEBHOOK_EVENT_PRESETS = [
   { id: 'all', label: 'Tất cả sự kiện (*)', value: '*' },
   {
+    id: 'accounts',
+    label: 'Vòng đời tài khoản Billing (account.*)',
+    value: 'account.*',
+  },
+  {
     id: 'provisioning',
     label: 'Chỉ sự kiện Provisioning / Billing',
     value: 'provisioning_create,provisioning_suspend,provisioning_unsuspend,provisioning_terminate,provisioning_change_package,provisioning_change_password',
@@ -1271,7 +1276,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   2. Outbound Event Webhooks (Perfex CRM, ERP, n8n, Automation)
                 </h3>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  Tự động đẩy thông báo JSON (kèm chữ ký bảo mật <code>X-SPanel-Signature</code> HMAC-SHA256) sang hệ thống CRM / Billing bên ngoài khi phát sinh sự kiện trên SPanel.
+                  Tự động đẩy thông báo JSON (ký HMAC-SHA256 qua <code>X-SPanel-Timestamp</code> + <code>X-SPanel-Signature-256</code>, giữ <code>X-SPanel-Signature</code> cũ) sang hệ thống CRM / Billing khi phát sinh sự kiện; gửi lỗi sẽ tự thử lại với backoff tới 8 lần.
                 </p>
               </div>
               <button
@@ -1571,8 +1576,19 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                               background: isOk ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)',
                               color: isOk ? '#10b981' : '#ef4444',
                             }}>
-                              {deliv.status_code ? `HTTP ${deliv.status_code}` : (isOk ? '200 OK' : 'Timeout / Error')}
+                              {deliv.status_code ? `HTTP ${deliv.status_code}` : (isOk ? '200 OK' : (deliv.status === 'pending' && !deliv.attempts ? 'Đang chờ gửi' : 'Timeout / Error'))}
                             </span>
+                            {deliv.status === 'pending' && deliv.attempts > 0 && (
+                              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '3px' }}>
+                                Thử lại {deliv.attempts}/{deliv.max_attempts}
+                                {deliv.next_attempt_at ? ` · lần tới ${new Date(deliv.next_attempt_at).toLocaleTimeString()}` : ''}
+                              </div>
+                            )}
+                            {deliv.status === 'failed' && deliv.attempts > 1 && (
+                              <div style={{ fontSize: '0.7rem', color: '#ef4444', marginTop: '3px' }}>
+                                Đã bỏ sau {deliv.attempts} lần thử
+                              </div>
+                            )}
                           </td>
                           <td style={{ fontSize: '0.78rem', fontFamily: 'monospace', color: 'var(--text-muted)' }}>
                             {deliv.latency_ms ? `${deliv.latency_ms} ms` : '—'}

@@ -433,6 +433,16 @@ def _run_account_backup(account_id: int) -> None:
             account.last_action = "backup"
             db.commit()
             log_action(db, None, "provisioning_backup", account.external_id, detail=outcome)
+            from app.services import webhooks
+
+            data = account_to_dict(account, db)
+            data["backup"] = account.last_message
+            webhooks.emit_event(
+                db,
+                "account.backup_completed" if outcome == "ok" else "account.backup_failed",
+                data,
+                subject=account.user,
+            )
     except Exception:  # noqa: BLE001
         logger.exception("Provisioning backup of account %s failed", account_id)
     finally:

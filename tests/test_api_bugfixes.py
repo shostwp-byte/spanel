@@ -2,7 +2,7 @@
 
 Each test names the fault it guards against.
 """
-from types import SimpleNamespace
+import json
 from unittest.mock import patch
 
 import pytest
@@ -68,22 +68,17 @@ def test_system_events_reach_admin_webhooks():
         db.add(WebhookEndpoint(user_id=reseller.id, url="https://reseller.example.com/hook", events="*", is_active=True))
         db.commit()
 
-        class _InlineThread:
-            def __init__(self, target, args=(), daemon=None):
-                self._target, self._args = target, args
-
-            def start(self):
-                self._target(*self._args)
-
-        with patch.object(webhooks, "send_webhook_sync") as send, \
-                patch.object(webhooks, "threading", SimpleNamespace(Thread=_InlineThread)), \
-                patch.object(audit, "_write_audit_anchor"):
+        with patch.object(audit, "_write_audit_anchor"):
             audit.log_action(db, None, "provisioning_create", "whmcs:9", detail="example.com")
 
-    urls = sorted(call.args[0] for call in send.call_args_list)
+        sent = []
+        with patch.object(webhooks, "transport", side_effect=lambda url, body, headers: sent.append((url, body)) or (200, "OK")):
+            webhooks.process_due(db)
+
+    urls = sorted(url for url, _ in sent)
     # The administrator's endpoint receives it; a reseller cannot see
     # system-wide provisioning events.
     assert urls == ["https://billing.example.com/hook"]
-    payload = send.call_args_list[0].args[2]
+    payload = json.loads(sent[0][1])
     assert payload["event"] == "provisioning_create"
     assert payload["user_id"] is None

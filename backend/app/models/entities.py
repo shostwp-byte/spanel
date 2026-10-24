@@ -650,12 +650,47 @@ class WebhookEndpoint(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     url: Mapped[str] = mapped_column(String(500))
-    secret: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Encrypted with app.core.secrets ("fernet:..."); rows written before that
+    # hold plaintext until the webhook worker re-saves them on start.
+    secret: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     events: Mapped[str] = mapped_column(Text, default="*")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    
+
     owner: Mapped[User] = relationship(foreign_keys=[user_id])
+
+
+class WebhookOutbox(Base):
+    """One event for one endpoint, kept until delivered or given up on.
+
+    Doubles as the delivery history the panel shows. A failed attempt is
+    retried with exponential backoff by the worker in services/webhooks.py.
+    """
+
+    __tablename__ = "webhook_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    # Sent as X-SPanel-Delivery; the same across retries of this row.
+    delivery_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    endpoint_id: Mapped[Optional[int]] = mapped_column(ForeignKey("webhook_endpoints.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Owner of the endpoint, for scoping the history.
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    url: Mapped[str] = mapped_column(String(500), default="")
+    event: Mapped[str] = mapped_column(String(100), default="", index=True)
+    payload: Mapped[str] = mapped_column(Text, default="{}")
+    # pending (queued or waiting for a retry), delivering, success, failed (given up)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=8)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    last_status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    response_preview: Mapped[str] = mapped_column(Text, default="")
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    has_signature: Mapped[bool] = mapped_column(Boolean, default=False)
+    replayed_from: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class NotificationPref(Base):

@@ -201,6 +201,39 @@ def update_whitelabel(payload: WhiteLabelConfigSchema, db: Session = Depends(get
     return config
 
 
+_EVENT_NAME_RE = re.compile(r"^(\*|[a-z][a-z0-9_]*(\.[a-z0-9_]+)*(\.\*)?)$")
+
+
+def _validate_events(raw: str) -> str:
+    """Comma-separated event names; "*" for all, "account.*" for a family."""
+    items = []
+    for item in (raw or "").split(","):
+        name = item.strip()
+        if not name:
+            continue
+        if len(name) > 100 or not _EVENT_NAME_RE.fullmatch(name):
+            raise HTTPException(status_code=400, detail=f"Invalid event name: {name}")
+        if name not in items:
+            items.append(name)
+    return ",".join(items) or "*"
+
+
+@router.get("/webhooks/events")
+def list_webhook_events(current_user: User = Depends(get_current_user)):
+    """The event catalogue for the endpoint form."""
+    ensure_role(current_user.role, Role.reseller)
+    return {
+        "events": [{"name": name, "description": desc} for name, desc in webhooks_service.EVENT_CATALOGUE.items()],
+        "signature": {
+            "timestamp_header": "X-SPanel-Timestamp",
+            "signature_header": "X-SPanel-Signature-256",
+            "legacy_signature_header": "X-SPanel-Signature",
+            "scheme": "sha256=HMAC_SHA256(secret, timestamp + '.' + body)",
+            "tolerance_seconds": webhooks_service.SIGNATURE_TOLERANCE_SECONDS,
+        },
+    }
+
+
 def _webhook_to_out(webhook: WebhookEndpoint) -> dict:
     return {
         "id": webhook.id,
@@ -225,8 +258,8 @@ def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db)
     webhook = WebhookEndpoint(
         user_id=current_user.id,
         url=safe_url,
-        secret=payload.secret,
-        events=payload.events,
+        secret=webhooks_service.protect_secret(payload.secret),
+        events=_validate_events(payload.events),
         is_active=payload.is_active
     )
     db.add(webhook)
@@ -245,9 +278,9 @@ def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session 
     if payload.url is not None:
         webhook.url = _validate_webhook_url(payload.url)
     if payload.secret is not None and payload.secret.strip():
-        webhook.secret = payload.secret.strip()
+        webhook.secret = webhooks_service.protect_secret(payload.secret)
     if payload.events is not None:
-        webhook.events = payload.events
+        webhook.events = _validate_events(payload.events)
     if payload.is_active is not None:
         webhook.is_active = payload.is_active
 
@@ -298,9 +331,13 @@ def test_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: U
         "target": "spanel_diagnostic",
         "detail": "Gói tin kiểm tra kết nối Outbound Webhook từ SPanel",
     }
+    try:
+        secret = webhooks_service.endpoint_secret(webhook)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail="Webhook secret cannot be read; set it again") from exc
     delivery = webhooks_service.send_webhook_sync(
         webhook.url,
-        webhook.secret,
+        secret,
         test_payload,
         webhook_id=webhook.id,
         user_id=current_user.id,
@@ -363,7 +400,11 @@ def whmcs_connection_diagnostic(db: Session = Depends(get_db), current_user: Use
     hostname = p_settings.get("panel_hostname") or ""
     port = int(p_settings.get("panel_port") or 2222)
     deliveries = webhooks_service.list_deliveries(is_admin=True, limit=20)
-    failed_deliveries = [d for d in deliveries if d.get("status") != "success"]
+    # A pending row that has not been tried yet is not a failure.
+    failed_deliveries = [
+        d for d in deliveries
+        if d.get("status") == "failed" or (d.get("status") == "pending" and (d.get("attempts") or 0) > 0)
+    ]
 
     checks = [
         {

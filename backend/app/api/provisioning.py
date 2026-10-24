@@ -122,6 +122,16 @@ def _apply_cgroup_limits(user_id: int) -> None:
         pass
 
 
+def _emit(db: Session, event: str, account: ProvisioningAccount, **extra) -> None:
+    """Queue an account.* webhook event. Never carries a password."""
+    from app.services import webhooks
+
+    data = account_to_dict(account, db)
+    data.pop("sftp_password", None)
+    data.update(extra)
+    webhooks.emit_event(db, event, data, subject=account.user)
+
+
 def _provisioning_email(username: str) -> str:
     return f"{username}@users.spanel.dev"
 
@@ -344,6 +354,7 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
             dns.zone_for_new_domain(db, payload.domain, user.id)
         except Exception:  # noqa: BLE001 - the account exists; DNS sync retries on start
             db.rollback()
+    _emit(db, "account.created", account)
     body = account_to_dict(account, db)
     # Shown once: the billing system is the only thing that can hand the
     # customer their SFTP password.
@@ -441,6 +452,7 @@ def _suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Req
         raise HTTPException(status_code=400, detail=f"Cannot suspend account in status: {account.status}")
     suspend_account(db, account, payload.reason)
     log_action(db, None, "provisioning_suspend", external_id, detail=payload.reason, request=request)
+    _emit(db, "account.suspended", account, reason=payload.reason)
     return {"ok": True, "status": "suspended"}
 
 
@@ -458,6 +470,7 @@ def _unsuspend(external_id: str, request: Request, db: Session) -> dict:
         raise HTTPException(status_code=400, detail=f"Cannot unsuspend account in status: {account.status}")
     unsuspend_account(db, account)
     log_action(db, None, "provisioning_unsuspend", external_id, request=request)
+    _emit(db, "account.unsuspended", account)
     return {"ok": True, "status": "active"}
 
 
@@ -471,12 +484,24 @@ def _terminate(external_id: str, backup: bool, request: Request, db: Session) ->
     account = _account_by_external_id(db, external_id)
     if account.status == "terminated":
         return {"ok": True, "status": "terminated"}
+    # Captured first: termination deletes the user the event describes.
+    before = account_to_dict(account, db)
+    subject = account.user
+    subject_info = None
+    if subject is not None:
+        from types import SimpleNamespace
+
+        subject_info = SimpleNamespace(id=subject.id, username=subject.username, reseller_id=subject.reseller_id)
     deleted_domains = terminate_account(db, account, backup=backup)
     log_action(db, None, "provisioning_terminate", external_id, detail=",".join(deleted_domains), request=request)
     body = {"ok": True, "status": "terminated", "deleted_websites": deleted_domains}
     if backup:
         # "backup=<path>" or "backup failed: <reason>", set by terminate_account.
         body["backup"] = account.last_message or ""
+    from app.services import webhooks
+
+    before.update(status="terminated", deleted_websites=deleted_domains, backup=body.get("backup", ""))
+    webhooks.emit_event(db, "account.terminated", before, subject=subject_info)
     return body
 
 
@@ -510,6 +535,7 @@ def _change_password(external_id: str, payload: ProvisioningPasswordChange, requ
     account.last_action = "change_password"
     db.commit()
     log_action(db, None, "provisioning_change_password", external_id, request=request)
+    _emit(db, "account.password_changed", account, sftp_password_rotated=minted is not None)
     body = {"ok": True}
     if minted is not None:
         # This account's SFTP login was the panel password. It has been replaced
@@ -542,6 +568,7 @@ def _change_package(external_id: str, payload: ProvisioningPackageChange, reques
     db.commit()
     log_action(db, None, "provisioning_change_package", external_id, detail=str(package.id), request=request)
     _apply_cgroup_limits(account.user.id)
+    _emit(db, "account.package_changed", account, limits=payload.limits.model_dump(exclude_none=True) if payload.limits else {})
     return {"ok": True, "package_id": package.id}
 
 
@@ -569,6 +596,7 @@ def _reset_sftp_password(external_id: str, request: Request, db: Session) -> dic
     account.last_action = "reset_sftp_password"
     db.commit()
     log_action(db, None, "provisioning_reset_sftp_password", external_id, request=request)
+    _emit(db, "account.sftp_password_reset", account)
     # Shown once; the panel keeps no readable copy.
     return {"ok": True, "sftp_password": password, "sftp_username": account.user.username}
 

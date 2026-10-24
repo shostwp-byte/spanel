@@ -1,4 +1,4 @@
-"""Provisioning API hardening: token expiry, rate limit, creator, idempotency keys
+"""Provisioning API hardening and webhook outbox: token expiry, rate limit, creator, idempotency keys, webhook_outbox
 
 Revision ID: api_hardening
 Revises: 0045_enterprise_audit_watchdog
@@ -62,11 +62,52 @@ def upgrade() -> None:
             batch_op.create_index(batch_op.f("ix_provisioning_idempotency_keys_id"), ["id"], unique=False)
             batch_op.create_index(batch_op.f("ix_provisioning_idempotency_keys_created_at"), ["created_at"], unique=False)
 
+    if "webhook_endpoints" in existing_tables:
+        # Room for the encrypted secret ("fernet:" + token).
+        with op.batch_alter_table("webhook_endpoints", schema=None) as batch_op:
+            batch_op.alter_column("secret", existing_type=sa.String(length=255), type_=sa.String(length=512), existing_nullable=True)
+
+    if "webhook_outbox" not in existing_tables:
+        op.create_table(
+            "webhook_outbox",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("delivery_id", sa.String(length=40), nullable=False),
+            sa.Column("endpoint_id", sa.Integer(), sa.ForeignKey("webhook_endpoints.id", ondelete="CASCADE"), nullable=True),
+            sa.Column("user_id", sa.Integer(), nullable=True),
+            sa.Column("url", sa.String(length=500), nullable=False, server_default=""),
+            sa.Column("event", sa.String(length=100), nullable=False, server_default=""),
+            sa.Column("payload", sa.Text(), nullable=False, server_default="{}"),
+            sa.Column("status", sa.String(length=16), nullable=False, server_default="pending"),
+            sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("max_attempts", sa.Integer(), nullable=False, server_default="8"),
+            sa.Column("next_attempt_at", sa.DateTime(), nullable=True),
+            sa.Column("last_status_code", sa.Integer(), nullable=True),
+            sa.Column("response_preview", sa.Text(), nullable=False, server_default=""),
+            sa.Column("latency_ms", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("has_signature", sa.Boolean(), nullable=False, server_default="0"),
+            sa.Column("replayed_from", sa.String(length=40), nullable=True),
+            sa.Column("created_at", sa.DateTime(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(), nullable=False),
+            sa.Column("delivered_at", sa.DateTime(), nullable=True),
+            sa.PrimaryKeyConstraint("id"),
+        )
+        with op.batch_alter_table("webhook_outbox", schema=None) as batch_op:
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_id"), ["id"], unique=False)
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_delivery_id"), ["delivery_id"], unique=True)
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_endpoint_id"), ["endpoint_id"], unique=False)
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_user_id"), ["user_id"], unique=False)
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_event"), ["event"], unique=False)
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_status"), ["status"], unique=False)
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_next_attempt_at"), ["next_attempt_at"], unique=False)
+            batch_op.create_index(batch_op.f("ix_webhook_outbox_created_at"), ["created_at"], unique=False)
+
 
 def downgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     existing_tables = set(inspector.get_table_names())
+    if "webhook_outbox" in existing_tables:
+        op.drop_table("webhook_outbox")
     if "provisioning_idempotency_keys" in existing_tables:
         op.drop_table("provisioning_idempotency_keys")
     if "api_tokens" in existing_tables:
