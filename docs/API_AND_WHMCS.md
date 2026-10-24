@@ -39,7 +39,7 @@ Yêu cầu: WHMCS 7.x/8.x, PHP 7.4 – 8.3, extension cURL. Không cần thư vi
 
 Token dùng cho WHMCS cần các scope `plans:read,accounts:read,accounts:write,usage:read,sso`
 (hoặc bộ cũ `provisioning:read,provisioning:write`, vẫn hoạt động y như trước).
-Chỉ thêm `sso:admin` nếu muốn nút "Login to SPanel as Admin" trên WHMCS.
+Chỉ thêm `sso:admin` nếu muốn nút "Login to SPanel as Admin" trên WHMCS. Token có `sso:admin` **bắt buộc phải có IP Allowlist** (địa chỉ máy chủ WHMCS), vì link đăng nhập bỏ qua 2FA của admin.
 
 ### Bước 3: Thêm Server SPanel trong WHMCS
 
@@ -128,7 +128,7 @@ gọi tài khoản theo `external_id` nên không cần đổi username.
 | `accounts:write` | tạo, tạm khoá, mở khoá, xoá, đổi mật khẩu, đổi gói, reset SFTP, sao lưu |
 | `usage:read` | `GET /accounts/usage`, `GET /accounts/{external_id}/usage` |
 | `sso` | `POST /accounts/{external_id}/login` |
-| `sso:admin` | `POST /admin/login`: đăng nhập panel **bằng tài khoản admin đã tạo token** |
+| `sso:admin` | `POST /admin/login`: đăng nhập panel **bằng tài khoản admin đã tạo token** (token phải có IP Allowlist) |
 | `tokens:rotate` | `POST /token/rotate`: token tự xoay vòng |
 
 Token cũ giữ nguyên phạm vi: `provisioning:read` = `plans:read` + `accounts:read`
@@ -321,7 +321,7 @@ stored, so they can be retried with the same key.
 | `POST /api/provisioning/v1/accounts/{external_id}/sftp-password` | accounts:write | New random SFTP/SSH password → `{ok, sftp_password, sftp_username}` (shown once) |
 | `POST /api/provisioning/v1/accounts/{external_id}/backup` | accounts:write | Queue a full backup → `{ok, queued}`; result in `account.backup_*` webhooks |
 | `POST /api/provisioning/v1/accounts/{external_id}/login` | sso | One-time login link (300 s) → `{login_url, url, path, expires_in}` |
-| `POST /api/provisioning/v1/admin/login` | sso:admin | One-time login link for the administrator who issued the token |
+| `POST /api/provisioning/v1/admin/login` | sso:admin | One-time login link for the administrator who issued the token; 403 unless the token has an IP allowlist |
 | `POST /api/provisioning/v1/token/rotate` | tokens:rotate | Body `{"grace_minutes": 0}` → `{token, info}`: replaces the calling token |
 
 Administrator endpoints (panel session cookie, admin role): `GET /api/provisioning/v1/tokens`,

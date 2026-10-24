@@ -666,6 +666,10 @@ def create_admin_login_url(request: Request, db: Session = Depends(get_db)):
     that administrator, so it belongs only on a billing server trusted as much.
     """
     token = _authorize(request, db, "sso:admin")
+    if not (token.allowed_ips or "").strip():
+        # The link skips the administrator's own 2FA, so it is only handed out
+        # to a token pinned to the billing server's addresses.
+        raise HTTPException(status_code=403, detail="sso:admin requires the token to have an IP allowlist")
     admin = db.query(User).filter(User.id == token.created_by_id).first() if token.created_by_id else None
     if admin is None or admin.role != Role.admin or not admin.is_active:
         raise HTTPException(status_code=403, detail="Token has no active administrator to sign in as")

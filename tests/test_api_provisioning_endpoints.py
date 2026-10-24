@@ -196,12 +196,16 @@ def test_admin_sso_needs_explicit_scope_and_issuer():
     with SessionLocal() as db:
         admin = kit.make_user(db, "chief", role="admin")
         legacy = kit.make_token(db)
-        orphan = kit.make_token(db, scopes="sso:admin")
-        good = kit.make_token(db, scopes="sso:admin", created_by_id=admin.id)
+        orphan = kit.make_token(db, scopes="sso:admin", allowed_ips="testclient")
+        unpinned = kit.make_token(db, scopes="sso:admin", created_by_id=admin.id)
+        # TestClient's address is the literal "testclient", matched exactly.
+        good = kit.make_token(db, scopes="sso:admin", created_by_id=admin.id, allowed_ips="testclient")
     c = kit.client()
     with patch("app.api.provisioning.create_panel_login_token", return_value="tok123") as mint:
         assert c.post(f"{BASE}/admin/login", headers=kit.bearer(legacy)).status_code == 403
         assert c.post(f"{BASE}/admin/login", headers=kit.bearer(orphan)).status_code == 403
+        unpinned_resp = c.post(f"{BASE}/admin/login", headers=kit.bearer(unpinned))
+        assert unpinned_resp.status_code == 403 and "IP allowlist" in unpinned_resp.text
         resp = c.post(f"{BASE}/admin/login", headers=kit.bearer(good))
     assert resp.status_code == 200, resp.text
     assert resp.json()["path"] == "/api/auth/sso/tok123"
