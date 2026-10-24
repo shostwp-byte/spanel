@@ -299,12 +299,42 @@ class WebsiteAlias(Base):
     website: Mapped[Website] = relationship(back_populates="aliases")
 
 
+class RemoteDbHost(Base):
+    """A MySQL/MariaDB server other than the local one that customer databases
+    can live on. The admin password is Fernet-encrypted (app.core.secrets); the
+    CA certificate is public material and stored as PEM."""
+
+    __tablename__ = "remote_db_hosts"
+    __table_args__ = (UniqueConstraint("host", "port", name="uq_remote_db_hosts_host_port"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    host: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int] = mapped_column(Integer, default=3306)
+    admin_user: Mapped[str] = mapped_column(String(64), default="root")
+    admin_password: Mapped[str] = mapped_column(String(1024), default="")
+    use_tls: Mapped[bool] = mapped_column(Boolean, default=False)
+    ca_cert: Mapped[str] = mapped_column(Text, default="")
+    # Comma separated MySQL host patterns the customer accounts are created
+    # for. Empty means "the address this server reaches the host from".
+    allowed_client_hosts: Mapped[str] = mapped_column(String(512), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(16), default="unknown")
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    server_version: Mapped[str] = mapped_column(String(128), default="")
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class DatabaseAccount(Base):
     __tablename__ = "database_accounts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     website_id: Mapped[Optional[int]] = mapped_column(ForeignKey("websites.id", ondelete="CASCADE"), nullable=True)
+    # NULL is the local MariaDB. A host with databases on it cannot be deleted.
+    db_host_id: Mapped[Optional[int]] = mapped_column(ForeignKey("remote_db_hosts.id"), nullable=True, index=True)
     db_name: Mapped[str] = mapped_column(String(64), unique=True)
     db_user: Mapped[str] = mapped_column(String(64), unique=True)
     db_password: Mapped[str] = mapped_column(String(255))
@@ -315,6 +345,21 @@ class DatabaseAccount(Base):
 
     owner: Mapped["User"] = relationship()
     website: Mapped[Optional[Website]] = relationship(back_populates="database")
+    db_host: Mapped[Optional[RemoteDbHost]] = relationship()
+
+    @property
+    def db_host_name(self) -> str:
+        return self.db_host.name if self.db_host is not None else "localhost"
+
+    @property
+    def db_host_address(self) -> str:
+        """What a site's config puts in DB_HOST to reach this database."""
+        if self.db_host is None:
+            return "localhost"
+        host = self.db_host.host
+        if ":" in host:
+            host = f"[{host}]"
+        return host if int(self.db_host.port or 3306) == 3306 else f"{host}:{self.db_host.port}"
 
 
 class AuditLog(Base):
