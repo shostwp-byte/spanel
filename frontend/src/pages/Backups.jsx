@@ -2265,6 +2265,16 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                       >
                         <Cloud size={14} /> S3-Compatible Object Storage
                       </button>
+                      {['ftp', 'ftps'].map((ftpKind) => (
+                        <button
+                          key={ftpKind}
+                          type="button"
+                          className={sftpTargetForm.kind === ftpKind ? '' : 'secondary-light'}
+                          onClick={() => setSftpTargetForm((p) => ({ ...p, kind: ftpKind, port: 21, private_key: '' }))}
+                        >
+                          <Server size={14} /> {ftpKind === 'ftps' ? t('FTPS (FTP over TLS)') : t('FTP (unencrypted)')}
+                        </button>
+                      ))}
                     </div>
 
                     {sftpTargetForm.kind === 's3' && (
@@ -2288,7 +2298,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                     )}
                   </div>
 
-                  {sftpTargetForm.kind === 'sftp' ? (
+                  {sftpTargetForm.kind !== 's3' ? (
                     <>
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px' }}>
                         <label style={{ margin: 0 }}>
@@ -2316,10 +2326,17 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                           <input type="password" value={sftpTargetForm.password} onChange={(e) => setSftpTargetForm((p) => ({ ...p, password: e.target.value }))} placeholder="••••••••" />
                         </label>
                       </div>
-                      <label style={{ margin: 0 }}>
-                        <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>SSH Private Key (Tùy chọn)</span>
-                        <textarea rows={2} value={sftpTargetForm.private_key} onChange={(e) => setSftpTargetForm((p) => ({ ...p, private_key: e.target.value }))} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
-                      </label>
+                      {sftpTargetForm.kind === 'sftp' && (
+                        <label style={{ margin: 0 }}>
+                          <span style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>SSH Private Key (Tùy chọn)</span>
+                          <textarea rows={2} value={sftpTargetForm.private_key} onChange={(e) => setSftpTargetForm((p) => ({ ...p, private_key: e.target.value }))} placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
+                        </label>
+                      )}
+                      {sftpTargetForm.kind === 'ftp' && (
+                        <p className="hint" style={{ margin: 0 }}>
+                          {t('Plain FTP sends the password and the files unencrypted. Use FTPS or SFTP when the server offers it, and keep backup encryption on.')}
+                        </p>
+                      )}
                     </>
                   ) : (
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' }}>
