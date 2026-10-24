@@ -685,8 +685,10 @@ migrate_protect_php_from_autoremove() {
   )
   if [[ ${#php_packages[@]} -gt 0 ]]; then
     apt-mark manual "${php_packages[@]}" >/dev/null 2>&1 || true
-    echo "    apt: ${#php_packages[@]} PHP package(s) held back from autoremove"
+    apt-mark unhold "${php_packages[@]}" >/dev/null 2>&1 || true
+    echo "    apt: ${#php_packages[@]} PHP package(s) held back from autoremove and unheld for security updates"
   fi
+  apt-mark unhold nginx mariadb-server redis-server pdns-server exim4-daemon-heavy exim4-daemon-light dovecot-core rspamd fail2ban >/dev/null 2>&1 || true
 }
 
 migrate_site_cron_php_binary() {

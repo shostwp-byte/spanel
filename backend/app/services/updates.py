@@ -757,14 +757,14 @@ def upgrade_core_stack_packages(packages: Optional[list[str]] = None, hold_packa
     else:
         rc = 0
 
-    summary = f"Đã cập nhật & đồng bộ an toàn (Zero-Downtime + apt-mark hold/unhold) cho {len(target_pkgs)} thành phần Core Stack: {', '.join(upgraded_labels[:4])}{'...' if len(upgraded_labels) > 4 else ''}."
+    summary = f"Đã cập nhật & đồng bộ an toàn (Zero-Downtime) cho {len(target_pkgs)} thành phần Core Stack: {', '.join(upgraded_labels[:4])}{'...' if len(upgraded_labels) > 4 else ''}."
     state = _read_update_state()
     history = state.get("core_stack_history") if isinstance(state.get("core_stack_history"), list) else []
     history.insert(0, {
         "id": f"core-{int(time.time())}",
         "timestamp": _utc_now(),
         "packages": target_pkgs,
-        "apt_hold_enforced": True,
+        "apt_hold_enforced": bool(hold_packages),
         "summary": summary,
         "status": "completed" if rc == 0 else "warning",
     })
@@ -773,7 +773,7 @@ def upgrade_core_stack_packages(packages: Optional[list[str]] = None, hold_packa
 
     return {
         "status": "completed" if rc == 0 else "warning",
-        "apt_hold_enforced": True,
+        "apt_hold_enforced": bool(hold_packages),
         "summary": summary,
         "core_stack": check_core_stack_updates(),
     }
