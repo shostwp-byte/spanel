@@ -656,12 +656,6 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() + "Z" if value else None
 
 
-def _mask(value: str) -> str:
-    if not value:
-        return ""
-    return value[:2] + "••••" if len(value) <= 8 else f"{value[:3]}••••{value[-2:]}"
-
-
 def get_host(db: Session, host_id: int) -> RemoteDbHost:
     host = db.query(RemoteDbHost).filter(RemoteDbHost.id == int(host_id)).first()
     if host is None:
@@ -682,10 +676,8 @@ def phpmyadmin_server_index(db: Session, host: Optional[RemoteDbHost]) -> int:
 
 
 def serialize_host(db: Session, host: RemoteDbHost) -> dict[str, Any]:
-    try:
-        password = admin_password(host)
-    except RemoteDatabaseError:
-        password = ""
+    """A host for the admin page. The admin password never leaves the panel,
+    not even partly masked: has_password is all the form needs."""
     return {
         "id": host.id,
         "name": host.name,
@@ -693,7 +685,6 @@ def serialize_host(db: Session, host: RemoteDbHost) -> dict[str, Any]:
         "port": int(host.port or 3306),
         "admin_user": host.admin_user,
         "has_password": bool(host.admin_password),
-        "password_masked": _mask(password),
         "use_tls": bool(host.use_tls),
         "ca_cert": host.ca_cert or "",
         "has_ca_cert": bool((host.ca_cert or "").strip()),
