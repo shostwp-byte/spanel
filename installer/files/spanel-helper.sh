@@ -370,7 +370,8 @@ write_phpmyadmin_remote_servers() {
     if [[ ! "$spec" =~ $PMA_REMOTE_SPEC_RE ]]; then
       rm -f "$tmp"; deny "phpmyadmin-remote-servers: invalid server spec"
     fi
-    index="${BASH_REMATCH[1]}"; host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
+    # Decimal, so "08" can neither become a bad PHP octal literal nor miss 8.pem.
+    index="$((10#${BASH_REMATCH[1]}))"; host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
     tls="${BASH_REMATCH[4]}"; ca="${BASH_REMATCH[5]}"
     if (( 10#$index < 2 || 10#$index > 99 || 10#$port < 1 || 10#$port > 65535 )); then
       rm -f "$tmp"; deny "phpmyadmin-remote-servers: index or port out of range"
@@ -9476,7 +9477,7 @@ EOF
     # CA certificate (PEM on stdin) for phpMyAdmin server <index>, a remote MySQL host.
     [[ $# -eq 1 && "$1" =~ ^[0-9]{1,2}$ ]] || deny "usage: phpmyadmin-remote-ca <server-index>"
     (( 10#$1 >= 2 && 10#$1 <= 99 )) || deny "phpmyadmin-remote-ca: server index out of range"
-    write_phpmyadmin_remote_ca "$1"
+    write_phpmyadmin_remote_ca "$((10#$1))"
     ;;
 
   phpmyadmin-remote-servers)
