@@ -560,6 +560,28 @@ ensure_cron_jail_binary() {
 
 
 PANEL_SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+PANEL_DB_BACKUP_DIR="${SPANEL_DATA_DIR}/db-backups"
+DEFAULT_SNAPSHOT_KEEP=5
+# The units that open spanel.db. All of them are stopped while the file is
+# swapped: a oneshot still holding the old file would write into a WAL that
+# no longer belongs to the database on disk.
+SPANEL_DB_TIMERS=(spanel-backup-scheduler.timer spanel-malware-scheduler.timer spanel-notify.timer spanel-watchdog.timer spanel-maintenance.timer)
+SPANEL_DB_ONESHOTS=(spanel-backup-scheduler.service spanel-malware-scheduler.service spanel-notify.service spanel-watchdog.service spanel-maintenance.service)
+# What spanel-update rewrites outside the code tree, relative to /. A rollback
+# that restores the code but keeps the new units or the new tools vhost is
+# half a rollback.
+PANEL_SNAPSHOT_SYSTEM_GLOBS=(
+  "etc/systemd/system/spanel-*.service"
+  "etc/systemd/system/spanel-*.timer"
+  "etc/systemd/system/spanel-api.service.d"
+  "etc/nginx/conf.d/00-spanel-*.conf"
+  "etc/sudoers.d/spanel"
+  "usr/local/sbin/spanel"
+  "usr/local/sbin/spanel-api-start"
+  "usr/local/sbin/spanel-memory-guard"
+  "usr/local/sbin/spanel-change-ip"
+  "usr/local/bin/spanel-cron-jail"
+)
 
 panel_current_version() {
   local ver="1.0.0"
@@ -569,11 +591,123 @@ panel_current_version() {
   [[ -n "$ver" ]] && echo "$ver" || echo "1.0.0"
 }
 
+# The panel's SQLite file, from DATABASE_URL in .env. Only an absolute
+# sqlite:/// path with plain characters is accepted.
+panel_db_path() {
+  local url path
+  url="$(env_get DATABASE_URL)"
+  if [[ "$url" =~ ^sqlite:///(/[A-Za-z0-9._/-]+\.db)$ ]]; then
+    path="${BASH_REMATCH[1]}"
+  else
+    path="${APP_DIR}/backend/spanel.db"
+  fi
+  [[ "$path" != *..* ]] || deny "invalid database path"
+  echo "$path"
+}
+
+# The system python and its stdlib only (-I: no user site, no cwd on the path).
+# Never the panel's venv: that would be panel-writable code running as root.
+sqlite_online_copy() {
+  /usr/bin/python3 -I - "$1" "$2" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+PY
+}
+
+sqlite_integrity_ok() {
+  /usr/bin/python3 -I - "$1" <<'PY'
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+    row = conn.execute("PRAGMA integrity_check").fetchone()
+    tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+    conn.close()
+except sqlite3.Error as exc:
+    print(f"integrity_check: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not row or row[0] != "ok" or tables == 0:
+    print(f"integrity_check: {row[0] if row else 'no answer'} ({tables} tables)", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+sqlite_alembic_revision() {
+  /usr/bin/python3 -I - "$1" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    print(",".join(r[0] for r in conn.execute("SELECT version_num FROM alembic_version")))
+except sqlite3.Error:
+    pass
+PY
+}
+
+# Replace the panel database with <src>, safely:
+#   1. integrity_check the replacement before anything is stopped;
+#   2. stop the API and every timer/oneshot that opens the database;
+#   3. keep the current database (read through its WAL) as
+#      <db>.pre-restore-<ts>, so nothing is ever lost by a restore;
+#   4. drop -wal/-shm (they belong to the old file) and move the copy in;
+#   5. start what was running again.
+swap_panel_db() {
+  local src="$1" db ts timer tmp
+  local -a active_timers=()
+  db="$(panel_db_path)"
+  [[ -f "$src" ]] || deny "database copy not found"
+  sqlite_integrity_ok "$src" || deny "the database copy failed PRAGMA integrity_check; nothing was changed"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  tmp="${db}.restore-${ts}"
+  install -m 0640 -o spanel -g spanel "$src" "$tmp"
+
+  for timer in "${SPANEL_DB_TIMERS[@]}"; do
+    systemctl is-active --quiet "$timer" 2>/dev/null && active_timers+=("$timer")
+  done
+  systemctl stop "${SPANEL_DB_TIMERS[@]}" >/dev/null 2>&1 || true
+  systemctl stop "${SPANEL_DB_ONESHOTS[@]}" >/dev/null 2>&1 || true
+  systemctl stop spanel-api >/dev/null 2>&1 || true
+
+  if [[ -f "$db" ]]; then
+    sqlite_online_copy "$db" "${db}.pre-restore-${ts}" || cp -a "$db" "${db}.pre-restore-${ts}"
+    chown spanel:spanel "${db}.pre-restore-${ts}" 2>/dev/null || true
+    chmod 0640 "${db}.pre-restore-${ts}" 2>/dev/null || true
+  fi
+  rm -f "${db}-wal" "${db}-shm"
+  mv -f "$tmp" "$db"
+  # Keep the three newest pre-restore copies.
+  ls -1t "${db}".pre-restore-* 2>/dev/null | tail -n +4 | xargs -r rm -f
+
+  systemctl start spanel-api >/dev/null 2>&1 || true
+  for timer in "${active_timers[@]:-}"; do
+    [[ -n "$timer" ]] && systemctl start "$timer" >/dev/null 2>&1 || true
+  done
+  echo "database_restored=${db} previous=${db}.pre-restore-${ts}"
+}
+
+panel_snapshot_prune() {
+  local keep="$1" s
+  local old_snaps=()
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && old_snaps+=("$s")
+  done < <(ls -1t "${PANEL_SNAPSHOT_DIR}"/snapshot-*.tar.gz 2>/dev/null | tail -n +"$((keep + 1))" || true)
+  for s in "${old_snaps[@]:-}"; do
+    [[ -n "$s" ]] || continue
+    rm -f "$s" "${s%.tar.gz}.json" 2>/dev/null || true
+  done
+}
+
 panel_snapshot_create() {
-  local reason="${1:-manual}"
+  local reason="${1:-manual}" keep="${2:-$DEFAULT_SNAPSHOT_KEEP}"
   [[ "$reason" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || reason="manual"
+  [[ "$keep" =~ ^[0-9]{1,2}$ ]] || deny "snapshot keep must be a number"
+  (( keep >= 1 && keep <= 20 )) || deny "snapshot keep must be between 1 and 20"
   install -d -o root -g spanel -m 0750 "$PANEL_SNAPSHOT_DIR"
-  local ver ts snap_id work tar_path meta_path size_bytes
+  local ver ts snap_id work tar_path meta_path size_bytes db revision="" glob path
+  local -a system_paths=()
   ver="$(panel_current_version)"
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   snap_id="snapshot-v${ver}-${ts}"
@@ -589,12 +723,31 @@ panel_snapshot_create() {
   [[ -f "/usr/local/sbin/spanel-helper" ]] && cp -a "/usr/local/sbin/spanel-helper" "$work/sbin/spanel-helper"
   [[ -f "/usr/local/sbin/spanel-update" ]] && cp -a "/usr/local/sbin/spanel-update" "$work/sbin/spanel-update"
 
-  if [[ -f "${APP_DIR}/backend/spanel.db" ]]; then
-    if command -v sqlite3 >/dev/null 2>&1; then
-      sqlite3 "${APP_DIR}/backend/spanel.db" ".backup '${work}/backend/spanel.db.bak'" 2>/dev/null || cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    else
-      cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    fi
+  # The database through SQLite's online backup API, which reads committed
+  # pages from the WAL too: a plain cp of a WAL-mode file can miss them.
+  # Taken before spanel-update runs any migration, so restoring it is what
+  # reverses one (Alembic downgrades are not written for this schema).
+  db="$(panel_db_path)"
+  if [[ -f "$db" ]]; then
+    sqlite_online_copy "$db" "$work/backend/spanel.db.bak" || cp -a "$db" "$work/backend/spanel.db.bak"
+    revision="$(sqlite_alembic_revision "$work/backend/spanel.db.bak")"
+  fi
+
+  # The virtualenv is ~160 MB, too much to keep five copies of. Its exact
+  # package set is recorded instead; a rollback reinstalls it when it differs.
+  if [[ -x "${APP_DIR}/backend/.venv/bin/python" ]]; then
+    "${APP_DIR}/backend/.venv/bin/python" -m pip freeze --all >"$work/backend/pip-freeze.txt" 2>/dev/null || rm -f "$work/backend/pip-freeze.txt"
+  fi
+
+  shopt -s nullglob
+  for glob in "${PANEL_SNAPSHOT_SYSTEM_GLOBS[@]}"; do
+    for path in /$glob; do
+      [[ -e "$path" && ! -L "$path" ]] && system_paths+=("${path#/}")
+    done
+  done
+  shopt -u nullglob
+  if [[ ${#system_paths[@]} -gt 0 ]]; then
+    tar -C / -cpf "$work/system.tar" "${system_paths[@]}" 2>/dev/null || rm -f "$work/system.tar"
   fi
 
   tar -czf "$tar_path" -C "$work" .
@@ -609,30 +762,111 @@ panel_snapshot_create() {
   "version": "${ver}",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "size_bytes": ${size_bytes},
-  "reason": "${reason}"
+  "reason": "${reason}",
+  "db_revision": "${revision}",
+  "has_db": $([[ -n "$revision" || -f "$db" ]] && echo true || echo false),
+  "has_system_files": $([[ ${#system_paths[@]} -gt 0 ]] && echo true || echo false)
 }
 EOF
   chmod 0640 "$meta_path"
   chown root:spanel "$meta_path" 2>/dev/null || true
 
-  # Prune old snapshots beyond the newest 5
-  local old_snaps=() s
-  while IFS= read -r s; do
-    [[ -n "$s" ]] && old_snaps+=("$s")
-  done < <(ls -1t "${PANEL_SNAPSHOT_DIR}"/snapshot-*.tar.gz 2>/dev/null | tail -n +6 || true)
-  for s in "${old_snaps[@]:-}"; do
-    [[ -n "$s" ]] || continue
-    rm -f "$s" "${s%.tar.gz}.json" 2>/dev/null || true
-  done
-
+  panel_snapshot_prune "$keep"
   echo "${snap_id}"
 }
 
+# Put the system files of a snapshot back. The current versions are kept
+# aside first; if nginx refuses the restored set, they go back.
+panel_snapshot_restore_system() {
+  local work="$1" saved path
+  local -a paths=()
+  [[ -f "$work/system.tar" ]] || return 0
+  while IFS= read -r path; do
+    [[ -n "$path" && "$path" != /* && "$path" != *..* ]] && paths+=("$path")
+  done < <(tar -tf "$work/system.tar" 2>/dev/null)
+  [[ ${#paths[@]} -gt 0 ]] || return 0
+  saved="$work/system-current.tar"
+  tar -C / -cpf "$saved" --ignore-failed-read "${paths[@]}" 2>/dev/null || true
+  tar -C / -xpf "$work/system.tar"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    echo "restored nginx files fail nginx -t; keeping the current ones" >&2
+    [[ -f "$saved" ]] && tar -C / -xpf "$saved" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  visudo -c -f /etc/sudoers.d/spanel >/dev/null 2>&1 || {
+    [[ -f "$saved" ]] && tar -C / -xpf "$saved" etc/sudoers.d/spanel 2>/dev/null || true
+  }
+}
+
+panel_snapshot_restore_venv() {
+  local work="$1" current
+  [[ -f "$work/backend/pip-freeze.txt" && -x "${APP_DIR}/backend/.venv/bin/python" ]] || return 0
+  current="$(mktemp)"
+  "${APP_DIR}/backend/.venv/bin/python" -m pip freeze --all >"$current" 2>/dev/null || true
+  if ! cmp -s "$current" "$work/backend/pip-freeze.txt"; then
+    echo "Python packages differ from the snapshot; reinstalling the recorded set" >&2
+    "${APP_DIR}/backend/.venv/bin/python" -m pip install --no-input -q -r "$work/backend/pip-freeze.txt" >&2 \
+      || echo "pip could not reinstall the recorded packages; the panel may need: spanel-update" >&2
+  fi
+  rm -f "$current"
+}
+
+# Record the outcome of a restore that ran detached from the API, so the
+# Updates page does not show "rolling back" forever. The directory belongs to
+# the panel account: never follow a link it planted, write a fresh file and
+# rename it over the old name.
+panel_update_state_set() {
+  local status="$1" message="$2" snap="$3"
+  /usr/bin/python3 -I - "${SPANEL_DATA_DIR}/update-status.json" "$status" "$message" "$snap" <<'PY' || true
+import json, os, sys, tempfile, time
+path, status, message, snap = sys.argv[1:5]
+state = {}
+if os.path.isfile(path) and not os.path.islink(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = {}
+state.update({"last_update_status": status, "progress_phase": status, "progress_percent": 100,
+              "progress_message": message, "last_update_message": message, "rollback_snapshot_id": snap,
+              "last_update_finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".update-status.")
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(state, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+PY
+  chown spanel:spanel "${SPANEL_DATA_DIR}/update-status.json" 2>/dev/null || true
+}
+
 panel_snapshot_restore() {
-  local snap_id="${1:-}"
+  local snap_id="${1:-}" restore_db="" now="" arg
   [[ "$snap_id" =~ ^snapshot-[A-Za-z0-9._-]+$ ]] || deny "invalid snapshot id: $snap_id"
+  shift || true
+  for arg in "$@"; do
+    case "$arg" in
+      --restore-db) restore_db=1 ;;
+      --now) now=1 ;;
+      *) deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db] [--now]" ;;
+    esac
+  done
   local tar_path="${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz"
   [[ -f "$tar_path" ]] || deny "snapshot not found: $snap_id"
+
+  # From the API this runs inside spanel-api's own cgroup, and stopping
+  # spanel-api (to swap the database, or to restart it) would kill this
+  # very process half-way. Run the restore in a unit of its own instead.
+  if [[ -z "$now" ]] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --unit="spanel-snapshot-restore-$(date +%s)" --collect \
+      --description="SPanel snapshot restore ${snap_id}" \
+      --on-active=2s \
+      --setenv=SUDO_USER=spanel \
+      /usr/local/sbin/spanel-helper panel-snapshot-restore "$snap_id" ${restore_db:+--restore-db} --now >/dev/null
+    echo "scheduled=${snap_id}"
+    return 0
+  fi
 
   local work
   work="$(mktemp -d /tmp/spanel-restore.XXXXXX)"
@@ -669,15 +903,20 @@ panel_snapshot_restore() {
     chown root:root "/usr/local/sbin/spanel-update.new" 2>/dev/null || true
     mv -f "/usr/local/sbin/spanel-update.new" "/usr/local/sbin/spanel-update"
   fi
-  if [[ -f "$work/backend/spanel.db.bak" && "${2:-}" == "--restore-db" ]]; then
-    cp -a "$work/backend/spanel.db.bak" "${APP_DIR}/backend/spanel.db"
-    chown spanel:spanel "${APP_DIR}/backend/spanel.db" 2>/dev/null || true
+  panel_snapshot_restore_system "$work"
+  panel_snapshot_restore_venv "$work"
+
+  if [[ -n "$restore_db" && -f "$work/backend/spanel.db.bak" ]]; then
+    # swap_panel_db stops and starts spanel-api itself.
+    swap_panel_db "$work/backend/spanel.db.bak"
+  else
+    systemctl restart spanel-api >/dev/null 2>&1 || true
   fi
 
   rm -rf "$work"
   rm -rf /var/lib/spanel/update-state 2>/dev/null || true
-  systemctl restart spanel-api >/dev/null 2>&1 || true
   systemctl reload nginx >/dev/null 2>&1 || true
+  panel_update_state_set "rolled_back" "Restored snapshot ${snap_id}${restore_db:+ (database included)}." "$snap_id"
   echo "restored=${snap_id}"
 }
 
@@ -686,6 +925,29 @@ panel_snapshot_delete() {
   [[ "$snap_id" =~ ^snapshot-[A-Za-z0-9._-]+$ ]] || deny "invalid snapshot id: $snap_id"
   rm -f "${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz" "${PANEL_SNAPSHOT_DIR}/${snap_id}.json" 2>/dev/null || true
   echo "deleted=${snap_id}"
+}
+
+# Hot database backups (taken by the watchdog every 6 h and on demand) live
+# in PANEL_DB_BACKUP_DIR as spanel-<UTC stamp>-<reason>.db.
+panel_db_restore() {
+  local name="${1:-}" mode="${2:-}" src
+  [[ "$name" =~ ^spanel-[0-9]{8}T[0-9]{6}Z-[a-z0-9_-]{1,24}\.db$ ]] || deny "invalid database backup name"
+  src="${PANEL_DB_BACKUP_DIR}/${name}"
+  [[ -f "$src" && ! -L "$src" ]] || deny "database backup not found: $name"
+  sqlite_integrity_ok "$src" || deny "the backup failed PRAGMA integrity_check; nothing was changed"
+  if [[ "$mode" == "--now" ]] || ! command -v systemd-run >/dev/null 2>&1; then
+    swap_panel_db "$src"
+    return 0
+  fi
+  [[ -z "$mode" ]] || deny "usage: panel-db-restore <backup-name> [--now]"
+  # Same reason as panel-snapshot-restore: stopping spanel-api from inside
+  # spanel-api's cgroup would kill this process before the swap.
+  systemd-run --unit="spanel-db-restore-$(date +%s)" --collect \
+    --description="SPanel database restore ${name}" \
+    --on-active=2s \
+    --setenv=SUDO_USER=spanel \
+    /usr/local/sbin/spanel-helper panel-db-restore "$name" --now >/dev/null
+  echo "scheduled=${name}"
 }
 
 run_panel_update() {
@@ -8017,17 +8279,23 @@ case "$cmd" in
     ;;
 
   panel-snapshot-create)
-    panel_snapshot_create "${1:-manual}"
+    [[ $# -le 2 ]] || deny "usage: panel-snapshot-create [reason] [keep]"
+    panel_snapshot_create "${1:-manual}" "${2:-$DEFAULT_SNAPSHOT_KEEP}"
     ;;
 
   panel-snapshot-restore)
-    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db]"
-    panel_snapshot_restore "$1" "${2:-}"
+    [[ $# -ge 1 && $# -le 3 ]] || deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db] [--now]"
+    panel_snapshot_restore "$@"
     ;;
 
   panel-snapshot-delete)
     [[ $# -eq 1 ]] || deny "usage: panel-snapshot-delete <snapshot-id>"
     panel_snapshot_delete "$1"
+    ;;
+
+  panel-db-restore)
+    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: panel-db-restore <backup-name> [--now]"
+    panel_db_restore "$1" "${2:-}"
     ;;
 
   # ---- WAF --------------------------------------------------------------

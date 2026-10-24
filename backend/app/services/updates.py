@@ -29,6 +29,7 @@ SNAPSHOT_DIR = Path(os.environ.get("BACKUP_ROOT") or "/var/backups/spanel") / "p
 DEFAULT_REPO_URL = os.environ.get("SPANEL_REPO_URL") or os.environ.get("spanel_REPO_URL") or "https://github.com/shostwp-byte/spanel.git"
 DEFAULT_MANIFEST_URL = os.environ.get("SPANEL_UPDATE_MANIFEST_URL") or ""
 
+DEFAULT_SNAPSHOT_KEEP = 5
 SEMVER_TAG_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 URL_REDACT_RE = re.compile(r"""(?:https?://|git@)[^\s"'<>]+""", re.IGNORECASE)
 PATH_REDACT_RE = re.compile(r"""(?:/var/lib/spanel/update-[^\s"'<>]+|/etc/spanel/update-[^\s"'<>]+)""")
@@ -105,6 +106,7 @@ def get_update_source_config() -> dict:
         "auto_update_enabled": False,
         "auto_update_window": "02:00",
         "auto_rollback_enabled": True,
+        "snapshot_keep": DEFAULT_SNAPSHOT_KEEP,
     }
     try:
         if UPDATE_SOURCE_FILE.exists():
@@ -150,6 +152,12 @@ def save_update_source_config(payload: dict) -> dict:
         except (ValueError, TypeError):
             pass
 
+    if "snapshot_keep" in payload and payload["snapshot_keep"] is not None:
+        try:
+            current["snapshot_keep"] = max(1, min(20, int(payload["snapshot_keep"])))
+        except (ValueError, TypeError):
+            pass
+
     if "auto_update_window" in payload and payload["auto_update_window"]:
         win = str(payload["auto_update_window"]).strip()
         if re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", win):
@@ -185,6 +193,7 @@ def get_masked_source_info() -> dict:
         "auto_update_enabled": bool(cfg.get("auto_update_enabled", False)),
         "auto_update_window": cfg.get("auto_update_window", "02:00"),
         "auto_rollback_enabled": bool(cfg.get("auto_rollback_enabled", True)),
+        "snapshot_keep": int(cfg.get("snapshot_keep") or DEFAULT_SNAPSHOT_KEEP),
     }
 
 
@@ -488,6 +497,9 @@ def list_snapshots() -> list[dict]:
                 "size_bytes": size_bytes,
                 "size_mb": round(size_bytes / (1024 * 1024), 2),
                 "reason": meta.get("reason") or "pre-update",
+                "db_revision": meta.get("db_revision") or "",
+                "has_db": bool(meta.get("has_db", True)),
+                "has_system_files": bool(meta.get("has_system_files", False)),
             })
     except Exception:
         return []
@@ -497,9 +509,10 @@ def list_snapshots() -> list[dict]:
 def create_snapshot(reason: str = "manual") -> dict:
     """Create a recovery snapshot of the current Panel code, frontend dist, helper, and SQLite DB."""
     safe_reason = re.sub(r"[^a-zA-Z0-9_-]", "", reason or "manual")[:32] or "manual"
+    keep = int(get_update_source_config().get("snapshot_keep") or DEFAULT_SNAPSHOT_KEEP)
     res = shell.privileged(
         "panel-snapshot-create",
-        helper_args=[safe_reason],
+        helper_args=[safe_reason, str(max(1, min(20, keep)))],
         check=False,
         fallback=["bash", "-lc", f"echo snapshot-v{APP_VERSION}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"],
     )
@@ -518,7 +531,14 @@ def create_snapshot(reason: str = "manual") -> dict:
 
 
 def rollback_to_snapshot(snapshot_id: str, restore_db: bool = False) -> dict:
-    """Restore the panel to a specific snapshot and restart spanel-api."""
+    """Restore the panel to a snapshot: code, frontend, helper, the system
+    files the updater rewrites, the recorded Python packages and, with
+    restore_db, the database as it was before that update's migrations.
+
+    The helper runs the restore in a unit of its own (it has to stop
+    spanel-api, which would otherwise kill it half-way) and records the
+    outcome in the update state when it is done.
+    """
     if not re.fullmatch(r"snapshot-[A-Za-z0-9._-]+", snapshot_id or ""):
         raise ValueError("Invalid snapshot ID")
     args = [snapshot_id]
@@ -541,7 +561,14 @@ def rollback_to_snapshot(snapshot_id: str, restore_db: bool = False) -> dict:
         fallback=["bash", "-lc", f"echo restored={snapshot_id}"],
     )
     if res.returncode != 0:
+        state = _read_update_state()
+        state.update({"last_update_status": "failed", "progress_phase": "failed",
+                      "progress_message": sanitize_update_text(res.stderr or res.stdout or "Could not restore snapshot")})
+        _write_update_state(state)
         raise RuntimeError(sanitize_update_text(res.stderr or res.stdout or "Could not restore snapshot"))
+
+    if "scheduled=" in (res.stdout or ""):
+        return {"restored": snapshot_id, "status": "rolling_back", "restore_db": restore_db}
 
     state = _read_update_state()
     state.update({
@@ -553,7 +580,7 @@ def rollback_to_snapshot(snapshot_id: str, restore_db: bool = False) -> dict:
         "rollback_snapshot_id": snapshot_id,
     })
     _write_update_state(state)
-    return {"restored": snapshot_id, "status": "rolled_back"}
+    return {"restored": snapshot_id, "status": "rolled_back", "restore_db": restore_db}
 
 
 def delete_snapshot(snapshot_id: str) -> dict:

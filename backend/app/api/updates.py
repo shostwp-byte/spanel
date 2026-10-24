@@ -27,6 +27,7 @@ class UpdateSourcePayload(BaseModel):
     auto_update_enabled: Optional[bool] = None
     auto_update_window: Optional[str] = None
     auto_rollback_enabled: Optional[bool] = None
+    snapshot_keep: Optional[int] = None
 
 
 class SnapshotCreatePayload(BaseModel):
