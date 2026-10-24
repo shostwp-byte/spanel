@@ -233,7 +233,10 @@ def create_phpmyadmin_sso(database_id: int, request: Request, db: Session = Depe
             status_code=500,
             detail="Failed to access stored database password; please re-save the password in panel settings",
         )
-    token = create_phpmyadmin_token(item.db_user, db_password, item.db_name)
+    token = create_phpmyadmin_token(
+        item.db_user, db_password, item.db_name,
+        server=remote_mysql.phpmyadmin_server_index(db, item.db_host),
+    )
     log_action(
         db,
         current_user.id,
