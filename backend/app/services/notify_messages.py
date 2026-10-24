@@ -27,6 +27,8 @@ EVENTS: dict[str, dict] = {
                   "hint": "Once when usage passes the threshold, again only after it has dropped back."},
     "firewall_off": {"audience": ADMIN, "label": "The firewall is off",
                      "hint": "Switched off, or on but not filtering."},
+    "cluster_node_down": {"audience": ADMIN, "label": "A cluster node went down or came back",
+                          "hint": "Another SPanel server of the Multi Server cluster stopped answering, checked every minute."},
     "update_available": {"audience": ADMIN, "label": "A panel update is available",
                          "hint": "Once per new version."},
     "php_security_updated": {"audience": ADMIN, "label": "PHP security patches automatically applied",
@@ -96,6 +98,28 @@ def _firewall_off(p: dict, lang: str) -> tuple[str, list[str]]:
         ("Tường lửa đang tắt", ["Server không được tường lửa bảo vệ. Vào trang Tường lửa để bật lại."])
         if lang == "vi" else
         ("The firewall is off", ["The server is not protected by its firewall. Open Firewall to turn it back on."])
+    )
+
+
+def _cluster_node_down(p: dict, lang: str) -> tuple[str, list[str]]:
+    name = p.get("node") or ""
+    if p.get("recovered"):
+        return (
+            (f"Máy chủ cụm đã trực tuyến lại: {name}", [f"{name} ({p.get('url', '')}) phản hồi bình thường trở lại."])
+            if lang == "vi" else
+            (f"Cluster node back online: {name}", [f"{name} ({p.get('url', '')}) is answering again."])
+        )
+    return (
+        (f"Máy chủ cụm không phản hồi: {name}", [
+            f"{name} ({p.get('url', '')}) không phản hồi {p.get('failures', 2)} lần kiểm tra liên tiếp.",
+            f"Lỗi: {p.get('error', '')}",
+            "Đồng bộ DNS tới máy chủ này được giữ lại và sẽ tự gửi lại khi nó trực tuyến.",
+        ]) if lang == "vi" else
+        (f"Cluster node not answering: {name}", [
+            f"{name} ({p.get('url', '')}) did not answer {p.get('failures', 2)} checks in a row.",
+            f"Error: {p.get('error', '')}",
+            "DNS changes for it are kept and sent again once it is back.",
+        ])
     )
 
 
@@ -223,6 +247,7 @@ _RENDER: dict[str, Callable[[dict, str], tuple[str, list[str]]]] = {
     "service_down": _service_down,
     "disk_high": _disk_high,
     "firewall_off": _firewall_off,
+    "cluster_node_down": _cluster_node_down,
     "update_available": _update_available,
     "php_security_updated": _php_security_updated,
     "php_update_available": _php_update_available,

@@ -13,11 +13,12 @@ from app.api import remote_mysql as remote_mysql_api
 from app.core.config import settings
 from app.core.database import run_migrations
 from app.core.version import APP_VERSION
-from app.services import panel_settings as panel_brand_settings, auto_updater, resource_monitor
+from app.services import panel_settings as panel_brand_settings, auto_updater, resource_monitor, cluster_worker
 
 run_migrations()
 auto_updater.start_auto_update_daemon()
 resource_monitor.start_resource_monitor_daemon()
+cluster_worker.start_cluster_daemon()
 
 logger = logging.getLogger("spanel")
 

@@ -1399,7 +1399,16 @@ def restore_user_backup(
     chain_files: Optional[list[str]] = None,
     restore_mode: str = "full",
     passphrase: Optional[str] = None,
+    expected_username: Optional[str] = None,
+    require_new_user: bool = False,
 ) -> dict:
+    """Restore a user backup.
+
+    expected_username / require_new_user are for archives from another
+    machine (a cluster transfer): they are checked against the manifest
+    before anything is written, so an archive naming an existing account
+    cannot restore over it.
+    """
     mode = (restore_mode or "full").strip().lower()
     if mode not in VALID_RESTORE_MODES:
         mode = "full"
@@ -1419,6 +1428,10 @@ def restore_user_backup(
     username = user_info.get("username") or ""
     if not PANEL_USERNAME_RE.fullmatch(username):
         raise ValueError("Invalid user in backup")
+    if expected_username is not None and username != expected_username:
+        raise ValueError(f"The archive holds {username}, not {expected_username}")
+    if require_new_user and db.query(User.id).filter(User.username == username).first():
+        raise ValueError(f"An account named {username} already exists on this node")
 
     if chain_files:
         resolved_chain = [user_backup_path(p) for p in chain_files]
