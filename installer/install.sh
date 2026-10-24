@@ -693,6 +693,12 @@ install_privileged_helper() {
     install -d -m 0755 -o root -g spanel /etc/spanel/yara
     install -m 0644 -o root -g spanel "${SCRIPT_DIR}/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
   fi
+  install -d -m 0750 -o root -g spanel /etc/spanel
+  if [[ ! -s /etc/spanel/audit-hmac.key ]]; then
+    openssl rand -hex 32 >/etc/spanel/audit-hmac.key
+  fi
+  chown root:spanel /etc/spanel/audit-hmac.key
+  chmod 0640 /etc/spanel/audit-hmac.key
   # The launcher: every update fetches its steps from the release it installs.
   install -m 0755 -o root -g root "${SCRIPT_DIR}/files/spanel-update" /usr/local/sbin/spanel-update
   install -m 0440 -o root -g root "${SCRIPT_DIR}/files/spanel-sudoers" /etc/sudoers.d/spanel

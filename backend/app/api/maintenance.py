@@ -562,6 +562,7 @@ def _run_user_backup_job(
     target_user_id: int,
     target_id: int | None,
     backup_mode: str = "full",
+    passphrase: str | None = None,
 ) -> None:
     _set_backup_job(job_id, status="running", started_at=_now_iso(), message="Creating full user backup")
     db = SessionLocal()
@@ -577,6 +578,7 @@ def _run_user_backup_job(
             use_hierarchy=use_hierarchy,
             backup_mode=backup_mode,
             target_id=target_id,
+            passphrase=passphrase,
         )
         remote_file = ""
         target_name = ""
@@ -671,7 +673,13 @@ def _queue_site_backup(
     return job
 
 
-def _queue_user_backup(current_user: User, user: User, target_id: int | None, backup_mode: str = "full") -> dict:
+def _queue_user_backup(
+    current_user: User,
+    user: User,
+    target_id: int | None,
+    backup_mode: str = "full",
+    passphrase: str | None = None,
+) -> dict:
     job = _queue_backup_job(
         current_user,
         "user_backup",
@@ -679,7 +687,15 @@ def _queue_user_backup(current_user: User, user: User, target_id: int | None, ba
         target_user_id=user.id,
         target_id=target_id,
     )
-    _backup_job_executor.submit(_run_user_backup_job, job["job_id"], current_user.id, user.id, target_id, backup_mode)
+    _backup_job_executor.submit(
+        _run_user_backup_job,
+        job["job_id"],
+        current_user.id,
+        user.id,
+        target_id,
+        backup_mode,
+        passphrase,
+    )
     return job
 
 
@@ -909,10 +925,21 @@ def list_user_backups(user_id: int, db: Session = Depends(get_db), current_user:
 @router.post("/user-backups")
 def create_user_backup(payload: UserBackupCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     user = get_backup_user(db, current_user, payload.user_id)
+    if payload.passphrase and len(payload.passphrase.strip()) < backup.MIN_BACKUP_PASSPHRASE_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Encryption passphrase must be at least {backup.MIN_BACKUP_PASSPHRASE_LEN} characters",
+        )
     if payload.target_id:
         _get_accessible_sftp_target(db, current_user, payload.target_id)
     log_action(db, current_user.id, "queue_backup_user", user.username, payload.backup_mode, request=request)
-    return _queue_user_backup(current_user, user, payload.target_id, backup_mode=payload.backup_mode)
+    return _queue_user_backup(
+        current_user,
+        user,
+        payload.target_id,
+        backup_mode=payload.backup_mode,
+        passphrase=payload.passphrase,
+    )
 
 
 @router.post("/user-backups/upload")

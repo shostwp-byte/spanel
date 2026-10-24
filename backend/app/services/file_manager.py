@@ -1192,7 +1192,28 @@ def extract_archive(
         with tarfile.open(archive_file, "r:gz") as archive:
             _extract_tar_archive(archive, destination, archive_file)
     site_users.fix_site_path(str(destination), website.linux_user, check=True)
+    # Real-Time YARA + Heuristic scan on all files inside destination after extraction
+    infected_findings: list[str] = []
+    for root_dir, _, filenames in os.walk(destination):
+        for fname in filenames:
+            candidate_file = Path(root_dir) / fname
+            if candidate_file.is_symlink() or not candidate_file.is_file():
+                continue
+            if candidate_file.resolve() == archive_file.resolve():
+                continue
+            scan_res = malware_scan.scan_upload_realtime(
+                str(candidate_file),
+                domain=getattr(website, "domain", "") or "",
+                auto_quarantine=True,
+            )
+            if scan_res.get("status") == "infected":
+                candidate_file.unlink(missing_ok=True)
+                infected_findings.append(f"{fname} ({scan_res.get('signature')})")
     _clear_fastcgi_cache()
+    if infected_findings:
+        raise ValueError(
+            f"Archive extraction blocked by Real-Time Malware Shield: {', '.join(infected_findings[:5])}"
+        )
     return str(destination)
 
 

@@ -727,15 +727,27 @@ def install_dependencies(app: SiteApp) -> str:
     return (result.stdout or "").strip()[-4000:]
 
 
+def _require_app_secret_key() -> bytes:
+    secret = (settings.secret_key or "").strip()
+    if not secret:
+        raise RuntimeError("SECRET_KEY is required for application webhook signing")
+    return secret.encode("utf-8")
+
+
 def webhook_token_for(app: SiteApp) -> str:
-    """Deterministic HMAC-SHA256 webhook token for 1-Click Git Auto-Deploy."""
-    # A hard-coded fallback would make every server's webhook tokens computable
-    # from this repository, so an empty SECRET_KEY is an error instead.
-    if not settings.secret_key:
-        raise RuntimeError("SECRET_KEY is empty; cannot derive webhook tokens")
-    secret = settings.secret_key.encode("utf-8")
-    msg = f"site-app-webhook:{app.id}:{app.owner_id}:{app.name}".encode("utf-8")
+    """Deterministic HMAC-SHA256 URL endpoint token for 1-Click Git Auto-Deploy."""
+    secret = _require_app_secret_key()
+    msg = f"site-app-webhook-url:{app.id}:{app.owner_id}:{app.name}".encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def webhook_secret_for(app: SiteApp) -> str:
+    """Dedicated HMAC signing secret for GitHub (X-Hub-Signature-256) / GitLab (X-Gitlab-Token),
+    cryptographically separated from the URL path token.
+    """
+    secret = _require_app_secret_key()
+    msg = f"site-app-webhook-secret:{app.id}:{app.owner_id}:{app.name}".encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
 
 
 def verify_webhook_token(app: SiteApp, token: str) -> bool:
@@ -745,13 +757,22 @@ def verify_webhook_token(app: SiteApp, token: str) -> bool:
 
 
 def verify_github_webhook_signature(app: SiteApp, raw_body: bytes, signature_header: str | None) -> bool:
-    """Verify GitHub X-Hub-Signature-256 HMAC-SHA256 against the raw webhook request body."""
+    """Verify GitHub X-Hub-Signature-256 HMAC-SHA256 against the raw webhook request body using the dedicated webhook secret."""
     sig = (signature_header or "").strip().lower()
     if not sig.startswith("sha256="):
         return False
-    secret = webhook_token_for(app).encode("utf-8")
+    secret = webhook_secret_for(app).encode("utf-8")
     expected = "sha256=" + hmac.new(secret, raw_body or b"", hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig)
+
+
+def verify_gitlab_webhook_token(app: SiteApp, token_header: str | None) -> bool:
+    """Verify GitLab X-Gitlab-Token header against the dedicated webhook secret."""
+    provided = (token_header or "").strip()
+    if not provided:
+        return False
+    expected = webhook_secret_for(app)
+    return hmac.compare_digest(expected, provided)
 
 
 def git_auto_deploy(app: SiteApp) -> dict:

@@ -105,14 +105,14 @@ def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), curr
     if db.query(DatabaseAccount).filter(DatabaseAccount.db_user == db_user).first():
         raise HTTPException(status_code=409, detail="Database user already exists")
 
+    if getattr(payload, "remote_db_host_id", None):
+        raise HTTPException(
+            status_code=501,
+            detail="Remote MySQL provisioning is disabled until full database lifecycle tracking (backup, restore, quota, and deletion) is enabled.",
+        )
+
     try:
-        if getattr(payload, "remote_db_host_id", None):
-            remote_host = multi_server.get_active_remote_db_host(payload.remote_db_host_id)
-            if not remote_host:
-                raise HTTPException(status_code=404, detail="Remote MySQL/MariaDB host not found or disabled")
-            multi_server.provision_remote_database(remote_host, db_name, db_user, db_password)
-        else:
-            mariadb.create_database_credentials(db_name, db_user, db_password)
+        mariadb.create_database_credentials(db_name, db_user, db_password)
     except HTTPException:
         raise
     except ValueError as exc:

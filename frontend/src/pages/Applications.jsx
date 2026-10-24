@@ -109,6 +109,12 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
     setNotice(t('Copied Git Webhook Auto-Deploy URL to clipboard.'));
   }
 
+  function copyWebhookSecret(app) {
+    if (!app.webhook_secret) return;
+    navigator.clipboard?.writeText(app.webhook_secret);
+    setNotice(t('Copied Git Webhook HMAC Secret to clipboard.'));
+  }
+
   async function controlSiteApp(app, action) {
     const data = await request(`/site-apps/${app.id}/control`, { method: 'POST', body: JSON.stringify({ action }) }, `${action} ${app.name}...`);
     if (data) {
@@ -398,6 +404,7 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
               {app.kind === 'docker' && <div><dt>{t('In container')}</dt><dd>port {app.container_port} · {app.cpu_limit} CPU</dd></div>}
               <div><dt>{t('Unit')}</dt><dd><code>{app.unit}</code></dd></div>
               {app.webhook_path && <div><dt>{t('Git Webhook')}</dt><dd><code>{app.webhook_path}</code></dd></div>}
+              {app.webhook_secret && <div><dt>{t('Webhook Secret')}</dt><dd><code onClick={() => copyWebhookSecret(app)} style={{ cursor: 'pointer' }} title={t('Click to copy HMAC Secret')}>{app.webhook_secret.slice(0, 16)}…</code></dd></div>}
             </dl>
             <div className="site-app-actions">
               <div className="site-app-fields">

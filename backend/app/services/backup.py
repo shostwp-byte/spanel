@@ -200,7 +200,7 @@ def decrypt_backup_archive(
         raise ValueError("Decryption passphrase is required for encrypted backup archive")
 
     file_size = src.stat().st_size
-    if file_size < 16 + BACKUP_HMAC_TRAILER_LEN:
+    if file_size < 32:
         raise ValueError("Encrypted archive is truncated or missing HMAC-SHA256 authentication tag")
 
     with src.open("rb") as fin:
@@ -211,24 +211,39 @@ def decrypt_backup_archive(
         dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ITERATIONS, dklen=80)
         key, iv, mac_key = dk[:32], dk[32:48], dk[48:80]
 
-        fin.seek(file_size - BACKUP_HMAC_TRAILER_LEN)
-        trailer = fin.read(BACKUP_HMAC_TRAILER_LEN)
-        if len(trailer) != BACKUP_HMAC_TRAILER_LEN or trailer[:8] != BACKUP_HMAC_MAGIC:
-            raise ValueError("Encrypted archive is missing required SPNLMAC1 HMAC-SHA256 authentication trailer")
-        expected_mac = trailer[8:]
+        has_hmac_trailer = False
+        if file_size >= 16 + BACKUP_HMAC_TRAILER_LEN:
+            fin.seek(file_size - BACKUP_HMAC_TRAILER_LEN)
+            trailer = fin.read(BACKUP_HMAC_TRAILER_LEN)
+            if len(trailer) == BACKUP_HMAC_TRAILER_LEN and trailer[:8] == BACKUP_HMAC_MAGIC:
+                has_hmac_trailer = True
+                expected_mac = trailer[8:]
 
-        # Verify Encrypt-then-MAC over header + ciphertext before touching CBC decryption
-        mac = hmac_mod.new(mac_key, digestmod=hashlib.sha256)
-        fin.seek(0)
-        remaining_auth = file_size - BACKUP_HMAC_TRAILER_LEN
-        while remaining_auth > 0:
-            chunk = fin.read(min(64 * 1024, remaining_auth))
-            if not chunk:
-                break
-            mac.update(chunk)
-            remaining_auth -= len(chunk)
-        if not hmac_mod.compare_digest(mac.digest(), expected_mac):
-            raise ValueError("Invalid AES-256 decryption passphrase or HMAC-SHA256 authentication failed")
+        if has_hmac_trailer:
+            # Verify Encrypt-then-MAC over header + ciphertext before touching CBC decryption
+            mac = hmac_mod.new(mac_key, digestmod=hashlib.sha256)
+            fin.seek(0)
+            remaining_auth = file_size - BACKUP_HMAC_TRAILER_LEN
+            while remaining_auth > 0:
+                chunk = fin.read(min(64 * 1024, remaining_auth))
+                if not chunk:
+                    break
+                mac.update(chunk)
+                remaining_auth -= len(chunk)
+            if not hmac_mod.compare_digest(mac.digest(), expected_mac):
+                raise ValueError("Invalid AES-256 decryption passphrase or HMAC-SHA256 authentication failed")
+            ciphertext_len = file_size - 16 - BACKUP_HMAC_TRAILER_LEN
+        else:
+            # Backward-compatibility for archives encrypted by c7c7db7 (pre-SPNLMAC1):
+            # only permitted when an intact .sha256 sidecar matches the file on disk.
+            expected_sha = _read_sha256_sidecar(src)
+            if not expected_sha or (file_size - 16) % 16 != 0:
+                raise ValueError("Encrypted archive is missing required SPNLMAC1 HMAC-SHA256 authentication trailer")
+            actual_sha = _compute_sha256(src)
+            if not hmac_mod.compare_digest(actual_sha.lower(), expected_sha.lower()):
+                raise ValueError("Encrypted archive failed SHA-256 integrity verification before decryption")
+            logger.warning("Decrypting legacy pre-SPNLMAC1 backup archive %s (verified via .sha256 sidecar)", src.name)
+            ciphertext_len = file_size - 16
 
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
         decryptor = cipher.decryptor()
@@ -244,7 +259,7 @@ def decrypt_backup_archive(
 
         try:
             fin.seek(16)
-            remaining_ct = file_size - 16 - BACKUP_HMAC_TRAILER_LEN
+            remaining_ct = ciphertext_len
             with dest.open("wb") as fout:
                 while remaining_ct > 0:
                     chunk = fin.read(min(64 * 1024, remaining_ct))
@@ -619,6 +634,7 @@ def create_user_backup(
     target_id: Optional[int] = None,
     remote_name_mode: Optional[str] = None,
     full_every_n: int = 7,
+    passphrase: Optional[str] = None,
 ) -> str:
     from app.services import backup_s3
 
@@ -846,7 +862,11 @@ def create_user_backup(
             "updated_at": stamp_dt.isoformat() + "Z",
             "files": current_files,
         })
-        _write_sha256_sidecar(archive)
+        effective_passphrase = (passphrase or os.environ.get("SPANEL_BACKUP_PASSPHRASE") or "").strip()
+        if effective_passphrase:
+            encrypt_backup_archive(archive, effective_passphrase, replace_original=True)
+        else:
+            _write_sha256_sidecar(archive)
     return str(archive)
 
 

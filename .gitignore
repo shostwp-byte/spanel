@@ -91,15 +91,13 @@ test_ssh.py
 setup.sh
 change_IP.sh
 
-# Test files & internal audit/plan reports
-# tests/ is tracked on purpose: it is the regression suite that catches code
-# from one change silently disappearing in the next.
+# Test files
 backend/tests/
-plan-report/
-BAO_CAO_DANH_GIA_ENTERPRISE_SPANEL.doc
 
 # Misc
 images.zip
+BAO_CAO_DANH_GIA_ENTERPRISE_SPANEL.doc
+*.doc
 
 # Playwright MCP session output and design survey screenshots: local only.
 .playwright-mcp/

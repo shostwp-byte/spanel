@@ -685,81 +685,61 @@ migrate_protect_php_from_autoremove() {
   )
   if [[ ${#php_packages[@]} -gt 0 ]]; then
     apt-mark manual "${php_packages[@]}" >/dev/null 2>&1 || true
-    echo "    apt: ${#php_packages[@]} PHP package(s) held back from autoremove"
+    apt-mark unhold "${php_packages[@]}" >/dev/null 2>&1 || true
+    echo "    apt: ${#php_packages[@]} PHP package(s) held back from autoremove and unheld for security updates"
   fi
+  apt-mark unhold nginx mariadb-server redis-server pdns-server exim4-daemon-heavy exim4-daemon-light dovecot-core rspamd fail2ban >/dev/null 2>&1 || true
 }
 
 migrate_site_cron_php_binary() {
   local db_path="$APP_DIR/backend/spanel.db"
   [[ -f "$db_path" ]] || return 0
-  [[ -d /var/spool/cron/crontabs ]] || return 0
-  SPANEL_DB_PATH="$db_path" python3 - <<'PY'
+  local py_bin="$APP_DIR/backend/.venv/bin/python"
+  [[ -x "$py_bin" ]] || py_bin="python3"
+  PYTHONPATH="$APP_DIR/backend" SPANEL_DB_PATH="$db_path" "$py_bin" - <<'PY'
 import os
-import re
-import shlex
-import sqlite3
 import subprocess
 from pathlib import Path
 
-PHP_VERSION_RE = re.compile(r"^\d\.\d$")
-INTERPRETER_RE = re.compile(r"(&&\s+)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)")
-MARKER_RE = re.compile(r"#\s*spanel:([a-z0-9.\-]{3,253})\s*$")
-QUOTED_REDIRECT_RE = re.compile(r"""\s'((?:\d?>>?|\d?>&\d)[^']*)'""")
+try:
+    from app.core.database import SessionLocal
+    from app.models.entities import Website
+    from app.services import cron as cron_service
 
-php_versions = {}
-with sqlite3.connect(f"file:{os.environ['SPANEL_DB_PATH']}?mode=ro", uri=True) as db:
-    for domain, php_version in db.execute("select domain, php_version from websites"):
-        php_versions[(domain or "").lower()] = (php_version or "").strip()
-
-
-def php_binary(domain):
-    version = php_versions.get(domain, "")
-    if not PHP_VERSION_RE.fullmatch(version):
-        return None
-    candidate = f"/usr/bin/php{version}"
-    return candidate if Path(candidate).exists() else None
-
-
-for spool in sorted(Path("/var/spool/cron/crontabs").iterdir()):
-    if not spool.is_file():
-        continue
-    try:
-        original = spool.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        continue
-    lines = original.splitlines()
-    changed = False
-    for index, line in enumerate(lines):
-        marker = MARKER_RE.search(line)
-        if not marker:
-            continue
-        new_line = line
-        # Unquote redirections so /bin/sh treats them as syntax again.
-        new_line = QUOTED_REDIRECT_RE.sub(lambda match: " " + match.group(1), new_line)
-        binary = php_binary(marker.group(1).lower())
-        if binary:
-            new_line = INTERPRETER_RE.sub(
-                lambda match: f"{match.group(1)}{shlex.quote(binary)}{match.group(3)}",
-                new_line,
-                count=1,
-            )
-        if new_line != line:
-            lines[index] = new_line
-            changed = True
-    if not changed:
-        continue
-    content = "\n".join(lines) + "\n"
-    result = subprocess.run(
-        ["runuser", "-u", spool.name, "--", "crontab", "-"],
-        input=content,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        print(f"Repaired spanel cron entries for {spool.name}")
-    else:
-        print(f"WARNING: could not rewrite crontab for {spool.name}: {result.stderr.strip()}")
+    # First, if any legacy user spool crontabs exist in /var/spool/cron/crontabs,
+    # migrate their spanel entries into /etc/cron.d/spanel-user-<user> via add_cron
+    spool_dir = Path("/var/spool/cron/crontabs")
+    with SessionLocal() as db:
+        websites_by_domain = {
+            (w.domain or "").lower(): w for w in db.query(Website).all()
+        }
+        if spool_dir.is_dir():
+            for spool in sorted(spool_dir.iterdir()):
+                if not spool.is_file() or spool.name in ("root", "www-data"):
+                    continue
+                try:
+                    raw_lines = spool.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
+                    continue
+                migrated_any = False
+                for raw_line in raw_lines:
+                    if "# spanel:" not in raw_line:
+                        continue
+                    parsed = cron_service._parse_cron_line(0, raw_line)
+                    dom = raw_line.rsplit("# spanel:", 1)[-1].strip().lower()
+                    site = websites_by_domain.get(dom)
+                    if site and parsed.get("schedule") and parsed.get("command"):
+                        try:
+                            cron_service.add_cron(site, parsed["schedule"], parsed["command"])
+                            migrated_any = True
+                        except Exception:
+                            pass
+                if migrated_any:
+                    subprocess.run(["crontab", "-r", "-u", spool.name], check=False, capture_output=True)
+        # Enforce full spanel-cron-jail (/bin/sh -c '...') confinement across all websites
+        cron_service.enforce_all_cron_confinement(db)
+except Exception as exc:
+    print(f"WARNING: cron confinement migration notice: {exc}")
 PY
 }
 
@@ -1502,25 +1482,18 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
       install -d -m 0755 -o root -g spanel /etc/spanel/yara
       install -m 0644 -o root -g spanel "$SOURCE_DIR/installer/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
     fi
+    install -d -m 0750 -o root -g spanel /etc/spanel
+    if [[ ! -s /etc/spanel/audit-hmac.key ]]; then
+      openssl rand -hex 32 >/etc/spanel/audit-hmac.key
+    fi
+    chown root:spanel /etc/spanel/audit-hmac.key
+    chmod 0640 /etc/spanel/audit-hmac.key
     if [[ -f "$SOURCE_DIR/installer/files/spanel-watchdog.service" && -f "$SOURCE_DIR/installer/files/spanel-watchdog.timer" ]]; then
       install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-watchdog.service" /etc/systemd/system/spanel-watchdog.service
       sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-watchdog.service
       install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-watchdog.timer" /etc/systemd/system/spanel-watchdog.timer
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
-    fi
-    # Build c7c7db7 pinned the core stack and PHP with apt-mark hold after every
-    # panel-driven upgrade, which stops unattended-upgrades from applying their
-    # security fixes. Release those pins once; the marker keeps a hold an admin
-    # sets by hand later from being undone on the next update.
-    if [[ ! -f /var/lib/spanel/.apt-holds-released ]] && command -v apt-mark >/dev/null 2>&1; then
-      mapfile -t spanel_held < <(apt-mark showhold 2>/dev/null | grep -E '^(php[0-9]+\.[0-9]+(-.*)?|nginx|mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|postfix|dovecot-core|rspamd|openssl|fail2ban)$' || true)
-      if [[ ${#spanel_held[@]} -gt 0 ]]; then
-        apt-mark unhold "${spanel_held[@]}" >/dev/null 2>&1 || true
-        echo "Released apt holds set by SPanel: ${spanel_held[*]}"
-      fi
-      install -d -m 0755 /var/lib/spanel
-      touch /var/lib/spanel/.apt-holds-released
     fi
     install -m 0440 -o root -g root  "$SOURCE_DIR/installer/files/spanel-sudoers"   /etc/sudoers.d/spanel
     visudo -c -f /etc/sudoers.d/spanel >/dev/null

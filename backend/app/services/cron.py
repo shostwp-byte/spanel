@@ -16,7 +16,7 @@ CRON_JAIL_BIN = "/usr/local/bin/spanel-cron-jail"
 # Matches the interpreter token of an already installed cron line so it can be
 # repointed when the website switches PHP version.
 CRON_PHP_TOKEN_RE = re.compile(
-    r"((?:&&\s+|root\s+)?(?:/usr/local/s?bin/spanel-cron-jail\s+.+?\s+--\s+)?)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)"
+    r"((?:&&\s+|root\s+)?(?:/usr/local/s?bin/spanel-cron-jail\s+.+?\s+--\s+(?:/bin/sh\s+-c\s+'?)?)?)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)"
 )
 CRON_JAIL_PREFIX_RE = re.compile(r"^(?:root\s+)?/usr/local/s?bin/spanel-cron-jail\s+.+?\s+--\s+")
 # `>file`, `>>file` and `2>file` open a target; `2>&1` / `1>&2` only duplicate a
@@ -284,7 +284,15 @@ def _parse_cron_line(index: int, line: str) -> dict:
     if command.startswith("cd ") and " && " in command:
         command = command.split(" && ", 1)[1].strip()
     command = CRON_JAIL_PREFIX_RE.sub("", command).strip()
-    command = _unescape_percent(command).replace(" --allow-root", "").strip()
+    command = _unescape_percent(command)
+    if command.startswith("/bin/sh -c "):
+        try:
+            sh_parts = shlex.split(command)
+            if len(sh_parts) == 3 and sh_parts[0] == "/bin/sh" and sh_parts[1] == "-c":
+                command = sh_parts[2].strip()
+        except ValueError:
+            pass
+    command = command.replace(" --allow-root", "").strip()
     command = _strip_open_basedir(command)
     return {"index": index, "schedule": schedule, "command": command, "line": line}
 
@@ -321,30 +329,135 @@ def _strip_open_basedir(command: str) -> str:
     return " ".join(shlex.quote(arg) for arg in cleaned)
 
 
+def validate_cron_write_line(cron_user: str, line: str) -> bool:
+    """Verify a tenant cron line strictly matches the root-enforced spanel-cron-jail format
+    with the entire command + redirection encapsulated inside a single-quoted /bin/sh -c argument.
+    """
+    raw = (line or "").strip()
+    if not raw or raw.startswith("#") or raw.startswith("SHELL=") or raw.startswith("PATH="):
+        return True
+    user = site_users.validate_linux_user(cron_user)
+    parts = raw.split(maxsplit=5)
+    if len(parts) < 6:
+        return False
+    sched = " ".join(parts[:5])
+    try:
+        _validate_schedule(sched)
+    except ValueError:
+        return False
+    rest = parts[5].strip()
+    marker_match = re.search(r"\s+(#\s*spanel:[a-z0-9.\-]{3,253})\s*$", rest)
+    if not marker_match:
+        return False
+    body = rest[:marker_match.start()].strip()
+    # Must not contain unescaped newlines or null bytes
+    if any(ch in body for ch in ("\r", "\n", "\x00")):
+        return False
+    # Unescape crontab \% before tokenizing with shlex
+    unescaped_body = _unescape_percent(body)
+    try:
+        tokens = shlex.split(unescaped_body)
+    except ValueError:
+        return False
+    # Exact 8 tokens required:
+    # ['root', '/usr/local/bin/spanel-cron-jail', '<user>', '<cwd>', '--', '/bin/sh', '-c', '<cmd>']
+    if len(tokens) != 8:
+        return False
+    if tokens[0] != "root" or tokens[1] != CRON_JAIL_BIN or tokens[2] != user:
+        return False
+    if tokens[4] != "--" or tokens[5] != "/bin/sh" or tokens[6] != "-c" or not tokens[7]:
+        return False
+    # Verify <cwd> is inside /home/<user>/
+    home_root = Path(site_users.HOME_ROOT.as_posix()) / user
+    cwd_path = Path(tokens[3])
+    if not cwd_path.is_absolute() or ".." in cwd_path.parts:
+        return False
+    cwd_posix = cwd_path.as_posix()
+    home_posix = home_root.as_posix()
+    if cwd_posix != home_posix and not cwd_posix.startswith(home_posix + "/"):
+        return False
+    # Ensure the raw string after `-- /bin/sh -c ` is a single-quoted string with no trailing unquoted operators
+    after_sh_c = re.split(r"\s+--\s+/bin/sh\s+-c\s+", body, maxsplit=1)
+    if len(after_sh_c) != 2:
+        return False
+    quoted_arg = after_sh_c[1].strip()
+    if not (quoted_arg.startswith("'") and quoted_arg.endswith("'")):
+        return False
+    return True
+
+
+def _render_jailed_line(cron_user: str, safe_schedule: str, doc_root_str: str, safe_command: str, safe_domain: str) -> str:
+    marker = f"# spanel:{safe_domain}"
+    if cron_user != "www-data":
+        return (
+            f"{safe_schedule} root {CRON_JAIL_BIN} {shlex.quote(cron_user)} "
+            f"{shlex.quote(doc_root_str)} -- /bin/sh -c {_escape_percent(shlex.quote(safe_command))} {marker}"
+        )
+    return f"{safe_schedule} cd {shlex.quote(doc_root_str)} && {_escape_percent(safe_command)} {marker}"
+
+
+def _upgrade_legacy_cron_line(cron_user: str, line: str, fallback_doc_root: str = "", fallback_php_bin: str = "php") -> str:
+    """Convert a legacy tenant crontab line into the strict root spanel-cron-jail /bin/sh -c format."""
+    if cron_user == "www-data" or validate_cron_write_line(cron_user, line):
+        return line
+    raw = (line or "").strip()
+    if not raw or raw.startswith("#") or raw.startswith("SHELL=") or raw.startswith("PATH="):
+        return line
+    marker_match = re.search(r"#\s*spanel:([a-z0-9.\-]{3,253})\s*$", raw)
+    if not marker_match:
+        raise ValueError("Refusing unmanaged cron line without spanel domain marker")
+    safe_domain = _validate_domain(marker_match.group(1))
+    parsed = _parse_cron_line(0, raw)
+    safe_schedule = _validate_schedule(parsed["schedule"])
+    # Extract working directory from legacy `cd <cwd> &&` or `spanel-cron-jail <user> <cwd> --`
+    cwd_str = fallback_doc_root
+    parts = raw.split(maxsplit=5)
+    body = parts[5] if len(parts) >= 6 else ""
+    cd_match = re.match(r"^(?:root\s+)?cd\s+(.+?)\s+&&\s+", body)
+    jail_match = re.match(r"^(?:root\s+)?/usr/local/s?bin/spanel-cron-jail\s+\S+\s+(\S+)\s+--\s+", body)
+    if jail_match:
+        try:
+            cwd_str = shlex.split(jail_match.group(1))[0]
+        except ValueError:
+            cwd_str = jail_match.group(1).strip("'\"")
+    elif cd_match:
+        try:
+            cwd_str = shlex.split(cd_match.group(1))[0]
+        except ValueError:
+            cwd_str = cd_match.group(1).strip("'\"")
+    if not cwd_str:
+        cwd_str = f"{site_users.HOME_ROOT.as_posix()}/{cron_user}/domains/{safe_domain}/public_html"
+    site_root = str(Path(cwd_str).parent) if Path(cwd_str).name == "public_html" else cwd_str
+    # Determine PHP interpreter from line if present
+    php_match = re.search(r"((?:/usr/bin/)?php\d\.\d)\b", raw)
+    php_bin = php_match.group(1) if php_match else fallback_php_bin
+    safe_command = _validate_command(parsed["command"], cwd_str, site_root, php_bin, cron_user)
+    return _render_jailed_line(cron_user, safe_schedule, cwd_str, safe_command, safe_domain)
+
+
 def add_cron(website: Website, schedule: str, command: str) -> str:
     safe_schedule = _validate_schedule(schedule)
     document_root = site_users.document_root(website.root_path)
     # The cron user has to be known before the command is rendered: it is what
     # open_basedir confines the interpreter to.
     cron_user = cron_user_for_website(website)
+    php_bin = php_binary(website)
     safe_command = _validate_command(
-        command, document_root, website.root_path, php_binary(website), cron_user
+        command, document_root, website.root_path, php_bin, cron_user
     )
     safe_domain = _validate_domain(website.domain)
-    marker = f"# spanel:{safe_domain}"
     doc_root_str = str(document_root)
-    if cron_user != "www-data":
-        line = (
-            f"{safe_schedule} root {CRON_JAIL_BIN} {shlex.quote(cron_user)} "
-            f"{shlex.quote(doc_root_str)} -- {_escape_percent(safe_command)} {marker}"
-        )
-    else:
-        line = f"{safe_schedule} cd {shlex.quote(doc_root_str)} && {_escape_percent(safe_command)} {marker}"
+    line = _render_jailed_line(cron_user, safe_schedule, doc_root_str, safe_command, safe_domain)
     if cron_user != "www-data":
         runtime_php_version = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
         site_users.ensure_site_runtime(website.domain, website.root_path, runtime_php_version, cron_user)
-    existing = list_cron_all(cron_user)
-    new_content = existing.rstrip() + ("\n" if existing.strip() else "") + line + "\n"
+    existing_lines = [
+        _upgrade_legacy_cron_line(cron_user, old_line, doc_root_str, php_bin)
+        for old_line in list_cron_all(cron_user).splitlines()
+        if old_line.strip()
+    ]
+    existing_lines.append(line)
+    new_content = "\n".join(existing_lines) + "\n"
     shell.privileged(
         "cron-write",
         helper_args=[cron_user],
@@ -383,7 +496,11 @@ def delete_cron(domain: str, index: int, cron_user: str = "www-data") -> str:
         raise ValueError("Cron not found")
     target = matching[index]
     full = list_cron_all(cron_user).splitlines()
-    new_lines = [line for line in full if line.strip() != target.strip()]
+    new_lines = [
+        _upgrade_legacy_cron_line(cron_user, line)
+        for line in full
+        if line.strip() and line.strip() != target.strip()
+    ]
     new_content = "\n".join(new_lines) + ("\n" if new_lines else "")
     shell.privileged(
         "cron-write",
@@ -403,17 +520,23 @@ def retarget_php_binary(website: Website) -> int:
     safe_domain = _validate_domain(website.domain)
     php_bin = php_binary(website)
     cron_user = cron_user_for_website(website)
+    doc_root_str = str(site_users.document_root(website.root_path))
     marker = f"spanel:{safe_domain}"
     lines = list_cron_all(cron_user).splitlines()
     updated: list[str] = []
     changed = 0
     for line in lines:
-        if marker in line:
-            new_line = CRON_PHP_TOKEN_RE.sub(lambda match: f"{match.group(1)}{php_bin}{match.group(3)}", line, count=1)
+        if not line.strip():
+            continue
+        norm_line = _upgrade_legacy_cron_line(cron_user, line, doc_root_str, php_bin)
+        if marker in norm_line:
+            new_line = CRON_PHP_TOKEN_RE.sub(lambda match: f"{match.group(1)}{php_bin}{match.group(3)}", norm_line, count=1)
             if new_line != line:
                 changed += 1
-                line = new_line
-        updated.append(line)
+                norm_line = new_line
+        elif norm_line != line:
+            changed += 1
+        updated.append(norm_line)
     if not changed:
         return 0
     new_content = "\n".join(updated) + ("\n" if updated else "")
@@ -450,7 +573,11 @@ def cron_security_status(db) -> dict:
             has_open_basedir = "open_basedir=" in line
             is_wp_cli = str(WP_CLI_PATH) in line or " wp " in line
             has_disable_funcs = "disable_functions=" in line or is_wp_cli
-            has_namespace_jail = CRON_JAIL_BIN in line
+            has_namespace_jail = (
+                CRON_JAIL_BIN in line
+                and "-- /bin/sh -c '" in line
+                and not re.search(r"'[^']*'\s*(?:\d?>>?|\d?>&\d)", line)
+            )
             fully_confined = bool(
                 has_open_basedir and has_disable_funcs and has_namespace_jail and c_user != "www-data"
             )
@@ -499,10 +626,15 @@ def enforce_all_cron_confinement(db) -> dict:
             checked += 1
             raw_line = entry.get("line", "")
             is_wp = str(WP_CLI_PATH) in raw_line or " wp " in raw_line
+            has_safe_jail = (
+                CRON_JAIL_BIN in raw_line
+                and "-- /bin/sh -c '" in raw_line
+                and not re.search(r"'[^']*'\s*(?:\d?>>?|\d?>&\d)", raw_line)
+            )
             if (
                 "open_basedir=" in raw_line
                 and ("disable_functions=" in raw_line or is_wp)
-                and (CRON_JAIL_BIN in raw_line or c_user == "www-data")
+                and (has_safe_jail or c_user == "www-data")
             ):
                 continue
             try:

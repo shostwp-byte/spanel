@@ -79,9 +79,11 @@ def _app_out(app: SiteApp) -> dict:
     try:
         token = site_apps.webhook_token_for(app)
         payload["webhook_token"] = token
+        payload["webhook_secret"] = site_apps.webhook_secret_for(app)
         payload["webhook_path"] = f"/api/site-apps/webhook/{app.id}/{token}"
     except Exception:
         payload["webhook_token"] = ""
+        payload["webhook_secret"] = ""
         payload["webhook_path"] = ""
     payload["websites"] = [website.domain for website in app.websites]
     return payload
@@ -520,11 +522,15 @@ async def git_webhook_auto_deploy(
 
     raw_body = await request.body()
     gh_sig = request.headers.get("X-Hub-Signature-256")
+    gl_token = request.headers.get("X-Gitlab-Token")
+    if gh_sig is None and gl_token is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing webhook signature header (X-Hub-Signature-256 or X-Gitlab-Token is required)",
+        )
     if gh_sig is not None and not site_apps.verify_github_webhook_signature(app, raw_body, gh_sig):
         raise HTTPException(status_code=403, detail="Invalid X-Hub-Signature-256 HMAC signature")
-
-    gl_token = request.headers.get("X-Gitlab-Token")
-    if gl_token is not None and not site_apps.verify_webhook_token(app, gl_token):
+    if gl_token is not None and not site_apps.verify_gitlab_webhook_token(app, gl_token):
         raise HTTPException(status_code=403, detail="Invalid X-Gitlab-Token header")
 
     gh_event = (request.headers.get("X-GitHub-Event") or "").strip().lower()

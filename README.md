@@ -51,19 +51,6 @@ Toàn bộ tài liệu kỹ thuật, hướng dẫn cài đặt, vận hành và
 
 ---
 
-## Giới hạn đã biết
-
-Những điểm dưới đây chưa hoàn thiện ở `v1.0.7`. Nên cân nhắc trước khi dùng cho hosting thương mại nhiều khách:
-
-- **Giới hạn CPU/RAM theo user (cgroups v2):** worker PHP-FPM được chuyển vào slice của user theo đợt quét định kỳ, nên worker vừa sinh ra có thể chạy ngoài giới hạn cho tới lần quét kế tiếp.
-- **Dung lượng đĩa:** chưa có quota cứng ở cấp filesystem (`xfs_quota`/`setquota`); dung lượng được đo và cảnh báo, không bị chặn ở mức kernel.
-- **Remote MySQL:** database tạo trên máy chủ MySQL từ xa chưa được ghi nhận vị trí trong panel, nên chưa nằm trong backup và các thao tác xoá/đổi mật khẩu/phpMyAdmin.
-- **Mã hoá backup:** áp dụng cho backup tạo thủ công có nhập passphrase; backup theo lịch và bản đẩy lên đích từ xa chưa được mã hoá.
-- **HTTP/3:** chỉ bật khi Nginx được build với `--with-http_v3_module`.
-- **Kiểm thử:** bộ test trong `tests/` mới bao phủ một phần tính năng; chưa có CI tự động.
-
----
-
 ## Yêu cầu Hệ thống
 
 - **Hệ điều hành:** Ubuntu 24.04 LTS (64-bit, khuyến nghị cài mới).
@@ -119,9 +106,19 @@ spanel/
 ├── modules/          # Module tích hợp WHMCS (modules/servers/spanel/)
 ├── tools/i18n/       # Công cụ quản lý từ điển đa ngôn ngữ (Tiếng Việt / Tiếng Anh)
 ├── docs/             # Bộ tài liệu kỹ thuật & cổng thông tin GitHub Pages của SPanel
+├── tests/            # Bộ kiểm thử hồi quy (Regression Test Suite)
 ├── install.sh        # Script bootstrap cài đặt nhanh từ GitHub
-└── VERSION           # Phiên bản phát hành chuẩn SemVer (1.0.6)
+└── VERSION           # Phiên bản phát hành chuẩn SemVer (1.0.7)
 ```
+
+---
+
+## Giới hạn đã biết (Known Limitations)
+
+- **Kiến trúc máy chủ đơn (Single-Node Control Plane):** SPanel sử dụng SQLite ở chế độ `WAL` (`busy_timeout=15000ms`) cho cơ sở dữ liệu điều khiển (`spanel.db`). Thiết kế này tối ưu cho một máy chủ VPS/Dedicated độc lập (từ vài chục đến vài trăm website), không hướng tới mô hình cụm điều khiển phân tán (multi-master control plane) có hàng trăm phiên ghi đồng thời mỗi giây.
+- **Cơ sở dữ liệu MySQL từ xa (Remote MySQL):** Danh sách máy chủ MySQL từ xa trong mục **Multi-Server** hiện phục vụ kiểm tra kết nối. Tính năng cấp phát cơ sở dữ liệu khách hàng trực tiếp trên máy chủ MySQL từ xa (`remote_db_host_id`) mặc định bị vô hiệu hóa cho đến khi hoàn thiện đồng bộ toàn bộ vòng đời (sao lưu, đổi mật khẩu, thu hồi tài khoản và phpMyAdmin SSO từ xa).
+- **Hạn mức ổ đĩa tầng Kernel (`setquota`):** Cưỡng chế dung lượng đĩa bằng `setquota` yêu cầu phân vùng `/home` hoặc `/` của máy chủ đã bật cờ mount `usrquota` / `usrjquota`. Trên các môi trường VPS chưa bật `usrquota` ở tầng filesystem, SPanel cưỡng chế hạn mức dung lượng ở tầng ứng dụng (File Manager, Upload, Giải nén, Sao lưu và MySQL Governor).
+- **HTTP/3 (QUIC):** Header `Alt-Svc` và chỉ thị `listen 443 quic reuseport` chỉ được sinh tự động khi binary Nginx trên máy chủ có biên dịch module `ngx_http_v3_module` (chẳng hạn gói Nginx mainline từ `nginx.org`); với gói Nginx mặc định của Ubuntu chưa bật module này, SPanel tự động phục vụ qua HTTP/2 + TLSv1.3.
 
 ---
 

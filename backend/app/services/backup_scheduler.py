@@ -154,6 +154,7 @@ def run_one(db, schedule: BackupSchedule, now: datetime | None = None) -> bool:
         try:
             sched_mode = getattr(schedule, "backup_mode", "full") or "full"
             sched_full_every = int(getattr(schedule, "full_every_n", 7) or 7)
+            sched_passphrase = getattr(schedule, "encryption_passphrase", None) or None
             archive = backup.create_user_backup(
                 user,
                 db,
@@ -162,6 +163,7 @@ def run_one(db, schedule: BackupSchedule, now: datetime | None = None) -> bool:
                 target_id=schedule.target_id,
                 remote_name_mode=getattr(schedule, "name_suffix", "full_date") if schedule.target_id else None,
                 full_every_n=sched_full_every,
+                encryption_passphrase=sched_passphrase,
             )
             target = _upload_if_configured(db, schedule, archive, username=user.username)
             if schedule.target_id:

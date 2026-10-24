@@ -308,6 +308,15 @@ FASTCGI_CACHE_SERVER_BLOCK = """    # SPANEL FASTCGI CACHE SERVER BEGIN
     if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wordpress_logged_in|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|edd_items_in_cart") { set $spanel_skip_cache 1; }
     add_header X-FastCGI-Cache $upstream_cache_status always;
     # SPANEL FASTCGI CACHE SERVER END"""
+
+
+def _fastcgi_cache_server_block() -> str:
+    if _nginx_supports_http3():
+        return FASTCGI_CACHE_SERVER_BLOCK.replace(
+            "    add_header X-FastCGI-Cache $upstream_cache_status always;\n",
+            "    add_header X-FastCGI-Cache $upstream_cache_status always;\n    add_header Alt-Svc 'h3=\":443\"; ma=86400' always;\n",
+        )
+    return FASTCGI_CACHE_SERVER_BLOCK
 # Kept byte-identical to the block in templates/nginx/wordpress.conf.j2: this
 # copy is injected into vhosts that already exist, that one renders new ones,
 # and a site should not behave differently for having been created earlier.
@@ -365,31 +374,45 @@ def _nginx_supports_http3() -> bool:
     return _NGINX_HTTP3_CACHE
 
 
-def _listen_443_directives(ip_address: str = "*", ipv6: Optional[bool] = None) -> list[str]:
+def _quic_needs_reuseport(prefix: str = "", domain: str = "", ipv6_bind: bool = False) -> bool:
+    """Nginx allows `reuseport` on at most one `listen ... quic` directive per address:port."""
+    target_token = "listen [::]:443 quic reuseport;" if ipv6_bind else f"listen {prefix}443 quic reuseport;"
+    conf_dir = Path("/etc/nginx/conf.d")
+    if not conf_dir.is_dir():
+        return True
+    exclude_name = f"{domain}.conf" if domain else ""
+    try:
+        for conf_file in sorted(conf_dir.glob("*.conf")):
+            if exclude_name and conf_file.name == exclude_name:
+                continue
+            if target_token in conf_file.read_text(encoding="utf-8", errors="ignore"):
+                return False
+    except OSError:
+        pass
+    return True
+
+
+def _listen_443_directives(
+    ip_address: str = "*",
+    ipv6: Optional[bool] = None,
+    domain: str = "",
+    reuseport: Optional[bool] = None,
+) -> list[str]:
     """Build TCP 443 (SSL/HTTP2) and optional UDP 443 (QUIC/HTTP3) listen directives."""
     prefix = f"{ip_address}:" if ip_address and ip_address != "*" else ""
     has_http3 = _nginx_supports_http3()
     directives = [f"listen {prefix}443 ssl http2;"]
     if has_http3:
-        directives.append(f"listen {prefix}443 quic;")
+        use_rp4 = reuseport if reuseport is not None else _quic_needs_reuseport(prefix, domain, ipv6_bind=False)
+        directives.append(f"listen {prefix}443 quic{' reuseport' if use_rp4 else ''};")
     if not prefix and (ipv6 if ipv6 is not None else panel_ipv6.is_enabled()):
         directives.append("listen [::]:443 ssl http2;")
         if has_http3:
-            directives.append("listen [::]:443 quic;")
+            use_rp6 = reuseport if reuseport is not None else _quic_needs_reuseport(prefix, domain, ipv6_bind=True)
+            directives.append(f"listen [::]:443 quic{' reuseport' if use_rp6 else ''};")
+    if has_http3:
+        directives.append("add_header Alt-Svc 'h3=\":443\"; ma=86400' always;")
     return directives
-
-
-def _https_listen_block(ip_address: str = "*") -> str:
-    """The lines that replace `listen 80;` when a vhost is switched to HTTPS.
-
-    Alt-Svc tells browsers to retry over HTTP/3, so it is only sent from a
-    server that also listens for QUIC. Advertising h3 from an Nginx built
-    without the v3 module makes clients attempt a protocol nobody answers.
-    """
-    lines = [f"    {d}" for d in _listen_443_directives(ip_address)]
-    if _nginx_supports_http3():
-        lines.append("    add_header Alt-Svc 'h3=\":443\"; ma=86400' always;")
-    return "\n".join(lines)
 
 # Block-opening directives that nest scopes; matched against the original
 # text so the trailing ``{`` is preserved.
@@ -992,9 +1015,11 @@ def _merge_certbot_ssl_config(new_content: str, existing_content: str) -> str:
     server_name = "_"
     if "server_name " in new_content:
         server_name = new_content.split("server_name ", 1)[1].split(";", 1)[0].strip()
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
+    vhost_domain = _domain_from_vhost(new_content)
+    ip_address = get_website_ip(vhost_domain)
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443_block = _https_listen_block(ip_address)
+    listen443_lines = [f"    {d}" for d in _listen_443_directives(ip_address, domain=vhost_domain)]
+    listen443_block = "\n".join(listen443_lines)
     ssl_lines = []
     seen_ssl_lines = set()
     for line in existing_content.splitlines():
@@ -1030,9 +1055,11 @@ def apply_manual_ssl_config(new_content: str, cert_path: str, key_path: str, ca_
     server_name = "_"
     if "server_name " in new_content:
         server_name = new_content.split("server_name ", 1)[1].split(";", 1)[0].strip()
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
+    vhost_domain = _domain_from_vhost(new_content)
+    ip_address = get_website_ip(vhost_domain)
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443_block = _https_listen_block(ip_address)
+    listen443_lines = [f"    {d}" for d in _listen_443_directives(ip_address, domain=vhost_domain)]
+    listen443_block = "\n".join(listen443_lines)
     ssl_lines = [
         f"    ssl_certificate {fullchain if ca else cert};",
         f"    ssl_certificate_key {key};",
@@ -1255,19 +1282,20 @@ def _replace_fastcgi_cache_blocks(content: str, enabled: bool = True) -> str:
     if "fastcgi_pass" not in cleaned:
         raise ValueError("Cannot find a PHP FastCGI location")
 
+    server_block = _fastcgi_cache_server_block()
     if "    client_max_body_size " in cleaned:
         cleaned = re.sub(
             r"(    client_max_body_size [^;]+;)",
-            lambda match: f"{match.group(1)}\n\n{FASTCGI_CACHE_SERVER_BLOCK}",
+            lambda match: f"{match.group(1)}\n\n{server_block}",
             cleaned,
             count=1,
         )
     elif "    server_tokens off;" in cleaned:
-        cleaned = cleaned.replace("    server_tokens off;", f"    server_tokens off;\n\n{FASTCGI_CACHE_SERVER_BLOCK}", 1)
+        cleaned = cleaned.replace("    server_tokens off;", f"    server_tokens off;\n\n{server_block}", 1)
     else:
         cleaned = re.sub(
             r"(    server_name [^;]+;)",
-            lambda match: f"{match.group(1)}\n\n{FASTCGI_CACHE_SERVER_BLOCK}",
+            lambda match: f"{match.group(1)}\n\n{server_block}",
             cleaned,
             count=1,
         )
@@ -1425,6 +1453,7 @@ def render_vhost(
         rewrite_mode=safe_rewrite_mode,
         app_port=safe_app_port,
         proxy_timeout=PROXY_TIMEOUT_SECONDS,
+        http3_enabled=_nginx_supports_http3(),
     )
     # Applied to the rendered output rather than through the templates: it is
     # one block, identical for all four app types, and this keeps it in step
