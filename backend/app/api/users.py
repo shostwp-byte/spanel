@@ -825,7 +825,7 @@ def impersonate_user(user_id: int, request: Request, db: Session = Depends(get_d
     enforce_rate_limit(request, "users_impersonate", max_requests=15, window_seconds=60, key_suffix=str(current_user.id))
     ensure_role(current_user.role, Role.reseller)
     query = db.query(User).filter(User.id == user_id)
-    if current_user.role == Role.reseller:
+    if normalize_role(current_user.role) == Role.reseller:
         query = query.filter(User.reseller_id == current_user.id)
     
     user = query.first()
@@ -835,7 +835,7 @@ def impersonate_user(user_id: int, request: Request, db: Session = Depends(get_d
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot impersonate yourself")
         
-    if current_user.role == Role.reseller and user.role != Role.end_user:
+    if normalize_role(current_user.role) == Role.reseller and normalize_role(user.role) != Role.end_user:
         raise HTTPException(status_code=403, detail="Resellers can only impersonate end users")
         
     from app.services.sso_tokens import create_panel_login_token

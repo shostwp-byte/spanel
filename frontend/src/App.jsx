@@ -1657,10 +1657,27 @@ function AppContent() {
     ]);
     if (siteData) {
       setWebsites(siteData);
-      if (!selectedWebsiteId && siteData[0]) setSelectedWebsiteId(String(siteData[0].id));
+      const stillExists = selectedWebsiteId && siteData.some(s => String(s.id) === String(selectedWebsiteId));
+      if (!stillExists) {
+        setSelectedWebsiteId(siteData[0] ? String(siteData[0].id) : '');
+      }
     }
     if (refreshedUser?.role === 'admin' || refreshedUser?.role === 'reseller') {
       await Promise.all([loadPackages(), loadUsers()]);
+    } else {
+      setUsers([]);
+    }
+  }
+
+  async function exitImpersonation() {
+    const targetName = currentUser?.impersonated_by || 'previous account';
+    const data = await request('/auth/impersonate-exit', { method: 'POST' }, `Returning to ${targetName}...`);
+    if (data?.access_token) {
+      setNotice(`Returned to ${targetName}.`);
+      setViewLevel(null);
+      await loadCurrentUser();
+      navigateToPage('users');
+      await refreshAll();
     }
   }
 
@@ -4671,6 +4688,9 @@ function AppContent() {
                   <strong>{accountLabel}</strong>
                   <small>{currentUser?.email || t(roleLabel(currentUser?.role))}</small>
                 </div>
+                {currentUser?.impersonated && currentUser?.impersonated_by && (
+                  <button type="button" role="menuitem" onClick={() => { setUserMenuOpen(false); exitImpersonation(); }}><ArrowRightLeft size={15} />{t('Return to')} {currentUser.impersonated_by}</button>
+                )}
                 <button type="button" role="menuitem" onClick={() => { setUserMenuOpen(false); navigateToPage('security'); }}><LockKeyhole size={15} />{t('Account security')}</button>
                 <button type="button" role="menuitem" className="user-menu-logout" onClick={() => { setUserMenuOpen(false); logout(); }}><LogOut size={15} />{t('Logout')}</button>
               </div>}

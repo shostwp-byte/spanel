@@ -494,10 +494,12 @@ export function UsersPage({
                       <Pencil size={14} />
                       {t('Edit')}
                     </button>
-                    <button className="mini secondary-light" disabled={!!loading} onClick={() => quickLoginUser(user)}>
-                      <LogIn size={14} />
-                      {t('Login as')}
-                    </button>
+                    {user.id !== currentUser?.id && (
+                      <button className="mini secondary-light" disabled={!!loading} onClick={() => quickLoginUser(user)}>
+                        <LogIn size={14} />
+                        {t('Login as')}
+                      </button>
+                    )}
                     {user.totp_enabled && user.id !== currentUser?.id && (
                       <button className="mini secondary-light" disabled={!!loading} onClick={() => resetUserTwoFactor(user)}>
                         {t('Reset 2FA')}
