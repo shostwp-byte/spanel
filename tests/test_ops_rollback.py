@@ -99,6 +99,9 @@ def test_swap_checks_integrity_before_stopping_anything_and_keeps_the_old_db():
     # The WAL and shared memory of the old file must not be applied to the new one.
     assert body.index('rm -f "${db}-wal" "${db}-shm"') < body.index('mv -f "$tmp" "$db"')
     assert "spanel-api" in body and "SPANEL_DB_TIMERS" in body
+    # A running oneshot (apt in the maintenance runner, a backup) is waited
+    # for, never killed.
+    assert 'systemctl stop "${SPANEL_DB_ONESHOTS[@]}"' not in body and "deadline" in body
 
 
 def test_restore_state_writer_does_not_follow_links(tmp_path):
@@ -132,6 +135,8 @@ def test_snapshot_keeps_system_files_and_package_set():
         assert f'"{glob}"' in text
     restore = _helper_function("panel_snapshot_restore_system")
     assert "nginx -t" in restore and "system-current.tar" in restore
+    # Units the newer release added are removed, but never the API's own.
+    assert "disable --now" in restore and '== /etc/systemd/system/spanel-api.service ]] && continue' in restore
 
 
 # --- spanel-update: auto_rollback_enabled and the apply gate -------------------------

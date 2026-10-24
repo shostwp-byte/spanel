@@ -665,11 +665,23 @@ swap_panel_db() {
   install -m 0640 -o spanel -g spanel "$src" "$tmp"
 
   for timer in "${SPANEL_DB_TIMERS[@]}"; do
-    systemctl is-active --quiet "$timer" 2>/dev/null && active_timers+=("$timer")
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then
+      active_timers+=("$timer")
+    fi
   done
   systemctl stop "${SPANEL_DB_TIMERS[@]}" >/dev/null 2>&1 || true
-  systemctl stop "${SPANEL_DB_ONESHOTS[@]}" >/dev/null 2>&1 || true
   systemctl stop spanel-api >/dev/null 2>&1 || true
+  # A oneshot already running is given a minute to finish, never killed: the
+  # maintenance runner may be half-way through apt, the backup runner through
+  # an archive. One still running after that keeps the old file open and
+  # writes there - a lost status line, not a damaged database (SQLite locks
+  # by inode, and the copy moved in below is a new one).
+  local deadline=$((SECONDS + 60)) unit
+  for unit in "${SPANEL_DB_ONESHOTS[@]}"; do
+    while systemctl is-active --quiet "$unit" 2>/dev/null && (( SECONDS < deadline )); do
+      sleep 2
+    done
+  done
 
   if [[ -f "$db" ]]; then
     sqlite_online_copy "$db" "${db}.pre-restore-${ts}" || cp -a "$db" "${db}.pre-restore-${ts}"
@@ -679,7 +691,7 @@ swap_panel_db() {
   rm -f "${db}-wal" "${db}-shm"
   mv -f "$tmp" "$db"
   # Keep the three newest pre-restore copies.
-  ls -1t "${db}".pre-restore-* 2>/dev/null | tail -n +4 | xargs -r rm -f
+  ls -1t "${db}".pre-restore-* 2>/dev/null | tail -n +4 | xargs -r rm -f || true
 
   systemctl start spanel-api >/dev/null 2>&1 || true
   for timer in "${active_timers[@]:-}"; do
@@ -788,6 +800,26 @@ panel_snapshot_restore_system() {
   saved="$work/system-current.tar"
   tar -C / -cpf "$saved" --ignore-failed-read "${paths[@]}" 2>/dev/null || true
   tar -C / -xpf "$work/system.tar"
+  # Units the newer release added and the snapshot's release does not know:
+  # left in place they would start code that is no longer there.
+  local unit_file unit
+  local -A in_snapshot=()
+  for path in "${paths[@]}"; do
+    in_snapshot["$path"]=1
+  done
+  # Only when the snapshot did record units, and never the API itself.
+  if [[ -n "${in_snapshot[etc/systemd/system/spanel-api.service]:-}" ]]; then
+    shopt -s nullglob
+    for unit_file in /etc/systemd/system/spanel-*.service /etc/systemd/system/spanel-*.timer; do
+      [[ "$unit_file" == /etc/systemd/system/spanel-api.service ]] && continue
+      if [[ -z "${in_snapshot[${unit_file#/}]:-}" ]]; then
+        unit="$(basename "$unit_file")"
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        rm -f "$unit_file"
+      fi
+    done
+    shopt -u nullglob
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
   if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
     echo "restored nginx files fail nginx -t; keeping the current ones" >&2
@@ -1176,7 +1208,7 @@ PY
 
   ls -1t "${PANEL_DR_DIR}"/panel-dr-*.spdr 2>/dev/null | tail -n +"$((PANEL_DR_KEEP_LOCAL + 1))" | while IFS= read -r old; do
     rm -f "$old" "${old%.spdr}.json"
-  done
+  done || true
   echo "archive=${out}"
   echo "manifest=${manifest}"
 }

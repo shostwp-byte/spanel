@@ -871,6 +871,8 @@ PY
   echo "  2. Backups > Restore: choose the backup destination, select all accounts, Restore."
   echo "     This recreates the Linux accounts, websites, databases and mailboxes."
   echo "  3. Point DNS / the server IP at this machine (spanel change-ip <old> <new> if the IP changed)."
+  echo "  4. Backups > Panel self-backup: create and confirm a passphrase for this server"
+  echo "     (the old server's passphrase file is never inside the archive)."
 }
 
 menu() {
