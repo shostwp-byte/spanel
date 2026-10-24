@@ -163,7 +163,7 @@ def run_one(db, schedule: BackupSchedule, now: datetime | None = None) -> bool:
                 target_id=schedule.target_id,
                 remote_name_mode=getattr(schedule, "name_suffix", "full_date") if schedule.target_id else None,
                 full_every_n=sched_full_every,
-                encryption_passphrase=sched_passphrase,
+                passphrase=sched_passphrase,
             )
             target = _upload_if_configured(db, schedule, archive, username=user.username)
             if schedule.target_id:
