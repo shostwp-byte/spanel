@@ -23,7 +23,7 @@ from app.schemas.schemas import (
     UserUpdate,
 )
 from app.services.audit import log_action
-from app.services import demo_mode, mail, mariadb, nginx, site_users, ssl, storage_quota, teardown, waf, wordpress, notifications, panel_settings
+from app.services import db_backends, demo_mode, mail, nginx, site_users, ssl, storage_quota, teardown, waf, wordpress, notifications, panel_settings
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -223,7 +223,7 @@ def _remove_user_from_backup_schedules(db: Session, user_id: int) -> None:
 def _delete_owned_website(db: Session, website: Website) -> None:
     db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
     if db_item:
-        mariadb.drop_database(db_item.db_name, db_item.db_user)
+        db_backends.backend_for(db_item).drop_database(db_item.db_name, db_item.db_user)
     nginx.delete_wordpress_vhost(website.domain)
     # Deleting the owner deletes the site, so its certificate goes too - left
     # behind it would keep certbot renewing a name this server no longer serves.

@@ -248,6 +248,38 @@ def set_database_write_lock(db_name: str, db_user: str, locked: bool) -> None:
     _run_sql(sql, check=False)
 
 
+def account_lock_sql(db_user: str, locked: bool, client_host: str = "localhost") -> str:
+    """ALTER USER ... ACCOUNT LOCK/UNLOCK (MariaDB >= 10.4.2, MySQL >= 5.7.6)."""
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    clause = "ACCOUNT LOCK" if locked else "ACCOUNT UNLOCK"
+    return f"ALTER USER {_quote_sql_string(safe_user)}@{_quote_sql_string(client_host)} {clause};\n"
+
+
+def set_account_locked(db_user: str, locked: bool) -> None:
+    """Lock or unlock a customer's MariaDB account for suspend/unsuspend.
+
+    ACCOUNT LOCK only refuses new logins, so on lock the sessions the account
+    already has open are killed too - otherwise a suspended site's persistent
+    connections keep working until they happen to reconnect.
+    """
+    safe_user = _validate_identifier(db_user)
+    result = _run_sql(account_lock_sql(safe_user, locked), check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not {'lock' if locked else 'unlock'} MariaDB account '{safe_user}': {(result.stderr or '').strip()}"
+        )
+    if not locked or settings.command_dry_run:
+        return
+    res = _run_sql(
+        f"SELECT ID FROM information_schema.PROCESSLIST WHERE USER = {_quote_sql_string(safe_user)};\n",
+        check=False,
+    )
+    kills = [f"KILL CONNECTION {line.strip()};" for line in (res.stdout or "").splitlines() if line.strip().isdigit()]
+    if kills:
+        _run_sql("\n".join(kills) + "\n", check=False)
+
+
 def get_database_tables_breakdown(db_name: str) -> list[dict]:
     """Return top tables by size (data + index bytes) inside a specific database."""
     safe_db = _validate_identifier(db_name)

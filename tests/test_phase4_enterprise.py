@@ -526,9 +526,10 @@ def test_p2_fastcgi_cache_http3_limits_github_hmac_remote_mysql(tmp_path):
     assert site_apps.verify_github_webhook_signature(app_obj, raw_body, url_token_sig) is False
     assert site_apps.verify_github_webhook_signature(app_obj, raw_body, "") is False
 
-    # P2.5: Unrequested Remote MySQL provisioning is blocked with HTTP 501 in databases.py
+    # P2.5: Remote MySQL provisioning is a real feature now (tests/test_rdb_*.py
+    # cover its lifecycle); the 501 stub that stood in for it is gone.
     databases_api_text = (repo_root / "backend" / "app" / "api" / "databases.py").read_text(encoding="utf-8")
-    assert "status_code=501" in databases_api_text
+    assert "status_code=501" not in databases_api_text
 
 
 if __name__ == "__main__":

@@ -37,19 +37,20 @@ from __future__ import annotations
 import logging
 
 from app.models.entities import DatabaseAccount, SftpAccount, SiteApp, WebauthnCredential
-from app.services import mariadb, sftp_accounts, site_apps
+from app.services import db_backends, sftp_accounts, site_apps
 
 logger = logging.getLogger("spanel.teardown")
 
 
 def drop_database_record(db, db_item: DatabaseAccount) -> None:
-    """Drop the MariaDB database and account, then forget the panel row.
+    """Drop the database and account wherever they live (local MariaDB or a
+    remote host), then forget the panel row.
 
     The row goes even if the drop fails, so a MariaDB that is already missing
     the database cannot wedge an account deletion forever.
     """
     try:
-        mariadb.drop_database(db_item.db_name, db_item.db_user)
+        db_backends.backend_for(db_item).drop_database(db_item.db_name, db_item.db_user)
     finally:
         db.delete(db_item)
         db.flush()

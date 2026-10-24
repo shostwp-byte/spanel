@@ -7,7 +7,8 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.models.entities import DatabaseAccount, User, UserPackage, Website
-from app.services import mariadb, resource_monitor, storage_quota
+from app.services import db_backends, resource_monitor, storage_quota
+from app.services.remote_mysql import RemoteDatabaseError
 from app.services.audit import log_action
 
 router = APIRouter(prefix="/resources", tags=["resources"])
@@ -441,7 +442,10 @@ def toggle_database_write_lock(
     if current_user.role == Role.reseller and (not owner or owner.reseller_id != current_user.id):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    mariadb.set_database_write_lock(item.db_name, item.db_user, payload.locked)
+    try:
+        db_backends.backend_for(item).set_write_lock(item.db_name, item.db_user, payload.locked)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     item.write_locked = payload.locked
     item.write_locked_reason = (
         (payload.reason or f"MANUAL: Locked by {current_user.username}")
@@ -480,7 +484,10 @@ def inspect_database_tables(
         if current_user.role == Role.reseller and (not owner or owner.reseller_id != current_user.id):
             raise HTTPException(status_code=403, detail="Access denied")
 
-    tables = mariadb.get_database_tables_breakdown(item.db_name)
+    try:
+        tables = db_backends.backend_for(item).tables_breakdown(item.db_name)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {
         "id": item.id,
         "db_name": item.db_name,
@@ -507,7 +514,10 @@ def optimize_database_endpoint(
         if current_user.role == Role.reseller and (not owner or owner.reseller_id != current_user.id):
             raise HTTPException(status_code=403, detail="Access denied")
 
-    result = mariadb.optimize_database(item.db_name)
+    try:
+        result = db_backends.backend_for(item).optimize(item.db_name)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     resource_monitor.collect_and_enforce_mysql_quotas(db)
     storage_quota.forget_user_storage(item.owner_id)
     log_action(db, current_user.id, "optimize_database", item.db_name, request=request)
