@@ -19,6 +19,14 @@ fi
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# sudo keeps the caller's working directory, which for the API is the
+# spanel-owned backend/. `python3 - <<PY` puts the working directory first
+# on sys.path, so a planted json.py there would run as root. Start every
+# command from / and tell Python 3.11+ not to add the directory at all.
+cd /
+PYTHONSAFEPATH=1
+export PYTHONSAFEPATH
+
 ALLOWED_SERVICES=(nginx mariadb redis-server fail2ban clamav-daemon exim4 dovecot rspamd pdns maldet docker php5.6-fpm php7.4-fpm php8.0-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm spanel-api)
 ALLOWED_ACTIONS=(start stop restart reload status is-active is-enabled)
 HOME_ROOT="/home"
