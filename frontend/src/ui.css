@@ -2524,32 +2524,43 @@ table.table {
   }
 
   .aapanel-resources-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
     margin: 0 !important;
     gap: 8px !important;
   }
   .aapanel-resource-card {
-    padding: 11px 14px !important;
-    min-height: 64px !important;
+    padding: 10px 10px !important;
+    min-height: 62px !important;
     border-radius: 10px !important;
+    gap: 6px !important;
+  }
+  .aapanel-res-text {
+    min-width: 0 !important;
+    flex: 1 1 auto !important;
   }
   .aapanel-res-label {
-    font-size: 12px !important;
-    margin-bottom: 4px !important;
+    font-size: 11.5px !important;
+    margin-bottom: 3px !important;
   }
   .aapanel-res-detail {
-    font-size: 13px !important;
+    font-size: 11.5px !important;
+    line-height: 1.25 !important;
+    word-break: break-word !important;
   }
   .aapanel-res-value {
-    font-size: 17px !important;
+    font-size: 15px !important;
+    white-space: nowrap !important;
+    flex-shrink: 0 !important;
   }
   .aapanel-res-donut {
-    width: 44px !important;
-    height: 44px !important;
+    width: 38px !important;
+    height: 38px !important;
+    flex-shrink: 0 !important;
   }
   .aapanel-res-donut-inner {
-    width: 34px !important;
-    height: 34px !important;
-    font-size: 11px !important;
+    width: 29px !important;
+    height: 29px !important;
+    font-size: 10.5px !important;
   }
 
   /* DirectAdmin Feature Grid on Tablet & Mobile */
@@ -2673,7 +2684,7 @@ table.table {
     gap: 4px !important;
   }
   .aapanel-resources-grid {
-    grid-template-columns: 1fr !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
     gap: 8px !important;
     margin: 0 !important;
   }
