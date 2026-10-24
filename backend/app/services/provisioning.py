@@ -336,8 +336,10 @@ def apply_account_limits(user: User, package, limits=None) -> None:
 
     The package side is the panel's own rule (api/users.py) so an account
     made by a billing system is limited exactly like one made in the panel:
-    terminal, SFTP sub-accounts, mailboxes, cgroup and MySQL limits included,
-    not only websites and disk as before.
+    terminal, SFTP sub-accounts, mailboxes and bandwidth too, not only
+    websites and disk as before. (The CPU/memory/IO and MySQL fields it also
+    copies are not mapped columns on User, for panel-made users either; the
+    database limit falls back to the package where it is enforced.)
     """
     from app.api.users import _apply_package_limits
 
