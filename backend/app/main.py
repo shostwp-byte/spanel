@@ -13,12 +13,14 @@ from app.api import remote_mysql as remote_mysql_api
 from app.core.config import settings
 from app.core.database import run_migrations
 from app.core.version import APP_VERSION
-from app.services import panel_settings as panel_brand_settings, auto_updater, resource_monitor, cluster_worker
+from app.services import panel_settings as panel_brand_settings, auto_updater, resource_monitor, cluster_worker, webhooks as webhooks_service
 
 run_migrations()
 auto_updater.start_auto_update_daemon()
 resource_monitor.start_resource_monitor_daemon()
 cluster_worker.start_cluster_daemon()
+# Delivers queued webhooks and retries failed ones (services/webhooks.py).
+webhooks_service.start_webhook_worker()
 
 logger = logging.getLogger("spanel")
 

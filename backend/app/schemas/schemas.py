@@ -1667,6 +1667,14 @@ class DaBulkImportRequest(BaseModel):
     archive_paths: list[str]
     force: bool = False
 
+class ProvisioningLimits(BaseModel):
+    """Per-account overrides of the package limits, e.g. from WHMCS
+    configurable options. Each field left out keeps the package value; 0 means
+    unlimited, as it does on the package."""
+    storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    bandwidth_limit_mb: Optional[int] = Field(default=None, ge=0, le=1_000_000_000)
+    website_limit: Optional[int] = Field(default=None, ge=0, le=100_000)
+
 class ProvisioningAccountCreate(BaseModel):
     external_id: str = Field(min_length=1, max_length=255)
     username: str = Field(min_length=3, max_length=32, pattern=r"^[a-z_][a-z0-9_-]{2,31}$")
@@ -1679,6 +1687,9 @@ class ProvisioningAccountCreate(BaseModel):
     install_wordpress: bool = False
     enable_ssl: bool = False
     is_reseller: bool = False
+    # Reseller quota package (ResellerPackage.id); only for is_reseller.
+    reseller_package_id: Optional[int] = Field(default=None, ge=1)
+    limits: Optional[ProvisioningLimits] = None
 
     @field_validator("username")
     @classmethod
@@ -1723,9 +1734,21 @@ class ProvisioningAccountOut(BaseModel):
     status: str
     panel_url: Optional[str] = None
     created_at: Optional[datetime] = None
+    # Only in the response to the create that set it: the account's own
+    # SFTP/SSH password, never stored readable by the panel.
+    sftp_password: Optional[str] = None
+    is_reseller: bool = False
+    reseller_package_id: Optional[int] = None
+    last_action: str = ""
 
     class Config:
         from_attributes = True
+
+class ProvisioningAccountList(BaseModel):
+    items: list[ProvisioningAccountOut]
+    total: int
+    page: int
+    per_page: int
 
 class ProvisioningSuspendRequest(BaseModel):
     reason: str = ""
@@ -1735,11 +1758,23 @@ class ProvisioningPasswordChange(BaseModel):
 
 class ProvisioningPackageChange(BaseModel):
     package_id: int = Field(ge=1)
+    reseller_package_id: Optional[int] = Field(default=None, ge=1)
+    limits: Optional[ProvisioningLimits] = None
 
 class ApiTokenCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     scopes: str = "provisioning:read,provisioning:write"
+    # Addresses and CIDR ranges, comma separated. Empty allows any address.
     allowed_ips: str = ""
+    # None keeps the token valid until revoked, as tokens always were.
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    # 0 uses the panel default.
+    rate_limit_per_minute: int = Field(default=0, ge=0, le=6000)
+
+class ApiTokenRotate(BaseModel):
+    # How long the old token keeps working after the new one is issued, so the
+    # billing system can be switched over without failed calls. 0 = at once.
+    grace_minutes: int = Field(default=0, ge=0, le=10080)
 
 class ApiTokenOut(BaseModel):
     id: int
@@ -1749,6 +1784,9 @@ class ApiTokenOut(BaseModel):
     is_active: bool
     last_used_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    rate_limit_per_minute: int = 0
 
     class Config:
         from_attributes = True
@@ -1766,6 +1804,8 @@ class ProvisioningUsageOut(BaseModel):
     database_count: int
     bandwidth_used_bytes: int = 0
     bandwidth_limit_bytes: Optional[int] = None
+    # Accounts a reseller owns; their usage is included in the figures above.
+    user_count: int = 0
 
 
 class McpTokenCreate(BaseModel):

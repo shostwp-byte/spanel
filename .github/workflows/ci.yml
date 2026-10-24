@@ -53,6 +53,31 @@ jobs:
           done
           exit $status
 
+  whmcs-module:
+    name: WHMCS module (PHP ${{ matrix.php }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest and newest PHP the module supports (WHMCS 8.x range).
+        php: ["7.4", "8.3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: none
+          coverage: none
+      - name: php -l on the module and its test harness
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            php -l "$f" || status=1
+          done < <(find modules tests/php -name '*.php' -print0)
+          exit $status
+      - name: Module test harness
+        run: php tests/php/spanel_module_test.php
+
   frontend:
     name: Frontend build
     runs-on: ubuntu-24.04
