@@ -57,8 +57,8 @@ server {
     if ($request_uri ~* "/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?\.xml|/cart/|/checkout/|/my-account/|/wc-api/|/addons/") { set $spanel_skip_cache 1; }
     if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wordpress_logged_in|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|edd_items_in_cart") { set $spanel_skip_cache 1; }
     add_header X-FastCGI-Cache $upstream_cache_status always;
-    add_header Alt-Svc 'h3=":443"; ma=86400' always;
-    # SPANEL FASTCGI CACHE SERVER END
+{% if http3_enabled %}    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+{% endif %}    # SPANEL FASTCGI CACHE SERVER END
 
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
