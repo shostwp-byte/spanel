@@ -311,11 +311,8 @@ FASTCGI_CACHE_SERVER_BLOCK = """    # SPANEL FASTCGI CACHE SERVER BEGIN
 
 
 def _fastcgi_cache_server_block() -> str:
-    if _nginx_supports_http3():
-        return FASTCGI_CACHE_SERVER_BLOCK.replace(
-            "    add_header X-FastCGI-Cache $upstream_cache_status always;\n",
-            "    add_header X-FastCGI-Cache $upstream_cache_status always;\n    add_header Alt-Svc 'h3=\":443\"; ma=86400' always;\n",
-        )
+    # Alt-Svc is emitted exclusively by _listen_443_directives() on SSL server blocks
+    # so HTTP-only vhosts never advertise h3=":443" and SSL vhosts never emit duplicate Alt-Svc headers.
     return FASTCGI_CACHE_SERVER_BLOCK
 # Kept byte-identical to the block in templates/nginx/wordpress.conf.j2: this
 # copy is injected into vhosts that already exist, that one renders new ones,
@@ -397,8 +394,11 @@ def _listen_443_directives(
     ipv6: Optional[bool] = None,
     domain: str = "",
     reuseport: Optional[bool] = None,
+    include_reuseport: Optional[bool] = None,
 ) -> list[str]:
     """Build TCP 443 (SSL/HTTP2) and optional UDP 443 (QUIC/HTTP3) listen directives."""
+    if reuseport is None and include_reuseport is not None:
+        reuseport = include_reuseport
     prefix = f"{ip_address}:" if ip_address and ip_address != "*" else ""
     has_http3 = _nginx_supports_http3()
     directives = [f"listen {prefix}443 ssl http2;"]
@@ -413,6 +413,34 @@ def _listen_443_directives(
     if has_http3:
         directives.append("add_header Alt-Svc 'h3=\":443\"; ma=86400' always;")
     return directives
+
+
+def _ensure_quic_reuseport_owner() -> None:
+    """Ensure that if a vhost carrying `quic reuseport` was deleted, the first remaining QUIC vhost inherits it."""
+    conf_dir = Path("/etc/nginx/conf.d")
+    if not conf_dir.is_dir():
+        return
+    try:
+        conf_files = sorted(conf_dir.glob("*.conf"))
+        contents = {cf: cf.read_text(encoding="utf-8", errors="ignore") for cf in conf_files}
+    except OSError:
+        return
+    for plain_tok, rp_tok in (
+        ("listen 443 quic;", "listen 443 quic reuseport;"),
+        ("listen [::]:443 quic;", "listen [::]:443 quic reuseport;"),
+    ):
+        if any(rp_tok in text for text in contents.values()):
+            continue
+        for cf in conf_files:
+            text = contents[cf]
+            if plain_tok in text:
+                updated = text.replace(plain_tok, rp_tok, 1)
+                try:
+                    cf.write_text(updated, encoding="utf-8")
+                    contents[cf] = updated
+                except OSError:
+                    pass
+                break
 
 # Block-opening directives that nest scopes; matched against the original
 # text so the trailing ``{`` is preserved.
@@ -1032,6 +1060,8 @@ def _merge_certbot_ssl_config(new_content: str, existing_content: str) -> str:
             seen_ssl_lines.add(line.strip())
     https_lines = []
     for line in new_content.splitlines():
+        if "add_header Alt-Svc " in line:
+            continue
         if f"    {listen80}" in line:
             https_lines.append(line.replace(f"    {listen80}", listen443_block))
         else:
@@ -1071,6 +1101,8 @@ def apply_manual_ssl_config(new_content: str, cert_path: str, key_path: str, ca_
     https_lines = []
     inserted = False
     for line in new_content.splitlines():
+        if "add_header Alt-Svc " in line:
+            continue
         if f"    {listen80}" in line:
             https_lines.append(line.replace(f"    {listen80}", listen443_block))
         else:
@@ -1701,6 +1733,7 @@ def delete_wordpress_vhost(domain: str):
         return str(target)
     target.unlink(missing_ok=True)
     _delete_custom_include(domain)
+    _ensure_quic_reuseport_owner()
     shell.privileged("nginx-reload", fallback=["bash", "-lc", "nginx -t && systemctl reload nginx"])
     return str(target)
 
