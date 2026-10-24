@@ -28,7 +28,25 @@ def test_pillar5_woocommerce_fastcgi_cache_and_http3_quic():
     assert "/cart/|/checkout/|/my-account/|/wc-api/|/addons/" in tpl_text
     assert "utm_[a-z]+" in tpl_text and "fbclid=" in tpl_text and "gclid=" in tpl_text
     assert "add-to-cart=|wc-ajax=" in tpl_text
-    assert 'add_header Alt-Svc \'h3=":443"; ma=86400\' always;' in tpl_text
+    # Alt-Svc belongs to the HTTPS listen block, not the cache block: a plain
+    # HTTP vhost or an Nginx without the v3 module must not advertise h3.
+    assert "Alt-Svc" not in tpl_text
+    assert "Alt-Svc" not in FASTCGI_CACHE_SERVER_BLOCK
+
+
+def test_alt_svc_only_with_quic(monkeypatch):
+    from app.services import nginx
+
+    monkeypatch.setattr(nginx, "_nginx_supports_http3", lambda: False)
+    block = nginx._https_listen_block("203.0.113.5")
+    assert "listen 203.0.113.5:443 ssl http2;" in block
+    assert "quic" not in block
+    assert "Alt-Svc" not in block
+
+    monkeypatch.setattr(nginx, "_nginx_supports_http3", lambda: True)
+    block = nginx._https_listen_block("203.0.113.5")
+    assert "listen 203.0.113.5:443 quic;" in block
+    assert "add_header Alt-Svc 'h3=\":443\"; ma=86400' always;" in block
 
 
 def test_pillar5_slow_query_and_php_slowlog_inspector():

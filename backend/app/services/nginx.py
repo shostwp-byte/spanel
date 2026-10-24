@@ -307,7 +307,6 @@ FASTCGI_CACHE_SERVER_BLOCK = """    # SPANEL FASTCGI CACHE SERVER BEGIN
     if ($request_uri ~* "/wp-admin/|/wp-login.php|/xmlrpc.php|wp-.*.php|/feed/|sitemap(_index)?\\.xml|/cart/|/checkout/|/my-account/|/wc-api/|/addons/") { set $spanel_skip_cache 1; }
     if ($http_cookie ~* "comment_author|wordpress_[a-f0-9]+|wordpress_logged_in|wp-postpass|woocommerce_items_in_cart|woocommerce_cart_hash|wp_woocommerce_session|edd_items_in_cart") { set $spanel_skip_cache 1; }
     add_header X-FastCGI-Cache $upstream_cache_status always;
-    add_header Alt-Svc 'h3=":443"; ma=86400' always;
     # SPANEL FASTCGI CACHE SERVER END"""
 # Kept byte-identical to the block in templates/nginx/wordpress.conf.j2: this
 # copy is injected into vhosts that already exist, that one renders new ones,
@@ -378,6 +377,19 @@ def _listen_443_directives(ip_address: str = "*", ipv6: Optional[bool] = None) -
         if has_http3:
             directives.append("listen [::]:443 quic;")
     return directives
+
+
+def _https_listen_block(ip_address: str = "*") -> str:
+    """The lines that replace `listen 80;` when a vhost is switched to HTTPS.
+
+    Alt-Svc tells browsers to retry over HTTP/3, so it is only sent from a
+    server that also listens for QUIC. Advertising h3 from an Nginx built
+    without the v3 module makes clients attempt a protocol nobody answers.
+    """
+    lines = [f"    {d}" for d in _listen_443_directives(ip_address)]
+    if _nginx_supports_http3():
+        lines.append("    add_header Alt-Svc 'h3=\":443\"; ma=86400' always;")
+    return "\n".join(lines)
 
 # Block-opening directives that nest scopes; matched against the original
 # text so the trailing ``{`` is preserved.
@@ -982,8 +994,7 @@ def _merge_certbot_ssl_config(new_content: str, existing_content: str) -> str:
         server_name = new_content.split("server_name ", 1)[1].split(";", 1)[0].strip()
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443_lines = [f"    {d}" for d in _listen_443_directives(ip_address)]
-    listen443_block = "\n".join(listen443_lines)
+    listen443_block = _https_listen_block(ip_address)
     ssl_lines = []
     seen_ssl_lines = set()
     for line in existing_content.splitlines():
@@ -1021,8 +1032,7 @@ def apply_manual_ssl_config(new_content: str, cert_path: str, key_path: str, ca_
         server_name = new_content.split("server_name ", 1)[1].split(";", 1)[0].strip()
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443_lines = [f"    {d}" for d in _listen_443_directives(ip_address)]
-    listen443_block = "\n".join(listen443_lines)
+    listen443_block = _https_listen_block(ip_address)
     ssl_lines = [
         f"    ssl_certificate {fullchain if ca else cert};",
         f"    ssl_certificate_key {key};",
