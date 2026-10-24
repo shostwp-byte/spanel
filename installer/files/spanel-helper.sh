@@ -4176,12 +4176,13 @@ upgrade_php_version() {
     [[ -n "$pkg" ]] && installed_pkgs+=("$pkg")
   done < <(dpkg-query -W -f='${Package}\t${Status}\n' "php${version}-*" "php${version}" 2>/dev/null | awk -F'\t' '$2 == "install ok installed" {print $1}')
   if [[ ${#installed_pkgs[@]} -gt 0 ]]; then
+    # Unhold only clears pins left by earlier builds. The packages are not held
+    # again afterwards: a hold makes unattended-upgrades skip them, and nothing
+    # in SPanel patches PHP on a schedule, so a hold would leave security fixes
+    # waiting for an admin to press the button.
     apt-mark unhold "${installed_pkgs[@]}" >/dev/null 2>&1 || true
-    apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${installed_pkgs[@]}" || {
-      apt-mark hold "${installed_pkgs[@]}" >/dev/null 2>&1 || true
-      deny "Failed to upgrade PHP ${version} packages"
-    }
-    apt-mark hold "${installed_pkgs[@]}" >/dev/null 2>&1 || true
+    apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${installed_pkgs[@]}" \
+      || deny "Failed to upgrade PHP ${version} packages"
   fi
   if command -v "php-fpm${version}" >/dev/null 2>&1; then
     "php-fpm${version}" -t >/dev/null 2>&1 || deny "php-fpm${version} configuration test failed after upgrade"

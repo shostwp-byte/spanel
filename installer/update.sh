@@ -1509,6 +1509,19 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
     fi
+    # Build c7c7db7 pinned the core stack and PHP with apt-mark hold after every
+    # panel-driven upgrade, which stops unattended-upgrades from applying their
+    # security fixes. Release those pins once; the marker keeps a hold an admin
+    # sets by hand later from being undone on the next update.
+    if [[ ! -f /var/lib/spanel/.apt-holds-released ]] && command -v apt-mark >/dev/null 2>&1; then
+      mapfile -t spanel_held < <(apt-mark showhold 2>/dev/null | grep -E '^(php[0-9]+\.[0-9]+(-.*)?|nginx|mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|postfix|dovecot-core|rspamd|openssl|fail2ban)$' || true)
+      if [[ ${#spanel_held[@]} -gt 0 ]]; then
+        apt-mark unhold "${spanel_held[@]}" >/dev/null 2>&1 || true
+        echo "Released apt holds set by SPanel: ${spanel_held[*]}"
+      fi
+      install -d -m 0755 /var/lib/spanel
+      touch /var/lib/spanel/.apt-holds-released
+    fi
     install -m 0440 -o root -g root  "$SOURCE_DIR/installer/files/spanel-sudoers"   /etc/sudoers.d/spanel
     visudo -c -f /etc/sudoers.d/spanel >/dev/null
     sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper wp --info >/dev/null
