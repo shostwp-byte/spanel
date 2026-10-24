@@ -1,7 +1,7 @@
 """Remote MySQL hosts in the panel database; databases remember their host
 
 Revision ID: rdb_remote_hosts
-Revises: 0045_enterprise_audit_watchdog
+Revises: isolation_resource_limits
 Create Date: 2026-10-24 09:00:00.000000
 
 Remote database hosts used to live in /var/lib/spanel/multi-server.json next
@@ -22,7 +22,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "rdb_remote_hosts"
-down_revision: Union[str, None] = "0045_enterprise_audit_watchdog"
+down_revision: Union[str, None] = "isolation_resource_limits"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

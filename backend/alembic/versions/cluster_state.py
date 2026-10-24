@@ -1,7 +1,7 @@
 """Cluster: zone origins, DNS sync outbox, account transfer jobs
 
 Revision ID: cluster_state
-Revises: 0045_enterprise_audit_watchdog
+Revises: rdb_remote_hosts
 Create Date: 2026-10-24 10:00:00.000000
 
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "cluster_state"
-down_revision: Union[str, None] = "0045_enterprise_audit_watchdog"
+down_revision: Union[str, None] = "rdb_remote_hosts"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

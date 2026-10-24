@@ -1,7 +1,7 @@
 """Provisioning API hardening and webhook outbox: token expiry, rate limit, creator, idempotency keys, webhook_outbox
 
 Revision ID: api_hardening
-Revises: 0045_enterprise_audit_watchdog
+Revises: cluster_state
 Create Date: 2026-10-24 10:00:00.000000
 
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "api_hardening"
-down_revision: Union[str, None] = "0045_enterprise_audit_watchdog"
+down_revision: Union[str, None] = "cluster_state"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
