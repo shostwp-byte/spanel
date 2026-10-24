@@ -1,12 +1,15 @@
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.core.database import get_db
 from app.core.permissions import Role, ensure_role
 from app.models.entities import User
 from app.schemas.schemas import SystemAutoUpdateConfig
-from app.services import updates, auto_updater, php
+from app.services import updates, auto_updater, maintenance_window, php
+from app.services.audit import log_action
 
 router = APIRouter(prefix="/updates", tags=["updates"])
 
@@ -190,6 +193,50 @@ def acknowledge_php_update_notifications(
 
 class CoreStackUpgradePayload(BaseModel):
     packages: Optional[list[str]] = None
+
+
+class CoreStackSchedulePayload(BaseModel):
+    enabled: Optional[bool] = None
+    window: Optional[str] = None
+    weekdays: Optional[list[int]] = None
+    packages: Optional[list[str]] = None
+
+
+class MaintenanceWindowPayload(BaseModel):
+    window_minutes: Optional[int] = None
+    core_stack: Optional[CoreStackSchedulePayload] = None
+
+
+@router.get("/maintenance-window")
+def get_maintenance_window(current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return maintenance_window.overview()
+
+
+@router.put("/maintenance-window")
+def save_maintenance_window(
+    payload: MaintenanceWindowPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    changes = payload.model_dump(exclude_unset=True)
+    try:
+        config = maintenance_window.save_config(changes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # The blacklist follows the schedule: while the panel patches these
+    # packages, unattended-upgrades must leave them alone, and when it stops,
+    # they go back to the OS.
+    core = config["core_stack"]
+    result = updates.set_core_stack_blacklist(core["enabled"], core["packages"])
+    log_action(db, current_user.id, "update_maintenance_window", "core_stack",
+               f"enabled={core['enabled']} window={core['window']} packages={','.join(core['packages'])}",
+               request=request)
+    overview = maintenance_window.overview()
+    overview["blacklist_applied"] = result.returncode == 0
+    return overview
 
 
 @router.get("/core-stack/status")

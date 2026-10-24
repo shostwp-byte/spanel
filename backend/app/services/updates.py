@@ -681,8 +681,39 @@ def check_core_stack_updates() -> dict:
     }
 
 
-def upgrade_core_stack_packages(packages: Optional[list[str]] = None, hold_packages: bool = False) -> dict:
-    """Safely upgrade selected (or all) Core Infrastructure Stack packages using --only-upgrade, pre/post syntax check and zero-downtime reload."""
+CORE_STACK_RESULT_RE = re.compile(r"^(upgraded|post_check|reloaded)=([A-Za-z0-9.,:+_-]*)$")
+
+
+def parse_core_stack_output(stdout: str) -> dict:
+    """What the helper says it did: `upgraded=a,b`, `post_check=ok|failed:...`,
+    `reloaded=a,b`, one per line. Anything else is apt's own chatter."""
+    found: dict = {"upgraded": [], "reloaded": [], "post_check": ""}
+    for line in (stdout or "").splitlines():
+        match = CORE_STACK_RESULT_RE.match(line.strip())
+        if not match:
+            continue
+        key, value = match.groups()
+        if key == "post_check":
+            found["post_check"] = value
+        else:
+            found[key] = [item for item in value.split(",") if item]
+    return found
+
+
+def upgrade_core_stack_packages(packages: Optional[list[str]] = None, trigger: str = "manual") -> dict:
+    """Upgrade selected (or all) core stack packages through the helper.
+
+    Everything that needs root happens there in one place: nginx -t before
+    apt is touched, `apt-get install --only-upgrade`, nginx -t again, and a
+    reload of each service whose package version actually changed. These
+    checks used to run here as the panel account, where `systemctl reload`
+    is refused and `nginx -t` cannot read the certificates - so every run
+    reported a warning whatever happened.
+
+    Packages are no longer put on hold afterwards: a hold also stops security
+    updates, and unattended-upgrades is kept away from these packages by a
+    Package-Blacklist instead (see set_core_stack_blacklist).
+    """
     allowed_map = {item["pkg"]: item for item in CORE_STACK_SERVICES}
     if packages:
         target_pkgs = [p for p in packages if p in allowed_map]
@@ -691,92 +722,69 @@ def upgrade_core_stack_packages(packages: Optional[list[str]] = None, hold_packa
     if not target_pkgs:
         raise ValueError("Không có gói hạ tầng hợp lệ để cập nhật.")
 
-    is_linux = os.name != "nt" and Path("/usr/bin/apt-get").exists()
-    upgraded_labels = [allowed_map[p]["label"] for p in target_pkgs]
-
-    if is_linux:
-        # 1. Pre-upgrade configuration validation before touching any packages
-        for p in target_pkgs:
-            svc = allowed_map[p]
-            if svc["precheck"]:
-                pre_res = subprocess.run(
-                    ["bash", "-lc", svc["precheck"]],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=10,
-                )
-                if pre_res.returncode != 0:
-                    err_detail = (pre_res.stderr or pre_res.stdout or "syntax error").strip()[:200]
-                    raise RuntimeError(f"Kiểm tra cấu hình trước cập nhật thất bại cho {svc['label']}: {err_detail}")
-
-        # 2. Selective upgrade via helper (`updates-core-stack-patch`) with apt-mark unhold -> --only-upgrade
-        pkg_str = " ".join(target_pkgs)
-        hold_cmd = f"apt-mark hold {pkg_str} >/dev/null 2>&1 || true; " if hold_packages else ""
-        cmd = (
-            f"apt-mark unhold {pkg_str} >/dev/null 2>&1 || true; "
-            f"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
-            f"DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "
-            f"-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pkg_str}; "
-            f"rc=$?; {hold_cmd}exit $rc"
-        )
-        helper_args = (["--hold"] if hold_packages else []) + target_pkgs
-        res = shell.privileged(
-            "updates-core-stack-patch",
-            helper_args=helper_args,
-            check=False,
-            fallback=["bash", "-lc", cmd],
-        )
-        rc = res.returncode
-
-        # 3. Post-upgrade configuration validation & zero-downtime reload
-        if rc == 0:
-            for p in target_pkgs:
-                svc = allowed_map[p]
-                if svc["precheck"]:
-                    post_res = subprocess.run(
-                        ["bash", "-lc", svc["precheck"]],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=10,
-                    )
-                    if post_res.returncode != 0:
-                        rc = post_res.returncode
-                        continue
-                if svc["reload"]:
-                    reload_res = subprocess.run(
-                        ["bash", "-lc", svc["reload"]],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=10,
-                    )
-                    if reload_res.returncode != 0 and rc == 0:
-                        rc = reload_res.returncode
+    res = shell.privileged(
+        "updates-core-stack-patch",
+        helper_args=target_pkgs,
+        check=False,
+        fallback=["bash", "-lc", "echo upgraded=; echo post_check=ok"],
+        timeout=3600,
+    )
+    parsed = parse_core_stack_output(res.stdout)
+    ok = res.returncode == 0 and not parsed["post_check"].startswith("failed")
+    upgraded = [p for p in parsed["upgraded"] if p in allowed_map]
+    labels = [allowed_map[p]["label"] for p in upgraded]
+    if not ok:
+        lines = (res.stderr or res.stdout or "").strip().splitlines()
+        detail = parsed["post_check"] or sanitize_update_text(lines[-1] if lines else "helper failed")
+        summary = f"Cập nhật Core Stack thất bại: {detail[:300]}"
+    elif upgraded:
+        summary = (f"Đã cập nhật an toàn {len(upgraded)} thành phần Core Stack: "
+                   f"{', '.join(labels[:4])}{'...' if len(labels) > 4 else ''}.")
     else:
-        rc = 0
+        summary = "Không có bản cập nhật mới cho các gói Core Stack đã chọn."
 
-    summary = f"Đã cập nhật & đồng bộ an toàn (Zero-Downtime) cho {len(target_pkgs)} thành phần Core Stack: {', '.join(upgraded_labels[:4])}{'...' if len(upgraded_labels) > 4 else ''}."
     state = _read_update_state()
     history = state.get("core_stack_history") if isinstance(state.get("core_stack_history"), list) else []
     history.insert(0, {
         "id": f"core-{int(time.time())}",
         "timestamp": _utc_now(),
         "packages": target_pkgs,
-        "apt_hold_enforced": bool(hold_packages),
+        "upgraded": upgraded,
+        "reloaded": parsed["reloaded"],
+        "trigger": trigger if trigger in {"manual", "scheduled"} else "manual",
         "summary": summary,
-        "status": "completed" if rc == 0 else "warning",
+        "status": "completed" if ok else "failed",
     })
     state["core_stack_history"] = history[:20]
     _write_update_state(state)
 
     return {
-        "status": "completed" if rc == 0 else "warning",
-        "apt_hold_enforced": bool(hold_packages),
+        "status": "completed" if ok else "failed",
+        "upgraded": upgraded,
+        "reloaded": parsed["reloaded"],
         "summary": summary,
         "core_stack": check_core_stack_updates(),
     }
+
+
+def set_core_stack_blacklist(enabled: bool, packages: Optional[list[str]] = None):
+    """Keep unattended-upgrades off the packages the panel patches itself.
+
+    Two mechanisms upgrading nginx is one too many: unattended-upgrades does
+    not run nginx -t and does not know the panel's window. While scheduled
+    core stack patching is on, the helper writes a Package-Blacklist for the
+    selected packages; turning it off removes the file and hands them back.
+    """
+    allowed = {item["pkg"] for item in CORE_STACK_SERVICES}
+    selected = [p for p in (packages or []) if p in allowed]
+    if enabled and not selected:
+        enabled = False
+    return shell.privileged(
+        "updates-core-blacklist",
+        helper_args=(["on", *selected] if enabled else ["off"]),
+        check=False,
+        fallback=["bash", "-lc", "echo core stack blacklist unchanged (no helper)"],
+    )
 
 
 def run_os_update():

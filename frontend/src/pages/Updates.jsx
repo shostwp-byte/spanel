@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
+import { MaintenanceWindowCard } from '../components/MaintenanceWindowCard.jsx';
 
 const UPDATE_STEPS = [
   { key: 'snapshot', label: '1. Tạo Snapshot Dự phòng', minPct: 10 },
@@ -1188,6 +1189,8 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         )}
       </div>
+
+      <MaintenanceWindowCard request={request} setNotice={setNotice} loading={loading} />
 
       {/* 4D. Smart Core Infrastructure Auto-Patch Card */}
       {coreServices.length > 0 && (

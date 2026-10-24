@@ -35,6 +35,8 @@ EVENTS: dict[str, dict] = {
                              "hint": "When new minor/security releases exist for installed PHP branches."},
     "backup_failed_admin": {"audience": ADMIN, "label": "A scheduled backup failed",
                             "hint": "Any schedule on the server, with the error."},
+    "maintenance_job_failed": {"audience": ADMIN, "label": "A maintenance window job failed",
+                               "hint": "Scheduled panel update, core stack or PHP patching, panel self-backup, backup verification."},
     "malware_found_admin": {"audience": ADMIN, "label": "Malware found",
                             "hint": "Any scan on the server that finds something."},
     "ssl_expiring_admin": {"audience": ADMIN, "label": "Certificates about to expire",
@@ -117,6 +119,15 @@ def _backup_failed(p: dict, lang: str) -> tuple[str, list[str]]:
                 ["Lần chạy backup theo lịch không hoàn tất:", *_listed(errors, "...và {n} lỗi khác", "", lang)])
     return (f"Scheduled backup failed ({p.get('when', '')})",
             ["The scheduled backup did not complete:", *_listed(errors, "", "...and {n} more", lang)])
+
+
+def _maintenance_job_failed(p: dict, lang: str) -> tuple[str, list[str]]:
+    detail = str(p.get("detail") or "")[:600]
+    if lang == "vi":
+        return (f"Tác vụ bảo trì thất bại: {p.get('job', '')}",
+                [f"Lúc {p.get('when', '')}.", detail, "Xem trang Cập nhật hệ thống > Khung giờ bảo trì."])
+    return (f"Maintenance job failed: {p.get('job', '')}",
+            [f"At {p.get('when', '')}.", detail, "See Updates > Maintenance window."])
 
 
 def _malware_found(p: dict, lang: str) -> tuple[str, list[str]]:
@@ -227,6 +238,7 @@ _RENDER: dict[str, Callable[[dict, str], tuple[str, list[str]]]] = {
     "php_security_updated": _php_security_updated,
     "php_update_available": _php_update_available,
     "backup_failed_admin": _backup_failed,
+    "maintenance_job_failed": _maintenance_job_failed,
     "malware_found_admin": _malware_found,
     "ssl_expiring_admin": _ssl_expiring,
     "login_new_ip": _login_new_ip,

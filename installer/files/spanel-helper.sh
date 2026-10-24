@@ -405,19 +405,96 @@ run_os_update() {
   echo "OS update started in background. Log: /var/log/spanel-os-update.log"
 }
 
+CORE_STACK_BLACKLIST_FILE="/etc/apt/apt.conf.d/52spanel-core-stack-blacklist"
+
+# The unit to reload after a core stack package changed version. Empty where
+# the package's own postinst already restarts the daemon (MariaDB, Redis,
+# PowerDNS) or there is no daemon (openssl).
+core_stack_reload_unit() {
+  case "$1" in
+    nginx) echo nginx ;;
+    exim4-daemon-heavy) echo exim4 ;;
+    dovecot-core) echo dovecot ;;
+    rspamd) echo rspamd ;;
+    fail2ban) echo fail2ban ;;
+    *) echo "" ;;
+  esac
+}
+
+# Package-Blacklist entries for one core stack package: the binary packages
+# that come from the same source and move together. unattended-upgrades
+# matches each entry as a Python regex anchored at the start of the name.
+core_stack_blacklist_patterns() {
+  case "$1" in
+    nginx) printf '%s\n' '^nginx$' '^nginx-(common|core|full|light|extras)$' '^libnginx-mod-' ;;
+    mariadb-server) printf '%s\n' '^mariadb-' '^libmariadb' '^mysql-common$' ;;
+    redis-server) printf '%s\n' '^redis-(server|tools)$' ;;
+    pdns-server) printf '%s\n' '^pdns-' ;;
+    exim4-daemon-heavy) printf '%s\n' '^exim4' ;;
+    dovecot-core) printf '%s\n' '^dovecot-' ;;
+    rspamd) printf '%s\n' '^rspamd$' ;;
+    openssl) printf '%s\n' '^openssl$' '^libssl3' ;;
+    fail2ban) printf '%s\n' '^fail2ban$' ;;
+    *) return 1 ;;
+  esac
+}
+
+# The apt.conf.d snippet that keeps unattended-upgrades off the packages the
+# panel patches itself, so exactly one mechanism upgrades them: the panel's,
+# inside its maintenance window and with nginx -t before and after.
+render_core_blacklist() {
+  local pkg pattern
+  echo "// Managed by SPanel. These packages are patched by the panel's scheduled"
+  echo "// core stack patching (maintenance window, nginx -t before and after);"
+  echo "// turning that off in Updates removes this file."
+  echo "Unattended-Upgrade::Package-Blacklist {"
+  for pkg in "$@"; do
+    while IFS= read -r pattern; do
+      [[ -n "$pattern" ]] && printf '    "%s";\n' "$pattern"
+    done < <(core_stack_blacklist_patterns "$pkg")
+  done
+  echo "};"
+}
+
+set_core_stack_blacklist() {
+  local mode="${1:-}" pkg tmp
+  shift || true
+  case "$mode" in
+    off)
+      [[ $# -eq 0 ]] || deny "usage: updates-core-blacklist off"
+      rm -f "$CORE_STACK_BLACKLIST_FILE"
+      echo "core stack blacklist removed"
+      ;;
+    on)
+      [[ $# -ge 1 ]] || deny "usage: updates-core-blacklist on <pkg> [pkg...]"
+      for pkg in "$@"; do
+        core_stack_blacklist_patterns "$pkg" >/dev/null || deny "core stack package not allowed: $pkg"
+      done
+      install -d -m 0755 /etc/apt/apt.conf.d
+      tmp="$(mktemp "${CORE_STACK_BLACKLIST_FILE}.XXXXXX")"
+      render_core_blacklist "$@" >"$tmp"
+      chmod 0644 "$tmp"
+      mv -f "$tmp" "$CORE_STACK_BLACKLIST_FILE"
+      echo "core stack blacklist written: $*"
+      ;;
+    *)
+      deny "usage: updates-core-blacklist <on|off> [pkg...]"
+      ;;
+  esac
+}
+
 upgrade_core_stack_packages() {
   export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
-  local valid_pkgs=() pkg need_nginx_check=0 hold_after=0
+  local valid_pkgs=() pkg need_nginx_check=0 unit after
+  local changed=() reloaded=()
+  declare -A before=()
   for pkg in "$@"; do
     case "$pkg" in
-      --hold)
-        hold_after=1
-        ;;
       nginx)
         valid_pkgs+=("nginx")
         need_nginx_check=1
         ;;
-      mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|postfix|dovecot-core|rspamd|openssl|fail2ban)
+      mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|dovecot-core|rspamd|openssl|fail2ban)
         valid_pkgs+=("$pkg")
         ;;
       *)
@@ -431,22 +508,46 @@ upgrade_core_stack_packages() {
     nginx -t >/dev/null 2>&1 || deny "nginx -t pre-upgrade configuration test failed"
   fi
 
+  for pkg in "${valid_pkgs[@]}"; do
+    before[$pkg]="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+  done
+
+  # Holds are not used any more (they block security updates too); undo any
+  # an older panel left behind so --only-upgrade can move these packages.
   apt-mark unhold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
   apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true
   local upgrade_rc=0
-  apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
-  if [[ "$hold_after" -eq 1 ]]; then
-    apt-mark hold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
-  fi
-
+  apt-get install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
   [[ "$upgrade_rc" -eq 0 ]] || deny "apt-get --only-upgrade failed for core stack packages"
 
+  for pkg in "${valid_pkgs[@]}"; do
+    after="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+    if [[ -n "${before[$pkg]}" && "$after" != "${before[$pkg]}" ]]; then
+      changed+=("$pkg")
+    fi
+  done
+  echo "upgraded=$(IFS=,; echo "${changed[*]:-}")"
+
   if [[ "$need_nginx_check" -eq 1 ]] && command -v nginx >/dev/null 2>&1; then
-    nginx -t >/dev/null 2>&1 || deny "nginx -t post-upgrade configuration test failed"
-    systemctl reload nginx >/dev/null 2>&1 || true
+    if ! nginx -t >/dev/null 2>&1; then
+      # Leave the running nginx alone: a reload with a config the new
+      # binary rejects would take every site down.
+      echo "post_check=failed:nginx"
+      deny "nginx -t post-upgrade configuration test failed; nginx was not reloaded"
+    fi
   fi
 
-  echo "Core stack packages selectively upgraded: ${valid_pkgs[*]}"
+  for pkg in "${changed[@]:-}"; do
+    [[ -n "$pkg" ]] || continue
+    unit="$(core_stack_reload_unit "$pkg")"
+    [[ -n "$unit" ]] || continue
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      systemctl reload "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || true
+      reloaded+=("$unit")
+    fi
+  done
+  echo "reloaded=$(IFS=,; echo "${reloaded[*]:-}")"
+  echo "post_check=ok"
 }
 
 ensure_cron_jail_binary() {
@@ -7899,6 +8000,11 @@ case "$cmd" in
   updates-core-stack-patch)
     [[ $# -ge 1 ]] || deny "usage: updates-core-stack-patch <pkg> [pkg...]"
     upgrade_core_stack_packages "$@"
+    ;;
+
+  updates-core-blacklist)
+    [[ $# -ge 1 ]] || deny "usage: updates-core-blacklist <on|off> [pkg...]"
+    set_core_stack_blacklist "$@"
     ;;
 
   updates-os-auto)
