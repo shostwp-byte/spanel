@@ -6966,6 +6966,12 @@ delete_panel_user_runtime() {
   done
   crontab -r -u "$user" 2>/dev/null || true
   rm -f "/etc/cron.d/spanel-user-${user}" 2>/dev/null || true
+  local old_uid
+  old_uid="$(id -u "$user" 2>/dev/null || true)"
+  rm -f "/etc/spanel/limits/${user}.env" 2>/dev/null || true
+  if [[ "$old_uid" =~ ^[0-9]+$ && "$old_uid" -ge 1000 ]]; then
+    rm -rf "/etc/systemd/system/user-${old_uid}.slice.d" 2>/dev/null || true
+  fi
   # Ask, then insist. An SFTP session or a PHP worker still winding down is
   # enough to make the userdel below refuse.
   pkill -u "$user" 2>/dev/null || true
@@ -7313,6 +7319,103 @@ apply_php_fpm_tuning_to_pool_file() {
   php_fpm_set_directive "$pool_file" "request_terminate_timeout" "${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s"
 }
 
+apply_saved_user_limits_to_pool_file() {
+  local pool_file="$1" u_name="$2"
+  local limits_file="/etc/spanel/limits/${u_name}.env"
+  [[ -f "$limits_file" && -f "$pool_file" ]] || return 0
+  local cpu_pct=0 mem_high=0 mem_max=0 tasks_max=0 max_c per_worker_mb max_spare
+  cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+  mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+  mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+  tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+  [[ "$cpu_pct" =~ ^[0-9]+$ ]] || cpu_pct=0
+  [[ "$mem_high" =~ ^[0-9]+$ ]] || mem_high=0
+  [[ "$mem_max" =~ ^[0-9]+$ ]] || mem_max=0
+  [[ "$tasks_max" =~ ^[0-9]+$ ]] || tasks_max=0
+
+  max_c="${PHP_FPM_MAX_CHILDREN:-8}"
+  [[ "$max_c" =~ ^[0-9]+$ ]] || max_c=8
+  if (( tasks_max > 0 && tasks_max < max_c * 2 )); then
+    max_c=$(( tasks_max / 2 ))
+    (( max_c < 2 )) && max_c=2
+  fi
+  if (( mem_max > 0 )); then
+    local mem_cap=$(( mem_max / 64 ))
+    (( mem_cap < 2 )) && mem_cap=2
+    (( mem_cap < max_c )) && max_c="$mem_cap"
+    per_worker_mb=$(( mem_max / 2 ))
+    (( per_worker_mb < 128 )) && per_worker_mb=128
+    (( per_worker_mb > 1024 )) && per_worker_mb=1024
+    php_fpm_set_directive "$pool_file" "php_admin_value[memory_limit]" "${per_worker_mb}M"
+  fi
+  php_fpm_set_directive "$pool_file" "pm.max_children" "$max_c"
+  php_fpm_set_directive "$pool_file" "listen.backlog" "64"
+  if (( cpu_pct > 0 || mem_max > 0 || mem_high > 0 || tasks_max > 0 )); then
+    max_spare=2
+    (( max_c < max_spare )) && max_spare="$max_c"
+    php_fpm_set_directive "$pool_file" "pm" "dynamic"
+    php_fpm_set_directive "$pool_file" "pm.start_servers" "1"
+    php_fpm_set_directive "$pool_file" "pm.min_spare_servers" "1"
+    php_fpm_set_directive "$pool_file" "pm.max_spare_servers" "$max_spare"
+  fi
+}
+
+ensure_php_fpm_cgroup_dropin() {
+  local fpm_ver="$1" dropin_dir
+  [[ "$fpm_ver" =~ ^[0-9]+\.[0-9]+$ ]] || return 0
+  dropin_dir="/etc/systemd/system/php${fpm_ver}-fpm.service.d"
+  install -d -o root -g root -m 0755 "$dropin_dir"
+  cat >"${dropin_dir}/50-spanel-cgroup.conf" <<'DROPIN'
+[Service]
+ExecStartPost=-/usr/local/sbin/spanel-helper cgroup-classify-workers
+ExecReload=-/usr/local/sbin/spanel-helper cgroup-classify-workers
+DROPIN
+  chmod 0644 "${dropin_dir}/50-spanel-cgroup.conf"
+}
+
+classify_all_tenant_workers() {
+  [[ -d /sys/fs/cgroup/user.slice ]] || return 0
+  echo "+cpu +memory +io +pids" >/sys/fs/cgroup/user.slice/cgroup.subtree_control 2>/dev/null || true
+  local pid uid uname comm slice_unit cg_slice cg_scope cg_current limits_file
+  local cpu_pct mem_high mem_max tasks_max
+  while read -r pid uid uname comm; do
+    [[ "$pid" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ ]] || continue
+    (( uid >= 1000 && uid < 65000 )) || continue
+    slice_unit="user-${uid}.slice"
+    cg_slice="/sys/fs/cgroup/user.slice/${slice_unit}"
+    if [[ ! -d "$cg_slice" ]]; then
+      systemctl start "$slice_unit" >/dev/null 2>&1 || mkdir -p "$cg_slice" 2>/dev/null || true
+    fi
+    echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
+    cg_scope="${cg_slice}/spanel.scope"
+    mkdir -p "$cg_scope" 2>/dev/null || true
+    limits_file="/etc/spanel/limits/${uname}.env"
+    if [[ -f "$limits_file" ]]; then
+      cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+      mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+      mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+      tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+      if [[ "$cpu_pct" =~ ^[0-9]+$ ]] && (( cpu_pct > 0 )); then
+        echo "$(( cpu_pct * 1000 )) 100000" >"${cg_scope}/cpu.max" 2>/dev/null || true
+      fi
+      if [[ "$mem_high" =~ ^[0-9]+$ ]] && (( mem_high > 0 )); then
+        echo "$(( mem_high * 1048576 ))" >"${cg_scope}/memory.high" 2>/dev/null || true
+      fi
+      if [[ "$mem_max" =~ ^[0-9]+$ ]] && (( mem_max > 0 )); then
+        echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
+      fi
+      if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
+        echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
+      fi
+    fi
+    cg_current="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
+    [[ "$cg_current" == *"${slice_unit}/spanel.scope"* ]] && continue
+    if [[ -w "${cg_scope}/cgroup.procs" ]]; then
+      echo "$pid" >"${cg_scope}/cgroup.procs" 2>/dev/null || true
+    fi
+  done < <(ps -eo pid=,uid=,user:32=,comm= 2>/dev/null || true)
+}
+
 retune_php_fpm_pools() {
   local pool_file php_version pool_user count=0 versions=""
   shopt -s nullglob
@@ -7323,6 +7426,7 @@ retune_php_fpm_pools() {
     pool_user="$(awk -F= '/^[[:space:]]*user[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$pool_file")"
     if [[ -n "$pool_user" ]]; then
       ensure_php_runtime_dirs "$pool_user"
+      apply_saved_user_limits_to_pool_file "$pool_file" "$pool_user"
       usermod -aG "$pool_user" www-data 2>/dev/null || true
     fi
     count=$((count + 1))
@@ -7334,8 +7438,10 @@ retune_php_fpm_pools() {
   done
   shopt -u nullglob
   for php_version in $versions; do
+    ensure_php_fpm_cgroup_dropin "$php_version"
     systemctl reload "php${php_version}-fpm" 2>/dev/null || true
   done
+  classify_all_tenant_workers
   echo "Retuned ${count} SPanel PHP-FPM pool(s)."
 }
 
@@ -7598,7 +7704,10 @@ php_admin_value[open_basedir] = ${target}:${sess_dir}:${upload_dir}:/usr/share/p
 php_admin_value[upload_tmp_dir] = ${upload_dir}
 php_admin_value[session.save_path] = ${sess_dir}
 POOL
+  apply_saved_user_limits_to_pool_file "$pool_file" "$user"
+  ensure_php_fpm_cgroup_dropin "$php_version"
   systemctl reload "php${php_version}-fpm"
+  classify_all_tenant_workers
 }
 
 ensure_php_runtime_dirs() {
@@ -9104,6 +9213,20 @@ PY
     slice_unit="user-${u_uid}.slice"
     slice_dir="/etc/systemd/system/${slice_unit}.d"
     install -d -o root -g root -m 0755 "$slice_dir"
+    install -d -o root -g spanel -m 0750 /etc/spanel /etc/spanel/limits
+    cat >"/etc/spanel/limits/${u_name}.env" <<EOF
+CPU_PCT=${cpu_pct}
+MEM_HIGH_MB=${mem_high}
+MEM_MAX_MB=${mem_max}
+TASKS_MAX=${tasks_max}
+IO_READ_MBPS=${io_r}
+IO_WRITE_MBPS=${io_w}
+IOPS_READ=${iops_r}
+IOPS_WRITE=${iops_w}
+STORAGE_MB=${storage_mb}
+EOF
+    chown root:spanel "/etc/spanel/limits/${u_name}.env"
+    chmod 0640 "/etc/spanel/limits/${u_name}.env"
 
     root_dev="$(findmnt -no SOURCE / 2>/dev/null | head -n1 || true)"
     if [[ "$root_dev" == /dev/nvme* || "$root_dev" == /dev/mmcblk* ]]; then
@@ -9152,6 +9275,7 @@ PY
     chmod 0644 "${slice_dir}/50-spanel-limits.conf"
 
     systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl start "$slice_unit" >/dev/null 2>&1 || true
     # Apply live to active slice if running
     systemctl set-property "$slice_unit" \
       CPUAccounting=yes MemoryAccounting=yes TasksAccounting=yes IOAccounting=yes \
@@ -9160,33 +9284,19 @@ PY
       MemoryMax="$( (( mem_max > 0 )) && printf '%sM' "$mem_max" || printf 'infinity' )" \
       TasksMax="$( (( tasks_max > 0 )) && printf '%s' "$tasks_max" || printf 'infinity' )" >/dev/null 2>&1 || true
 
-    # Tune PHP-FPM pools owned by this user to respect memory_max & tasks_max
+    # Tune PHP-FPM pools owned by this user to respect persisted limits
     shopt -s nullglob
     fpm_versions_to_reload=()
     for pool_file in /etc/php/*/fpm/pool.d/spanel-"${u_name}"-*.conf /etc/php/*/fpm/pool.d/spanel-"${u_name}".conf; do
       [[ -f "$pool_file" ]] || continue
       calculate_php_fpm_pool_tuning "$pool_file"
-      max_c="$PHP_FPM_MAX_CHILDREN"
-      if (( tasks_max > 0 && tasks_max < max_c * 2 )); then
-        max_c=$(( tasks_max / 2 ))
-        (( max_c < 2 )) && max_c=2
-      fi
-      if (( mem_max > 0 )); then
-        mem_cap=$(( mem_max / 64 ))
-        (( mem_cap < 2 )) && mem_cap=2
-        (( mem_cap < max_c )) && max_c="$mem_cap"
-        per_worker_mb=$(( mem_max / 2 ))
-        (( per_worker_mb < 128 )) && per_worker_mb=128
-        (( per_worker_mb > 1024 )) && per_worker_mb=1024
-        php_fpm_set_directive "$pool_file" "php_admin_value[memory_limit]" "${per_worker_mb}M"
-      fi
-      php_fpm_set_directive "$pool_file" "pm.max_children" "$max_c"
-      php_fpm_set_directive "$pool_file" "listen.backlog" "64"
+      apply_saved_user_limits_to_pool_file "$pool_file" "$u_name"
       fpm_ver="$(echo "$pool_file" | awk -F'/' '{print $4}')"
       [[ -n "$fpm_ver" ]] && fpm_versions_to_reload+=("$fpm_ver")
     done
     shopt -u nullglob
     for fpm_ver in $(printf '%s\n' "${fpm_versions_to_reload[@]}" | sort -u); do
+      ensure_php_fpm_cgroup_dropin "$fpm_ver"
       systemctl reload "php${fpm_ver}-fpm" >/dev/null 2>&1 || true
     done
 
@@ -9209,18 +9319,9 @@ PY
       fi
     fi
 
-    # Move all active processes of this user (including forked PHP-FPM pool workers)
+    # Classify all active processes of this user (including pre-spawned PHP-FPM pool workers)
     # into user-<UID>.slice/spanel.scope so Cgroups v2 enforces hard CPU/RAM/IO limits.
-    if [[ -d /sys/fs/cgroup/user.slice ]]; then
-      cg_slice="/sys/fs/cgroup/user.slice/${slice_unit}"
-      cg_scope="${cg_slice}/spanel.scope"
-      mkdir -p "$cg_scope" 2>/dev/null || true
-      if [[ -w "${cg_scope}/cgroup.procs" ]]; then
-        for pid in $(ps -u "$u_name" -o pid= 2>/dev/null || true); do
-          [[ "$pid" =~ ^[0-9]+$ ]] && echo "$pid" >"${cg_scope}/cgroup.procs" 2>/dev/null || true
-        done
-      fi
-    fi
+    classify_all_tenant_workers
     echo "Applied Cgroups v2 & PHP-FPM resource limits for ${u_name} (UID ${u_uid})"
     ;;
 
@@ -9228,19 +9329,7 @@ PY
     # Classify all tenant PHP-FPM worker processes & user tasks into their respective
     # Cgroups v2 user-<UID>.slice/spanel.scope so an attacked site cannot escape its slice.
     [[ $# -eq 0 ]] || deny "usage: cgroup-classify-workers"
-    if [[ -d /sys/fs/cgroup/user.slice ]]; then
-      while read -r pid uid comm; do
-        [[ "$pid" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ ]] || continue
-        (( uid >= 1000 && uid < 65000 )) || continue
-        cg_current="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
-        [[ "$cg_current" == *"user-${uid}.slice"* ]] && continue
-        cg_scope="/sys/fs/cgroup/user.slice/user-${uid}.slice/spanel.scope"
-        mkdir -p "$cg_scope" 2>/dev/null || true
-        if [[ -w "${cg_scope}/cgroup.procs" ]]; then
-          echo "$pid" >"${cg_scope}/cgroup.procs" 2>/dev/null || true
-        fi
-      done < <(ps -eo pid=,uid=,comm= 2>/dev/null || true)
-    fi
+    classify_all_tenant_workers
     ;;
 
   mysql-governor-ensure)
