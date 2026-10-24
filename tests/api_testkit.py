@@ -106,3 +106,8 @@ def make_token(db, scopes: str = "provisioning:read,provisioning:write", allowed
 
 def bearer(raw: str) -> dict:
     return {"Authorization": f"Bearer {raw}"}
+
+
+def app_paths(app: FastAPI) -> set[str]:
+    """Every path the app serves, as OpenAPI lists them."""
+    return set(app.openapi()["paths"].keys())
