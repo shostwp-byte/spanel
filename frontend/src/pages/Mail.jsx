@@ -335,7 +335,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function applyMailDnsView(domain, data) {
-    setMailDns(prev => ({ domain, records: data?.records || (prev?.domain?.id === domain.id ? prev.records : []), relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null, dmarc: data?.dmarc || null, hosts: data?.hosts || null, mtaSts: data?.mta_sts || null }));
+    setMailDns(prev => ({ domain, records: data?.records || (prev?.domain?.id === domain.id && prev.records) || [], relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null, dmarc: data?.dmarc || null, hosts: data?.hosts || null, mtaSts: data?.mta_sts || null }));
     setHostsDraft(data?.hosts?.served?.length ? data.hosts.served : ['mail', 'mta-sts', 'autoconfig', 'autodiscover']);
     setMtaStsForm({ mode: data?.mta_sts?.mode || '', tls_rpt: (data?.mta_sts?.tls_rpt || []).join(', ') });
     const policy = data?.dmarc?.policy;
