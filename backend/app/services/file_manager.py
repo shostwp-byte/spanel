@@ -1192,8 +1192,20 @@ def extract_archive(
         with tarfile.open(archive_file, "r:gz") as archive:
             _extract_tar_archive(archive, destination, archive_file)
     site_users.fix_site_path(str(destination), website.linux_user, check=True)
-    # Real-Time YARA + Heuristic scan on all files inside destination after extraction
-    infected_findings: list[str] = []
+    # Real-Time YARA + Heuristic scan on extracted executable/script/disguised files
+    # with bounded file count (<= 500 priority files, <= 10 MB each, <= 8s budget)
+    # so large WordPress/static archives extract without HTTP timeout.
+    _STATIC_EXTS = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp",
+        ".woff", ".woff2", ".ttf", ".eot", ".otf",
+        ".css", ".map", ".mo", ".po", ".pot",
+        ".mp4", ".webm", ".mp3", ".wav", ".ogg", ".pdf",
+    }
+    _MAX_SYNC_SCAN_FILES = 500
+    _MAX_SYNC_SCAN_BYTES = 10 * 1024 * 1024
+    _MAX_SYNC_SCAN_SECONDS = 8.0
+
+    priority_candidates: list[tuple[int, Path]] = []
     for root_dir, _, filenames in os.walk(destination):
         for fname in filenames:
             candidate_file = Path(root_dir) / fname
@@ -1201,18 +1213,51 @@ def extract_archive(
                 continue
             if candidate_file.resolve() == archive_file.resolve():
                 continue
-            scan_res = malware_scan.scan_upload_realtime(
-                str(candidate_file),
-                domain=getattr(website, "domain", "") or "",
-                auto_quarantine=True,
-            )
-            if scan_res.get("status") == "infected":
-                candidate_file.unlink(missing_ok=True)
-                infected_findings.append(f"{fname} ({scan_res.get('signature')})")
+            try:
+                fsize = candidate_file.stat().st_size
+            except OSError:
+                continue
+            if fsize <= 0 or fsize > _MAX_SYNC_SCAN_BYTES:
+                continue
+            lower_name = fname.lower()
+            ext = Path(lower_name).suffix
+            if ext in _STATIC_EXTS:
+                # Quick 64-byte magic check for disguised ELF/PE/shebang/PHP inside static extensions
+                try:
+                    with candidate_file.open("rb") as fh:
+                        head = fh.read(64)
+                except OSError:
+                    continue
+                if not (
+                    head.startswith((b"\x7fELF", b"MZ", b"#!"))
+                    or b"<?php" in head.lower()
+                    or b"<?=" in head
+                ):
+                    continue
+                priority_candidates.append((0, candidate_file))
+            elif ext in {".php", ".phtml", ".phar", ".php3", ".php4", ".php5", ".php7", ".php8", ".inc", ".sh", ".py", ".pl", ".cgi"}:
+                priority_candidates.append((0, candidate_file))
+            else:
+                priority_candidates.append((1, candidate_file))
+
+    priority_candidates.sort(key=lambda item: item[0])
+    infected_findings: list[str] = []
+    scan_deadline = time.monotonic() + _MAX_SYNC_SCAN_SECONDS
+    for _, candidate_file in priority_candidates[:_MAX_SYNC_SCAN_FILES]:
+        if time.monotonic() > scan_deadline:
+            break
+        scan_res = malware_scan.scan_upload_realtime(
+            str(candidate_file),
+            domain=getattr(website, "domain", "") or "",
+            auto_quarantine=True,
+        )
+        if scan_res.get("status") == "infected":
+            candidate_file.unlink(missing_ok=True)
+            infected_findings.append(f"{candidate_file.name} ({scan_res.get('signature')})")
     _clear_fastcgi_cache()
     if infected_findings:
         raise ValueError(
-            f"Archive extraction blocked by Real-Time Malware Shield: {', '.join(infected_findings[:5])}"
+            f"Archive extraction blocked by Malware Shield (Real-Time): {', '.join(infected_findings[:5])}"
         )
     return str(destination)
 

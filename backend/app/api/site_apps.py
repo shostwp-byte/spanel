@@ -517,7 +517,14 @@ async def git_webhook_auto_deploy(
 ):
     """Unauthenticated HMAC-verified webhook endpoint for GitHub / GitLab push auto-deploy."""
     app = db.query(SiteApp).filter(SiteApp.id == app_id).first()
-    if not app or not site_apps.verify_webhook_token(app, token):
+    if not app:
+        raise HTTPException(status_code=403, detail="Invalid or expired webhook token")
+    if not site_apps.verify_webhook_token(app, token):
+        if site_apps.is_legacy_webhook_token(app, token):
+            raise HTTPException(
+                status_code=403,
+                detail="Legacy pre-v1.0.7 webhook URL detected: please copy the updated domain-separated Webhook URL and Webhook Secret from the SPanel Applications page.",
+            )
         raise HTTPException(status_code=403, detail="Invalid or expired webhook token")
 
     raw_body = await request.body()

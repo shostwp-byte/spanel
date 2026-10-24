@@ -728,7 +728,7 @@ def install_dependencies(app: SiteApp) -> str:
 
 
 def _require_app_secret_key() -> bytes:
-    secret = (settings.secret_key or "").strip()
+    secret = (getattr(settings, "webhook_secret_key", "") or settings.secret_key or "").strip()
     if not secret:
         raise RuntimeError("SECRET_KEY is required for application webhook signing")
     return secret.encode("utf-8")
@@ -739,6 +739,19 @@ def webhook_token_for(app: SiteApp) -> str:
     secret = _require_app_secret_key()
     msg = f"site-app-webhook-url:{app.id}:{app.owner_id}:{app.name}".encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def legacy_webhook_token_for(app: SiteApp) -> str:
+    """Pre-v1.0.7 non-domain-separated token (used only to detect and report legacy webhook URLs)."""
+    secret = _require_app_secret_key()
+    msg = f"site-app-webhook:{app.id}:{app.owner_id}:{app.name}".encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def is_legacy_webhook_token(app: SiteApp, token: str) -> bool:
+    expected_legacy = legacy_webhook_token_for(app)
+    provided = (token or "").strip()
+    return bool(provided) and hmac.compare_digest(expected_legacy, provided)
 
 
 def webhook_secret_for(app: SiteApp) -> str:

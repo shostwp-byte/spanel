@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     app_name: str = "spanel"
     app_env: str = "development"
     secret_key: str = DEFAULT_SECRET_KEY
+    webhook_secret_key: str = ""
     access_token_expire_minutes: int = 120  # was 720; shorter window if a token is stolen
     # A session is silently re-issued while it is in use (see the slide-session
     # middleware), so this is really an *idle* timeout: leave the panel alone
