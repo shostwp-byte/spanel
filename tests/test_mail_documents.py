@@ -104,10 +104,13 @@ def test_srv_records_follow_the_client_host(db, mail_env, monkeypatch):
     assert records["srv-imaps"]["name"] == "_imaps._tcp.example.com"
     assert records["srv-imaps"]["value"] == "1 993 panel.example.net"
     assert records["srv-submission"]["value"] == "1 587 panel.example.net"
-    assert records["srv-autodiscover"]["host"] == "autodiscover"
+    # Outlook's SRV record only once autodiscover.<domain> is served.
+    assert "srv-autodiscover" not in records
     assert "mta-sts-txt" not in records and "tls-rpt" not in records
     row.mail_hosts = "mail,mta-sts,autodiscover"
-    assert _records(row)["srv-submissions"]["value"] == "1 465 mail.example.com"
+    records = _records(row)
+    assert records["srv-submissions"]["value"] == "1 465 mail.example.com"
+    assert records["srv-autodiscover"]["value"] == "1 443 autodiscover.example.com"
 
 
 def test_mta_sts_needs_its_hosts_and_publishes_an_id(db, mail_env, monkeypatch):

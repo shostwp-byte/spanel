@@ -1346,8 +1346,9 @@ def dns_records(row: MailDomain) -> list[dict]:
                                    ("srv-submission", "_submission._tcp", PORTS["submission"])):
             records.append({"key": key, "type": "SRV", "name": f"{service}.{domain}", "value": f"1 {port} {host}",
                             "priority": 0})
-    records.append({"key": "srv-autodiscover", "type": "SRV", "name": f"_autodiscover._tcp.{domain}",
-                    "value": f"1 443 autodiscover.{domain}", "priority": 0, "host": "autodiscover"})
+    if "autodiscover" in served_hosts(row):
+        records.append({"key": "srv-autodiscover", "type": "SRV", "name": f"_autodiscover._tcp.{domain}",
+                        "value": f"1 443 autodiscover.{domain}", "priority": 0, "host": "autodiscover"})
     if row.mta_sts_mode in MTA_STS_MODES and row.mta_sts_id:
         records.append({"key": "mta-sts-txt", "type": "TXT", "name": f"_mta-sts.{domain}",
                         "value": f"v=STSv1; id={row.mta_sts_id}", "host": "mta-sts"})
