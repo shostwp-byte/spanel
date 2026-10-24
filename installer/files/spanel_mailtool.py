@@ -164,6 +164,75 @@ def dkim_maps(selectors: dict) -> tuple[list[str], list[str]]:
     return domains, chosen
 
 
+# --- sending limits and the hold ------------------------------------------------------------------
+# With auto-hold on, a mailbox or website account over its hourly limit does
+# not get its mail refused: the message is frozen in the queue (logged as
+# "SPanel hold"), for an administrator to release or delete from the panel's
+# queue page. Past twice the limit it is refused all the same, so a runaway
+# script cannot fill the spool.
+
+def _limit(value, what: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100000:
+        raise ToolError(f"invalid {what}")
+    return value
+
+
+def render_rate_acls(auth_rate: int, local_rate: int, domain_rate: int, hold: bool) -> dict[str, str]:
+    """Exim ACL statements for the sending limits: "rcpt" goes in
+    acl_check_rcpt (signed-in mailboxes), "data" at the top of acl_check_data
+    (where a held message is frozen) and "not_smtp" in acl_check_not_smtp
+    (PHP's sendmail, per Linux user)."""
+    auth_rate = _limit(auth_rate, "mailbox sending limit")
+    local_rate = _limit(local_rate, "website sending limit")
+    domain_rate = _limit(domain_rate, "domain sending limit")
+    rcpt, data, not_smtp = "", "", ""
+    if auth_rate and hold:
+        rcpt += (
+            f"\n  deny    message = Sending limit reached: at most {auth_rate} recipients an hour for each mailbox\n"
+            "          authenticated = *\n"
+            f"          ratelimit = {2 * auth_rate} / 1h / per_rcpt / readonly / $authenticated_id\n"
+            "  warn    authenticated = *\n"
+            f"          ratelimit = {auth_rate} / 1h / per_rcpt / $authenticated_id\n"
+            f"          set acl_m_hold = $authenticated_id is over its limit of {auth_rate} recipients an hour\n"
+        )
+        data = (
+            "  # Over its sending limit: kept in the queue for an administrator.\n"
+            "  warn    condition = ${if def:acl_m_hold}\n"
+            "          control = freeze/no_tell\n"
+            "          logwrite = SPanel hold: $acl_m_hold\n"
+        )
+    elif auth_rate:
+        rcpt += (
+            f"\n  deny    message = Sending limit reached: at most {auth_rate} recipients an hour for each mailbox\n"
+            "          authenticated = *\n"
+            f"          ratelimit = {auth_rate} / 1h / per_rcpt / $authenticated_id\n"
+        )
+    if domain_rate:
+        rcpt += (
+            "\n  deny    message = Domain sending limit reached for ${lc:$sender_address_domain}\n"
+            "          authenticated = *\n"
+            "          ratelimit = ${lookup{${lc:$sender_address_domain}}lsearch*{/etc/exim4/spanel_ratelimits}"
+            f"{{$value}}{{{domain_rate}}}}} / 1h / per_rcpt / dom:${{lc:$sender_address_domain}}\n"
+        )
+    if local_rate and hold:
+        not_smtp = (
+            f"  deny    message = Sending limit reached: at most {local_rate} messages an hour\n"
+            "          !condition = ${if eq{$sender_ident}{root}}\n"
+            f"          ratelimit = {2 * local_rate} / 1h / per_mail / readonly / $sender_ident\n"
+            "  warn    !condition = ${if eq{$sender_ident}{root}}\n"
+            f"          ratelimit = {local_rate} / 1h / per_mail / $sender_ident\n"
+            "          control = freeze/no_tell\n"
+            f"          logwrite = SPanel hold: $sender_ident is over its limit of {local_rate} messages an hour\n"
+        )
+    elif local_rate:
+        not_smtp = (
+            f"  deny    message = Sending limit reached: at most {local_rate} messages an hour\n"
+            "          !condition = ${if eq{$sender_ident}{root}}\n"
+            f"          ratelimit = {local_rate} / 1h / per_mail / $sender_ident\n"
+        )
+    return {"rcpt": rcpt, "data": data, "not_smtp": not_smtp}
+
+
 # --- mail hosts: mail.<domain> and friends, with their own certificate --------------------
 # One Let's Encrypt certificate per mail domain, named after mail.<domain>,
 # covers the hosts the panel turned on. nginx serves them on 80/443 (the ACME

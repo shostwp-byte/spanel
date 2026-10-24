@@ -2381,6 +2381,101 @@ def queue_size() -> int | None:
     return int(text) if result.returncode == 0 and text.isdigit() else None
 
 
+# The queue: listed from `exim -bp`, each message acted on by its id. Exim
+# 4.97 (Ubuntu 24.04) writes ids as 6-11-4 characters, older ones 6-6-2.
+QUEUE_ID_RE = re.compile(r"^[0-9A-Za-z]{6}-(?:[0-9A-Za-z]{11}-[0-9A-Za-z]{4}|[0-9A-Za-z]{6}-[0-9A-Za-z]{2})$")
+QUEUE_ACTIONS = ("retry", "freeze", "thaw", "delete")
+MAX_QUEUE_BATCH = 100
+_QUEUE_HEAD_RE = re.compile(
+    r"^\s*(?P<age>\d+[smhdw])\s+(?P<size>\d+(?:\.\d+)?[KMG]?)\s+(?P<id>\S+)\s+<(?P<sender>[^>]*)>"
+    r"(?P<frozen>\s+\*\*\* frozen \*\*\*)?\s*$")
+_QUEUE_RCPT_RE = re.compile(r"^\s+(?:(?P<mark>\+?D)\s+)?(?P<address>\S+)\s*$")
+_AGE_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_queue(text: str) -> list[dict]:
+    """`exim -bp` output -> one dict a message: id, age (as printed and in
+    seconds), size, sender ("" for a bounce), frozen, recipients with whether
+    each is delivered. Lines that fit nothing are skipped."""
+    messages: list[dict] = []
+    current = None
+    for line in (text or "").splitlines():
+        if not line.strip():
+            current = None
+            continue
+        head = _QUEUE_HEAD_RE.match(line)
+        if head and QUEUE_ID_RE.fullmatch(head.group("id")):
+            age = head.group("age")
+            current = {"id": head.group("id"), "age": age, "age_seconds": int(age[:-1]) * _AGE_SECONDS[age[-1]],
+                       "size": head.group("size"), "sender": head.group("sender"),
+                       "frozen": bool(head.group("frozen")), "recipients": []}
+            messages.append(current)
+            continue
+        rcpt = _QUEUE_RCPT_RE.match(line)
+        if current is not None and rcpt:
+            current["recipients"].append({"address": rcpt.group("address"), "delivered": bool(rcpt.group("mark"))})
+    for message in messages:
+        message["pending"] = sum(1 for item in message["recipients"] if not item["delivered"])
+    return messages
+
+
+def queue_list(q: str = "", state: str = "", page: int = 1, per_page: int = 50) -> dict:
+    """The queue, oldest first, searched by id, sender or recipient; state
+    "frozen" (held) or "active" narrows it."""
+    _require_active()
+    result = _helper("mail-queue-list", timeout=120)
+    messages = parse_queue(result.stdout)
+    term = (q or "").strip().lower()
+    if term:
+        messages = [item for item in messages if term in item["id"].lower() or term in item["sender"].lower()
+                    or any(term in rcpt["address"].lower() for rcpt in item["recipients"])]
+    if state == "frozen":
+        messages = [item for item in messages if item["frozen"]]
+    elif state == "active":
+        messages = [item for item in messages if not item["frozen"]]
+    messages.sort(key=lambda item: -item["age_seconds"])
+    page, per_page = _page(page, per_page)
+    return {"items": messages[(page - 1) * per_page: page * per_page], "total": len(messages),
+            "frozen": sum(1 for item in messages if item["frozen"]), "page": page, "per_page": per_page}
+
+
+def _queue_id(value: str) -> str:
+    qid = str(value or "").strip()
+    if not QUEUE_ID_RE.fullmatch(qid):
+        raise MailError("That is not a message id of the mail queue.")
+    return qid
+
+
+def queue_message(qid: str) -> dict:
+    """A queued message's envelope and headers - never its body."""
+    _require_active()
+    result = _helper("mail-queue-show", _queue_id(qid), timeout=60)
+    return {"id": qid, "headers": result.stdout or ""}
+
+
+def queue_action(action: str, ids) -> list[str]:
+    """retry, freeze (hold), thaw (release) or delete messages; Exim's lines."""
+    _require_active()
+    if action not in QUEUE_ACTIONS:
+        raise MailError("The queue actions are retry, freeze, thaw and delete.")
+    clean = []
+    for value in ids or []:
+        qid = _queue_id(value)
+        if qid not in clean:
+            clean.append(qid)
+    if not clean:
+        raise MailError("Choose at least one message.")
+    if len(clean) > MAX_QUEUE_BATCH:
+        raise MailError(f"At most {MAX_QUEUE_BATCH} messages at a time.")
+    result = _helper("mail-queue-action", action, *clean, timeout=120)
+    return [line for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def queue_retry_all() -> None:
+    _require_active()
+    _helper("mail-queue-retry-all", timeout=60)
+
+
 def _controller(path: str):
     try:
         key = RSPAMD_KEY_FILE.read_text(encoding="utf-8").strip()

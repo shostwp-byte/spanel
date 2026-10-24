@@ -6,7 +6,7 @@ domains; an administrator sees every domain, and alone chooses relays, sets a
 domain's own DNS records and reads the logs.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -162,6 +162,11 @@ class MailSettingsIn(BaseModel):
 
 class AllowIn(BaseModel):
     value: str = Field(min_length=3, max_length=254)
+
+
+class QueueActionIn(BaseModel):
+    action: str = Field(pattern="^(retry|freeze|thaw|delete)$")
+    ids: list[str] = Field(min_length=1, max_length=mail.MAX_QUEUE_BATCH)
 
 
 # --- overview and domains ----------------------------------------------------------------
@@ -545,6 +550,40 @@ def relay_test(payload: RelayTestIn, request: Request, db: Session = Depends(get
 def get_log(lines: int = 200, q: str = "", current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
     return {"lines": _answer(lambda: mail.mail_log(lines, q)), "queue": mail.queue_size()}
+
+
+@router.get("/queue")
+def get_queue(q: str = Query(default="", max_length=200), state: str = Query(default="", pattern="^(|frozen|active)$"),
+              page: int = Query(default=1, ge=1), per_page: int = Query(default=50, ge=1, le=200),
+              current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return _answer(lambda: mail.queue_list(q, state, page, per_page))
+
+
+@router.get("/queue/{message_id}")
+def get_queue_message(message_id: str, current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return _answer(lambda: mail.queue_message(message_id))
+
+
+@router.post("/queue/action")
+def post_queue_action(payload: QueueActionIn, request: Request, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    """Retry, hold (freeze), release (thaw) or delete queued messages."""
+    ensure_role(current_user.role, Role.admin)
+    lines = _answer(lambda: mail.queue_action(payload.action, payload.ids))
+    log_action(db, current_user.id, f"mail_queue_{payload.action}", ", ".join(payload.ids[:20]),
+               f"{len(payload.ids)} message(s)", request=request)
+    return {"lines": lines}
+
+
+@router.post("/queue/retry-all")
+def post_queue_retry_all(request: Request, db: Session = Depends(get_db),
+                         current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    _answer(mail.queue_retry_all)
+    log_action(db, current_user.id, "mail_queue_retry_all", "queue", "", request=request)
+    return {"ok": True}
 
 
 @router.get("/rspamd/stat")

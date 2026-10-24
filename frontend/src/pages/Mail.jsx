@@ -42,11 +42,16 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   const [dmarcForm, setDmarcForm] = useState(null);
   const [hostsDraft, setHostsDraft] = useState([]);
   const [mtaStsForm, setMtaStsForm] = useState({ mode: '', tls_rpt: '' });
+  const [queueList, setQueueList] = useState(null);
+  const [queueFilter, setQueueFilter] = useState({ q: '', state: '', page: 1 });
+  const [queueSelected, setQueueSelected] = useState([]);
+  const [queueDetail, setQueueDetail] = useState(null);
 
   useEffect(() => { loadMailInfo(); loadMailboxes(); }, []);
   useEffect(() => { if (mailTab === 'server' || mailTab === 'settings') { loadMailSettings(); loadEximLog(); } }, [mailTab]);
   useEffect(() => { if (mailTab === 'relay' || mailTab === 'relays') loadMailRelays(); }, [mailTab]);
   useEffect(() => { if (mailTab === 'forwarders') loadForwarders(); }, [mailTab]);
+  useEffect(() => { if (mailTab === 'queue') loadQueue(1); }, [mailTab]);
   useEffect(() => { if (mailTab === 'rspamd') { loadRspamdStat(); loadRspamdHistory(1); } }, [mailTab]);
   useEffect(() => { if (mailTab === 'rspamd' && rspamdView === 'log') loadRspamdLog(); }, [mailTab, rspamdView]);
 
@@ -172,6 +177,91 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     if (mode === 'enforce' && !confirm(t('Enforce MTA-STS for {domain}?\n\nOther mail servers will then deliver only over TLS to mail.{domain} with a valid certificate, and remember that for a week. Run it in testing mode first, with TLS reports on.', { domain: domain.domain }))) return;
     const data = await request(`/mail/domains/${domain.id}/mta-sts`, { method: 'PUT', body: JSON.stringify({ mode, tls_rpt: splitAddresses(mtaStsForm.tls_rpt || '') }) }, t('Saving...'));
     if (data) { setNotice(t('MTA-STS and TLS reporting saved.')); applyMailDnsView(domain, data); }
+  }
+
+  async function loadQueue(page = queueFilter.page, state = queueFilter.state) {
+    const params = new URLSearchParams({ page: String(page), per_page: '50' });
+    if (queueFilter.q.trim()) params.set('q', queueFilter.q.trim());
+    if (state) params.set('state', state);
+    const data = await request(`/mail/queue?${params.toString()}`, { silent: true });
+    if (data) { setQueueList(data); setQueueFilter(prev => ({ ...prev, page, state })); setQueueSelected([]); }
+  }
+
+  async function queueAction(action, ids) {
+    const labels = { retry: t('Retry'), freeze: t('Hold'), thaw: t('Release'), delete: t('Delete') };
+    if (action === 'delete' && !confirm(t('Delete {n} message(s) from the queue? They are not delivered and nobody is told.', { n: ids.length }))) return;
+    const data = await request('/mail/queue/action', { method: 'POST', body: JSON.stringify({ action, ids }) }, t('{action}...', { action: labels[action] }));
+    if (data) { setNotice(t('{action}: {n} message(s).', { action: labels[action], n: ids.length })); setQueueDetail(null); loadQueue(); }
+  }
+
+  async function queueRetryAll() {
+    if (!confirm(t('Try every message in the queue again now, held ones included?'))) return;
+    const data = await request('/mail/queue/retry-all', { method: 'POST' }, t('Retrying...'));
+    if (data) { setNotice(t('The whole queue is being retried.')); setTimeout(() => loadQueue(), 3000); }
+  }
+
+  async function openQueueMessage(item) {
+    const data = await request(`/mail/queue/${encodeURIComponent(item.id)}`, { silent: true });
+    if (data) setQueueDetail({ item, headers: data.headers });
+  }
+
+  function renderMailQueue() {
+    const list = queueList;
+    const items = list?.items || [];
+    const pages = Math.max(1, Math.ceil((list?.total || 0) / (list?.per_page || 50)));
+    const allChosen = items.length > 0 && items.every(item => queueSelected.includes(item.id));
+    return <div className="mail-tab">
+      <div className="mail-toolbar">
+        <form className="mail-search" onSubmit={e => { e.preventDefault(); loadQueue(1); }}>
+          <input value={queueFilter.q} placeholder={t('Id, sender or recipient')} aria-label={t('Search')} onChange={e => setQueueFilter(prev => ({ ...prev, q: e.target.value }))} />
+          <button type="submit" className="secondary-light icon-only" aria-label={t('Search')} title={t('Search')}><Search size={14}/></button>
+        </form>
+        <select value={queueFilter.state} aria-label={t('State')} onChange={e => loadQueue(1, e.target.value)}>
+          <option value="">{t('Every message')}</option>
+          <option value="frozen">{t('Held (frozen)')}</option>
+          <option value="active">{t('Waiting to be sent')}</option>
+        </select>
+        <button type="button" className="secondary-light" disabled={!!loading} onClick={() => loadQueue()}><RefreshCw size={14}/> {t('Refresh')}</button>
+        <button type="button" className="secondary-light" disabled={!!loading || !list?.total} onClick={queueRetryAll}><Play size={14}/> {t('Retry all')}</button>
+      </div>
+      {queueSelected.length > 0 && <div className="actions">
+        <span className="hint">{t('{n} selected', { n: queueSelected.length })}</span>
+        <button className="mini secondary-light" disabled={!!loading} onClick={() => queueAction('retry', queueSelected)}><Play size={13}/> {t('Retry')}</button>
+        <button className="mini secondary-light" disabled={!!loading} onClick={() => queueAction('freeze', queueSelected)}><Square size={13}/> {t('Hold')}</button>
+        <button className="mini secondary-light" disabled={!!loading} onClick={() => queueAction('thaw', queueSelected)}><RotateCcw size={13}/> {t('Release')}</button>
+        <button className="mini danger" disabled={!!loading} onClick={() => queueAction('delete', queueSelected)}><Trash2 size={13}/> {t('Delete')}</button>
+      </div>}
+      {list === null && <p className="hint">{t('Loading…')}</p>}
+      {list && items.length === 0 && <EmptyState icon={Send} message={queueFilter.q || queueFilter.state ? t('No queued message matches.') : t('The mail queue is empty.')} />}
+      {items.length > 0 && <div className="table">
+        <div className="row mail-row">
+          <label className="check-line"><input type="checkbox" checked={allChosen} onChange={e => setQueueSelected(e.target.checked ? items.map(item => item.id) : [])} /><span>{t('{n} messages, {frozen} held', { n: list.total, frozen: list.frozen })}</span></label>
+        </div>
+        {items.map(item => <div className="row mail-row" key={item.id}>
+          <span className="mail-row-name">
+            <label className="check-line"><input type="checkbox" checked={queueSelected.includes(item.id)} aria-label={t('Select {id}', { id: item.id })}
+              onChange={e => setQueueSelected(prev => e.target.checked ? [...prev, item.id] : prev.filter(id => id !== item.id))} />
+              <strong><code>{item.id}</code></strong></label>
+            <small>{item.sender || t('(bounce)')} → {item.recipients.filter(rcpt => !rcpt.delivered).map(rcpt => rcpt.address).join(', ') || '—'}</small>
+            <small>{t('{age} in the queue · {size}', { age: item.age, size: item.size })}{item.frozen && <span className="badge warn">{t('Held')}</span>}</small>
+          </span>
+          <span className="row-actions">
+            <button className="mini secondary-light" disabled={!!loading} onClick={() => openQueueMessage(item)}><Eye size={13}/> {t('Headers')}</button>
+            <button className="mini secondary-light" disabled={!!loading} onClick={() => queueAction('retry', [item.id])} title={t('Retry')}><Play size={13}/></button>
+            {item.frozen
+              ? <button className="mini secondary-light" disabled={!!loading} onClick={() => queueAction('thaw', [item.id])} title={t('Release')}><RotateCcw size={13}/></button>
+              : <button className="mini secondary-light" disabled={!!loading} onClick={() => queueAction('freeze', [item.id])} title={t('Hold')}><Square size={13}/></button>}
+            <button className="mini danger" disabled={!!loading} onClick={() => queueAction('delete', [item.id])} aria-label={t('Delete {name}', { name: item.id })} title={t('Delete')}><Trash2 size={13}/></button>
+          </span>
+        </div>)}
+      </div>}
+      {pages > 1 && <div className="firewall-ip-pager">
+        <button className="mini secondary-light" disabled={queueFilter.page <= 1} onClick={() => loadQueue(queueFilter.page - 1)}>{t('Previous')}</button>
+        <span className="hint">{t('Page {page} of {pages}', { page: queueFilter.page, pages })}</span>
+        <button className="mini secondary-light" disabled={queueFilter.page >= pages} onClick={() => loadQueue(queueFilter.page + 1)}>{t('Next')}</button>
+      </div>}
+      <p className="hint">{t('Held messages are kept until released or deleted (7 days at most). With auto-hold on, mail from a mailbox or website over its sending limit is held here instead of refused.')}</p>
+    </div>;
   }
 
   async function saveMailDmarc(domain, reset = false) {
@@ -968,6 +1058,19 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
           </div>
         </div>
       </div>}
+      {queueDetail && <div className="modal-overlay" onClick={() => setQueueDetail(null)}>
+        <div className="modal-card" onClick={e => e.stopPropagation()}>
+          <div className="modal-header">
+            <h3><code>{queueDetail.item.id}</code></h3>
+            <button className="secondary-light" onClick={() => setQueueDetail(null)} aria-label={t('Close')}><X size={16}/></button>
+          </div>
+          <div className="modal-body"><pre className="mail-log">{queueDetail.headers || '—'}</pre></div>
+          <div className="modal-actions">
+            <button className="secondary-light" onClick={() => setQueueDetail(null)}>{t('Close')}</button>
+            <button className="danger" disabled={!!loading} onClick={() => queueAction('delete', [queueDetail.item.id])}><Trash2 size={14}/> {t('Delete')}</button>
+          </div>
+        </div>
+      </div>}
       {forwarderEdit && <div className="modal-overlay" onClick={() => setForwarderEdit(null)}>
         <div className="modal-card" onClick={e => e.stopPropagation()}>
           <div className="modal-header">
@@ -998,9 +1101,9 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     const tabs = [
       ['mailboxes', 'Mailboxes', Inbox], ['domains', 'Domains', Globe],
       // Server-wide: relays, the spam filter and the mail server itself.
-      ...(isAdmin ? [['relay', 'Relays', Send], ['rspamd', 'Rspamd', ShieldCheck], ['server', 'Server', Server]] : []),
+      ...(isAdmin ? [['relay', 'Relays', Send], ['rspamd', 'Rspamd', ShieldCheck], ['queue', 'Queue', Inbox], ['server', 'Server', Server]] : []),
     ];
-    const serverTabs = ['relay', 'rspamd', 'server'];
+    const serverTabs = ['relay', 'rspamd', 'queue', 'server'];
     const activeTab = domains.length || serverTabs.includes(mailTab) ? mailTab : 'domains';
     return <>
       <div className="section mail-page">
@@ -1024,6 +1127,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
         {activeTab === 'domains' && renderMailDomains()}
         {activeTab === 'relay' && renderMailRelays()}
         {activeTab === 'rspamd' && renderMailRspamd()}
+        {activeTab === 'queue' && renderMailQueue()}
         {activeTab === 'server' && renderMailServer()}
       </div>
       {domains.length > 0 && !serverTabs.includes(activeTab) && renderMailClientHelp()}

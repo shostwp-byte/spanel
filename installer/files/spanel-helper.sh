@@ -1903,11 +1903,12 @@ mail_write_exim_conf() {
   # mailboxes, forwarders and routes exist is in the maps mail-sync writes.
   local tmp
   tmp="$(mktemp "${MAIL_EXIM_CONF}.XXXXXX")"
-  python3 - "$MAIL_SETTINGS_FILE" "$MAIL_EXIM_DIR" "$MAIL_TLS_DIR" "$tmp" <<'PY' || { rm -f "$tmp"; deny "could not write the Exim configuration"; }
+  [[ -f "$MAIL_TOOL" ]] || deny "${MAIL_TOOL} is missing - run the SPanel update again"
+  python3 - "$MAIL_SETTINGS_FILE" "$MAIL_EXIM_DIR" "$MAIL_TLS_DIR" "$tmp" "$MAIL_TOOL_DIR" <<'PY' || { rm -f "$tmp"; deny "could not write the Exim configuration"; }
 import json
 import sys
 
-settings_path, M, tls_dir, out_path = sys.argv[1:5]
+settings_path, M, tls_dir, out_path, tool_dir = sys.argv[1:6]
 try:
     with open(settings_path, encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -2037,6 +2038,7 @@ acl_check_rcpt:
   accept
 
 acl_check_data:
+@@HOLD@@
   # The From: address must be on one of the account's domains too; a message
   # that passes is DKIM-signed for that domain on its way out.
   deny    message = The From address is not one of your mail domains
@@ -2228,26 +2230,13 @@ relay_login:
   client_send = <; ; @@USER@@ ; @@PASS@@
 """
 
-auth_block = ""
-if auth_rate:
-    auth_block = (
-        "\n  deny    message = Sending limit reached: at most %d recipients an hour for each mailbox\n"
-        "          authenticated = *\n"
-        "          ratelimit = %d / 1h / per_rcpt / $authenticated_id\n" % (auth_rate, auth_rate)
-    )
-if domain_rate:
-    auth_block += (
-        "\n  deny    message = Domain sending limit reached for ${lc:$sender_address_domain}\n"
-        "          authenticated = *\n"
-        "          ratelimit = ${lookup{${lc:$sender_address_domain}}lsearch*{/etc/exim4/spanel_ratelimits}{$value}{%d}} / 1h / per_rcpt / dom:${lc:$sender_address_domain}\n" % domain_rate
-    )
-local_block = ""
-if local_rate:
-    local_block = (
-        "  deny    message = Sending limit reached: at most %d messages an hour\n"
-        "          !condition = ${if eq{$sender_ident}{root}}\n"
-        "          ratelimit = %d / 1h / per_mail / $sender_ident\n" % (local_rate, local_rate)
-    )
+# The sending limits, refusing or (auto-hold) freezing: the mail tool's.
+sys.path.insert(0, tool_dir)
+import spanel_mailtool  # noqa: E402
+
+rate_acls = spanel_mailtool.render_rate_acls(auth_rate, local_rate, domain_rate,
+                                             raw.get("auto_hold_on_rate_exceed", True) is not False)
+auth_block, local_block, hold_block = rate_acls["rcpt"], rate_acls["not_smtp"], rate_acls["data"]
 spam_block = ""
 if spam:
     spam_block = r"""
@@ -2269,6 +2258,7 @@ if spam:
 """
 
 conf = (conf.replace("@@AUTHRATE@@", auth_block)
+            .replace("@@HOLD@@", hold_block)
             .replace("@@LOCALRATE@@", local_block)
             .replace("@@SPAM@@", spam_block)
             .replace("@@DKIM@@", DKIM)
@@ -3808,6 +3798,51 @@ mail_log_tail() {
 
 mail_queue_count() {
   exim4 -bpc 2>/dev/null || echo 0
+}
+
+require_queue_id() {
+  # Exim's message ids: the 4.97+ form (Ubuntu 24.04) and the older one.
+  [[ "$1" =~ ^[0-9A-Za-z]{6}-([0-9A-Za-z]{11}-[0-9A-Za-z]{4}|[0-9A-Za-z]{6}-[0-9A-Za-z]{2})$ ]] \
+    || deny "invalid message id: $1"
+}
+
+mail_queue_list() {
+  # The queue as `exim -bp` prints it, at most 4 MB of it; the panel parses it.
+  exim4 -bp 2>/dev/null | head -c 4000000 || true
+}
+
+mail_queue_show() {
+  # One message's envelope and headers (exim -Mvh), never its body.
+  require_queue_id "$1"
+  exim4 -Mvh "$1" 2>/dev/null | head -c 200000 || deny "no message ${1} in the queue"
+}
+
+mail_queue_action() {
+  # retry | freeze | thaw | delete, for up to 100 messages.
+  local action="$1" id flag
+  shift
+  [[ $# -ge 1 && $# -le 100 ]] || deny "usage: mail-queue-action <retry|freeze|thaw|delete> <id>..."
+  for id in "$@"; do require_queue_id "$id"; done
+  case "$action" in
+    freeze) flag=-Mf ;;
+    thaw) flag=-Mt ;;
+    delete) flag=-Mrm ;;
+    retry)
+      # A delivery can take minutes: in the background, as exim4 -qf does.
+      setsid timeout 600 exim4 -M "$@" >/dev/null 2>&1 < /dev/null &
+      echo "retrying $# message(s)"
+      return 0
+      ;;
+    *) deny "invalid queue action: $action" ;;
+  esac
+  # Exim says per message what it did (or that the message is gone).
+  exim4 "$flag" "$@" 2>&1 | head -c 20000 || true
+}
+
+mail_queue_retry_all() {
+  # Every message, frozen ones included, tried again now.
+  setsid timeout 1800 exim4 -qff >/dev/null 2>&1 < /dev/null &
+  echo "retrying the whole queue"
 }
 
 mail_rspamd_log() {
@@ -8407,6 +8442,26 @@ case "$cmd" in
   mail-queue)
     [[ $# -eq 0 ]] || deny "usage: mail-queue"
     mail_queue_count
+    ;;
+
+  mail-queue-list)
+    [[ $# -eq 0 ]] || deny "usage: mail-queue-list"
+    mail_queue_list
+    ;;
+
+  mail-queue-show)
+    [[ $# -eq 1 ]] || deny "usage: mail-queue-show <id>"
+    mail_queue_show "$1"
+    ;;
+
+  mail-queue-action)
+    [[ $# -ge 2 ]] || deny "usage: mail-queue-action <retry|freeze|thaw|delete> <id>..."
+    mail_queue_action "$@"
+    ;;
+
+  mail-queue-retry-all)
+    [[ $# -eq 0 ]] || deny "usage: mail-queue-retry-all"
+    mail_queue_retry_all
     ;;
 
   mail-rspamd-log)
