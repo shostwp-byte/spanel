@@ -41,6 +41,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   const [forwarderEdit, setForwarderEdit] = useState(null);
   const [dmarcForm, setDmarcForm] = useState(null);
   const [hostsDraft, setHostsDraft] = useState([]);
+  const [mtaStsForm, setMtaStsForm] = useState({ mode: '', tls_rpt: '' });
 
   useEffect(() => { loadMailInfo(); loadMailboxes(); }, []);
   useEffect(() => { if (mailTab === 'server' || mailTab === 'settings') { loadMailSettings(); loadEximLog(); } }, [mailTab]);
@@ -166,6 +167,13 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     if (data) { setNotice(off ? t('The mail hosts of {domain} are no longer served.', { domain: domain.domain }) : t('{names} served with their own certificate.', { names })); applyMailDnsView(domain, data); loadMailInfo(); }
   }
 
+  async function saveMailMtaSts(domain) {
+    const mode = mtaStsForm.mode;
+    if (mode === 'enforce' && !confirm(t('Enforce MTA-STS for {domain}?\n\nOther mail servers will then deliver only over TLS to mail.{domain} with a valid certificate, and remember that for a week. Run it in testing mode first, with TLS reports on.', { domain: domain.domain }))) return;
+    const data = await request(`/mail/domains/${domain.id}/mta-sts`, { method: 'PUT', body: JSON.stringify({ mode, tls_rpt: splitAddresses(mtaStsForm.tls_rpt || '') }) }, t('Saving...'));
+    if (data) { setNotice(t('MTA-STS and TLS reporting saved.')); applyMailDnsView(domain, data); }
+  }
+
   async function saveMailDmarc(domain, reset = false) {
     const f = dmarcForm;
     const body = reset ? null : {
@@ -235,8 +243,9 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function applyMailDnsView(domain, data) {
-    setMailDns(prev => ({ domain, records: data?.records || (prev?.domain?.id === domain.id ? prev.records : []), relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null, dmarc: data?.dmarc || null, hosts: data?.hosts || null }));
+    setMailDns(prev => ({ domain, records: data?.records || (prev?.domain?.id === domain.id ? prev.records : []), relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null, dmarc: data?.dmarc || null, hosts: data?.hosts || null, mtaSts: data?.mta_sts || null }));
     setHostsDraft(data?.hosts?.served?.length ? data.hosts.served : ['mail', 'mta-sts', 'autoconfig', 'autodiscover']);
+    setMtaStsForm({ mode: data?.mta_sts?.mode || '', tls_rpt: (data?.mta_sts?.tls_rpt || []).join(', ') });
     const policy = data?.dmarc?.policy;
     setDmarcForm(policy ? { ...policy, rua: (policy.rua || []).join(', '), ruf: (policy.ruf || []).join(', ') } : null);
   }
@@ -572,7 +581,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function renderMailDns() {
-    const { domain, records, relay, hostedZone, dkim, dmarc, hosts } = mailDns;
+    const { domain, records, relay, hostedZone, dkim, dmarc, hosts, mtaSts } = mailDns;
     const statusLabel = { ok: t('Found'), missing: t('Missing'), different: t('Different'), unknown: t('Not checked') };
     const statusClass = { ok: 'ok', missing: 'bad', different: 'warn', unknown: '' };
     const titles = {
@@ -587,6 +596,13 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
       'mta-sts': t('MTA-STS policy host (optional)'),
       autoconfig: t('Thunderbird set-up host (optional)'),
       autodiscover: t('Outlook set-up host (optional)'),
+      'srv-imaps': t('Where mail apps find IMAP (SRV)'),
+      'srv-pop3s': t('Where mail apps find POP3 (SRV)'),
+      'srv-submissions': t('Where mail apps find SMTP (SRV)'),
+      'srv-submission': t('Where mail apps find SMTP with STARTTLS (SRV)'),
+      'srv-autodiscover': t('Where Outlook finds its set-up (SRV)'),
+      'mta-sts-txt': t('MTA-STS policy id (TXT)'),
+      'tls-rpt': t('TLS reports (TLS-RPT)'),
     };
     const titleFor = record => titles[record.key] || t('Asked for by the relay {relay}', { relay: record.relay });
     return <div className="section mail-dns-page">
@@ -641,6 +657,24 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
           </>}
           {dkim.state === 'retiring' && <button className="secondary-light" disabled={!!loading} onClick={() => advanceMailDkim(domain)}><Trash2 size={14}/> {t('Retire the previous key now')}</button>}
         </div>
+      </div>}
+      {mtaSts && <div className="mail-relay-card">
+        <div className="mail-relay-card-head"><ShieldCheck size={15}/><strong>{t('MTA-STS and TLS reports')}</strong>{mtaSts.mode && <span className="badge ok">{mtaSts.mode}</span>}</div>
+        <p className="hint">{t('MTA-STS tells other mail servers to deliver to mail.{domain} only over TLS with a certificate that matches; TLS reports tell you when that fails.', { domain: domain.domain })}</p>
+        {!mtaSts.ready && <p className="hint">{t('Serve mail.{domain} and mta-sts.{domain} above first: the policy is published on mta-sts.{domain}.', { domain: domain.domain })}</p>}
+        <div className="mail-settings-grid">
+          <label className="field"><span className="field-label">{t('MTA-STS mode')}</span>
+            <select value={mtaStsForm.mode} disabled={!mtaSts.ready && !mtaSts.mode} onChange={e => setMtaStsForm(prev => ({ ...prev, mode: e.target.value }))}>
+              <option value="">{t('Off')}</option>
+              <option value="testing">{t('testing: report only')}</option>
+              <option value="enforce">{t('enforce: TLS required')}</option>
+              <option value="none">{t('none: withdraw the policy')}</option>
+            </select></label>
+          <label className="field"><span className="field-label">{t('TLS reports to (rua)')}</span>
+            <input value={mtaStsForm.tls_rpt} placeholder="tls-reports@example.com" spellCheck={false} onChange={e => setMtaStsForm(prev => ({ ...prev, tls_rpt: e.target.value }))} /></label>
+        </div>
+        {mtaSts.mode && <p className="hint">{t('Policy:')} <a href={mtaSts.policy_url} target="_blank" rel="noopener noreferrer">{mtaSts.policy_url}</a></p>}
+        <div className="actions"><button className="secondary-light" disabled={!!loading} onClick={() => saveMailMtaSts(domain)}><Save size={14}/> {t('Save')}</button></div>
       </div>}
       {dmarc && dmarcForm && <div className="mail-relay-card">
         <div className="mail-relay-card-head"><ShieldCheck size={15}/><strong>{t('DMARC policy')}</strong>{!dmarc.custom && <span className="badge">{t('Default')}</span>}</div>

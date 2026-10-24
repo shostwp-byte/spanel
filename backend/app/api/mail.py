@@ -91,6 +91,12 @@ class MailHostsIn(BaseModel):
     hosts: list[str] = Field(default_factory=lambda: ["mail"], max_length=4)
 
 
+class MtaStsIn(BaseModel):
+    # testing, enforce or none; "" is off.
+    mode: str = Field(default="", max_length=10)
+    tls_rpt: list[str] = Field(default_factory=list, max_length=mail.DMARC_MAX_REPORT_ADDRESSES)
+
+
 class DmarcIn(BaseModel):
     p: str = Field(max_length=12)
     sp: str = Field(default="", max_length=12)
@@ -296,6 +302,16 @@ def post_mail_hosts(domain_id: int, payload: MailHostsIn, request: Request, db: 
     ensure_role(current_user.role, Role.end_user)
     row = _answer(lambda: mail.set_mail_hosts(db, current_user, domain_id, payload.hosts))
     log_action(db, current_user.id, "mail_hosts", row.domain, row.mail_hosts, request=request)
+    return mail.dns_view(db, row, current_user, check=False)
+
+
+@router.put("/domains/{domain_id}/mta-sts")
+def put_mta_sts(domain_id: int, payload: MtaStsIn, request: Request, db: Session = Depends(get_db),
+                current_user: User = Depends(get_current_user)):
+    """The domain's MTA-STS mode and TLS-RPT report addresses."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_mta_sts(db, current_user, domain_id, payload.mode, payload.tls_rpt))
+    log_action(db, current_user.id, "mail_mta_sts", row.domain, row.mta_sts_mode or "off", request=request)
     return mail.dns_view(db, row, current_user, check=False)
 
 

@@ -200,8 +200,145 @@ def check_mail_hosts(data) -> dict:
     if email and not EMAIL_RE.fullmatch(email):
         raise ToolError(f"invalid email: {email!r}")
     ordered = [label for label in MAIL_HOST_LABELS if label in clean]
+    mta_sts = data.get("mta_sts")
+    if mta_sts is not None:
+        if not isinstance(mta_sts, dict) or mta_sts.get("mode") not in MTA_STS_MODES:
+            raise ToolError("the MTA-STS mode is testing, enforce or none")
+        max_age = mta_sts.get("max_age", MTA_STS_MAX_AGE)
+        if not isinstance(max_age, int) or isinstance(max_age, bool) or not 86400 <= max_age <= 31557600:
+            raise ToolError("the MTA-STS max_age is 86400 to 31557600 seconds")
+        # The policy names the MX the panel publishes, never anything sent in.
+        mta_sts = {"mode": mta_sts["mode"], "mx": [f"mail.{domain}"], "max_age": max_age}
     return {"domain": domain, "hosts": ordered, "names": [f"{label}.{domain}" for label in ordered],
-            "cert_name": f"mail.{domain}", "email": email}
+            "cert_name": f"mail.{domain}", "email": email, "mta_sts": mta_sts}
+
+
+# --- what the mail hosts serve: MTA-STS, Thunderbird autoconfig, Outlook autodiscover ----------
+
+MTA_STS_MODES = ("testing", "enforce", "none")
+MTA_STS_MAX_AGE = 604800
+MAIL_PORTS = {"imap": 993, "pop3": 995, "smtps": 465, "submission": 587}
+
+
+def render_mta_sts_policy(mode: str, mx: list[str], max_age: int = MTA_STS_MAX_AGE) -> str:
+    """/.well-known/mta-sts.txt (RFC 8461 3.2): CRLF-separated key: value lines."""
+    if mode not in MTA_STS_MODES:
+        raise ToolError("the MTA-STS mode is testing, enforce or none")
+    if not mx or any(not DOMAIN_RE.fullmatch(host) for host in mx):
+        raise ToolError("an MTA-STS policy names at least one MX host")
+    if not isinstance(max_age, int) or not 86400 <= max_age <= 31557600:
+        raise ToolError("the MTA-STS max_age is 86400 to 31557600 seconds")
+    lines = ["version: STSv1", f"mode: {mode}", *[f"mx: {host}" for host in mx], f"max_age: {max_age}"]
+    return "".join(line + "\r\n" for line in lines)
+
+
+def _xml(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def render_autoconfig(domain: str, host: str) -> str:
+    """Thunderbird's autoconfig document (config-v1.1.xml): IMAP, POP3 and
+    SMTP on host, signed in with the full address."""
+    for name in (domain, host):
+        if not DOMAIN_RE.fullmatch(name or ""):
+            raise ToolError(f"invalid name: {name!r}")
+    d, h = _xml(domain), _xml(host)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<clientConfig version="1.1">
+  <emailProvider id="{d}">
+    <domain>{d}</domain>
+    <displayName>{d}</displayName>
+    <displayShortName>{d}</displayShortName>
+    <incomingServer type="imap">
+      <hostname>{h}</hostname>
+      <port>{MAIL_PORTS['imap']}</port>
+      <socketType>SSL</socketType>
+      <username>%EMAILADDRESS%</username>
+      <authentication>password-cleartext</authentication>
+    </incomingServer>
+    <incomingServer type="pop3">
+      <hostname>{h}</hostname>
+      <port>{MAIL_PORTS['pop3']}</port>
+      <socketType>SSL</socketType>
+      <username>%EMAILADDRESS%</username>
+      <authentication>password-cleartext</authentication>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname>{h}</hostname>
+      <port>{MAIL_PORTS['smtps']}</port>
+      <socketType>SSL</socketType>
+      <username>%EMAILADDRESS%</username>
+      <authentication>password-cleartext</authentication>
+    </outgoingServer>
+    <outgoingServer type="smtp">
+      <hostname>{h}</hostname>
+      <port>{MAIL_PORTS['submission']}</port>
+      <socketType>STARTTLS</socketType>
+      <username>%EMAILADDRESS%</username>
+      <authentication>password-cleartext</authentication>
+    </outgoingServer>
+  </emailProvider>
+</clientConfig>
+"""
+
+
+def render_autodiscover(domain: str, host: str) -> str:
+    """Outlook's POX autodiscover answer: IMAP and SMTP on host over SSL.
+    The same for every address of the domain (nginx serves it as a file)."""
+    for name in (domain, host):
+        if not DOMAIN_RE.fullmatch(name or ""):
+            raise ToolError(f"invalid name: {name!r}")
+    h = _xml(host)
+
+    def protocol(kind: str, port: int, extra: str = "") -> str:
+        return (f"      <Protocol>\n        <Type>{kind}</Type>\n        <Server>{h}</Server>\n        <Port>{port}</Port>\n"
+                f"        <DomainRequired>off</DomainRequired>\n        <SPA>off</SPA>\n        <SSL>on</SSL>\n"
+                f"        <AuthRequired>on</AuthRequired>\n{extra}      </Protocol>\n")
+
+    return ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">\n'
+            '  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">\n'
+            '    <Account>\n'
+            '      <AccountType>email</AccountType>\n'
+            '      <Action>settings</Action>\n'
+            + protocol("IMAP", MAIL_PORTS["imap"])
+            + protocol("SMTP", MAIL_PORTS["smtps"], "        <UsePOPAuth>on</UsePOPAuth>\n        <SMTPLast>off</SMTPLast>\n")
+            + '    </Account>\n  </Response>\n</Autodiscover>\n')
+
+
+def mailhost_documents(item: dict) -> dict[str, str]:
+    """The files a domain's mail hosts serve, by file name: only those of the
+    hosts that are on (and the MTA-STS policy only when there is one)."""
+    host = f"mail.{item['domain']}"
+    files = {}
+    if "mta-sts" in item["hosts"] and item.get("mta_sts"):
+        policy = item["mta_sts"]
+        files["mta-sts.txt"] = render_mta_sts_policy(policy["mode"], policy["mx"], policy["max_age"])
+    if "autoconfig" in item["hosts"]:
+        files["config-v1.1.xml"] = render_autoconfig(item["domain"], host)
+    if "autodiscover" in item["hosts"]:
+        files["autodiscover.xml"] = render_autodiscover(item["domain"], host)
+    return files
+
+
+def write_mailhost_documents(docs_dir: str, item: dict) -> list[str]:
+    """Put the documents in docs_dir (root's) and take out those no longer served."""
+    import os
+
+    files = mailhost_documents(item)
+    for name in ("mta-sts.txt", "config-v1.1.xml", "autodiscover.xml"):
+        path = os.path.join(docs_dir, name)
+        if name in files:
+            with open(path + ".new", "w", encoding="utf-8", newline="") as handle:
+                handle.write(files[name])
+            os.chmod(path + ".new", 0o644)
+            os.replace(path + ".new", path)
+        else:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+    return sorted(files)
 
 
 def render_mailhosts_nginx(domain: str, names: list[str], cert_name: str, docs_dir: str, with_tls: bool) -> str:
@@ -245,8 +382,22 @@ def render_mailhosts_nginx(domain: str, names: list[str], cert_name: str, docs_d
 
 
 def _mailhost_locations() -> list[str]:
-    """What the mail hosts serve besides the challenge (MTA-STS, autoconfig)."""
-    return []
+    """What the mail hosts serve besides the challenge. Outlook POSTs to
+    autodiscover, which a static file answers with 405: that is turned into
+    a GET of the same file (error_page ... =200 $uri)."""
+    return [
+        "    location = /.well-known/mta-sts.txt { try_files /mta-sts.txt =404; }",
+        "    location = /mail/config-v1.1.xml { default_type application/xml; try_files /config-v1.1.xml =404; }",
+        "    location = /.well-known/autoconfig/mail/config-v1.1.xml {",
+        "        default_type application/xml;",
+        "        try_files /config-v1.1.xml =404;",
+        "    }",
+        "    location ~* ^/autodiscover/autodiscover\\.xml$ {",
+        "        default_type application/xml;",
+        "        error_page 405 =200 $uri;",
+        "        try_files /autodiscover.xml =404;",
+        "    }",
+    ]
 
 
 def render_sni(entries: dict, tls_dir: str) -> tuple[list[str], list[str], str]:
@@ -374,6 +525,12 @@ def main(argv: list[str]) -> int:
             item = check_mail_hosts(_read_json_stdin(200_000))
             sys.stdout.write(render_mailhosts_nginx(item["domain"], item["names"], item["cert_name"], args[0],
                                                     args[1] == "https"))
+            return 0
+        if command == "mailhost-docs" and len(args) == 1:
+            item = check_mail_hosts(_read_json_stdin(200_000))
+            if args[0] != f"/var/www/spanel-mailhosts/{item['domain']}":
+                raise ToolError("the documents go in /var/www/spanel-mailhosts/<domain>")
+            print(" ".join(write_mailhost_documents(args[0], item)))
             return 0
         if command == "sni-apply" and len(args) == 5:
             print("changed" if sni_apply(*args) else "unchanged")

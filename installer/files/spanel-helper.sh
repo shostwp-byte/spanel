@@ -4054,9 +4054,11 @@ mail_hosts_register() {
 
 mail_hosts_apply() {
   # A mail domain's hosts, as JSON on stdin (checked by the mail tool):
-  #   {"domain", "hosts": ["mail", "mta-sts", "autoconfig", "autodiscover"], "email"}
-  # Issues (or extends) the certificate, writes the nginx server blocks and
-  # registers mail.<domain> for SNI. Prints the names served.
+  #   {"domain", "hosts": ["mail", "mta-sts", "autoconfig", "autodiscover"], "email",
+  #    "mta_sts": {"mode": "testing"|"enforce"|"none", "max_age"} or null}
+  # Issues (or extends) the certificate, writes what the hosts serve and the
+  # nginx server blocks, and registers mail.<domain> for SNI. Prints the
+  # names served.
   [[ -f "$WEBMAIL_NGINX" ]] || deny "the Email addon is not installed"
   [[ -f "$MAIL_TOOL" ]] || deny "${MAIL_TOOL} is missing - run the SPanel update again"
   local payload domain cert_name email names conf docs tmp host rc=0 had_tls=no
@@ -4103,6 +4105,8 @@ mail_hosts_apply() {
     fi
     rm -f "${conf}.previous"
   fi
+  # What the hosts serve: the MTA-STS policy, autoconfig and autodiscover.
+  python3 -I "$MAIL_TOOL" mailhost-docs "$docs" <"$payload" >/dev/null || { rm -f "$payload" "$tmp"; exit 1; }
   python3 -I "$MAIL_TOOL" mailhosts-nginx "$docs" https <"$payload" >"$tmp" || { rm -f "$payload" "$tmp"; deny "could not write the mail hosts' server block"; }
   cp -a "$conf" "${conf}.previous" 2>/dev/null || true
   install -m 0644 "$tmp" "$conf"

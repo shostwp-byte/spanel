@@ -114,7 +114,10 @@ def test_serving_the_mail_hosts(db, mail_env, monkeypatch):
     mail.set_mail_hosts(db, owner, row.id, ["mta-sts"])
     verb, args, payload = sent[-1]
     assert verb == "mail-hosts-apply"
-    assert json.loads(payload) == {"domain": "example.com", "hosts": ["mail", "mta-sts"], "email": mail.app_settings.ssl_email or ""}
+    assert json.loads(payload) == {"domain": "example.com", "hosts": ["mail", "mta-sts"],
+                                   "email": mail.app_settings.ssl_email or "", "mta_sts": None}
+    # What the panel sends, the helper's check accepts.
+    assert tool.check_mail_hosts(json.loads(payload))["names"] == ["mail.example.com", "mta-sts.example.com"]
     assert row.mail_hosts == "mail,mta-sts"
     assert mail.client_host(row) == "mail.example.com"
     assert mail.client_settings(row)["host"] == "mail.example.com"

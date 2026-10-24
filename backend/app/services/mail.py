@@ -601,22 +601,91 @@ def set_mail_hosts(db: Session, actor: User, domain_id: int, labels) -> MailDoma
     if elsewhere:
         raise MailError(f"Point {', '.join(elsewhere)} at this server first (an A record to {server_ip() or 'its address'}); "
                         "a certificate is issued only for names that reach it.")
-    payload = {"domain": row.domain, "hosts": chosen, "email": app_settings.ssl_email or ""}
-    _helper("mail-hosts-apply", input=json.dumps(payload), timeout=600)
+    _apply_mail_hosts(row, chosen)
     row.mail_hosts = ",".join(chosen)
     db.commit()
     publish_dns_quietly(db, row)
     return row
 
 
+def _apply_mail_hosts(row: MailDomain, chosen: list[str]) -> None:
+    mode = row.mta_sts_mode or ""
+    payload = {"domain": row.domain, "hosts": chosen, "email": app_settings.ssl_email or "",
+               "mta_sts": {"mode": mode, "max_age": MTA_STS_MAX_AGE} if mode in MTA_STS_MODES else None}
+    _helper("mail-hosts-apply", input=json.dumps(payload), timeout=600)
+
+
 def remove_mail_hosts(db: Session, actor: User, domain_id: int) -> MailDomain:
     _require_active()
     row = get_domain(db, actor, domain_id)
+    if row.mta_sts_mode in ("testing", "enforce"):
+        # Senders keep the policy for max_age and would refuse mail.<domain>
+        # once its certificate is gone.
+        raise MailError("Set MTA-STS to none and wait a week before the mail hosts stop being served.", status=409)
     _helper("mail-hosts-remove", row.domain, timeout=300)
     row.mail_hosts = ""
     db.commit()
     publish_dns_quietly(db, row)
     return row
+
+
+# --- MTA-STS and TLS-RPT ----------------------------------------------------------------------------
+# MTA-STS (RFC 8461) tells other mail servers to deliver to mail.<domain>
+# only over TLS with a certificate that matches: the policy file on
+# https://mta-sts.<domain>/ (written by the helper from the mode alone) and
+# _mta-sts.<domain> TXT naming its id. TLS-RPT (RFC 8460) asks them to report
+# TLS failures to the addresses in _smtp._tls.<domain>.
+
+MTA_STS_MODES = ("testing", "enforce", "none")
+MTA_STS_MAX_AGE = 604800
+
+
+def tls_rpt_addresses(row: MailDomain) -> list[str]:
+    return [line.strip() for line in (row.tls_rpt or "").splitlines() if line.strip()]
+
+
+def mta_sts_view(row: MailDomain) -> dict:
+    served = served_hosts(row)
+    return {"mode": row.mta_sts_mode or "", "id": row.mta_sts_id or "", "tls_rpt": tls_rpt_addresses(row),
+            "ready": "mail" in served and "mta-sts" in served, "max_age": MTA_STS_MAX_AGE,
+            "policy_url": f"https://mta-sts.{row.domain}/.well-known/mta-sts.txt"}
+
+
+def set_mta_sts(db: Session, actor: User, domain_id: int, mode: str, tls_rpt) -> MailDomain:
+    """The domain's MTA-STS mode ("" off) and TLS-RPT addresses."""
+    _require_active()
+    row = get_domain(db, actor, domain_id)
+    mode = (mode or "").strip().lower()
+    if mode and mode not in MTA_STS_MODES:
+        raise MailError("The MTA-STS mode is testing, enforce or none, or empty for off.")
+    if mode and not {"mail", "mta-sts"} <= set(served_hosts(row)):
+        raise MailError(f"Serve mail.{row.domain} and mta-sts.{row.domain} first (Mail hosts): the policy is "
+                        f"published there, and enforce needs mail.{row.domain}'s own certificate.")
+    addresses = _report_addresses(tls_rpt, "TLS report")
+    old_mode, old_id, old_rpt = row.mta_sts_mode or "", row.mta_sts_id or "", tls_rpt_addresses(row)
+    if mode != old_mode:
+        row.mta_sts_mode = mode
+        row.mta_sts_id = datetime.utcnow().strftime("%Y%m%d%H%M%S") if mode else ""
+    row.tls_rpt = "\n".join(addresses)
+    db.flush()
+    if mode != old_mode and served_hosts(row):
+        try:
+            _apply_mail_hosts(row, served_hosts(row))
+        except MailError:
+            db.rollback()
+            raise
+    db.commit()
+    # The TXT records follow; one turned off leaves the zone.
+    if old_mode and not mode and old_id:
+        withdraw_dns_quietly(db, row, f"_mta-sts.{row.domain}", "TXT", f"v=STSv1; id={old_id}")
+    if old_rpt and not addresses:
+        withdraw_dns_quietly(db, row, f"_smtp._tls.{row.domain}", "TXT", render_tls_rpt(old_rpt))
+    publish_dns_quietly(db, row)
+    return row
+
+
+def render_tls_rpt(addresses: list[str]) -> str:
+    return "v=TLSRPTv1; rua=" + ",".join(f"mailto:{address}" for address in addresses)
 
 
 def webmail_host_taken(db: Session, domain: str) -> bool:
@@ -1267,7 +1336,34 @@ def dns_records(row: MailDomain) -> list[dict]:
         for label in MAIL_HOST_LABELS[1:]:
             records.append({"key": label, "type": "A", "name": f"{label}.{domain}", "value": ip, "optional": True,
                             "host": label})
+    # Where mail apps find the servers (RFC 6186, RFC 8314): the name they
+    # connect to is mail.<domain> once it has its own certificate.
+    host = client_host(row)
+    if host:
+        for key, service, port in (("srv-imaps", "_imaps._tcp", PORTS["imap"]),
+                                   ("srv-pop3s", "_pop3s._tcp", PORTS["pop3"]),
+                                   ("srv-submissions", "_submissions._tcp", PORTS["smtps"]),
+                                   ("srv-submission", "_submission._tcp", PORTS["submission"])):
+            records.append({"key": key, "type": "SRV", "name": f"{service}.{domain}", "value": f"1 {port} {host}",
+                            "priority": 0})
+    records.append({"key": "srv-autodiscover", "type": "SRV", "name": f"_autodiscover._tcp.{domain}",
+                    "value": f"1 443 autodiscover.{domain}", "priority": 0, "host": "autodiscover"})
+    if row.mta_sts_mode in MTA_STS_MODES and row.mta_sts_id:
+        records.append({"key": "mta-sts-txt", "type": "TXT", "name": f"_mta-sts.{domain}",
+                        "value": f"v=STSv1; id={row.mta_sts_id}", "host": "mta-sts"})
+    if tls_rpt_addresses(row):
+        records.append({"key": "tls-rpt", "type": "TXT", "name": f"_smtp._tls.{domain}",
+                        "value": render_tls_rpt(tls_rpt_addresses(row))})
     return records
+
+
+# Records the panel alone writes: in the zone they always follow the panel.
+PANEL_RECORD_KEYS = ("srv-imaps", "srv-pop3s", "srv-submissions", "srv-submission", "srv-autodiscover",
+                     "mta-sts-txt", "tls-rpt")
+
+
+def _srv_text(text: str) -> str:
+    return " ".join(part.rstrip(".").lower() for part in (text or "").split())
 
 
 def _resolve(name: str, rtype: str) -> list[str] | None:
@@ -1369,6 +1465,10 @@ def check_dns(row: MailDomain, lookup=None, zone_name: str = "") -> list[dict]:
         elif rtype in ("MX", "CNAME"):
             found = lookup(name, rtype)
             ok = found is not None and want.rstrip(".").lower() in found
+        elif rtype == "SRV":
+            found = lookup(name, rtype)
+            wanted = _srv_text(f"{record.get('priority') or 0} {want}")
+            ok = found is not None and any(_srv_text(item) == wanted for item in found)
         else:
             found = lookup(name, rtype)
             ok = found is not None and want in found
@@ -1417,6 +1517,7 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
         "dkim": dkim_view(row),
         "dmarc": dmarc_view(row),
         "hosts": {"served": served_hosts(row), "available": list(MAIL_HOST_LABELS), "client": client_settings(row)},
+        "mta_sts": mta_sts_view(row),
         "hosted_zone": zone.name if zone else "",
         "relay": {
             "choice": row.relay or "",
@@ -1458,6 +1559,8 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[
     def same(existing: list[str], content: str, rtype: str) -> bool:
         if rtype == "TXT":
             return [dns._untxt(item) for item in existing] == [dns._untxt(content)]
+        if rtype == "SRV":
+            return [_srv_text(item) for item in existing] == [_srv_text(content)]
         return [item.rstrip(".").lower() for item in existing] == [content.rstrip(".").lower()]
 
     wanted_hosts = set(served_hosts(row)) | set(hosts or ())
@@ -1470,6 +1573,9 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[
         name = dns._absolute(record["name"])
         if rtype == "MX":
             content = f"{record.get('priority') if record.get('priority') is not None else 10} {dns._absolute(record['value'])}"
+        elif rtype == "SRV":
+            weight, port, target = record["value"].split()
+            content = f"{record.get('priority') or 0} {weight} {port} {dns._absolute(target)}"
         elif rtype == "CNAME":
             content = dns._absolute(record["value"])
         elif rtype == "TXT":
@@ -1477,8 +1583,8 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[
         else:
             content = record["value"]
         existing = current(name, rtype)
-        if key in DKIM_KEYS or record.get("source") == "relay":
-            if rtype == "TXT" and key not in DKIM_KEYS:
+        if key in DKIM_KEYS or key in PANEL_RECORD_KEYS or record.get("source") == "relay":
+            if rtype == "TXT" and key not in DKIM_KEYS and key not in PANEL_RECORD_KEYS:
                 # Another TXT of the same name (a verification string, say) stays.
                 wanted = [item for item in existing if dns._untxt(item) != record["value"]] + [content]
                 if sorted(wanted) != sorted(existing):
@@ -2444,7 +2550,8 @@ def backup_manifest(db: Session, user: User) -> dict:
         "domains": [{"domain": row.domain, "catch_all": row.catch_all or "", "relay": row.relay or "",
                      "dkim_selector": row.dkim_selector or DKIM_SELECTOR,
                      "dkim_keys": _dkim_keys_for_backup(row),
-                     "dmarc": dmarc_policy(row) if row.dmarc_policy else None}
+                     "dmarc": dmarc_policy(row) if row.dmarc_policy else None,
+                     "tls_rpt": tls_rpt_addresses(row)}
                     for row in domains],
         "autoresponders": [{"local_part": row.local_part, "domain": row.domain, "subject": row.subject,
                             "body": row.body, "enabled": bool(row.enabled), "start_date": row.start_date or "",
@@ -2493,6 +2600,11 @@ def restore_manifest(db: Session, user: User, section, stage_mail) -> list[str]:
         row.catch_all = normalize_destination(catch_all) if catch_all else ""
         relay = str(entry.get("relay") or "")
         row.relay = relay if relay == "direct" or relay in {item["id"] for item in _relays()} else ""
+        if isinstance(entry.get("tls_rpt"), list):
+            try:
+                row.tls_rpt = "\n".join(_report_addresses(entry["tls_rpt"], "TLS report"))
+            except MailError as exc:
+                raise ValueError(f"Invalid TLS report address for {name} in backup: {exc.message}") from exc
         if isinstance(entry.get("dmarc"), dict):
             try:
                 row.dmarc_policy = json.dumps(normalize_dmarc(entry["dmarc"]), sort_keys=True)
