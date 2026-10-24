@@ -1,0 +1,47 @@
+name: SPanel Enterprise CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  backend-and-security-suite:
+    name: Backend, Security & Enterprise Verification (Ubuntu 24.04 + Python 3.12)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends yara openssl shellcheck
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pytest httpx
+
+      - name: Validate helper shell scripts syntax
+        run: |
+          bash -n installer/files/spanel-helper.sh
+          bash -n installer/files/spanel-cron-jail.sh
+          bash -n installer/install.sh
+          bash -n installer/update.sh
+          shellcheck --severity=error installer/files/spanel-helper.sh installer/files/spanel-cron-jail.sh installer/install.sh installer/update.sh
+
+      - name: Run Phase 4 Enterprise Verification Suite (P0 / P1 / P2)
+        env:
+          SECRET_KEY: "ci-enterprise-test-secret-key-32-bytes-minimum-spanel"
+        run: |
+          python tests/test_phase4_enterprise.py
