@@ -7,7 +7,14 @@ Type=oneshot
 User=spanel
 Group=spanel
 WorkingDirectory=/opt/spanel/backend
+EnvironmentFile=/opt/spanel/backend/.env
+Environment=HOME=/opt/spanel
+Environment=SPANEL_USE_HELPER=true
+# No -I here: isolated mode ignores PYTHONPATH and leaves the working directory
+# off sys.path, so `-m app.services.system` fails with "No module named 'app'".
+# The backend is not installed into the venv; it is found through PYTHONPATH,
+# the same way the da-import unit in spanel-helper.sh runs its module.
 Environment=PYTHONPATH=/opt/spanel/backend
-ExecStart=/opt/spanel/backend/.venv/bin/python -I -m app.services.system
+ExecStart=/opt/spanel/backend/.venv/bin/python -m app.services.system
 StandardOutput=journal
 StandardError=journal

@@ -465,7 +465,3 @@ def run_self_healing_check(reason: str = "manual") -> dict:
 if __name__ == "__main__":
     print(json.dumps(run_self_healing_check(reason="systemd-timer")))
 
-
-if __name__ == "__main__":
-    print(json.dumps(run_self_healing_check(reason="systemd-timer")))
-
