@@ -293,10 +293,14 @@ def _waf_block(domain: str) -> str:
 
 
 FASTCGI_CACHE_SERVER_BLOCK = """    # SPANEL FASTCGI CACHE SERVER BEGIN
+    set $spanel_cache_uri $request_uri;
     set $spanel_skip_cache 0;
     if ($request_method = POST) { set $spanel_skip_cache 1; }
     if ($query_string != "") { set $spanel_skip_cache 1; }
-    if ($query_string ~* "^(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*)(?:&(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*))*$") { set $spanel_skip_cache 0; }
+    if ($query_string ~* "^(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|msclkid=[^&]*|_ga=[^&]*|mc_[ce]id=[^&]*)(?:&(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|msclkid=[^&]*|_ga=[^&]*|mc_[ce]id=[^&]*))*$") {
+        set $spanel_skip_cache 0;
+        set $spanel_cache_uri $uri;
+    }
     if ($query_string ~* "add-to-cart=|wc-ajax=| nocache=") { set $spanel_skip_cache 1; }
     if ($http_cache_control ~* "no-cache|no-store|max-age=0") { set $spanel_skip_cache 1; }
     if ($http_pragma = "no-cache") { set $spanel_skip_cache 1; }
@@ -320,6 +324,7 @@ FASTCGI_CACHE_SERVER_BLOCK = """    # SPANEL FASTCGI CACHE SERVER BEGIN
 # bypass it, so whoever edits the page sees the change immediately.
 FASTCGI_CACHE_LOCATION_BLOCK = """        # SPANEL FASTCGI CACHE LOCATION BEGIN
         fastcgi_cache SPANEL_FASTCGI;
+        fastcgi_cache_key "$scheme$request_method$host$spanel_cache_uri";
         fastcgi_cache_methods GET HEAD;
         fastcgi_cache_valid 200 301 302 10m;
         fastcgi_cache_valid 404 1m;
@@ -334,6 +339,45 @@ FASTCGI_CACHE_LOCATION_BLOCK = """        # SPANEL FASTCGI CACHE LOCATION BEGIN
         fastcgi_cache_lock_timeout 5s;
         fastcgi_cache_lock_age 5s;
         # SPANEL FASTCGI CACHE LOCATION END"""
+
+
+_NGINX_HTTP3_CACHE: Optional[bool] = None
+
+
+def _nginx_supports_http3() -> bool:
+    """Return True if the installed Nginx binary was built with --with-http_v3_module."""
+    global _NGINX_HTTP3_CACHE
+    import os
+    import subprocess
+
+    override = os.environ.get("SPANEL_ENABLE_HTTP3", "").strip().lower()
+    if override in ("1", "true", "yes"):
+        return True
+    if override in ("0", "false", "no"):
+        return False
+    if _NGINX_HTTP3_CACHE is not None:
+        return _NGINX_HTTP3_CACHE
+    try:
+        proc = subprocess.run(["nginx", "-V"], capture_output=True, text=True, timeout=3, check=False)
+        combined = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        _NGINX_HTTP3_CACHE = "--with-http_v3_module" in combined
+    except Exception:
+        _NGINX_HTTP3_CACHE = False
+    return _NGINX_HTTP3_CACHE
+
+
+def _listen_443_directives(ip_address: str = "*", ipv6: Optional[bool] = None) -> list[str]:
+    """Build TCP 443 (SSL/HTTP2) and optional UDP 443 (QUIC/HTTP3) listen directives."""
+    prefix = f"{ip_address}:" if ip_address and ip_address != "*" else ""
+    has_http3 = _nginx_supports_http3()
+    directives = [f"listen {prefix}443 ssl http2;"]
+    if has_http3:
+        directives.append(f"listen {prefix}443 quic;")
+    if not prefix and (ipv6 if ipv6 is not None else panel_ipv6.is_enabled()):
+        directives.append("listen [::]:443 ssl http2;")
+        if has_http3:
+            directives.append("listen [::]:443 quic;")
+    return directives
 
 # Block-opening directives that nest scopes; matched against the original
 # text so the trailing ``{`` is preserved.
@@ -938,100 +982,8 @@ def _merge_certbot_ssl_config(new_content: str, existing_content: str) -> str:
         server_name = new_content.split("server_name ", 1)[1].split(";", 1)[0].strip()
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
+    listen443_lines = [f"    {d}" for d in _listen_443_directives(ip_address)]
+    listen443_block = "\n".join(listen443_lines)
     ssl_lines = []
     seen_ssl_lines = set()
     for line in existing_content.splitlines():
@@ -1045,7 +997,7 @@ def _merge_certbot_ssl_config(new_content: str, existing_content: str) -> str:
     https_lines = []
     for line in new_content.splitlines():
         if f"    {listen80}" in line:
-            https_lines.append(line.replace(f"    {listen80}", f"    {listen443}"))
+            https_lines.append(line.replace(f"    {listen80}", listen443_block))
         else:
             https_lines.append(line)
         if "server_name" in line and ssl_lines:
@@ -1069,100 +1021,8 @@ def apply_manual_ssl_config(new_content: str, cert_path: str, key_path: str, ca_
         server_name = new_content.split("server_name ", 1)[1].split(";", 1)[0].strip()
     ip_address = get_website_ip(_domain_from_vhost(new_content))
     listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
-    ip_address = get_website_ip(_domain_from_vhost(new_content))
-    listen80 = f"listen {ip_address}:80;" if ip_address and ip_address != "*" else "listen 80;"
-    listen443 = f"listen {ip_address}:443 ssl http2;" if ip_address and ip_address != "*" else "listen 443 ssl http2;"
+    listen443_lines = [f"    {d}" for d in _listen_443_directives(ip_address)]
+    listen443_block = "\n".join(listen443_lines)
     ssl_lines = [
         f"    ssl_certificate {fullchain if ca else cert};",
         f"    ssl_certificate_key {key};",
@@ -1175,7 +1035,7 @@ def apply_manual_ssl_config(new_content: str, cert_path: str, key_path: str, ca_
     inserted = False
     for line in new_content.splitlines():
         if f"    {listen80}" in line:
-            https_lines.append(line.replace(f"    {listen80}", f"    {listen443}"))
+            https_lines.append(line.replace(f"    {listen80}", listen443_block))
         else:
             https_lines.append(line)
         if not inserted and "server_name" in line:

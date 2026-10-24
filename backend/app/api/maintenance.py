@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -519,7 +519,13 @@ def upload_archive_to_target(
     return target.name, result["remote_file"]
 
 
-def _run_site_backup_job(job_id: str, request_user_id: int, website_id: int, backup_mode: str = "full") -> None:
+def _run_site_backup_job(
+    job_id: str,
+    request_user_id: int,
+    website_id: int,
+    backup_mode: str = "full",
+    passphrase: str | None = None,
+) -> None:
     _set_backup_job(job_id, status="running", started_at=_now_iso(), message="Creating website backup")
     db = SessionLocal()
     try:
@@ -528,7 +534,12 @@ def _run_site_backup_job(job_id: str, request_user_id: int, website_id: int, bac
             raise ValueError("User not found")
         website = get_owned_website(db, user, website_id)
         db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
-        archive = backup.create_backup(website, db_item.db_name if db_item else None, backup_mode=backup_mode)
+        archive = backup.create_backup(
+            website,
+            db_item.db_name if db_item else None,
+            backup_mode=backup_mode,
+            passphrase=passphrase,
+        )
         log_action(db, user.id, "backup", website.domain, f"{archive} ({backup_mode})")
         _set_backup_job(
             job_id,
@@ -649,9 +660,14 @@ def _run_sftp_backup_job(
         db.close()
 
 
-def _queue_site_backup(current_user: User, website: Website, backup_mode: str = "full") -> dict:
+def _queue_site_backup(
+    current_user: User,
+    website: Website,
+    backup_mode: str = "full",
+    passphrase: str | None = None,
+) -> dict:
     job = _queue_backup_job(current_user, "site_backup", "Website backup queued", website_id=website.id)
-    _backup_job_executor.submit(_run_site_backup_job, job["job_id"], current_user.id, website.id, backup_mode)
+    _backup_job_executor.submit(_run_site_backup_job, job["job_id"], current_user.id, website.id, backup_mode, passphrase)
     return job
 
 
@@ -726,7 +742,12 @@ def _quota_check_for_website(db: Session, website: Website):
 @router.post("/backup")
 def create_backup(payload: BackupCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = get_owned_website(db, current_user, payload.website_id)
-    return _queue_site_backup(current_user, website, backup_mode=payload.backup_mode)
+    if payload.passphrase and len(payload.passphrase.strip()) < backup.MIN_BACKUP_PASSPHRASE_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Encryption passphrase must be at least {backup.MIN_BACKUP_PASSPHRASE_LEN} characters",
+        )
+    return _queue_site_backup(current_user, website, backup_mode=payload.backup_mode, passphrase=payload.passphrase)
 
 
 @router.get("/backup-jobs")
@@ -750,7 +771,13 @@ def restore_backup(payload: RestoreBackup, db: Session = Depends(get_db), curren
     website = get_owned_website(db, current_user, payload.website_id)
     mode = getattr(payload, "restore_mode", "full") or "full"
     try:
-        path = backup.restore_backup(website, payload.backup_file, db=db, restore_mode=mode)
+        path = backup.restore_backup(
+            website,
+            payload.backup_file,
+            db=db,
+            restore_mode=mode,
+            passphrase=payload.passphrase,
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if website.linux_user and mode in {"full", "files_only"}:
@@ -902,30 +929,41 @@ def restore_user_backup(payload: UserRestoreBackup, request: Request, db: Sessio
     ensure_role(current_user.role, Role.admin)
     mode = getattr(payload, "restore_mode", "full") or "full"
     try:
-        result = backup.restore_user_backup(payload.backup_file, db, restore_mode=mode)
+        result = backup.restore_user_backup(payload.backup_file, db, restore_mode=mode, passphrase=payload.passphrase)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     log_action(db, current_user.id, "restore_user", result.get("username", "user"), f"{payload.backup_file} ({mode})", request=request)
     return result
 
 
+class BackupVerifyPayload(BaseModel):
+    backup_file: Optional[str] = None
+    website_id: Optional[int] = None
+    passphrase: Optional[str] = None
+
+
 @router.post("/backups/verify")
 def verify_backup_archive(
-    backup_file: str,
-    website_id: int | None = None,
-    passphrase: str | None = None,
+    payload: Optional[BackupVerifyPayload] = Body(default=None),
+    backup_file: Optional[str] = Query(default=None),
+    website_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if website_id is not None:
-        website = get_owned_website(db, current_user, website_id)
+    target_file = (payload.backup_file if payload and payload.backup_file else backup_file) or ""
+    target_site_id = payload.website_id if (payload and payload.website_id is not None) else website_id
+    secret = payload.passphrase if payload else None
+    if not target_file:
+        raise HTTPException(status_code=400, detail="backup_file is required")
+    if target_site_id is not None:
+        website = get_owned_website(db, current_user, target_site_id)
         try:
-            path = backup.backup_path(website.domain, backup_file)
+            path = backup.backup_path(website.domain, target_file)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Backup not found") from exc
     else:
         try:
-            path = backup.user_backup_path(backup_file)
+            path = backup.user_backup_path(target_file)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Backup not found") from exc
         allowed = _allowed_backup_usernames(db, current_user)
@@ -934,7 +972,7 @@ def verify_backup_archive(
             if info.get("username") not in allowed:
                 raise HTTPException(status_code=403, detail="Access denied")
     try:
-        return backup.verify_backup_integrity(path, passphrase=passphrase)
+        return backup.verify_backup_integrity(path, passphrase=secret)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Backup not found") from exc
 
@@ -959,7 +997,7 @@ def encrypt_backup_endpoint(
         path = backup.user_backup_path(payload.backup_file)
     try:
         enc_path = backup.encrypt_backup_archive(path, payload.passphrase, replace_original=True)
-        return backup.verify_backup_integrity(enc_path)
+        return backup.verify_backup_integrity(enc_path, passphrase=payload.passphrase)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

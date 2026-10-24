@@ -1,18 +1,46 @@
 import datetime as dt
 import hashlib
+import hmac
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Request
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.entities import AuditLog, User
 from app.services.webhooks import dispatch_webhook
 
 
 logger = logging.getLogger("spanel.audit")
 GENESIS_HASH = "0" * 64
+AUDIT_HMAC_KEY_FILE = Path("/etc/spanel/audit-hmac.key")
+
+
+def _audit_anchor_path() -> Path:
+    custom = os.environ.get("SPANEL_AUDIT_ANCHOR_PATH", "").strip()
+    if custom:
+        return Path(custom)
+    return Path("/var/lib/spanel/audit-chain-anchor.json")
+
+
+def _audit_hmac_key() -> bytes:
+    env_key = os.environ.get("SPANEL_AUDIT_HMAC_KEY", "").strip()
+    if env_key:
+        return env_key.encode("utf-8")
+    try:
+        if AUDIT_HMAC_KEY_FILE.is_file():
+            raw = AUDIT_HMAC_KEY_FILE.read_text(encoding="utf-8").strip()
+            if raw:
+                return raw.encode("utf-8")
+    except OSError:
+        pass
+    secret = settings.secret_key or "spanel-default-secret"
+    return hmac.new(secret.encode("utf-8"), b"spanel-audit-hmac-v1", hashlib.sha256).digest()
 
 
 def _canonical_ts(value: Optional[dt.datetime]) -> str:
@@ -39,7 +67,55 @@ def _compute_entry_hash(
         detail or "",
         _canonical_ts(created_at),
     ])
-    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+    return hmac.new(
+        _audit_hmac_key(),
+        payload.encode("utf-8", errors="replace"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _read_audit_anchor() -> Optional[dict]:
+    path = _audit_anchor_path()
+    try:
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def _write_audit_anchor(
+    last_id: Optional[int],
+    head_hash: str,
+    total_entries: int,
+    action: str,
+    target: str,
+) -> None:
+    anchor = {
+        "last_id": int(last_id or 0),
+        "head_hash": head_hash,
+        "total_entries": int(total_entries),
+        "updated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    logger.info(
+        "AUDIT_ANCHOR id=%s total=%s head=%s action=%s target=%s",
+        anchor["last_id"],
+        anchor["total_entries"],
+        head_hash,
+        action,
+        target,
+    )
+    path = _audit_anchor_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(anchor, indent=2), encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        tmp_path.replace(path)
+    except OSError:
+        pass
 
 
 def log_action(
@@ -89,19 +165,20 @@ def log_action(
         prev_hash = GENESIS_HASH
 
     entry_hash = _compute_entry_hash(prev_hash, user_id, action, target, detail, now)
-    db.add(
-        AuditLog(
-            user_id=user_id,
-            action=action,
-            target=target,
-            detail=detail,
-            prev_hash=prev_hash,
-            entry_hash=entry_hash,
-            created_at=now,
-        )
+    entry = AuditLog(
+        user_id=user_id,
+        action=action,
+        target=target,
+        detail=detail,
+        prev_hash=prev_hash,
+        entry_hash=entry_hash,
+        created_at=now,
     )
+    db.add(entry)
     try:
         db.commit()
+        total_count = db.query(AuditLog).count()
+        _write_audit_anchor(entry.id, entry_hash, total_count, action, target)
     except Exception:
         db.rollback()
         logger.exception("Failed to write audit log: action=%s target=%s", action, target)
@@ -112,22 +189,36 @@ def log_action(
         pass
 
 
-def verify_audit_chain(db: Session, seal_unhashed: bool = True) -> dict:
-    """Verify the SHA-256 hash chain across all AuditLog entries.
+def verify_audit_chain(db: Session, seal_unhashed: bool = False) -> dict:
+    """Verify the HMAC-SHA256 hash chain and external anchor across all AuditLog entries.
 
-    If legacy rows exist without `entry_hash` and `seal_unhashed=True`, they are
-    cryptographically sealed into the chain on first verification.
+    By default `seal_unhashed=False` so rows with blanked `entry_hash` are flagged
+    as tampered rather than silently re-sealed. Even when `seal_unhashed=True` (used
+    only for one-time migration of pre-chain rows), any unhashed row appearing after
+    an already-sealed row is treated as tampering.
     """
     rows = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
     total = len(rows)
+    anchor = _read_audit_anchor()
     if total == 0:
+        tampered_empty = []
+        if anchor and int(anchor.get("total_entries") or 0) > 0:
+            tampered_empty.append({
+                "id": int(anchor.get("last_id") or 0),
+                "action": "chain_truncated",
+                "target": "audit_logs",
+                "created_at": anchor.get("updated_at", ""),
+                "expected_hash": (anchor.get("head_hash") or "")[:16],
+                "actual_hash": "EMPTY_TABLE",
+            })
         return {
-            "valid": True,
+            "valid": len(tampered_empty) == 0,
+            "cipher": "HMAC-SHA256",
             "total_entries": 0,
             "verified_entries": 0,
             "sealed_legacy_entries": 0,
             "head_hash": GENESIS_HASH,
-            "tampered_entries": [],
+            "tampered_entries": tampered_empty,
             "checked_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 
@@ -135,6 +226,7 @@ def verify_audit_chain(db: Session, seal_unhashed: bool = True) -> dict:
     sealed_count = 0
     verified_count = 0
     tampered = []
+    seen_sealed_row = False
 
     for row in rows:
         computed = _compute_entry_hash(
@@ -146,16 +238,25 @@ def verify_audit_chain(db: Session, seal_unhashed: bool = True) -> dict:
             row.created_at,
         )
         if not row.entry_hash:
-            if seal_unhashed:
+            if seal_unhashed and not seen_sealed_row and not row.prev_hash:
                 row.prev_hash = expected_prev
                 row.entry_hash = computed
                 sealed_count += 1
                 verified_count += 1
                 expected_prev = computed
             else:
+                tampered.append({
+                    "id": row.id,
+                    "action": row.action,
+                    "target": row.target,
+                    "created_at": _canonical_ts(row.created_at),
+                    "expected_hash": computed[:16],
+                    "actual_hash": "MISSING_HASH",
+                })
                 expected_prev = computed
             continue
 
+        seen_sealed_row = True
         if row.prev_hash != expected_prev or row.entry_hash != computed:
             tampered.append({
                 "id": row.id,
@@ -176,8 +277,33 @@ def verify_audit_chain(db: Session, seal_unhashed: bool = True) -> dict:
         except Exception:
             db.rollback()
 
+    if anchor:
+        anchor_total = int(anchor.get("total_entries") or 0)
+        anchor_last_id = int(anchor.get("last_id") or 0)
+        anchor_head = str(anchor.get("head_hash") or "")
+        last_row_id = int(rows[-1].id or 0)
+        if total < anchor_total or (anchor_last_id and last_row_id < anchor_last_id):
+            tampered.append({
+                "id": anchor_last_id or last_row_id,
+                "action": "chain_tail_truncated",
+                "target": f"expected_total={anchor_total},actual_total={total}",
+                "created_at": anchor.get("updated_at", ""),
+                "expected_hash": anchor_head[:16],
+                "actual_hash": expected_prev[:16],
+            })
+        elif total == anchor_total and anchor_head and anchor_head != expected_prev and not tampered:
+            tampered.append({
+                "id": last_row_id,
+                "action": "chain_anchor_mismatch",
+                "target": "audit_logs",
+                "created_at": anchor.get("updated_at", ""),
+                "expected_hash": anchor_head[:16],
+                "actual_hash": expected_prev[:16],
+            })
+
     return {
         "valid": len(tampered) == 0,
+        "cipher": "HMAC-SHA256",
         "total_entries": total,
         "verified_entries": verified_count,
         "sealed_legacy_entries": sealed_count,
@@ -194,7 +320,7 @@ def list_audit_logs(
     limit: int = 100,
 ) -> dict:
     safe_limit = max(1, min(int(limit or 100), 500))
-    chain_status = verify_audit_chain(db, seal_unhashed=True)
+    chain_status = verify_audit_chain(db, seal_unhashed=False)
 
     query = db.query(AuditLog)
     if action_filter and action_filter.strip():

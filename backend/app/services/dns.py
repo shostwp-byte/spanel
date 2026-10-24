@@ -895,24 +895,6 @@ def _parse_ds_record(zone: str, raw_ds: str) -> dict:
     }
 
 
-def _stored_dnssec_fallback(zone: str) -> dict | None:
-    raw = panel_settings._read_raw_lenient().get("dnssec_zones")
-    if isinstance(raw, dict) and isinstance(raw.get(zone), dict):
-        return raw[zone]
-    return None
-
-
-def _save_dnssec_fallback(zone: str, state: dict | None) -> None:
-    raw = panel_settings._read_raw_lenient()
-    zones = dict(raw.get("dnssec_zones") or {}) if isinstance(raw.get("dnssec_zones"), dict) else {}
-    if state is None:
-        zones.pop(zone, None)
-    else:
-        zones[zone] = state
-    raw["dnssec_zones"] = zones
-    panel_settings._write_raw(raw)
-
-
 def _format_cryptokeys_status(zone: str, keys: list[dict]) -> dict:
     active_keys = [k for k in (keys or []) if isinstance(k, dict) and k.get("active")]
     ds_records = []
@@ -941,90 +923,52 @@ def _format_cryptokeys_status(zone: str, keys: list[dict]) -> dict:
 
 
 def get_dnssec_status(zone: str) -> dict:
-    """Return DNSSEC status, DS records, and DNSKEY records for a zone."""
+    """Return DNSSEC status, DS records, and DNSKEY records for a zone directly from PowerDNS."""
     zone = normalize_zone(zone)
     apex = _absolute(zone)
-    try:
-        keys = _request("GET", f"/zones/{apex}/cryptokeys")
-        if isinstance(keys, list):
-            return _format_cryptokeys_status(zone, keys)
-    except DnsError:
-        fallback = _stored_dnssec_fallback(zone)
-        if fallback is not None:
-            return fallback
-        return _format_cryptokeys_status(zone, [])
-    return _format_cryptokeys_status(zone, [])
+    keys = _request("GET", f"/zones/{apex}/cryptokeys")
+    return _format_cryptokeys_status(zone, keys if isinstance(keys, list) else [])
 
 
 def enable_dnssec(zone: str) -> dict:
-    """Enable 1-Click DNSSEC (CSK ECDSAP256SHA256 / Algorithm 13) on a zone and return DS/DNSKEY records."""
-    import base64
-    import hashlib
-
+    """Enable 1-Click DNSSEC (CSK ECDSAP256SHA256 / Algorithm 13) on a zone and return verified PowerDNS DS/DNSKEY records."""
     zone = normalize_zone(zone)
     apex = _absolute(zone)
+    existing = _request("GET", f"/zones/{apex}/cryptokeys")
+    active = [k for k in (existing or []) if isinstance(k, dict) and k.get("active")]
+    if not active:
+        _request(
+            "POST",
+            f"/zones/{apex}/cryptokeys",
+            {"keytype": "csk", "active": True, "published": True, "algorithm": "ecdsa256"},
+        )
     try:
-        existing = _request("GET", f"/zones/{apex}/cryptokeys")
-        active = [k for k in (existing or []) if isinstance(k, dict) and k.get("active")]
-        if not active:
-            _request(
-                "POST",
-                f"/zones/{apex}/cryptokeys",
-                {"keytype": "csk", "active": True, "published": True, "algorithm": "ecdsa256"},
-            )
-        try:
-            _request("PUT", f"/zones/{apex}/rectify")
-        except DnsError:
-            pass
-        keys = _request("GET", f"/zones/{apex}/cryptokeys")
-        status = _format_cryptokeys_status(zone, keys if isinstance(keys, list) else [])
-        _save_dnssec_fallback(zone, status)
-        from app.services import multi_server
-        multi_server.trigger_background_zone_sync(zone, action="upsert")
-        return status
+        _request("PUT", f"/zones/{apex}/rectify")
     except DnsError:
-        # Fallback via pdnsutil helper or deterministic CSK record generation when PowerDNS HTTP cryptokeys is unavailable
-        digest_sha256 = hashlib.sha256(f"spanel-dnssec-csk:{zone}".encode("utf-8")).hexdigest().upper()
-        digest_sha384 = hashlib.sha384(f"spanel-dnssec-csk:{zone}".encode("utf-8")).hexdigest().upper()
-        key_tag = (int(digest_sha256[:4], 16) % 60000) + 1000
-        pub_b64 = base64.b64encode(hashlib.sha512(f"dnskey:{zone}".encode("utf-8")).digest()).decode("ascii")
-        fake_keys = [{
-            "id": 1,
-            "keytype": "csk",
-            "active": True,
-            "published": True,
-            "algorithm": "ECDSAP256SHA256",
-            "dnskey": f"257 3 13 {pub_b64}",
-            "ds": [
-                f"{key_tag} 13 2 {digest_sha256}",
-                f"{key_tag} 13 4 {digest_sha384}",
-            ],
-        }]
-        status = _format_cryptokeys_status(zone, fake_keys)
-        _save_dnssec_fallback(zone, status)
-        return status
+        pass
+    keys = _request("GET", f"/zones/{apex}/cryptokeys")
+    status = _format_cryptokeys_status(zone, keys if isinstance(keys, list) else [])
+    if not status["enabled"] or not status["ds_records"]:
+        raise DnsError("PowerDNS did not confirm an active DNSSEC signing key or DS record for this zone.", status=502)
+    from app.services import multi_server
+    multi_server.trigger_background_zone_sync(zone, action="upsert")
+    return status
 
 
 def disable_dnssec(zone: str) -> dict:
-    """Disable DNSSEC on a zone and remove its signing keys."""
+    """Disable DNSSEC on a zone and remove its signing keys from PowerDNS."""
     zone = normalize_zone(zone)
     apex = _absolute(zone)
-    _save_dnssec_fallback(zone, None)
-    try:
-        keys = _request("GET", f"/zones/{apex}/cryptokeys")
-        if isinstance(keys, list):
-            for key in keys:
-                key_id = key.get("id")
-                if key_id is not None:
-                    try:
-                        _request("DELETE", f"/zones/{apex}/cryptokeys/{key_id}")
-                    except DnsError:
-                        pass
-        from app.services import multi_server
-        multi_server.trigger_background_zone_sync(zone, action="upsert")
-    except DnsError:
-        pass
-    return _format_cryptokeys_status(zone, [])
+    keys = _request("GET", f"/zones/{apex}/cryptokeys")
+    if isinstance(keys, list):
+        for key in keys:
+            key_id = key.get("id")
+            if key_id is not None:
+                _request("DELETE", f"/zones/{apex}/cryptokeys/{key_id}")
+    remaining = _request("GET", f"/zones/{apex}/cryptokeys")
+    from app.services import multi_server
+    multi_server.trigger_background_zone_sync(zone, action="upsert")
+    return _format_cryptokeys_status(zone, remaining if isinstance(remaining, list) else [])
 
 
 def restore_defaults(db: Session, zone: str) -> None:

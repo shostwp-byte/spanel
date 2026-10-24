@@ -43,10 +43,14 @@ server {
     }
 
     # SPANEL FASTCGI CACHE SERVER BEGIN
+    set $spanel_cache_uri $request_uri;
     set $spanel_skip_cache 0;
     if ($request_method = POST) { set $spanel_skip_cache 1; }
     if ($query_string != "") { set $spanel_skip_cache 1; }
-    if ($query_string ~* "^(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*)(?:&(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|mc_[ce]id=[^&]*))*$") { set $spanel_skip_cache 0; }
+    if ($query_string ~* "^(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|msclkid=[^&]*|_ga=[^&]*|mc_[ce]id=[^&]*)(?:&(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|msclkid=[^&]*|_ga=[^&]*|mc_[ce]id=[^&]*))*$") {
+        set $spanel_skip_cache 0;
+        set $spanel_cache_uri $uri;
+    }
     if ($query_string ~* "add-to-cart=|wc-ajax=| nocache=") { set $spanel_skip_cache 1; }
     if ($http_cache_control ~* "no-cache|no-store|max-age=0") { set $spanel_skip_cache 1; }
     if ($http_pragma = "no-cache") { set $spanel_skip_cache 1; }
@@ -110,6 +114,7 @@ server {
         fastcgi_read_timeout 300;
         # SPANEL FASTCGI CACHE LOCATION BEGIN
         fastcgi_cache SPANEL_FASTCGI;
+        fastcgi_cache_key "$scheme$request_method$host$spanel_cache_uri";
         fastcgi_cache_methods GET HEAD;
         fastcgi_cache_valid 200 301 302 10m;
         fastcgi_cache_valid 404 1m;

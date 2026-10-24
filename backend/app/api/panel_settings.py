@@ -257,7 +257,7 @@ def verify_audit_logs_chain(
     current_user: User = Depends(get_current_user),
 ):
     ensure_role(current_user.role, Role.admin)
-    res = verify_audit_chain(db, seal_unhashed=True)
+    res = verify_audit_chain(db, seal_unhashed=False)
     log_action(
         db,
         current_user.id,
@@ -266,7 +266,7 @@ def verify_audit_logs_chain(
         detail=f"valid={res.get('valid')} total={res.get('total_entries')}",
         request=request,
     )
-    return verify_audit_chain(db, seal_unhashed=True)
+    return verify_audit_chain(db, seal_unhashed=False)
 
 
 @router.get("/cron-security")

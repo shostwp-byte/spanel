@@ -56,6 +56,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   const [siteBackupMode, setSiteBackupMode] = useState('full');
   const [userRestoreMode, setUserRestoreMode] = useState('full');
   const [siteRestoreMode, setSiteRestoreMode] = useState('full');
+  const [siteBackupPassphrase, setSiteBackupPassphrase] = useState('');
   const [lastRestoredUserCredentials, setLastRestoredUserCredentials] = useState(null);
 
   // Schedule Builder / Editor state
@@ -216,6 +217,10 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
 
   async function createBackup() {
     if (!selectedWebsiteId) return;
+    if (siteBackupPassphrase && siteBackupPassphrase.trim().length > 0 && siteBackupPassphrase.trim().length < 12) {
+      setError('Mật khẩu mã hóa AES-256 phải có tối thiểu 12 ký tự.');
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -224,9 +229,11 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         body: JSON.stringify({
           website_id: Number(selectedWebsiteId),
           backup_mode: siteBackupMode,
+          passphrase: siteBackupPassphrase.trim() || undefined,
         }),
       });
       queueBackupJob(data, t('websiteBackupRunningInBackground'));
+      setSiteBackupPassphrase('');
     } catch (err) {
       setError(err.message);
     } finally {
@@ -307,14 +314,63 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     setLoading(true);
     setError('');
     try {
-      const params = new URLSearchParams({ backup_file: backupFile });
-      if (websiteId) params.set('website_id', String(websiteId));
-      const res = await request(`/maintenance/backups/verify?${params.toString()}`, { method: 'POST' });
-      if (res?.valid) {
-        setNotice(`Xác thực toàn vẹn SHA-256 thành công cho ${res.filename}: SHA-256=${String(res.sha256 || '').slice(0, 16)}... (${res.member_count} mục trong gói .tar.gz).`);
-      } else {
-        setError(res?.error || 'Bản sao lưu không vượt qua kiểm tra toàn vẹn SHA-256.');
+      let res = await request('/maintenance/backups/verify', {
+        method: 'POST',
+        body: JSON.stringify({
+          backup_file: backupFile,
+          website_id: websiteId ? Number(websiteId) : null,
+        }),
+      });
+      if (res?.status === 'passphrase_required' || (res?.encrypted && !res?.valid)) {
+        const entered = window.prompt('Bản sao lưu đã được mã hóa AES-256-CBC + HMAC-SHA256. Nhập mật khẩu (tối thiểu 12 ký tự) để xác thực:');
+        if (!entered) {
+          setLoading(false);
+          return;
+        }
+        res = await request('/maintenance/backups/verify', {
+          method: 'POST',
+          body: JSON.stringify({
+            backup_file: backupFile,
+            website_id: websiteId ? Number(websiteId) : null,
+            passphrase: entered,
+          }),
+        });
       }
+      if (res?.valid) {
+        const encBadge = res.encrypted ? ` · Đã xác thực ${res.cipher} + ${res.mac || 'HMAC-SHA256'}` : '';
+        setNotice(`Xác thực toàn vẹn SHA-256 thành công cho ${res.filename}: SHA-256=${String(res.sha256 || '').slice(0, 16)}... (${res.member_count} mục trong gói .tar.gz${encBadge}).`);
+      } else {
+        setError(res?.error || 'Bản sao lưu không vượt qua kiểm tra toàn vẹn SHA-256 / HMAC-SHA256.');
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function encryptBackupArchiveItem(backupFile, websiteId = null) {
+    if (!backupFile) return;
+    const passphrase = window.prompt('Nhập mật khẩu mã hóa AES-256-CBC + HMAC-SHA256 (tối thiểu 12 ký tự):');
+    if (!passphrase) return;
+    if (passphrase.trim().length < 12) {
+      setError('Mật khẩu mã hóa AES-256 phải có tối thiểu 12 ký tự.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      const res = await request('/maintenance/backups/encrypt', {
+        method: 'POST',
+        body: JSON.stringify({
+          backup_file: backupFile,
+          website_id: websiteId ? Number(websiteId) : null,
+          passphrase: passphrase.trim(),
+        }),
+      });
+      if (websiteId) await loadBackups(websiteId);
+      else await loadUserBackups();
+      setNotice(`Đã mã hóa AES-256-CBC + HMAC-SHA256 cho ${res?.filename || backupFile}.`);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -1192,6 +1248,14 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   <option value="full">Full Backup (Đầy đủ)</option>
                   <option value="incremental">Incremental (Gia tăng)</option>
                 </select>
+                <input
+                  type="password"
+                  value={siteBackupPassphrase}
+                  onChange={(e) => setSiteBackupPassphrase(e.target.value)}
+                  placeholder="Mật khẩu AES-256 (≥12 ký tự, tùy chọn)"
+                  style={{ height: '38px', width: '240px', fontSize: '0.82rem' }}
+                  title="Nếu nhập mật khẩu (tối thiểu 12 ký tự), bản sao lưu sẽ được mã hóa AES-256-CBC + HMAC-SHA256"
+                />
                 <label className="button secondary-light" style={{ margin: 0, cursor: selectedWebsiteId ? 'pointer' : 'not-allowed', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                   <Upload size={15} /> Tải lên file .tar.gz
                   <input type="file" accept=".tar.gz,application/gzip" onChange={uploadBackupArchive} hidden disabled={loading || !selectedWebsiteId} />
@@ -1303,6 +1367,15 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                               title="Kiểm tra toàn vẹn SHA-256 & cấu trúc gói .tar.gz"
                             >
                               <ShieldCheck size={14} /> SHA-256
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-light"
+                              onClick={() => encryptBackupArchiveItem(item, selectedWebsiteId)}
+                              disabled={loading}
+                              title="Mã hóa bản sao lưu bằng AES-256-CBC + HMAC-SHA256"
+                            >
+                              <KeyRound size={14} /> AES-256
                             </button>
                             <button
                               type="button"

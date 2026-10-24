@@ -99,11 +99,14 @@ def _hostname_conflicts(db, domain: str, exclude_website_id: int | None = None) 
 SITE_MANIFEST = "site_manifest.json"
 VALID_RESTORE_MODES = ("full", "files_only", "database_only", "mail_only")
 OPENSSL_SALT_MAGIC = b"Salted__"
+BACKUP_HMAC_MAGIC = b"SPNLMAC1"
+BACKUP_HMAC_TRAILER_LEN = len(BACKUP_HMAC_MAGIC) + 32
+MIN_BACKUP_PASSPHRASE_LEN = 12
 PBKDF2_ITERATIONS = 100_000
 
 
 def is_encrypted_backup(archive_path: str | Path) -> bool:
-    """Return True if the backup archive is encrypted with OpenSSL AES-256-CBC (PBKDF2) Salted__ format."""
+    """Return True if the backup archive is encrypted with AES-256-CBC + HMAC-SHA256 (Salted__ format)."""
     path = Path(archive_path)
     if not path.is_file():
         return str(path).endswith(".enc")
@@ -122,7 +125,8 @@ def encrypt_backup_archive(
     output_path: Optional[str | Path] = None,
     replace_original: bool = True,
 ) -> Path:
-    """Encrypt a backup archive using AES-256-CBC with PBKDF2-HMAC-SHA256 (100,000 iterations, OpenSSL compatible)."""
+    """Encrypt a backup archive using AES-256-CBC + Encrypt-then-MAC HMAC-SHA256 (PBKDF2 100,000 iterations)."""
+    import hmac as hmac_mod
     from cryptography.hazmat.primitives import padding as sym_padding
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -130,28 +134,38 @@ def encrypt_backup_archive(
     if not src.is_file():
         raise FileNotFoundError(f"Backup archive not found: {src}")
     secret = (passphrase or "").strip()
-    if len(secret) < 4:
-        raise ValueError("Encryption passphrase must be at least 4 characters")
+    if len(secret) < MIN_BACKUP_PASSPHRASE_LEN:
+        raise ValueError(f"Encryption passphrase must be at least {MIN_BACKUP_PASSPHRASE_LEN} characters")
     if is_encrypted_backup(src):
         return src
 
     salt = secrets.token_bytes(8)
-    dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ITERATIONS, dklen=48)
-    key, iv = dk[:32], dk[32:48]
+    dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ITERATIONS, dklen=80)
+    key, iv, mac_key = dk[:32], dk[32:48], dk[48:80]
 
     tmp_enc = Path(output_path).resolve() if output_path else src.with_name(src.name + ".enc.tmp")
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
     encryptor = cipher.encryptor()
     padder = sym_padding.PKCS7(128).padder()
+    mac = hmac_mod.new(mac_key, digestmod=hashlib.sha256)
 
     with src.open("rb") as fin, tmp_enc.open("wb") as fout:
-        fout.write(OPENSSL_SALT_MAGIC + salt)
+        header = OPENSSL_SALT_MAGIC + salt
+        fout.write(header)
+        mac.update(header)
         while chunk := fin.read(64 * 1024):
             padded = padder.update(chunk)
             if padded:
-                fout.write(encryptor.update(padded))
+                ct = encryptor.update(padded)
+                if ct:
+                    fout.write(ct)
+                    mac.update(ct)
         final_padded = padder.finalize()
-        fout.write(encryptor.update(final_padded) + encryptor.finalize())
+        final_ct = encryptor.update(final_padded) + encryptor.finalize()
+        if final_ct:
+            fout.write(final_ct)
+            mac.update(final_ct)
+        fout.write(BACKUP_HMAC_MAGIC + mac.digest())
 
     if output_path:
         final_dest = tmp_enc
@@ -173,7 +187,8 @@ def decrypt_backup_archive(
     output_path: Optional[str | Path] = None,
     replace_original: bool = False,
 ) -> Path:
-    """Decrypt an AES-256-CBC (PBKDF2-HMAC-SHA256) backup archive."""
+    """Verify Encrypt-then-MAC HMAC-SHA256 and decrypt an AES-256-CBC backup archive."""
+    import hmac as hmac_mod
     from cryptography.hazmat.primitives import padding as sym_padding
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -184,13 +199,37 @@ def decrypt_backup_archive(
     if not secret:
         raise ValueError("Decryption passphrase is required for encrypted backup archive")
 
+    file_size = src.stat().st_size
+    if file_size < 16 + BACKUP_HMAC_TRAILER_LEN:
+        raise ValueError("Encrypted archive is truncated or missing HMAC-SHA256 authentication tag")
+
     with src.open("rb") as fin:
         header = fin.read(16)
         if len(header) < 16 or header[:8] != OPENSSL_SALT_MAGIC:
             raise ValueError("Archive is not in AES-256-CBC Salted__ format")
         salt = header[8:16]
-        dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ITERATIONS, dklen=48)
-        key, iv = dk[:32], dk[32:48]
+        dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, PBKDF2_ITERATIONS, dklen=80)
+        key, iv, mac_key = dk[:32], dk[32:48], dk[48:80]
+
+        fin.seek(file_size - BACKUP_HMAC_TRAILER_LEN)
+        trailer = fin.read(BACKUP_HMAC_TRAILER_LEN)
+        if len(trailer) != BACKUP_HMAC_TRAILER_LEN or trailer[:8] != BACKUP_HMAC_MAGIC:
+            raise ValueError("Encrypted archive is missing required SPNLMAC1 HMAC-SHA256 authentication trailer")
+        expected_mac = trailer[8:]
+
+        # Verify Encrypt-then-MAC over header + ciphertext before touching CBC decryption
+        mac = hmac_mod.new(mac_key, digestmod=hashlib.sha256)
+        fin.seek(0)
+        remaining_auth = file_size - BACKUP_HMAC_TRAILER_LEN
+        while remaining_auth > 0:
+            chunk = fin.read(min(64 * 1024, remaining_auth))
+            if not chunk:
+                break
+            mac.update(chunk)
+            remaining_auth -= len(chunk)
+        if not hmac_mod.compare_digest(mac.digest(), expected_mac):
+            raise ValueError("Invalid AES-256 decryption passphrase or HMAC-SHA256 authentication failed")
+
         cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
         decryptor = cipher.decryptor()
         unpadder = sym_padding.PKCS7(128).unpadder()
@@ -204,8 +243,14 @@ def decrypt_backup_archive(
             dest = src.with_name(clean_name)
 
         try:
+            fin.seek(16)
+            remaining_ct = file_size - 16 - BACKUP_HMAC_TRAILER_LEN
             with dest.open("wb") as fout:
-                while chunk := fin.read(64 * 1024):
+                while remaining_ct > 0:
+                    chunk = fin.read(min(64 * 1024, remaining_ct))
+                    if not chunk:
+                        break
+                    remaining_ct -= len(chunk)
                     dec = decryptor.update(chunk)
                     if dec:
                         unpadded = unpadder.update(dec)
@@ -297,7 +342,8 @@ def verify_backup_integrity(archive_path: str | Path, passphrase: Optional[str] 
             finally:
                 tmp_dec.unlink(missing_ok=True)
         else:
-            tar_ok = True
+            tar_ok = False
+            error_detail = "Passphrase required to verify encrypted backup archive"
     else:
         try:
             with tarfile.open(path, "r:gz") as tar:
@@ -311,6 +357,7 @@ def verify_backup_integrity(archive_path: str | Path, passphrase: Optional[str] 
     valid = bool(sidecar_match and tar_ok and not error_detail)
     return {
         "valid": valid,
+        "status": "passphrase_required" if (encrypted and not passphrase) else ("valid" if valid else "invalid"),
         "filename": path.name,
         "size": path.stat().st_size,
         "sha256": actual_sha,
@@ -318,6 +365,7 @@ def verify_backup_integrity(archive_path: str | Path, passphrase: Optional[str] 
         "sidecar_match": sidecar_match,
         "encrypted": encrypted,
         "cipher": "AES-256-CBC-PBKDF2-SHA256" if encrypted else "none",
+        "mac": "HMAC-SHA256" if encrypted else "none",
         "member_count": member_count,
         "error": error_detail,
     }
@@ -418,6 +466,7 @@ def create_backup(
     backup_mode: str = "full",
     target_id: Optional[int] = None,
     full_every_n: int = 7,
+    passphrase: Optional[str] = None,
 ) -> str:
     stamp_dt = datetime.utcnow()
     stamp = stamp_dt.strftime("%Y%m%d%H%M%S")
@@ -520,7 +569,10 @@ def create_backup(
             "updated_at": stamp_dt.isoformat() + "Z",
             "files": current_files,
         })
-        _write_sha256_sidecar(archive)
+        if passphrase and passphrase.strip():
+            encrypt_backup_archive(archive, passphrase.strip(), replace_original=True)
+        else:
+            _write_sha256_sidecar(archive)
     finally:
         sql_file.unlink(missing_ok=True)
         manifest_file.unlink(missing_ok=True)

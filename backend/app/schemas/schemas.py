@@ -882,6 +882,7 @@ class DatabaseCreate(BaseModel):
     db_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     db_user: Optional[str] = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     db_password: Optional[str] = Field(default=None, min_length=12, max_length=128)
+    remote_db_host_id: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("db_name", mode="before")
     @classmethod
@@ -1312,6 +1313,7 @@ class FirewallBlocklistUrl(BaseModel):
 class BackupCreate(BaseModel):
     website_id: int
     backup_mode: Literal["full", "incremental"] = "full"
+    passphrase: Optional[str] = None
 
 
 def _validate_backup_schedule(value: str) -> str:
@@ -1326,6 +1328,7 @@ class UserBackupCreate(BaseModel):
     user_id: int
     target_id: Optional[int] = None
     backup_mode: Literal["full", "incremental"] = "full"
+    passphrase: Optional[str] = None
 
 
 

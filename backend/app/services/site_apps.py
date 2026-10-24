@@ -740,6 +740,16 @@ def verify_webhook_token(app: SiteApp, token: str) -> bool:
     return bool(provided) and hmac.compare_digest(expected, provided)
 
 
+def verify_github_webhook_signature(app: SiteApp, raw_body: bytes, signature_header: str | None) -> bool:
+    """Verify GitHub X-Hub-Signature-256 HMAC-SHA256 against the raw webhook request body."""
+    sig = (signature_header or "").strip().lower()
+    if not sig.startswith("sha256="):
+        return False
+    secret = webhook_token_for(app).encode("utf-8")
+    expected = "sha256=" + hmac.new(secret, raw_body or b"", hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
 def git_auto_deploy(app: SiteApp) -> dict:
     """Pull latest git commit in the application directory, install dependencies, and restart unit."""
     linux_user = owner_linux_user(app)

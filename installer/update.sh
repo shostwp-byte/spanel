@@ -1495,6 +1495,20 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
   if id -u spanel >/dev/null 2>&1; then
     install -m 0750 -o root -g spanel "$SOURCE_DIR/installer/files/spanel-helper.sh" /usr/local/sbin/spanel-helper
     sed -i "s#^APP_DIR=\"/opt/spanel\"#APP_DIR=\"${APP_DIR}\"#" /usr/local/sbin/spanel-helper
+    if [[ -f "$SOURCE_DIR/installer/files/spanel-cron-jail.sh" ]]; then
+      install -m 0755 -o root -g root "$SOURCE_DIR/installer/files/spanel-cron-jail.sh" /usr/local/bin/spanel-cron-jail
+    fi
+    if [[ -f "$SOURCE_DIR/installer/files/spanel_webshells.yar" ]]; then
+      install -d -m 0755 -o root -g spanel /etc/spanel/yara
+      install -m 0644 -o root -g spanel "$SOURCE_DIR/installer/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
+    fi
+    if [[ -f "$SOURCE_DIR/installer/files/spanel-watchdog.service" && -f "$SOURCE_DIR/installer/files/spanel-watchdog.timer" ]]; then
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-watchdog.service" /etc/systemd/system/spanel-watchdog.service
+      sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-watchdog.service
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-watchdog.timer" /etc/systemd/system/spanel-watchdog.timer
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
+    fi
     install -m 0440 -o root -g root  "$SOURCE_DIR/installer/files/spanel-sudoers"   /etc/sudoers.d/spanel
     visudo -c -f /etc/sudoers.d/spanel >/dev/null
     sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper wp --info >/dev/null

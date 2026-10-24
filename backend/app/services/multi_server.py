@@ -4,9 +4,11 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import ssl
+import subprocess
 import threading
 import time
 import urllib.error
@@ -19,6 +21,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.secrets import decrypt as _decrypt_secret, encrypt as _encrypt_secret, is_encrypted as _is_encrypted_secret
 from app.core.version import APP_VERSION
 from app.models.entities import DnsZone, User, Website, WebsiteAlias
 from app.services import dns, panel_settings, server_network, system as system_service
@@ -136,11 +139,24 @@ def _sanitize_node(node: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _decrypt_remote_db_password(raw_pw: str) -> str:
+    val = (raw_pw or "").strip()
+    if not val:
+        return ""
+    if _is_encrypted_secret(val):
+        try:
+            return _decrypt_secret(val)
+        except Exception:
+            return ""
+    return val
+
+
 def _sanitize_remote_db(host: dict[str, Any]) -> dict[str, Any]:
     out = dict(host)
-    pwd = str(out.pop("admin_password", "") or "")
-    out["password_masked"] = _mask_secret(pwd)
-    out["has_password"] = bool(pwd)
+    raw_pwd = str(out.pop("admin_password", "") or "")
+    pwd = _decrypt_remote_db_password(raw_pwd)
+    out["password_masked"] = _mask_secret(pwd or raw_pwd)
+    out["has_password"] = bool(raw_pwd)
     return out
 
 
@@ -801,6 +817,17 @@ def check_cluster_conflict(domain: str = "", username: str = "") -> dict[str, An
 
 # --- Remote Database Hosts (Remote MySQL / MariaDB Nodes) ---------------------
 
+_DB_IDENT_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+_RESERVED_REMOTE_DB_USERS = frozenset({"root", "mysql", "mariadb.sys", "debian-sys-maint", "spanel"})
+
+
+def _validate_remote_db_identifier(value: str, label: str = "identifier") -> str:
+    cleaned = (value or "").strip().lower()
+    if not _DB_IDENT_RE.match(cleaned):
+        raise ValueError(f"Invalid remote database {label}: '{value}'")
+    return cleaned
+
+
 def _probe_mysql_banner(host: str, port: int, timeout: float = 4.0) -> tuple[int, str]:
     """Connect to a remote MySQL/MariaDB TCP port and parse its initial handshake version."""
     started = time.perf_counter()
@@ -818,6 +845,32 @@ def _probe_mysql_banner(host: str, port: int, timeout: float = 4.0) -> tuple[int
     return latency_ms, version_str
 
 
+def _open_remote_mysql_connection(entry: dict[str, Any], timeout: int = 5):
+    """Open an authenticated PyMySQL connection to a remote MySQL/MariaDB node."""
+    import pymysql
+
+    host = str(entry.get("host") or "").strip()
+    port = int(entry.get("port") or 3306)
+    admin_user = str(entry.get("admin_user") or "root").strip()
+    admin_password = _decrypt_remote_db_password(str(entry.get("admin_password") or ""))
+    use_tls = bool(entry.get("use_tls", False))
+
+    kwargs: dict[str, Any] = {
+        "host": host,
+        "port": port,
+        "user": admin_user,
+        "password": admin_password,
+        "connect_timeout": timeout,
+        "read_timeout": timeout,
+        "write_timeout": timeout,
+        "charset": "utf8mb4",
+        "autocommit": True,
+    }
+    if use_tls:
+        kwargs["ssl"] = {"ssl": {}}
+    return pymysql.connect(**kwargs)
+
+
 def add_remote_db_host(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "").strip()[:80]
     host = str(payload.get("host") or "").strip().lower()
@@ -830,6 +883,12 @@ def add_remote_db_host(payload: dict[str, Any]) -> dict[str, Any]:
     if not (1 <= port <= 65535):
         raise ValueError("Cổng MySQL/MariaDB phải nằm trong khoảng 1 – 65535.")
 
+    stored_password = (
+        _encrypt_secret(admin_password)
+        if admin_password and not _is_encrypted_secret(admin_password)
+        else admin_password
+    )
+
     host_id = f"rdb_{secrets.token_hex(4)}"
     entry = {
         "id": host_id,
@@ -837,7 +896,7 @@ def add_remote_db_host(payload: dict[str, Any]) -> dict[str, Any]:
         "host": host,
         "port": port,
         "admin_user": admin_user,
-        "admin_password": admin_password,
+        "admin_password": stored_password,
         "use_tls": bool(payload.get("use_tls", False)),
         "enabled": bool(payload.get("enabled", True)),
         "status": "unknown",
@@ -853,7 +912,7 @@ def add_remote_db_host(payload: dict[str, Any]) -> dict[str, Any]:
         if any(h.get("host") == host and int(h.get("port", 3306)) == port for h in state.get("remote_db_hosts", [])):
             raise ValueError(f"Máy chủ Database {host}:{port} đã tồn tại trong danh sách.")
         state.setdefault("remote_db_hosts", []).append(entry)
-        _append_log(state, "add_remote_db", f"{name} ({host}:{port})", "info", "Đã thêm cấu hình Remote MySQL/MariaDB Node.")
+        _append_log(state, "add_remote_db", f"{name} ({host}:{port})", "info", "Đã thêm cấu hình Remote MySQL/MariaDB Node (mã hóa mật khẩu Fernet AES).")
         _write_state(state)
 
     return test_remote_db_host(host_id)
@@ -865,11 +924,28 @@ def test_remote_db_host(host_id: str) -> dict[str, Any]:
         entry = next((h for h in state.get("remote_db_hosts", []) if h.get("id") == host_id), None)
         if not entry:
             raise ValueError("Không tìm thấy máy chủ Remote Database này.")
+        entry_copy = dict(entry)
         host = str(entry.get("host") or "")
         port = int(entry.get("port") or 3306)
 
     try:
-        latency_ms, version_str = _probe_mysql_banner(host, port)
+        has_pw = bool(_decrypt_remote_db_password(str(entry_copy.get("admin_password") or "")))
+        if has_pw:
+            try:
+                started = time.perf_counter()
+                conn = _open_remote_mysql_connection(entry_copy, timeout=4)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT VERSION()")
+                        row = cur.fetchone()
+                        version_str = str(row[0]) if row and row[0] else "MySQL / MariaDB"
+                finally:
+                    conn.close()
+                latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
+            except ImportError:
+                latency_ms, version_str = _probe_mysql_banner(host, port)
+        else:
+            latency_ms, version_str = _probe_mysql_banner(host, port)
         status = "online"
         last_error = ""
     except Exception as exc:
@@ -890,6 +966,142 @@ def test_remote_db_host(host_id: str) -> dict[str, Any]:
         entry["last_error"] = last_error
         _write_state(state)
         return _sanitize_remote_db(entry)
+
+
+def get_active_remote_db_host(host_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Return an active Remote DB host configuration (with decrypted admin_password) for database provisioning."""
+    with _state_lock:
+        state = _read_state()
+        hosts = state.get("remote_db_hosts", [])
+        target = None
+        if host_id and host_id != "auto":
+            target = next((h for h in hosts if h.get("id") == host_id and h.get("enabled", True)), None)
+        elif host_id == "auto":
+            target = next((h for h in hosts if h.get("enabled", True)), None)
+        if not target:
+            return None
+        out = dict(target)
+        out["admin_password_plain"] = _decrypt_remote_db_password(str(out.get("admin_password") or ""))
+        return out
+
+
+def provision_remote_database(
+    host_entry: dict[str, Any],
+    db_name: str,
+    db_user: str,
+    db_password: str,
+    allowed_client_host: str = "%",
+) -> dict[str, Any]:
+    """Connect to a remote MySQL/MariaDB server via PyMySQL (or mysql CLI fallback) and provision database + user."""
+    safe_db = _validate_remote_db_identifier(db_name, "db_name")
+    safe_user = _validate_remote_db_identifier(db_user, "db_user")
+    if safe_user in _RESERVED_REMOTE_DB_USERS:
+        raise ValueError(f"'{safe_user}' is a reserved database account and cannot be provisioned.")
+    client_host = (allowed_client_host or "%").strip()
+    if any(ch in client_host for ch in ("'", '"', ";", "`", "\\")):
+        raise ValueError("Invalid allowed_client_host")
+
+    host = str(host_entry.get("host") or "").strip()
+    port = int(host_entry.get("port") or 3306)
+    admin_user = str(host_entry.get("admin_user") or "root").strip()
+    admin_pw = str(
+        host_entry.get("admin_password_plain")
+        or _decrypt_remote_db_password(str(host_entry.get("admin_password") or ""))
+    )
+
+    try:
+        conn = _open_remote_mysql_connection(host_entry, timeout=8)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE DATABASE IF NOT EXISTS `{safe_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+                cur.execute("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s", (safe_user, client_host, db_password))
+                cur.execute("ALTER USER %s@%s IDENTIFIED BY %s", (safe_user, client_host, db_password))
+                cur.execute(f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO %s@%s", (safe_user, client_host))
+                cur.execute("FLUSH PRIVILEGES")
+        finally:
+            conn.close()
+    except ImportError:
+        escaped_pw = db_password.replace("\\", "\\\\").replace("'", "''")
+        sql = (
+            f"CREATE DATABASE IF NOT EXISTS `{safe_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+            f"CREATE USER IF NOT EXISTS '{safe_user}'@'{client_host}' IDENTIFIED BY '{escaped_pw}';\n"
+            f"ALTER USER '{safe_user}'@'{client_host}' IDENTIFIED BY '{escaped_pw}';\n"
+            f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO '{safe_user}'@'{client_host}';\n"
+            "FLUSH PRIVILEGES;\n"
+        )
+        env = os.environ.copy()
+        if admin_pw:
+            env["MYSQL_PWD"] = admin_pw
+        cmd = ["mysql", "-h", host, "-P", str(port), "-u", admin_user]
+        if host_entry.get("use_tls"):
+            cmd.append("--ssl")
+        subprocess.run(cmd, input=sql, text=True, capture_output=True, env=env, timeout=10, check=True)
+
+    with _state_lock:
+        state = _read_state()
+        _append_log(
+            state,
+            "provision_remote_db",
+            f"{safe_db}@{host}:{port}",
+            "success",
+            f"Đã khởi tạo CSDL '{safe_db}' và user '{safe_user}' trên Remote MySQL {host}:{port}.",
+        )
+        _write_state(state)
+
+    return {
+        "host_id": host_entry.get("id"),
+        "host": host,
+        "port": port,
+        "db_name": safe_db,
+        "db_user": safe_user,
+    }
+
+
+def drop_remote_database(
+    host_entry: dict[str, Any],
+    db_name: str,
+    db_user: str,
+    allowed_client_host: str = "%",
+) -> dict[str, Any]:
+    """Drop a database and user on a remote MySQL/MariaDB server."""
+    safe_db = _validate_remote_db_identifier(db_name, "db_name")
+    safe_user = _validate_remote_db_identifier(db_user, "db_user")
+    if safe_user in _RESERVED_REMOTE_DB_USERS:
+        raise ValueError(f"'{safe_user}' is a reserved database account and cannot be dropped.")
+    client_host = (allowed_client_host or "%").strip()
+    if any(ch in client_host for ch in ("'", '"', ";", "`", "\\")):
+        raise ValueError("Invalid allowed_client_host")
+
+    host = str(host_entry.get("host") or "").strip()
+    port = int(host_entry.get("port") or 3306)
+    admin_user = str(host_entry.get("admin_user") or "root").strip()
+    admin_pw = str(
+        host_entry.get("admin_password_plain")
+        or _decrypt_remote_db_password(str(host_entry.get("admin_password") or ""))
+    )
+
+    try:
+        conn = _open_remote_mysql_connection(host_entry, timeout=8)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP DATABASE IF EXISTS `{safe_db}`")
+                cur.execute("DROP USER IF EXISTS %s@%s", (safe_user, client_host))
+                cur.execute("FLUSH PRIVILEGES")
+        finally:
+            conn.close()
+    except ImportError:
+        sql = (
+            f"DROP DATABASE IF EXISTS `{safe_db}`;\n"
+            f"DROP USER IF EXISTS '{safe_user}'@'{client_host}';\n"
+            "FLUSH PRIVILEGES;\n"
+        )
+        env = os.environ.copy()
+        if admin_pw:
+            env["MYSQL_PWD"] = admin_pw
+        cmd = ["mysql", "-h", host, "-P", str(port), "-u", admin_user]
+        subprocess.run(cmd, input=sql, text=True, capture_output=True, env=env, timeout=10, check=True)
+
+    return {"host_id": host_entry.get("id"), "host": host, "port": port, "dropped_db": safe_db}
 
 
 def delete_remote_db_host(host_id: str) -> None:

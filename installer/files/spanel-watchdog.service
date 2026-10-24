@@ -4,8 +4,10 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=root
+User=spanel
+Group=spanel
 WorkingDirectory=/opt/spanel/backend
-ExecStart=/usr/local/sbin/spanel-helper watchdog-run
+Environment=PYTHONPATH=/opt/spanel/backend
+ExecStart=/opt/spanel/backend/.venv/bin/python -I -m app.services.system
 StandardOutput=journal
 StandardError=journal

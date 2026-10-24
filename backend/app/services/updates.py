@@ -681,8 +681,8 @@ def check_core_stack_updates() -> dict:
     }
 
 
-def upgrade_core_stack_packages(packages: Optional[list[str]] = None) -> dict:
-    """Safely upgrade selected (or all) Core Infrastructure Stack packages using apt-mark unhold/hold, --only-upgrade, pre/post syntax check and zero-downtime reload."""
+def upgrade_core_stack_packages(packages: Optional[list[str]] = None, hold_packages: bool = False) -> dict:
+    """Safely upgrade selected (or all) Core Infrastructure Stack packages using --only-upgrade, pre/post syntax check and zero-downtime reload."""
     allowed_map = {item["pkg"]: item for item in CORE_STACK_SERVICES}
     if packages:
         target_pkgs = [p for p in packages if p in allowed_map]
@@ -710,18 +710,20 @@ def upgrade_core_stack_packages(packages: Optional[list[str]] = None) -> dict:
                     err_detail = (pre_res.stderr or pre_res.stdout or "syntax error").strip()[:200]
                     raise RuntimeError(f"Kiểm tra cấu hình trước cập nhật thất bại cho {svc['label']}: {err_detail}")
 
-        # 2. Selective upgrade via helper (`updates-core-stack-patch`) with apt-mark unhold -> --only-upgrade -> apt-mark hold
+        # 2. Selective upgrade via helper (`updates-core-stack-patch`) with apt-mark unhold -> --only-upgrade
         pkg_str = " ".join(target_pkgs)
+        hold_cmd = f"apt-mark hold {pkg_str} >/dev/null 2>&1 || true; " if hold_packages else ""
         cmd = (
             f"apt-mark unhold {pkg_str} >/dev/null 2>&1 || true; "
             f"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
             f"DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "
             f"-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pkg_str}; "
-            f"rc=$?; apt-mark hold {pkg_str} >/dev/null 2>&1 || true; exit $rc"
+            f"rc=$?; {hold_cmd}exit $rc"
         )
+        helper_args = (["--hold"] if hold_packages else []) + target_pkgs
         res = shell.privileged(
             "updates-core-stack-patch",
-            helper_args=target_pkgs,
+            helper_args=helper_args,
             check=False,
             fallback=["bash", "-lc", cmd],
         )

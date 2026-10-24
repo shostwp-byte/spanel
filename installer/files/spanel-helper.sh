@@ -407,9 +407,12 @@ run_os_update() {
 
 upgrade_core_stack_packages() {
   export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
-  local valid_pkgs=() pkg need_nginx_check=0
+  local valid_pkgs=() pkg need_nginx_check=0 hold_after=0
   for pkg in "$@"; do
     case "$pkg" in
+      --hold)
+        hold_after=1
+        ;;
       nginx)
         valid_pkgs+=("nginx")
         need_nginx_check=1
@@ -432,7 +435,9 @@ upgrade_core_stack_packages() {
   apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true
   local upgrade_rc=0
   apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
-  apt-mark hold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
+  if [[ "$hold_after" -eq 1 ]]; then
+    apt-mark hold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
+  fi
 
   [[ "$upgrade_rc" -eq 0 ]] || deny "apt-get --only-upgrade failed for core stack packages"
 
@@ -441,7 +446,7 @@ upgrade_core_stack_packages() {
     systemctl reload nginx >/dev/null 2>&1 || true
   fi
 
-  echo "Core stack packages selectively upgraded and pinned: ${valid_pkgs[*]}"
+  echo "Core stack packages selectively upgraded: ${valid_pkgs[*]}"
 }
 
 ensure_cron_jail_binary() {
@@ -1902,6 +1907,7 @@ def whole(key, low, high, fallback):
 host = str(raw.get("hostname") or "localhost.localdomain")
 auth_rate = whole("auth_rate_per_hour", 0, 100000, 300)
 local_rate = whole("local_rate_per_hour", 0, 100000, 300)
+domain_rate = whole("domain_rate_per_hour", 0, 100000, 500)
 max_mb = whole("max_message_mb", 1, 200, 50)
 spam = raw.get("spam_enabled", True) is not False
 
@@ -2203,6 +2209,12 @@ if auth_rate:
         "          authenticated = *\n"
         "          ratelimit = %d / 1h / per_rcpt / $authenticated_id\n" % (auth_rate, auth_rate)
     )
+if domain_rate:
+    auth_block += (
+        "\n  deny    message = Domain sending limit reached for ${lc:$sender_address_domain}\n"
+        "          authenticated = *\n"
+        "          ratelimit = ${lookup{${lc:$sender_address_domain}}lsearch*{/etc/exim4/spanel_ratelimits}{$value}{%d}} / 1h / per_rcpt / dom:${lc:$sender_address_domain}\n" % domain_rate
+    )
 local_block = ""
 if local_rate:
     local_block = (
@@ -2260,9 +2272,10 @@ mail_ensure_maps() {
   install -d -o root -g dovecot -m 0750 "$MAIL_DOVECOT_DIR"
   local list
   for list in domains mailboxes aliases catchall senders local_senders dkim_domains \
-      relay_routes relay_hosts relay_transports relay_auth relay_credentials; do
+      relay_routes relay_hosts relay_transports relay_auth relay_credentials ratelimits; do
     [[ -f "$MAIL_EXIM_DIR/$list" ]] || install -m 0640 -o root -g Debian-exim /dev/null "$MAIL_EXIM_DIR/$list"
   done
+  [[ -f /etc/exim4/spanel_ratelimits ]] || install -m 0640 -o root -g Debian-exim /dev/null /etc/exim4/spanel_ratelimits
   for list in users denied; do
     [[ -f "$MAIL_DOVECOT_DIR/$list" ]] || install -m 0640 -o root -g dovecot /dev/null "$MAIL_DOVECOT_DIR/$list"
   done
@@ -3052,7 +3065,7 @@ mail_rspamd_group() {
 }
 
 mail_write_rspamd_conf() {
-  local key group header reject greylist
+  local key group header rewrite reject greylist subject_tag
   group="$(mail_rspamd_group)"
   install -d -o root -g spanel -m 0750 /etc/spanel
   if [[ ! -s "$MAIL_RSPAMD_KEY_FILE" ]]; then
@@ -3063,8 +3076,9 @@ mail_write_rspamd_conf() {
   chown root:spanel "$MAIL_RSPAMD_KEY_FILE"
   chmod 0640 "$MAIL_RSPAMD_KEY_FILE"
   key="$(tr -d '[:space:]' <"$MAIL_RSPAMD_KEY_FILE")"
-  read -r header reject greylist < <(python3 - "$MAIL_SETTINGS_FILE" <<'PY'
+  read -r header rewrite reject greylist subject_tag < <(python3 - "$MAIL_SETTINGS_FILE" <<'PY'
 import json
+import re
 import sys
 
 try:
@@ -3087,9 +3101,15 @@ header = score("spam_header_score", 6.0)
 reject = score("spam_reject_score", 15.0)
 if reject <= header:
     reject = header + 1
-print(f"{header:g}", f"{reject:g}", "yes" if raw.get("greylisting", True) is not False else "no")
+rewrite = score("spam_rewrite_score", min(reject - 0.5, header + 2.0))
+if rewrite < header or rewrite >= reject:
+    rewrite = min(reject - 0.5, header + 2.0)
+raw_tag = str(raw.get("spam_subject_tag") or "[SPAM]").strip()
+tag = re.sub(r'[^A-Za-z0-9_\-\[\]()*:! ]+', '', raw_tag)[:32].strip() or "[SPAM]"
+print(f"{header:g}", f"{rewrite:g}", f"{reject:g}", "yes" if raw.get("greylisting", True) is not False else "no", tag)
 PY
 )
+  [[ -n "${subject_tag:-}" ]] || subject_tag="[SPAM]"
   install -d -m 0755 "$MAIL_RSPAMD_LOCAL" "$MAIL_RSPAMD_OVERRIDE"
 
   # override.d, not local.d: local.d would merge with the stock secure_ip list,
@@ -3131,7 +3151,8 @@ ${MAIL_MARKER}
 reject = ${reject};
 add_header = ${header};
 greylist = $([[ "$greylist" == "yes" ]] && echo 4 || echo null);
-rewrite_subject = null;
+rewrite_subject = ${rewrite};
+subject = "${subject_tag} %s";
 EOF
   cat >"$MAIL_RSPAMD_LOCAL/greylist.conf" <<EOF
 ${MAIL_MARKER}
@@ -3152,12 +3173,12 @@ enabled = false;
 EOF
   mail_write_rspamd_resolver "$(cat "$MAIL_EXIM_DIR/resolver" 2>/dev/null || echo local)"
   local list
-  for list in spanel-allow-senders spanel-allow-domains; do
+  for list in spanel-allow-senders spanel-allow-domains spanel-block-senders spanel-block-domains; do
     [[ -f "$MAIL_RSPAMD_LOCAL/${list}.map" ]] || install -m 0644 -o root -g root /dev/null "$MAIL_RSPAMD_LOCAL/${list}.map"
   done
-  # The allowlist: envelope sender or From header, as an address or a domain.
+  # The allowlist & blocklist: envelope sender or From header, as an address or a domain.
   # A score rather than an early "accept": Rspamd leaves early verdicts out of
-  # its history, and an allowed message must still show in the log.
+  # its history, and an allowed/blocked message must still show in the log.
   cat >"$MAIL_RSPAMD_LOCAL/multimap.conf" <<EOF
 ${MAIL_MARKER}
 SPANEL_ALLOW_SENDER {
@@ -3189,6 +3210,36 @@ SPANEL_ALLOW_DOMAIN_MIME {
   map = "file://${MAIL_RSPAMD_LOCAL}/spanel-allow-domains.map";
   score = -50.0;
   description = "From domain on the SPanel allowlist";
+}
+SPANEL_BLOCK_SENDER {
+  type = "from";
+  filter = "email:addr";
+  map = "file://${MAIL_RSPAMD_LOCAL}/spanel-block-senders.map";
+  score = 50.0;
+  description = "Sender on the SPanel blocklist";
+}
+SPANEL_BLOCK_SENDER_MIME {
+  type = "header";
+  header = "From";
+  filter = "email:addr";
+  map = "file://${MAIL_RSPAMD_LOCAL}/spanel-block-senders.map";
+  score = 50.0;
+  description = "From address on the SPanel blocklist";
+}
+SPANEL_BLOCK_DOMAIN {
+  type = "from";
+  filter = "email:domain";
+  map = "file://${MAIL_RSPAMD_LOCAL}/spanel-block-domains.map";
+  score = 50.0;
+  description = "Sender domain on the SPanel blocklist";
+}
+SPANEL_BLOCK_DOMAIN_MIME {
+  type = "header";
+  header = "From";
+  filter = "email:domain";
+  map = "file://${MAIL_RSPAMD_LOCAL}/spanel-block-domains.map";
+  score = 50.0;
+  description = "From domain on the SPanel blocklist";
 }
 EOF
   chmod 0644 "$MAIL_RSPAMD_LOCAL"/worker-normal.inc "$MAIL_RSPAMD_OVERRIDE"/worker-proxy.inc \
@@ -3323,29 +3374,85 @@ def score(key):
     return value
 
 
+def whole_opt(key, low, high, fallback):
+    if data.get(key) is None:
+        return fallback
+    return whole(key, low, high)
+
+
+def score_opt(key, fallback):
+    if data.get(key) is None:
+        return fallback
+    return score(key)
+
+
+header_val = score("spam_header_score")
+reject_val = score("spam_reject_score")
+if reject_val <= header_val:
+    fail("the reject score must be higher than the Junk score")
+rewrite_val = score_opt("spam_rewrite_score", min(reject_val - 0.5, header_val + 2.0))
+if not (header_val <= rewrite_val < reject_val):
+    rewrite_val = min(reject_val - 0.5, header_val + 2.0)
+raw_subject_tag = str(data.get("spam_subject_tag") or saved.get("spam_subject_tag") or "[SPAM]").strip()
+subject_tag = re.sub(r'[^A-Za-z0-9_\-\[\]()*:! ]+', '', raw_subject_tag)[:32].strip() or "[SPAM]"
+
+domain_rate_default = whole_opt("domain_rate_per_hour", 0, 100000, int(saved.get("domain_rate_per_hour", 500) or 500))
+raw_domain_limits = data.get("domain_rate_limits")
+if raw_domain_limits is None:
+    raw_domain_limits = saved.get("domain_rate_limits") or {}
+if not isinstance(raw_domain_limits, dict):
+    fail("domain_rate_limits must be an object mapping domain to hourly rate")
+domain_rate_limits = {}
+ratelimit_lines = []
+for dom_key, dom_val in sorted(raw_domain_limits.items()):
+    dom_clean = str(dom_key).strip().lower()
+    if not DOMAIN_RE.fullmatch(dom_clean):
+        fail(f"invalid domain in domain_rate_limits: {dom_key!r}")
+    try:
+        lim_int = int(dom_val)
+    except (TypeError, ValueError):
+        fail(f"invalid rate limit for {dom_clean}")
+    if not 1 <= lim_int <= 100000:
+        fail(f"rate limit for {dom_clean} must be between 1 and 100000")
+    domain_rate_limits[dom_clean] = lim_int
+    ratelimit_lines.append(f"{dom_clean}: {lim_int}")
+if domain_rate_default > 0:
+    ratelimit_lines.append(f"*: {domain_rate_default}")
+
 settings = {
     "hostname": saved.get("hostname") or "localhost.localdomain",
     "auth_rate_per_hour": whole("auth_rate_per_hour", 0, 100000),
     "local_rate_per_hour": whole("local_rate_per_hour", 0, 100000),
+    "domain_rate_per_hour": domain_rate_default,
+    "auto_hold_on_rate_exceed": bool(data.get("auto_hold_on_rate_exceed", saved.get("auto_hold_on_rate_exceed", True))),
+    "domain_rate_limits": domain_rate_limits,
     "max_message_mb": whole("max_message_mb", 1, 200),
     "spam_enabled": bool(data.get("spam_enabled", True)),
-    "spam_header_score": score("spam_header_score"),
-    "spam_reject_score": score("spam_reject_score"),
+    "spam_header_score": header_val,
+    "spam_rewrite_score": rewrite_val,
+    "spam_reject_score": reject_val,
+    "spam_subject_tag": subject_tag,
     "greylisting": bool(data.get("greylisting", True)),
 }
-if settings["spam_reject_score"] <= settings["spam_header_score"]:
-    fail("the reject score must be higher than the Junk score")
 
 senders = [str(item).strip().lower() for item in data.get("allow_senders") or []]
 domains = [str(item).strip().lower() for item in data.get("allow_domains") or []]
-if len(senders) > 5000 or len(domains) > 5000:
-    fail("the allowlist is limited to 5000 senders and 5000 domains")
+block_senders = [str(item).strip().lower() for item in data.get("block_senders") or []]
+block_domains = [str(item).strip().lower() for item in data.get("block_domains") or []]
+if len(senders) > 5000 or len(domains) > 5000 or len(block_senders) > 5000 or len(block_domains) > 5000:
+    fail("the allowlist and blocklist are limited to 5000 senders and 5000 domains each")
 for item in senders:
     if not ADDRESS_RE.fullmatch(item):
         fail(f"invalid sender address on the allowlist: {item!r}")
 for item in domains:
     if not DOMAIN_RE.fullmatch(item):
         fail(f"invalid domain on the allowlist: {item!r}")
+for item in block_senders:
+    if not ADDRESS_RE.fullmatch(item):
+        fail(f"invalid sender address on the blocklist: {item!r}")
+for item in block_domains:
+    if not DOMAIN_RE.fullmatch(item):
+        fail(f"invalid domain on the blocklist: {item!r}")
 
 relays = data.get("relays") or []
 if not isinstance(relays, list) or len(relays) > 20:
@@ -3411,8 +3518,13 @@ write(os.path.join(exim_dir, "relay_hosts"), lines(hosts), 0o640, gid)
 write(os.path.join(exim_dir, "relay_transports"), lines(transports), 0o640, gid)
 write(os.path.join(exim_dir, "relay_auth"), lines(auth), 0o640, gid)
 write(os.path.join(exim_dir, "relay_credentials"), lines(credentials), 0o640, gid)
+write(os.path.join(exim_dir, "ratelimits"), lines(ratelimit_lines), 0o640, gid)
+if os.path.isdir("/etc/exim4"):
+    write("/etc/exim4/spanel_ratelimits", lines(ratelimit_lines), 0o640, gid)
 write(os.path.join(rspamd_dir, "spanel-allow-senders.map"), lines(sorted(set(senders))), 0o644, 0)
 write(os.path.join(rspamd_dir, "spanel-allow-domains.map"), lines(sorted(set(domains))), 0o644, 0)
+write(os.path.join(rspamd_dir, "spanel-block-senders.map"), lines(sorted(set(block_senders))), 0o644, 0)
+write(os.path.join(rspamd_dir, "spanel-block-domains.map"), lines(sorted(set(block_domains))), 0o644, 0)
 settings["relays"] = sorted(seen_ids)
 write(settings_path, json.dumps(settings, indent=2, sort_keys=True), 0o600, 0)
 print(f"{len(hosts)} relays")
@@ -4682,6 +4794,9 @@ firewall_apply_family() {
   while read -r port; do
     [[ -n "$port" ]] || continue
     "$ipt" -A "$FIREWALL_CHAIN" -p tcp --dport "$port" -j RETURN
+    if [[ "$port" == "443" ]]; then
+      "$ipt" -A "$FIREWALL_CHAIN" -p udp --dport 443 -j RETURN
+    fi
   done < <(firewall_protected_ports)
 
   # Ports an addon opens while it is on - DNS Manager's 53, over TCP and UDP.
@@ -6853,6 +6968,7 @@ delete_panel_user_runtime() {
     done
   done
   crontab -r -u "$user" 2>/dev/null || true
+  rm -f "/etc/cron.d/spanel-user-${user}" 2>/dev/null || true
   # Ask, then insist. An SFTP session or a PHP worker still winding down is
   # enough to make the userdel below refuse.
   pkill -u "$user" 2>/dev/null || true
@@ -7669,12 +7785,6 @@ case "$cmd" in
   updates-core-stack-patch)
     [[ $# -ge 1 ]] || deny "usage: updates-core-stack-patch <pkg> [pkg...]"
     upgrade_core_stack_packages "$@"
-    ;;
-
-  watchdog-run)
-    if [[ -x "${APP_DIR}/backend/.venv/bin/python" ]]; then
-      exec "${APP_DIR}/backend/.venv/bin/python" -c "from app.services.system import run_self_healing_check; import json; print(json.dumps(run_self_healing_check(reason='systemd-timer')))"
-    fi
     ;;
 
   updates-os-auto)
@@ -8979,14 +9089,15 @@ PY
     ;;
 
   user-limits-apply)
-    # Apply Linux Cgroups v2 (systemd user-<UID>.slice & spanel-user-<user>.slice)
-    # and PHP-FPM pool limits for a tenant account.
-    [[ $# -eq 9 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write>"
+    # Apply Linux Cgroups v2 (systemd user-<UID>.slice & spanel-user-<user>.slice),
+    # PHP-FPM pool limits, and optional Linux filesystem disk quota for a tenant account.
+    [[ $# -eq 9 || $# -eq 10 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write> [storage_limit_mb]"
     u_name="$1"
     cpu_pct="$2"; mem_high="$3"; mem_max="$4"; tasks_max="$5"
     io_r="$6"; io_w="$7"; iops_r="$8"; iops_w="$9"
+    storage_mb="${10:-0}"
     require_linux_user "$u_name"
-    for num_arg in "$cpu_pct" "$mem_high" "$mem_max" "$tasks_max" "$io_r" "$io_w" "$iops_r" "$iops_w"; do
+    for num_arg in "$cpu_pct" "$mem_high" "$mem_max" "$tasks_max" "$io_r" "$io_w" "$iops_r" "$iops_w" "$storage_mb"; do
       [[ "$num_arg" =~ ^[0-9]{1,9}$ ]] || deny "invalid numeric resource limit: $num_arg"
     done
     ensure_panel_user_home "$u_name"
@@ -9054,6 +9165,7 @@ PY
 
     # Tune PHP-FPM pools owned by this user to respect memory_max & tasks_max
     shopt -s nullglob
+    fpm_versions_to_reload=()
     for pool_file in /etc/php/*/fpm/pool.d/spanel-"${u_name}"-*.conf /etc/php/*/fpm/pool.d/spanel-"${u_name}".conf; do
       [[ -f "$pool_file" ]] || continue
       calculate_php_fpm_pool_tuning "$pool_file"
@@ -9066,11 +9178,39 @@ PY
         mem_cap=$(( mem_max / 64 ))
         (( mem_cap < 2 )) && mem_cap=2
         (( mem_cap < max_c )) && max_c="$mem_cap"
+        per_worker_mb=$(( mem_max / 2 ))
+        (( per_worker_mb < 128 )) && per_worker_mb=128
+        (( per_worker_mb > 1024 )) && per_worker_mb=1024
+        php_fpm_set_directive "$pool_file" "php_admin_value[memory_limit]" "${per_worker_mb}M"
       fi
       php_fpm_set_directive "$pool_file" "pm.max_children" "$max_c"
       php_fpm_set_directive "$pool_file" "listen.backlog" "64"
+      fpm_ver="$(echo "$pool_file" | awk -F'/' '{print $4}')"
+      [[ -n "$fpm_ver" ]] && fpm_versions_to_reload+=("$fpm_ver")
     done
     shopt -u nullglob
+    for fpm_ver in $(printf '%s\n' "${fpm_versions_to_reload[@]}" | sort -u); do
+      systemctl reload "php${fpm_ver}-fpm" >/dev/null 2>&1 || true
+    done
+
+    # Enforce Linux filesystem disk quota (setquota) when usrquota is mounted on /home or /
+    if command -v setquota >/dev/null 2>&1; then
+      quota_mnt=""
+      if findmnt -no OPTIONS /home 2>/dev/null | grep -qE 'usrj?quota|quota'; then
+        quota_mnt="/home"
+      elif findmnt -no OPTIONS / 2>/dev/null | grep -qE 'usrj?quota|quota'; then
+        quota_mnt="/"
+      fi
+      if [[ -n "$quota_mnt" ]]; then
+        if (( storage_mb > 0 )); then
+          hard_kb=$(( storage_mb * 1024 ))
+          soft_kb=$(( hard_kb * 95 / 100 ))
+          setquota -u "$u_name" "$soft_kb" "$hard_kb" 0 0 "$quota_mnt" >/dev/null 2>&1 || true
+        else
+          setquota -u "$u_name" 0 0 0 0 "$quota_mnt" >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
 
     # Move all active processes of this user (including forked PHP-FPM pool workers)
     # into user-<UID>.slice/spanel.scope so Cgroups v2 enforces hard CPU/RAM/IO limits.
@@ -9322,16 +9462,55 @@ EOF
       "$wp_php" -d pcre.jit=0 -d open_basedir="$wp_site_basedir" /usr/local/bin/wp "$@"
     ;;
 
-  # ---- crontab managed for www-data ------------------------------------
+  # ---- crontab managed via root-owned /etc/cron.d/spanel-user-<user> ---
   cron-list)
     user="${1:-www-data}"
-    if [[ "$user" != "www-data" ]]; then require_linux_user "$user"; fi
+    if [[ "$user" != "www-data" ]]; then
+      require_linux_user "$user"
+      cron_file="/etc/cron.d/spanel-user-${user}"
+      if [[ -f "$cron_file" ]]; then
+        grep -vE '^(#|$|SHELL=|PATH=)' "$cron_file" 2>/dev/null || true
+        exit 0
+      fi
+    fi
     exec runuser -u "$user" -- crontab -l 2>/dev/null
     ;;
   cron-write)
     # crontab content is fed via stdin
     user="${1:-www-data}"
-    if [[ "$user" != "www-data" ]]; then require_linux_user "$user"; fi
+    if [[ "$user" != "www-data" ]]; then
+      require_linux_user "$user"
+      ensure_cron_jail_binary
+      cron_file="/etc/cron.d/spanel-user-${user}"
+      tmp_cron="$(mktemp /etc/cron.d/.spanel-cron.XXXXXX)"
+      chmod 0644 "$tmp_cron"
+      chown root:root "$tmp_cron"
+      {
+        echo "# Managed by SPanel — root-enforced Mount Namespace Jail for ${user}"
+        echo "SHELL=/bin/sh"
+        echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        while IFS= read -r line; do
+          [[ -z "${line//[[:space:]]/}" ]] && continue
+          [[ "$line" =~ ^[[:space:]]*# ]] && continue
+          if [[ "$line" =~ ^([^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+)[[:space:]]+(.*)$ ]]; then
+            sched="${BASH_REMATCH[1]}"
+            rest="${BASH_REMATCH[2]}"
+            if [[ "$rest" == root\ * ]]; then
+              printf '%s %s\n' "$sched" "$rest"
+            else
+              printf '%s root %s\n' "$sched" "$rest"
+            fi
+          fi
+        done
+      } >"$tmp_cron"
+      mv -f "$tmp_cron" "$cron_file"
+      # Remove any user-writable crontab and deny direct crontab access so tenant cannot strip jail prefix
+      crontab -r -u "$user" 2>/dev/null || true
+      if ! grep -qxF "$user" /etc/cron.deny 2>/dev/null; then
+        printf '%s\n' "$user" >>/etc/cron.deny 2>/dev/null || true
+      fi
+      exit 0
+    fi
     ensure_cron_jail_binary
     exec runuser -u "$user" -- crontab -
     ;;

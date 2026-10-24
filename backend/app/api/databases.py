@@ -16,7 +16,7 @@ from app.core.permissions import Role, ensure_role, is_admin_role
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, User, Website
 from app.schemas.schemas import DatabaseCreate, DatabaseCreatedOut, DatabaseOut, DatabasePasswordUpdate
-from app.services import mariadb, panel_urls, resource_monitor, storage_quota
+from app.services import mariadb, multi_server, panel_urls, resource_monitor, storage_quota
 from app.services.audit import log_action
 from app.services.sso_tokens import consume_phpmyadmin_token, create_phpmyadmin_token
 
@@ -106,7 +106,15 @@ def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), curr
         raise HTTPException(status_code=409, detail="Database user already exists")
 
     try:
-        mariadb.create_database_credentials(db_name, db_user, db_password)
+        if getattr(payload, "remote_db_host_id", None):
+            remote_host = multi_server.get_active_remote_db_host(payload.remote_db_host_id)
+            if not remote_host:
+                raise HTTPException(status_code=404, detail="Remote MySQL/MariaDB host not found or disabled")
+            multi_server.provision_remote_database(remote_host, db_name, db_user, db_password)
+        else:
+            mariadb.create_database_credentials(db_name, db_user, db_password)
+    except HTTPException:
+        raise
     except ValueError as exc:
         # A reserved account, or one that already exists in MariaDB without
         # spanel knowing about it. Both are the caller's mistake, not a fault.

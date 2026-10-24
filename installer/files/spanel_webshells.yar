@@ -35,12 +35,15 @@ rule SPanel_PHP_Known_Webshell_Families {
 
 rule SPanel_CryptoMiner_XMRig {
     meta:
-        description = "Detects XMRig / Stratum cryptocurrency miner strings"
+        description = "Detects XMRig / Stratum cryptocurrency miner strings with pool/config context"
         severity = "high"
     strings:
-        $m1 = "stratum+tcp://" nocase
-        $m2 = "xmrig" nocase
-        $m3 = "cryptonight" nocase
+        $pool1 = "stratum+tcp://" nocase
+        $pool2 = "stratum+ssl://" nocase
+        $bin = "xmrig" nocase
+        $algo = "cryptonight" nocase
+        $cfg1 = "--donate-level" nocase
+        $cfg2 = "\"rx/0\"" nocase
     condition:
-        any of ($m*)
+        ($pool1 or $pool2) and ($bin or $algo or $cfg1 or $cfg2) or ($bin and ($algo or $cfg1 or $cfg2))
 }

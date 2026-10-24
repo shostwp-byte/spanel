@@ -1,19 +1,33 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# spanel-cron-jail — Private Mount Namespace Isolation Wrapper for Tenant Crons
+# spanel-cron-jail — Root-Enforced Private Mount Namespace Wrapper for Crons
 # ==============================================================================
-# Usage:
+# Usage (invoked as root from /etc/cron.d/spanel-user-<user>):
 #   /usr/local/bin/spanel-cron-jail <linux_user> <working_dir> -- <command> [args...]
 #
-# Isolates tenant cron jobs inside a private Linux mount namespace (unshare -m)
-# so /home/<other_user> directories are masked by an empty tmpfs and only the
-# tenant's own /home/<linux_user> remains visible inside /home.
+# Security Model:
+#   1. Must be invoked by root from /etc/cron.d/spanel-user-<user> (owned by
+#      root:root 0644, immutable by the tenant).
+#   2. Creates a private mount namespace (unshare --mount --propagation private)
+#      as root — does NOT rely on unprivileged user namespaces (which Ubuntu
+#      24.04 AppArmor blocks by default and which would grant CAP_SYS_ADMIN
+#      inside the namespace).
+#   3. Replaces /home with a tmpfs containing only /home/<linux_user>, hiding
+#      all other tenants' home directories.
+#   4. Drops privileges via `runuser -u <linux_user>` BEFORE changing into the
+#      tenant's working directory or executing the command, so the tenant
+#      process runs with non-root UID and cannot unmount the tmpfs.
 # ==============================================================================
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then
   echo "Usage: spanel-cron-jail <user> <cwd> -- <command> [args...]" >&2
   exit 64
+fi
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "spanel-cron-jail: must be executed as root from /etc/cron.d" >&2
+  exit 77
 fi
 
 JAIL_USER="$1"
@@ -34,10 +48,18 @@ if [[ ! "$JAIL_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
   exit 64
 fi
 
+case "$JAIL_USER" in
+  root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|_apt|nobody|spanel|spanel-sites|spanel-sftp|spanel-sftp-site|mysql|redis|nginx)
+    echo "spanel-cron-jail: reserved system user refused: $JAIL_USER" >&2
+    exit 64
+    ;;
+esac
+
 HOME_ROOT="/home"
 USER_HOME="${HOME_ROOT}/${JAIL_USER}"
 
-# Inner script executed inside the private mount namespace
+# Inner script executed as root inside the private mount namespace, then
+# immediately drops privileges to $jail_user before cd and exec.
 INNER_JAIL_SCRIPT='
   set -e
   jail_user="$1"
@@ -46,29 +68,22 @@ INNER_JAIL_SCRIPT='
   shift 3
   jail_home="${jail_root}/${jail_user}"
   if [[ -d "$jail_home" ]]; then
-    hold="$(mktemp -d /tmp/spanel-cron-hold.XXXXXX)"
+    hold="$(mktemp -d /run/spanel-cron-hold.XXXXXX 2>/dev/null || mktemp -d /tmp/spanel-cron-hold.XXXXXX)"
+    chmod 0700 "$hold"
     mount --bind "$jail_home" "$hold"
     mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$jail_root"
     mkdir -p "$jail_home"
     mount --move "$hold" "$jail_home"
     rmdir "$hold" 2>/dev/null || true
   fi
-  cd "$jail_cwd" 2>/dev/null || cd "$jail_home" 2>/dev/null || cd /tmp
-  exec "$@"
+  exec runuser -u "$jail_user" -- env -i \
+    HOME="$jail_home" \
+    USER="$jail_user" \
+    LOGNAME="$jail_user" \
+    PATH="/usr/local/bin:/usr/bin:/bin" \
+    bash -c '\''cd "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /tmp; shift; exec "$@"'\'' \
+    spanel-cron-exec "$jail_cwd" "$@"
 '
 
-if command -v unshare >/dev/null 2>&1; then
-  if [[ "$(id -u)" -eq 0 ]]; then
-    exec unshare --mount --propagation private -- \
-      bash -c "$INNER_JAIL_SCRIPT" spanel-cron-jail "$JAIL_USER" "$HOME_ROOT" "$JAIL_CWD" \
-      runuser -u "$JAIL_USER" -- "$@"
-  elif unshare --user --mount --map-root-user true >/dev/null 2>&1; then
-    exec unshare --user --mount --map-root-user --propagation private -- \
-      bash -c "$INNER_JAIL_SCRIPT" spanel-cron-jail "$JAIL_USER" "$HOME_ROOT" "$JAIL_CWD" \
-      "$@"
-  fi
-fi
-
-# Fallback when running inside restricted container without namespace cap
-cd "$JAIL_CWD" 2>/dev/null || cd "$USER_HOME" 2>/dev/null || cd /tmp
-exec "$@"
+exec unshare --mount --propagation private -- \
+  bash -c "$INNER_JAIL_SCRIPT" spanel-cron-jail "$JAIL_USER" "$HOME_ROOT" "$JAIL_CWD" "$@"

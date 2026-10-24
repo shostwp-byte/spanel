@@ -425,8 +425,12 @@ configure_fastcgi_cache() {
   install -d -o www-data -g www-data -m 0755 /var/cache/nginx/spanel-fastcgi
   find /var/cache/nginx/spanel-fastcgi -mindepth 1 -delete
   cat >/etc/nginx/conf.d/00-spanel-fastcgi-cache.conf <<'NGINX'
+map $request_uri $spanel_cache_uri {
+    default $request_uri;
+    "~^([^?]+)\?(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|msclkid=[^&]*|_ga=[^&]*|mc_[ce]id=[^&]*)(?:&(?:utm_[a-z]+=[^&]*|fbclid=[^&]*|gclid=[^&]*|ttclid=[^&]*|msclkid=[^&]*|_ga=[^&]*|mc_[ce]id=[^&]*))*$" $1;
+}
 fastcgi_cache_path /var/cache/nginx/spanel-fastcgi levels=1:2 keys_zone=SPANEL_FASTCGI:32m inactive=2h max_size=1g use_temp_path=off;
-fastcgi_cache_key "$scheme$request_method$host$request_uri";
+fastcgi_cache_key "$scheme$request_method$host$spanel_cache_uri";
 NGINX
 }
 
@@ -682,6 +686,13 @@ SSHD
 install_privileged_helper() {
   install -m 0750 -o root -g spanel "${SCRIPT_DIR}/files/spanel-helper.sh" /usr/local/sbin/spanel-helper
   sed -i "s#^APP_DIR=\"/opt/spanel\"#APP_DIR=\"${APP_DIR}\"#" /usr/local/sbin/spanel-helper
+  if [[ -f "${SCRIPT_DIR}/files/spanel-cron-jail.sh" ]]; then
+    install -m 0755 -o root -g root "${SCRIPT_DIR}/files/spanel-cron-jail.sh" /usr/local/bin/spanel-cron-jail
+  fi
+  if [[ -f "${SCRIPT_DIR}/files/spanel_webshells.yar" ]]; then
+    install -d -m 0755 -o root -g spanel /etc/spanel/yara
+    install -m 0644 -o root -g spanel "${SCRIPT_DIR}/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
+  fi
   # The launcher: every update fetches its steps from the release it installs.
   install -m 0755 -o root -g root "${SCRIPT_DIR}/files/spanel-update" /usr/local/sbin/spanel-update
   install -m 0440 -o root -g root "${SCRIPT_DIR}/files/spanel-sudoers" /etc/sudoers.d/spanel
@@ -1056,6 +1067,12 @@ Persistent=true
 WantedBy=timers.target
 SERVICE
 
+  if [[ -f "${SCRIPT_DIR}/files/spanel-watchdog.service" && -f "${SCRIPT_DIR}/files/spanel-watchdog.timer" ]]; then
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-watchdog.service" /etc/systemd/system/spanel-watchdog.service
+    sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-watchdog.service
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-watchdog.timer" /etc/systemd/system/spanel-watchdog.timer
+  fi
+
   systemctl daemon-reload
   systemctl disable --now spanel-auto-update.timer 2>/dev/null || true
   rm -f /etc/systemd/system/spanel-auto-update.service /etc/systemd/system/spanel-auto-update.timer
@@ -1065,6 +1082,7 @@ SERVICE
   systemctl enable --now spanel-backup-scheduler.timer
   systemctl enable --now spanel-malware-scheduler.timer
   systemctl enable --now spanel-notify.timer
+  systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
   systemctl enable spanel-autotune.service >/dev/null 2>&1 || true
   systemctl start spanel-autotune.service >/dev/null 2>&1 || true
   systemctl enable spanel-timesync.timer >/dev/null 2>&1 || true

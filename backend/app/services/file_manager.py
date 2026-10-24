@@ -11,6 +11,7 @@ from typing import Callable, Dict, Iterable, List, Optional
 
 from app.models.entities import Website
 from app.services import malware_queue
+from app.services import malware_scan
 from app.services import site_users
 from app.services import storage_quota
 from app.services.shell import shell
@@ -611,6 +612,7 @@ def upload_file(
             with tempfile.NamedTemporaryFile(
                 mode="w+b",
                 prefix="spanel-upload-",
+                suffix=Path(safe_name).suffix,
                 dir=str(_staging_directory()),
                 delete=False,
             ) as output:
@@ -620,6 +622,15 @@ def upload_file(
                 # No fsync. This file is renamed into the site a moment later
                 # and never read again, so forcing it to disk bought nothing
                 # and cost a write barrier on every upload.
+            scan_res = malware_scan.scan_upload_realtime(
+                str(staged_path),
+                domain=website.domain,
+                auto_quarantine=True,
+            )
+            if scan_res.get("status") == "infected":
+                raise ValueError(
+                    f"Upload blocked by Real-Time Malware Shield ({scan_res.get('signature')})"
+                )
             # One privileged call. It renames the staged file into place, fixes
             # ownership and clears the FastCGI cache; it used to be three, and
             # each sudo + helper start-up costs about 0.2s on a loaded VPS -
@@ -639,12 +650,21 @@ def upload_file(
                 staged_path.unlink(missing_ok=True)
     else:
         target_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = target_dir / f".{safe_name}.upload-{secrets.token_hex(8)}.tmp"
+        temp_path = target_dir / f".upload-{secrets.token_hex(8)}-{safe_name}"
         try:
             with temp_path.open("wb") as output:
                 shutil.copyfileobj(source_file, output, length=1024 * 1024)
                 output.flush()
                 os.fsync(output.fileno())
+            scan_res = malware_scan.scan_upload_realtime(
+                str(temp_path),
+                domain=website.domain,
+                auto_quarantine=True,
+            )
+            if scan_res.get("status") == "infected":
+                raise ValueError(
+                    f"Upload blocked by Real-Time Malware Shield ({scan_res.get('signature')})"
+                )
             temp_path.replace(target)
         except Exception:
             temp_path.unlink(missing_ok=True)

@@ -240,7 +240,7 @@ def _validate_service_config(name: str) -> tuple[bool, str]:
     if os.name == "nt" or settings.command_dry_run:
         return True, "config syntax ok (dry-run)"
     if name == "nginx" and shutil.which("nginx"):
-        res = shell.run(["nginx", "-t"], check=False)
+        res = shell.privileged("nginx-test", check=False, fallback=["nginx", "-t"])
         if res.returncode != 0:
             return False, (res.stderr or res.stdout or "nginx -t failed")[:240]
         return True, "nginx -t syntax ok"
@@ -312,7 +312,7 @@ def run_self_healing_check(reason: str = "manual") -> dict:
     now_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     now_ts = time.time()
 
-    services = [s for s in list_services() if s != "spanel-api"]
+    services = list_services() if reason == "systemd-timer" else [s for s in list_services() if s != "spanel-api"]
     if os.name != "nt" and not settings.command_dry_run and services:
         res = shell.run(["systemctl", "is-active", *services], check=False)
         answers = (res.stdout or "").split()[: len(services)]
@@ -460,3 +460,12 @@ def run_self_healing_check(reason: str = "manual") -> dict:
     result["healed_now"] = healed_now
     result["failed_now"] = failed_now
     return result
+
+
+if __name__ == "__main__":
+    print(json.dumps(run_self_healing_check(reason="systemd-timer")))
+
+
+if __name__ == "__main__":
+    print(json.dumps(run_self_healing_check(reason="systemd-timer")))
+

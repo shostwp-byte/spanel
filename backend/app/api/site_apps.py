@@ -7,8 +7,10 @@ that port; that side lives in app/api/websites.py.
 """
 
 from pathlib import Path
+from typing import Optional
+import json
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -504,15 +506,51 @@ def trigger_git_deploy(
 
 
 @router.post("/webhook/{app_id}/{token}")
-def git_webhook_auto_deploy(
+async def git_webhook_auto_deploy(
     app_id: int,
     token: str,
+    request: Request,
+    branch: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
     """Unauthenticated HMAC-verified webhook endpoint for GitHub / GitLab push auto-deploy."""
     app = db.query(SiteApp).filter(SiteApp.id == app_id).first()
     if not app or not site_apps.verify_webhook_token(app, token):
         raise HTTPException(status_code=403, detail="Invalid or expired webhook token")
+
+    raw_body = await request.body()
+    gh_sig = request.headers.get("X-Hub-Signature-256")
+    if gh_sig is not None and not site_apps.verify_github_webhook_signature(app, raw_body, gh_sig):
+        raise HTTPException(status_code=403, detail="Invalid X-Hub-Signature-256 HMAC signature")
+
+    gl_token = request.headers.get("X-Gitlab-Token")
+    if gl_token is not None and not site_apps.verify_webhook_token(app, gl_token):
+        raise HTTPException(status_code=403, detail="Invalid X-Gitlab-Token header")
+
+    gh_event = (request.headers.get("X-GitHub-Event") or "").strip().lower()
+    if gh_event == "ping":
+        return {"ok": True, "event": "ping", "app": app.name, "message": "Webhook ping acknowledged"}
+    if gh_event and gh_event not in {"push", "release", "workflow_run"}:
+        return {"ok": True, "skipped": True, "app": app.name, "reason": f"Ignored event {gh_event}"}
+
+    pushed_branch = ""
+    if raw_body:
+        try:
+            payload_json = json.loads(raw_body.decode("utf-8"))
+            if isinstance(payload_json, dict):
+                ref = str(payload_json.get("ref") or "")
+                if ref.startswith("refs/heads/"):
+                    pushed_branch = ref[len("refs/heads/"):]
+        except Exception:
+            pass
+    if branch and pushed_branch and pushed_branch != branch.strip():
+        return {
+            "ok": True,
+            "skipped": True,
+            "app": app.name,
+            "reason": f"Push to {pushed_branch} does not match target branch {branch.strip()}",
+        }
+
     try:
         result = site_apps.git_auto_deploy(app)
     except (RuntimeError, ValueError) as exc:
@@ -523,6 +561,7 @@ def git_webhook_auto_deploy(
     return {
         "ok": result.get("ok", True),
         "app": app.name,
+        "branch": pushed_branch or branch or "default",
         "status": app.status,
         "git_output": result.get("git_output", ""),
     }

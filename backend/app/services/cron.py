@@ -16,9 +16,9 @@ CRON_JAIL_BIN = "/usr/local/bin/spanel-cron-jail"
 # Matches the interpreter token of an already installed cron line so it can be
 # repointed when the website switches PHP version.
 CRON_PHP_TOKEN_RE = re.compile(
-    r"(&&\s+(?:/usr/local/bin/spanel-cron-jail\s+.+?\s+--\s+)?)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)"
+    r"((?:&&\s+|root\s+)?(?:/usr/local/s?bin/spanel-cron-jail\s+.+?\s+--\s+)?)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)"
 )
-CRON_JAIL_PREFIX_RE = re.compile(r"^/usr/local/bin/spanel-cron-jail\s+.+?\s+--\s+")
+CRON_JAIL_PREFIX_RE = re.compile(r"^(?:root\s+)?/usr/local/s?bin/spanel-cron-jail\s+.+?\s+--\s+")
 # `>file`, `>>file` and `2>file` open a target; `2>&1` / `1>&2` only duplicate a
 # descriptor. Cron executes commands with /bin/sh, so bash-only forms such as
 # `&>` are rejected instead of silently doing nothing.
@@ -279,6 +279,8 @@ def _parse_cron_line(index: int, line: str) -> dict:
     schedule = " ".join(parts[:5]) if len(parts) >= 5 else ""
     command = parts[5] if len(parts) >= 6 else ""
     command = re.sub(r"\s+#\s*spanel:[^\s]+\s*$", "", command).strip()
+    if command.startswith("root "):
+        command = command[5:].strip()
     if command.startswith("cd ") and " && " in command:
         command = command.split(" && ", 1)[1].strip()
     command = CRON_JAIL_PREFIX_RE.sub("", command).strip()
@@ -332,10 +334,12 @@ def add_cron(website: Website, schedule: str, command: str) -> str:
     marker = f"# spanel:{safe_domain}"
     doc_root_str = str(document_root)
     if cron_user != "www-data":
-        jail_prefix = f"{CRON_JAIL_BIN} {shlex.quote(cron_user)} {shlex.quote(doc_root_str)} -- "
+        line = (
+            f"{safe_schedule} root {CRON_JAIL_BIN} {shlex.quote(cron_user)} "
+            f"{shlex.quote(doc_root_str)} -- {_escape_percent(safe_command)} {marker}"
+        )
     else:
-        jail_prefix = ""
-    line = f"{safe_schedule} cd {shlex.quote(doc_root_str)} && {jail_prefix}{_escape_percent(safe_command)} {marker}"
+        line = f"{safe_schedule} cd {shlex.quote(doc_root_str)} && {_escape_percent(safe_command)} {marker}"
     if cron_user != "www-data":
         runtime_php_version = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
         site_users.ensure_site_runtime(website.domain, website.root_path, runtime_php_version, cron_user)
