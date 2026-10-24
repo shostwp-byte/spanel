@@ -959,10 +959,7 @@ def inspect_slow_bottlenecks(
                 header = lines[0]
                 m_pool = re.search(r"\[pool\s+([^\]]+)\]", header)
                 pool_name = m_pool.group(1) if m_pool else sf.stem
-                linux_user = ""
-                m_lu = re.match(r"^spanel-([a-z0-9_-]+)-[0-9a-f]{12}-", pool_name)
-                if m_lu:
-                    linux_user = m_lu.group(1)
+                linux_user = site_users.linux_user_from_pool_name(pool_name)
                 owner_user = user_by_name.get(linux_user)
                 owner_id = owner_user.id if owner_user else None
                 if allowed_user_ids is not None and owner_id not in allowed_user_ids:

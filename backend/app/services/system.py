@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from app.core.config import settings
+from app.services import site_users
 from app.services.shell import shell
 
 SELF_HEALING_FILE = Path("/var/lib/spanel/self-healing.json")
@@ -55,8 +56,19 @@ def list_services() -> list[str]:
     return [*BASE_SERVICES[:2], *installed_php_services(), *BASE_SERVICES[2:], *extra]
 
 
+def watched_services() -> list[str]:
+    """What the watchdog keeps running: the services page list plus every
+    hosting account's own PHP-FPM master. Those are not on the services page -
+    a busy server has hundreds - but one that dies takes its sites down.
+    """
+    return [*list_services(), *site_users.installed_user_php_fpm_units()]
+
+
 def service_action(name: str, action: str):
-    allowed_units = set(list_services()) | set(OPTIONAL_SERVICES) | {f"php{v}-fpm" for v in PHP_VERSION_ORDER}
+    allowed_units = (
+        set(list_services()) | set(OPTIONAL_SERVICES) | {f"php{v}-fpm" for v in PHP_VERSION_ORDER}
+        | set(site_users.installed_user_php_fpm_units())
+    )
     if name not in allowed_units:
         raise ValueError("Unsupported service")
     if action not in SUPPORTED_ACTIONS:
@@ -244,6 +256,10 @@ def _validate_service_config(name: str) -> tuple[bool, str]:
         if res.returncode != 0:
             return False, (res.stderr or res.stdout or "nginx -t failed")[:240]
         return True, "nginx -t syntax ok"
+    if name.startswith("spanel-php") and "-fpm@" in name:
+        # The unit tests its own config as root in ExecStartPre; run as the
+        # panel user, php-fpm -t cannot even open the master's error log.
+        return True, "php-fpm --test runs in the unit's ExecStartPre"
     if name.startswith("php") and name.endswith("-fpm"):
         ver = name.removeprefix("php").removesuffix("-fpm")
         fpm_bin = f"/usr/sbin/php-fpm{ver}"
@@ -312,7 +328,7 @@ def run_self_healing_check(reason: str = "manual") -> dict:
     now_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     now_ts = time.time()
 
-    services = list_services() if reason == "systemd-timer" else [s for s in list_services() if s != "spanel-api"]
+    services = watched_services() if reason == "systemd-timer" else [s for s in watched_services() if s != "spanel-api"]
     if os.name != "nt" and not settings.command_dry_run and services:
         res = shell.run(["systemctl", "is-active", *services], check=False)
         answers = (res.stdout or "").split()[: len(services)]
@@ -410,7 +426,9 @@ def run_self_healing_check(reason: str = "manual") -> dict:
         else:
             failed_now.append(name)
 
-    # Periodic Cgroups v2 worker classification for newly forked dynamic PHP-FPM children
+    # Tenant processes that run outside their account's slice - cron jobs, pools
+    # still on a distro PHP-FPM master - are moved in here. PHP on the account's
+    # own master starts inside the slice and is left alone.
     if not settings.command_dry_run:
         try:
             shell.privileged("cgroup-classify-workers", check=False, fallback=["true"])

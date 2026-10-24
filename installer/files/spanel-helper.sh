@@ -93,6 +93,24 @@ NGINX_HTTP_FLOOD_ZONES="${NGINX_BLOCKLIST_DIR}/http-flood-zones.conf"
 NGINX_HTTP_FLOOD_SERVER_CONF="${NGINX_BLOCKLIST_DIR}/http-flood-server.conf"
 PHP_FPM_DEFAULT_WORKER_MB=128
 PHP_FPM_DEFAULT_REQUEST_TERMINATE_TIMEOUT=300
+# Per-account PHP-FPM masters. Every hosting account gets one php-fpm master
+# per PHP version, run as spanel-php<ver>-fpm@<user>.service with
+# Slice=user-<uid>.slice, so the master and every worker it forks are born
+# under the account's CPU/memory/IO/tasks limits instead of being moved there
+# by a later scan. Pools live in ${SPANEL_PHP_FPM_ROOT}/<ver>/<user>/pool.d and
+# listen on ${SPANEL_PHP_RUN_ROOT}/<user>/<pool>.sock. The distro php<ver>-fpm
+# master stays for phpMyAdmin and the panel tools, and still serves any pool in
+# /etc/php/<ver>/fpm/pool.d that has not moved (or could not move) yet.
+# backend/app/services/site_users.py names the same paths; a test holds the two
+# together.
+SPANEL_PHP_FPM_ROOT="/etc/spanel/php-fpm"
+SPANEL_PHP_RUN_ROOT="/run/spanel-php"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+PHP_ETC_ROOT="/etc/php"
+PHP_LOG_DIR="/var/log/php"
+PHP_FPM_SBIN_DIR="/usr/sbin"
+# Both socket layouts, as they appear in a vhost's fastcgi_pass.
+PHP_FPM_SOCKET_GREP='(/run/php/[A-Za-z0-9._-]+|/run/spanel-php/[a-z0-9_-]+/[A-Za-z0-9._-]+)\.sock'
 MARIADB_TUNING_CONF="/etc/mysql/mariadb.conf.d/90-spanel-tuning.cnf"
 
 deny() { echo "spanel-helper: $*" >&2; exit 1; }
@@ -712,7 +730,7 @@ cleanup_orphans() {
   # certainty, and an admin who removed a site by accident should be able to get
   # it back. Nothing here is ever deleted without a copy.
   local mode="${1:-clean}" live_file stamp archive panel_domain name base
-  local sock vhost_socks php_version
+  local sock vhost_socks php_version removed_pools
   local -i certs=0 rules=0 baks=0 manual=0 sni=0 pools=0
   live_file="$(mktemp)"
   orphan_live_domains >"$live_file"
@@ -817,14 +835,15 @@ cleanup_orphans() {
   #    sites and had been cut to 6 workers per site because of it.
   vhost_socks="$(mktemp)"
   cat /etc/nginx/conf.d/*.conf 2>/dev/null \
-    | grep -oE '/run/php/[A-Za-z0-9._-]+\.sock' | sort -u >"$vhost_socks"
+    | grep -oE "$PHP_FPM_SOCKET_GREP" | sort -u >"$vhost_socks" || true
+  removed_pools=""
   # No sockets at all means nginx is unconfigured or unreadable, not that every
   # pool is dead. Same refusal as the empty live-domain list above.
   if [[ -s "$vhost_socks" ]]; then
-    for f in /etc/php/*/fpm/pool.d/spanel-*.conf; do
+    while IFS= read -r f; do
       [[ -f "$f" ]] || continue
-      sock="$(grep -m1 -E '^[[:space:]]*listen[[:space:]]*=' "$f" | sed -E 's/.*=[[:space:]]*//')"
-      [[ "$sock" == /run/php/*.sock ]] || continue
+      sock="$(php_pool_listen "$f" || true)"
+      [[ "$sock" == /run/php/*.sock || "$sock" == "$SPANEL_PHP_RUN_ROOT"/*.sock ]] || continue
       grep -qxF "$sock" "$vhost_socks" && continue
       base="$(basename "$f")"
       echo "php-pool	${base}"
@@ -833,8 +852,9 @@ cleanup_orphans() {
         install -d -m 0700 "${archive}/php-pools"
         cp -a "$f" "${archive}/php-pools/" 2>/dev/null || true
         rm -f "$f"
+        removed_pools+="${f}"$'\n'
       fi
-    done
+    done <<<"$(managed_php_pool_files)"
   fi
   rm -f "$vhost_socks"
 
@@ -844,11 +864,8 @@ cleanup_orphans() {
       systemctl reload nginx >/dev/null 2>&1 || true
     fi
     if (( pools > 0 )); then
-      for dir in /etc/php/*/fpm/pool.d; do
-        [[ -d "$dir" ]] || continue
-        php_version="$(echo "$dir" | awk -F/ '{print $4}')"
-        systemctl reload "php${php_version}-fpm" 2>/dev/null || true
-      done
+      # Distro masters reload; an account master whose last pool went stops.
+      reload_php_pool_owners <<<"$removed_pools"
       # The pool count is an input to pm.max_children, so the sites that are
       # left are entitled to the share the dead pools were holding.
       retune_php_fpm_pools >/dev/null 2>&1 || true
@@ -4104,6 +4121,7 @@ install_php_extension() {
     deny "$pkg is installed but PHP ${version} cannot load it"
   fi
   systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "$pkg is ready; php${version}-fpm reloaded."
 }
 
@@ -4188,6 +4206,7 @@ upgrade_php_version() {
   else
     systemctl start "php${version}-fpm" 2>/dev/null || true
   fi
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} packages safely upgraded and php${version}-fpm reloaded"
 }
 
@@ -4204,6 +4223,7 @@ harden_php_security() {
         "php-fpm${version}" -t >/dev/null 2>&1 || true
       fi
       systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm" 2>/dev/null || true
+      reload_user_php_fpm_masters "$version"
       echo "PHP ${version} anti-PHP2SHELL hardening disabled"
       return 0
       ;;
@@ -4236,6 +4256,7 @@ INI
   if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
     systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
   fi
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} anti-PHP2SHELL hardening (${mode}) applied: ${target}"
 }
 
@@ -4251,13 +4272,22 @@ uninstall_php_version() {
     return 0
   fi
   shopt -s nullglob
-  local pools=(/etc/php/"$version"/fpm/pool.d/spanel-*.conf)
+  local pools=(/etc/php/"$version"/fpm/pool.d/spanel-*.conf "$SPANEL_PHP_FPM_ROOT/$version"/*/pool.d/spanel-*.conf)
   shopt -u nullglob
   if [[ ${#pools[@]} -gt 0 ]]; then
     deny "cannot uninstall PHP ${version}: ${#pools[@]} website pool(s) still use this PHP version"
   fi
   echo "Stopping php${version}-fpm..."
   systemctl disable --now "php${version}-fpm" 2>/dev/null || true
+  # Per-account masters of this version have no pool left (checked above);
+  # anything still registered is leftover.
+  local leftover
+  for leftover in "$SPANEL_PHP_FPM_ROOT/$version"/*/; do
+    [[ -d "$leftover" ]] || continue
+    systemctl disable --now "$(user_php_fpm_unit "$version" "$(basename "$leftover")")" >/dev/null 2>&1 || true
+  done
+  rm -rf -- "${SPANEL_PHP_FPM_ROOT:?}/${version}" "${SYSTEMD_UNIT_DIR}/spanel-php${version}-fpm@.service" "${SYSTEMD_UNIT_DIR}/spanel-php${version}-fpm@"*.service.d
+  systemctl daemon-reload >/dev/null 2>&1 || true
   echo "Removing PHP $version packages..."
   local installed_pkgs=() pkg
   while IFS= read -r pkg; do
@@ -4419,6 +4449,7 @@ write_php_tune() {
     install -m 0644 -o root -g root "$target" "/etc/php/${version}/cli/conf.d/95-spanel-tune.ini"
   fi
   systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} tuned: ${target}"
 }
 
@@ -4443,6 +4474,7 @@ INI
     install -m 0644 -o root -g root "$target" "/etc/php/${version}/cli/conf.d/96-spanel-opcache.ini"
   fi
   systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "OPcache PHP ${version}: $([[ "$enabled" == "1" ]] && echo enabled || echo disabled)"
 }
 
@@ -4467,6 +4499,7 @@ write_php_config() {
   chmod 0644 "$tmp"
   mv -f -- "$tmp" "$target"
   systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} config updated: ${target}"
 }
 
@@ -6475,6 +6508,10 @@ is_allowed_service() {
     php_version="${BASH_REMATCH[1]}"
     [[ -f "/etc/php/${php_version}/fpm/php-fpm.conf" ]] && return 0
   fi
+  # A hosting account's own PHP-FPM master, once SPanel has set it up.
+  if [[ "$service" =~ ^spanel-php(5\.6|7\.4|8\.[0-5])-fpm@([a-z_][a-z0-9_-]{2,31})$ ]]; then
+    [[ -f "${SPANEL_PHP_FPM_ROOT}/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/php-fpm.conf" ]] && return 0
+  fi
   return 1
 }
 
@@ -6964,6 +7001,17 @@ delete_panel_user_runtime() {
       systemctl reload "php${php_version}-fpm" 2>/dev/null || true
     done
   done
+  # The account's own PHP-FPM masters, one per PHP version it used.
+  local user_fpm_dir user_fpm_ver user_fpm_unit
+  for user_fpm_dir in "$SPANEL_PHP_FPM_ROOT"/*/"$user"; do
+    [[ -d "$user_fpm_dir" ]] || continue
+    user_fpm_ver="$(basename "$(dirname "$user_fpm_dir")")"
+    user_fpm_unit="$(user_php_fpm_unit "$user_fpm_ver" "$user")"
+    systemctl disable --now "$user_fpm_unit" >/dev/null 2>&1 || true
+    rm -rf -- "$user_fpm_dir" "${SYSTEMD_UNIT_DIR}/${user_fpm_unit}.d"
+    rmdir -- "$(dirname "$user_fpm_dir")" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  done
   crontab -r -u "$user" 2>/dev/null || true
   rm -f "/etc/cron.d/spanel-user-${user}" 2>/dev/null || true
   local old_uid
@@ -7154,13 +7202,358 @@ delete_sftp_account() {
   userdel -f "$sub" 2>/dev/null || true
 }
 
+site_root_hash() {
+  printf '%s' "$1" | sha256sum | awk '{print substr($1, 1, 12)}'
+}
+
 site_php_pool_glob() {
   local user="$1" target="$2"
   require_linux_user "$user"
   target=$(readlink -m "$target") || deny "cannot resolve $target"
-  local site_hash
-  site_hash="$(printf '%s' "$target" | sha256sum | awk '{print substr($1, 1, 12)}')"
-  printf 'spanel-%s-%s-*' "$user" "$site_hash"
+  printf 'spanel-%s-%s-*' "$user" "$(site_root_hash "$target")"
+}
+
+# --- PHP-FPM pool naming (site_users.php_fpm_pool_name / php_fpm_socket) -----
+php_pool_name() {
+  # php_pool_name <user> <resolved-site-root> <php-version>
+  printf 'spanel-%s-%s-%s\n' "$1" "$(site_root_hash "$2")" "${3//./_}"
+}
+
+user_php_fpm_unit() {
+  # user_php_fpm_unit <php-version> <user>
+  printf 'spanel-php%s-fpm@%s.service\n' "$1" "$2"
+}
+
+user_php_fpm_dir() {
+  # user_php_fpm_dir <php-version> <user>
+  printf '%s/%s/%s\n' "$SPANEL_PHP_FPM_ROOT" "$1" "$2"
+}
+
+user_php_fpm_socket() {
+  # user_php_fpm_socket <user> <pool-name>
+  printf '%s/%s/%s.sock\n' "$SPANEL_PHP_RUN_ROOT" "$1" "$2"
+}
+
+legacy_php_pool_file() {
+  # legacy_php_pool_file <php-version> <pool-name>
+  printf '%s/%s/fpm/pool.d/%s.conf\n' "$PHP_ETC_ROOT" "$1" "$2"
+}
+
+# Every SPanel pool file on the box, one per line: pools of the per-account
+# masters first, then pools the distro master still serves.
+managed_php_pool_files() {
+  local f
+  for f in "$SPANEL_PHP_FPM_ROOT"/*/*/pool.d/spanel-*.conf "$PHP_ETC_ROOT"/*/fpm/pool.d/spanel-*.conf; do
+    [[ -f "$f" ]] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+php_pool_file_is_legacy() {
+  [[ "$1" == "$PHP_ETC_ROOT"/* ]]
+}
+
+php_pool_file_version() {
+  local f="$1"
+  if php_pool_file_is_legacy "$f"; then
+    f="${f#"$PHP_ETC_ROOT"/}"
+  else
+    f="${f#"$SPANEL_PHP_FPM_ROOT"/}"
+  fi
+  printf '%s\n' "${f%%/*}"
+}
+
+php_pool_file_user() {
+  awk -F= '/^[[:space:]]*user[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$1"
+}
+
+php_pool_listen() {
+  awk -F= '/^[[:space:]]*listen[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$1"
+}
+
+# The systemd unit serving a pool file: the distro master for a legacy pool,
+# the account's own master otherwise.
+php_pool_file_unit() {
+  local f="$1" ver user
+  ver="$(php_pool_file_version "$f")"
+  if php_pool_file_is_legacy "$f"; then
+    printf 'php%s-fpm.service\n' "$ver"
+    return 0
+  fi
+  user="${f#"$SPANEL_PHP_FPM_ROOT"/"$ver"/}"
+  user="${user%%/*}"
+  user_php_fpm_unit "$ver" "$user"
+}
+
+# Pool names, counted once. A pool that is moving between the two layouts
+# exists in both for a moment and is still one pool to size against.
+php_fpm_unique_pool_count() {
+  managed_php_pool_files | awk -F/ '{print $NF}' | sort -u | grep -c . || true
+}
+
+# Writes stdin to <path> when it differs from what is there; prints "changed"
+# when it wrote, so callers know whether systemd needs a daemon-reload.
+write_file_if_changed() {
+  local path="$1" mode="$2" tmp
+  tmp="$(mktemp "${path%/*}/.spanel-write.XXXXXX")" || deny "cannot write ${path}"
+  cat >"$tmp"
+  if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 0
+  fi
+  chmod "$mode" "$tmp"
+  mv -f -- "$tmp" "$path"
+  echo changed
+}
+
+render_user_php_fpm_unit() {
+  # render_user_php_fpm_unit <php-version>: the template, one per PHP version.
+  # No RuntimeDirectory=: two versions of one account share the socket
+  # directory, and systemd would delete it under the other when one stops.
+  local ver="$1"
+  cat <<UNIT
+# Generated by SPanel. One PHP ${ver} FPM master per hosting account; the
+# instance name is the Linux user. Slice=user-<uid>.slice comes from the
+# instance drop-in, so the master and its workers start inside the account's
+# resource limits. The distro php${ver}-fpm.service is left alone.
+[Unit]
+Description=SPanel PHP ${ver} FastCGI Process Manager for %i
+Documentation=man:php-fpm${ver}(8)
+After=network.target
+ConditionPathExists=${SPANEL_PHP_FPM_ROOT}/${ver}/%i/php-fpm.conf
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+Environment=PHP_INI_SCAN_DIR=${PHP_ETC_ROOT}/${ver}/fpm/conf.d
+ExecStartPre=/usr/bin/install -d -m 0755 -o root -g root ${SPANEL_PHP_RUN_ROOT}
+ExecStartPre=/usr/bin/install -d -m 0750 -o root -g www-data ${SPANEL_PHP_RUN_ROOT}/%i
+ExecStartPre=${PHP_FPM_SBIN_DIR}/php-fpm${ver} --test --fpm-config ${SPANEL_PHP_FPM_ROOT}/${ver}/%i/php-fpm.conf
+ExecStart=${PHP_FPM_SBIN_DIR}/php-fpm${ver} --nodaemonize --fpm-config ${SPANEL_PHP_FPM_ROOT}/${ver}/%i/php-fpm.conf
+ExecReload=/bin/kill -USR2 \$MAINPID
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+render_user_php_fpm_slice_dropin() {
+  # render_user_php_fpm_slice_dropin <uid>
+  cat <<DROPIN
+# Generated by SPanel: run this account's PHP inside its own slice.
+[Service]
+Slice=user-${1}.slice
+DROPIN
+}
+
+render_user_php_fpm_conf() {
+  # render_user_php_fpm_conf <php-version> <user>
+  local ver="$1" user="$2" dir
+  dir="$(user_php_fpm_dir "$ver" "$user")"
+  cat <<CONF
+; Generated by SPanel: PHP ${ver} FPM master for ${user}.
+; Pools are the files in ${dir}/pool.d. php.ini and conf.d are the
+; distro's (PHP_INI_SCAN_DIR in the unit), so PHP settings stay server-wide.
+[global]
+pid = ${SPANEL_PHP_RUN_ROOT}/${user}/php${ver}-fpm.pid
+error_log = ${PHP_LOG_DIR}/spanel-fpm-${user}-${ver}.log
+log_level = notice
+emergency_restart_threshold = 10
+emergency_restart_interval = 1m
+process_control_timeout = 10s
+include = ${dir}/pool.d/*.conf
+CONF
+}
+
+render_php_pool_conf() {
+  # render_php_pool_conf <pool-name> <user> <site-root> <listen-socket>
+  # Sizing comes from calculate_php_fpm_pool_tuning, which must run first.
+  local pool_name="$1" user="$2" target="$3" listen="$4"
+  # Per-user dirs for sessions/uploads. Sharing /tmp across pools lets one
+  # site read another's session files (mode 0600 helps but only inside the
+  # same uid; uploads land world-writable on tmpfs). Using 0700 dirs owned
+  # by the pool's Linux user contains the data inside the site's trust
+  # boundary - and, being owned by that user, counts against its disk quota.
+  local sess_dir="/var/lib/php/sessions/${user}"
+  local upload_dir="/var/lib/php/uploads/${user}"
+  cat <<POOL
+[${pool_name}]
+user = ${user}
+group = ${user}
+listen = ${listen}
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+listen.backlog = 64
+; SPanel auto-tunes these values from RAM, CPU and managed pool count.
+; Optional overrides: SPANEL_PHP_FPM_WORKER_MB, SPANEL_PHP_FPM_MAX_CHILDREN,
+; SPANEL_PHP_FPM_IDLE_TIMEOUT, SPANEL_PHP_FPM_MAX_REQUESTS,
+; SPANEL_PHP_FPM_REQUEST_TERMINATE_TIMEOUT.
+pm = ${PHP_FPM_PM_MODE}
+pm.max_children = ${PHP_FPM_MAX_CHILDREN}
+pm.process_idle_timeout = ${PHP_FPM_PROCESS_IDLE_TIMEOUT}s
+pm.max_requests = ${PHP_FPM_MAX_REQUESTS}
+request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s
+request_slowlog_timeout = 5s
+slowlog = /var/log/php/spanel-slow-${pool_name}.log
+chdir = /
+php_admin_value[open_basedir] = ${target}:${sess_dir}:${upload_dir}:/usr/share/php
+php_admin_value[upload_tmp_dir] = ${upload_dir}
+php_admin_value[session.save_path] = ${sess_dir}
+POOL
+}
+
+ensure_php_fpm_logrotate() {
+  # The per-account masters log beside the slowlogs, which never had a rule.
+  # copytruncate: nothing to signal, and one rule covers every master.
+  local rule
+  rule="$(cat <<ROTATE
+# Managed by SPanel.
+${PHP_LOG_DIR}/spanel-fpm-*.log ${PHP_LOG_DIR}/spanel-slow-*.log {
+    su root root
+    weekly
+    rotate 4
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+ROTATE
+)"
+  [[ -d /etc/logrotate.d ]] || return 0
+  printf '%s\n' "$rule" | write_file_if_changed /etc/logrotate.d/spanel-php-fpm 0644 >/dev/null
+}
+
+# Brings the account's master for one PHP version in line with its pool.d:
+# stopped and removed when there is no pool left, otherwise written, tested
+# and started or reloaded. Returns non-zero when the master is not serving,
+# which the caller turns into a fallback to the distro master.
+sync_user_php_fpm_master() {
+  local ver="$1" user="$2" dir unit dropin_dir uid daemon_reload=0 needs_restart=0
+  local pools=()
+  dir="$(user_php_fpm_dir "$ver" "$user")"
+  unit="$(user_php_fpm_unit "$ver" "$user")"
+  dropin_dir="${SYSTEMD_UNIT_DIR}/${unit}.d"
+  shopt -s nullglob
+  pools=("$dir"/pool.d/*.conf)
+  shopt -u nullglob
+  if (( ${#pools[@]} == 0 )); then
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    rm -rf -- "$dir" "$dropin_dir"
+    rmdir -- "${SPANEL_PHP_FPM_ROOT}/${ver}" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    return 0
+  fi
+  [[ -x "${PHP_FPM_SBIN_DIR}/php-fpm${ver}" ]] || return 1
+  uid="$(id -u "$user" 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  (( uid >= 1000 )) || return 1
+  install -d -m 0755 "$dropin_dir"
+  if [[ "$(render_user_php_fpm_unit "$ver" | write_file_if_changed "${SYSTEMD_UNIT_DIR}/spanel-php${ver}-fpm@.service" 0644)" == changed ]]; then
+    daemon_reload=1
+  fi
+  if [[ "$(render_user_php_fpm_slice_dropin "$uid" | write_file_if_changed "${dropin_dir}/10-spanel-slice.conf" 0644)" == changed ]]; then
+    # Slice= only takes effect on a fresh start.
+    daemon_reload=1
+    needs_restart=1
+  fi
+  render_user_php_fpm_conf "$ver" "$user" | write_file_if_changed "${dir}/php-fpm.conf" 0644 >/dev/null
+  ensure_php_fpm_logrotate || true
+  if (( daemon_reload )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  # Test before touching a running master: USR2 with a broken config takes
+  # down every site of the account, a refused test takes down none.
+  PHP_INI_SCAN_DIR="${PHP_ETC_ROOT}/${ver}/fpm/conf.d" \
+    "${PHP_FPM_SBIN_DIR}/php-fpm${ver}" --test --fpm-config "${dir}/php-fpm.conf" >/dev/null 2>&1 || return 1
+  if systemctl is-active --quiet "$unit" 2>/dev/null; then
+    if (( needs_restart )); then
+      systemctl restart "$unit" >/dev/null 2>&1 || return 1
+    else
+      systemctl reload "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || return 1
+    fi
+  else
+    systemctl enable "$unit" >/dev/null 2>&1 || true
+    # restart, not start: it also clears a failed state left by an earlier try.
+    systemctl restart "$unit" >/dev/null 2>&1 || return 1
+  fi
+  systemctl is-active --quiet "$unit" 2>/dev/null
+}
+
+# Reloads every running per-account master of one PHP version, for changes
+# they share with the distro master: php.ini, conf.d, extensions, binaries.
+reload_user_php_fpm_masters() {
+  local ver="$1" dir user unit
+  for dir in "$SPANEL_PHP_FPM_ROOT/$ver"/*/; do
+    [[ -f "${dir}php-fpm.conf" ]] || continue
+    user="$(basename "$dir")"
+    unit="$(user_php_fpm_unit "$ver" "$user")"
+    systemctl is-active --quiet "$unit" 2>/dev/null || continue
+    systemctl reload "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+# Reload (or for per-account masters, re-sync) the units serving the pool
+# files named on stdin, each once.
+reload_php_pool_owners() {
+  local f unit ver user seen=" "
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    unit="$(php_pool_file_unit "$f")"
+    [[ "$seen" == *" ${unit} "* ]] && continue
+    seen+="${unit} "
+    ver="$(php_pool_file_version "$f")"
+    if php_pool_file_is_legacy "$f"; then
+      systemctl reload "php${ver}-fpm" 2>/dev/null || true
+    else
+      user="${unit#spanel-php"${ver}"-fpm@}"
+      user="${user%.service}"
+      sync_user_php_fpm_master "$ver" "$user" || \
+        echo "warning: ${unit} is not running; see journalctl -u ${unit}" >&2
+    fi
+  done
+  return 0
+}
+
+# Pools still in the distro pool.d whose site already runs on its account's
+# master, once no vhost points at the old socket any more. Until the vhost is
+# rewritten the old pool is what serves the site, so it stays.
+prune_legacy_php_pools() {
+  local refs f name ver user sock versions=" " removed=0
+  refs="$(mktemp)"
+  cat "$NGINX_CONF_DIR"/*.conf 2>/dev/null | grep -oE "$PHP_FPM_SOCKET_GREP" | sort -u >"$refs" || true
+  # No sockets at all means nginx is unconfigured or unreadable, not that no
+  # site needs its pool. Same refusal as the orphan cleanup.
+  if [[ ! -s "$refs" ]]; then
+    rm -f -- "$refs"
+    return 0
+  fi
+  for f in "$PHP_ETC_ROOT"/*/fpm/pool.d/spanel-*.conf; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f" .conf)"
+    ver="$(php_pool_file_version "$f")"
+    user="$(php_pool_file_user "$f" || true)"
+    [[ -n "$user" ]] || continue
+    [[ -f "$(user_php_fpm_dir "$ver" "$user")/pool.d/${name}.conf" ]] || continue
+    sock="$(php_pool_listen "$f" || true)"
+    if [[ -n "$sock" ]] && grep -qxF "$sock" "$refs"; then
+      continue
+    fi
+    rm -f -- "$f"
+    echo "retired legacy pool ${name} (PHP ${ver})"
+    removed=$((removed + 1))
+    [[ "$versions" == *" ${ver} "* ]] || versions+="${ver} "
+  done
+  rm -f -- "$refs"
+  for ver in $versions; do
+    systemctl reload "php${ver}-fpm" 2>/dev/null || true
+  done
+  return 0
 }
 
 positive_int_or_default() {
@@ -7201,14 +7594,14 @@ php_fpm_cpu_count() {
 }
 
 php_fpm_pool_count() {
-  local current_pool="${1:-}" count=0 pool_file
-  shopt -s nullglob
-  for pool_file in /etc/php/*/fpm/pool.d/spanel-*.conf; do
-    [[ -f "$pool_file" ]] || continue
-    count=$((count + 1))
-  done
-  shopt -u nullglob
-  if [[ -n "$current_pool" && ! -f "$current_pool" ]]; then
+  local current_pool="${1:-}" count files
+  count="$(php_fpm_unique_pool_count)"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  # A pool about to be written counts too - unless it is already on disk in
+  # either layout under the same name. Read whole, then matched: `| grep -q`
+  # under pipefail turns an early match into a failure.
+  files="$(managed_php_pool_files)"
+  if [[ -n "$current_pool" && ! -f "$current_pool" && $'\n'"$files"$'\n' != *"/$(basename "$current_pool")"$'\n'* ]]; then
     count=$((count + 1))
   fi
   if (( count < 1 )); then
@@ -7363,8 +7756,8 @@ apply_saved_user_limits_to_pool_file() {
 ensure_php_fpm_cgroup_dropin() {
   local fpm_ver="$1" dropin_dir
   [[ "$fpm_ver" =~ ^[0-9]+\.[0-9]+$ ]] || return 0
-  dropin_dir="/etc/systemd/system/php${fpm_ver}-fpm.service.d"
-  install -d -o root -g root -m 0755 "$dropin_dir"
+  dropin_dir="${SYSTEMD_UNIT_DIR}/php${fpm_ver}-fpm.service.d"
+  install -d -m 0755 "$dropin_dir"
   cat >"${dropin_dir}/50-spanel-cgroup.conf" <<'DROPIN'
 [Service]
 ExecStartPost=-/usr/local/sbin/spanel-helper cgroup-classify-workers
@@ -7373,11 +7766,65 @@ DROPIN
   chmod 0644 "${dropin_dir}/50-spanel-cgroup.conf"
 }
 
+# Whole disk under / ("/dev/sda" for "/dev/sda1"), or nothing when / is not
+# on a plain block device (LVM, a container overlay). cgroup IO limits are
+# per device, and the panel's limits mean "the disk the sites live on".
+tenant_io_base_device() {
+  local root_dev base_dev
+  root_dev="$(findmnt -no SOURCE / 2>/dev/null | head -n1 || true)"
+  if [[ "$root_dev" == /dev/nvme* || "$root_dev" == /dev/mmcblk* ]]; then
+    base_dev="$(echo "$root_dev" | sed -E 's/p[0-9]+$//')"
+  elif [[ "$root_dev" == /dev/* ]]; then
+    base_dev="$(echo "$root_dev" | sed -E 's/[0-9]+$//')"
+  else
+    base_dev=""
+  fi
+  [[ -n "$base_dev" && -b "$base_dev" ]] || base_dev=""
+  printf '%s\n' "$base_dev"
+}
+
+# io.max line for a cgroup: "<maj:min> rbps=.. wbps=.. riops=.. wiops=..",
+# MB/s and IOPS from the limits file, 0 meaning no limit ("max").
+render_io_max_line() {
+  local majmin="$1" r_mbps="${2:-0}" w_mbps="${3:-0}" r_iops="${4:-0}" w_iops="${5:-0}" v
+  for v in r_mbps w_mbps r_iops w_iops; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || printf -v "$v" '0'
+  done
+  [[ "$majmin" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s rbps=%s wbps=%s riops=%s wiops=%s\n' "$majmin" \
+    "$( (( r_mbps > 0 )) && echo $(( r_mbps * 1048576 )) || echo max )" \
+    "$( (( w_mbps > 0 )) && echo $(( w_mbps * 1048576 )) || echo max )" \
+    "$( (( r_iops > 0 )) && echo "$r_iops" || echo max )" \
+    "$( (( w_iops > 0 )) && echo "$w_iops" || echo max )"
+}
+
+# Whether a process with this /proc/<pid>/cgroup content still needs moving
+# into user-<uid>.slice/spanel.scope. A process already anywhere inside the
+# account's slice - its own PHP-FPM master and workers, an SSH session - is
+# under the slice's limits; moving it out of a systemd unit's cgroup would
+# only leave systemd with a unit it no longer controls.
+tenant_process_needs_scope() {
+  local cg_current="$1" uid="$2"
+  [[ "$cg_current" == *"spanel-app-"* ]] && return 1
+  [[ "$cg_current" == *"/user-${uid}.slice/"* ]] && return 1
+  return 0
+}
+
+# What still runs outside the account's slice gets moved in after the fact:
+# pools left on the distro php-fpm master, cron jobs (cron.service), anything
+# started by root on the account's behalf. PHP served by the per-account
+# masters never needs this - it starts inside the slice.
 classify_all_tenant_workers() {
   [[ -d /sys/fs/cgroup/user.slice ]] || return 0
   echo "+cpu +memory +io +pids" >/sys/fs/cgroup/user.slice/cgroup.subtree_control 2>/dev/null || true
-  local pid uid uname comm slice_unit cg_slice cg_scope cg_current limits_file
-  local cpu_pct mem_high mem_max tasks_max
+  local pid uid uname comm slice_unit cg_slice cg_scope cg_current limits_file io_dev io_majmin io_line
+  local cpu_pct mem_high mem_max tasks_max io_r io_w iops_r iops_w
+  local prepared=" "
+  io_dev="$(tenant_io_base_device)"
+  io_majmin=""
+  if [[ -n "$io_dev" ]]; then
+    io_majmin="$(lsblk -dno MAJ:MIN "$io_dev" 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
   while read -r pid uid uname comm; do
     [[ "$pid" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ ]] || continue
     (( uid >= 1000 && uid < 65000 )) || continue
@@ -7390,65 +7837,84 @@ classify_all_tenant_workers() {
       esac
     fi
     cg_current="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
-    [[ "$cg_current" == *"spanel-app-"* ]] && continue
+    tenant_process_needs_scope "$cg_current" "$uid" || continue
     slice_unit="user-${uid}.slice"
     cg_slice="/sys/fs/cgroup/user.slice/${slice_unit}"
-    if [[ ! -d "$cg_slice" ]]; then
-      systemctl start "$slice_unit" >/dev/null 2>&1 || mkdir -p "$cg_slice" 2>/dev/null || true
-    fi
-    echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
     cg_scope="${cg_slice}/spanel.scope"
-    mkdir -p "$cg_scope" 2>/dev/null || true
-    if [[ -f "$limits_file" ]]; then
-      cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      if [[ "$cpu_pct" =~ ^[0-9]+$ ]] && (( cpu_pct > 0 )); then
-        echo "$(( cpu_pct * 1000 )) 100000" >"${cg_scope}/cpu.max" 2>/dev/null || true
+    # Limits are written once per account per scan, not once per process.
+    if [[ "$prepared" != *" ${uid} "* ]]; then
+      prepared+="${uid} "
+      if [[ ! -d "$cg_slice" ]]; then
+        systemctl start "$slice_unit" >/dev/null 2>&1 || mkdir -p "$cg_slice" 2>/dev/null || true
       fi
-      if [[ "$mem_high" =~ ^[0-9]+$ ]] && (( mem_high > 0 )); then
-        echo "$(( mem_high * 1048576 ))" >"${cg_scope}/memory.high" 2>/dev/null || true
-      fi
-      if [[ "$mem_max" =~ ^[0-9]+$ ]] && (( mem_max > 0 )); then
-        echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
-      fi
-      if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
-        echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
+      echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
+      mkdir -p "$cg_scope" 2>/dev/null || true
+      if [[ -f "$limits_file" ]]; then
+        cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        io_r="$(awk -F= '$1=="IO_READ_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        io_w="$(awk -F= '$1=="IO_WRITE_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        iops_r="$(awk -F= '$1=="IOPS_READ"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        iops_w="$(awk -F= '$1=="IOPS_WRITE"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        if [[ "$cpu_pct" =~ ^[0-9]+$ ]] && (( cpu_pct > 0 )); then
+          echo "$(( cpu_pct * 1000 )) 100000" >"${cg_scope}/cpu.max" 2>/dev/null || true
+        fi
+        if [[ "$mem_high" =~ ^[0-9]+$ ]] && (( mem_high > 0 )); then
+          echo "$(( mem_high * 1048576 ))" >"${cg_scope}/memory.high" 2>/dev/null || true
+        fi
+        if [[ "$mem_max" =~ ^[0-9]+$ ]] && (( mem_max > 0 )); then
+          echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
+        fi
+        if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
+          echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
+        fi
+        if [[ -n "$io_majmin" ]] && io_line="$(render_io_max_line "$io_majmin" "$io_r" "$io_w" "$iops_r" "$iops_w")"; then
+          echo "$io_line" >"${cg_scope}/io.max" 2>/dev/null || true
+        fi
       fi
     fi
-    [[ "$cg_current" == *"${slice_unit}/spanel.scope"* ]] && continue
     if [[ -w "${cg_scope}/cgroup.procs" ]]; then
       echo "$pid" >"${cg_scope}/cgroup.procs" 2>/dev/null || true
     fi
   done < <(ps -eo pid=,uid=,user:32=,comm= 2>/dev/null || true)
 }
 
+# The distro masters only need the classify hook while they still serve a
+# tenant pool; the per-account masters start in the slice on their own.
+legacy_php_pool_versions() {
+  local f ver versions=" "
+  for f in "$PHP_ETC_ROOT"/*/fpm/pool.d/spanel-*.conf; do
+    [[ -f "$f" ]] || continue
+    ver="$(php_pool_file_version "$f")"
+    [[ "$versions" == *" ${ver} "* ]] || versions+="${ver} "
+  done
+  printf '%s\n' "$versions"
+}
+
 retune_php_fpm_pools() {
-  local pool_file php_version pool_user count=0 versions=""
-  shopt -s nullglob
-  for pool_file in /etc/php/*/fpm/pool.d/spanel-*.conf; do
-    [[ -f "$pool_file" ]] || continue
+  local pool_file php_version pool_user count=0 files
+  files="$(managed_php_pool_files)"
+  while IFS= read -r pool_file; do
+    [[ -n "$pool_file" && -f "$pool_file" ]] || continue
     calculate_php_fpm_pool_tuning "$pool_file"
     apply_php_fpm_tuning_to_pool_file "$pool_file"
-    pool_user="$(awk -F= '/^[[:space:]]*user[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$pool_file")"
+    pool_user="$(php_pool_file_user "$pool_file" || true)"
     if [[ -n "$pool_user" ]]; then
       ensure_php_runtime_dirs "$pool_user"
       apply_saved_user_limits_to_pool_file "$pool_file" "$pool_user"
       usermod -aG "$pool_user" www-data 2>/dev/null || true
     fi
     count=$((count + 1))
-    php_version="$(echo "$pool_file" | awk -F/ '{print $4}')"
-    case " $versions " in
-      *" $php_version "*) ;;
-      *) versions="${versions} ${php_version}" ;;
-    esac
-  done
-  shopt -u nullglob
-  for php_version in $versions; do
+  done <<<"$files"
+  for php_version in $(legacy_php_pool_versions); do
     ensure_php_fpm_cgroup_dropin "$php_version"
-    systemctl reload "php${php_version}-fpm" 2>/dev/null || true
   done
+  reload_php_pool_owners <<<"$files"
+  # Boot runs this too, which makes it the place a pool left behind by an
+  # interrupted move is finally retired.
+  prune_legacy_php_pools >/dev/null || true
   classify_all_tenant_workers
   echo "Retuned ${count} SPanel PHP-FPM pool(s)."
 }
@@ -7653,66 +8119,75 @@ time_sync() {
 }
 
 delete_site_php_pools() {
-  local user="$1" target="$2" glob
+  local user="$1" target="$2" glob dir pool_file php_version removed=""
   glob="$(site_php_pool_glob "$user" "$target")"
-  for dir in /etc/php/*/fpm/pool.d; do
+  # Pools of the account's own masters, then any the distro master still has.
+  for dir in "$SPANEL_PHP_FPM_ROOT"/*/"$user"/pool.d "$PHP_ETC_ROOT"/*/fpm/pool.d; do
     [[ -d "$dir" ]] || continue
     for pool_file in "$dir"/$glob.conf; do
       [[ -f "$pool_file" ]] || continue
       rm -f "$pool_file"
-      local php_version
-      php_version="$(echo "$dir" | awk -F/ '{print $4}')"
-      systemctl reload "php${php_version}-fpm" 2>/dev/null || true
+      removed+="${pool_file}"$'\n'
     done
   done
+  # A master whose last pool went is stopped and removed by the re-sync.
+  [[ -n "$removed" ]] && reload_php_pool_owners <<<"$removed"
+  return 0
 }
 
+# Writes the site's pool for its account's own master and brings that master
+# up. When the master cannot serve a pool that is new to it - a new site, a
+# PHP version change, or the move of an existing site off the distro master -
+# the pool goes to the distro master instead, as before per-account masters,
+# and site_users.php_fpm_socket() follows: it names the account socket only
+# while the account's pool file exists.
 ensure_php_pool() {
   local user="$1" target="$2" php_version="$3"
   [[ "$php_version" != "none" ]] || return 0
   require_linux_user "$user"
   require_php_version "$php_version"
   target=$(readlink -m "$target") || deny "cannot resolve $target"
-  local pool_suffix="${php_version//./_}"
-  local site_hash
-  site_hash="$(printf '%s' "$target" | sha256sum | awk '{print substr($1, 1, 12)}')"
-  local pool_name="spanel-${user}-${site_hash}-${pool_suffix}"
-  local pool_file="/etc/php/${php_version}/fpm/pool.d/${pool_name}.conf"
-  # Per-user dirs for sessions/uploads. Sharing /tmp across pools lets one
-  # site read another's session files (mode 0600 helps but only inside the
-  # same uid; uploads land world-writable on tmpfs). Using 0700 dirs owned
-  # by the pool's Linux user contains the data inside the site's trust
-  # boundary.
-  local sess_dir="/var/lib/php/sessions/${user}"
-  local upload_dir="/var/lib/php/uploads/${user}"
+  local pool_name user_dir pool_file legacy_file unit previous=""
+  pool_name="$(php_pool_name "$user" "$target" "$php_version")"
+  user_dir="$(user_php_fpm_dir "$php_version" "$user")"
+  pool_file="${user_dir}/pool.d/${pool_name}.conf"
+  legacy_file="$(legacy_php_pool_file "$php_version" "$pool_name")"
+  unit="$(user_php_fpm_unit "$php_version" "$user")"
   ensure_php_runtime_dirs "$user"
+  # The distro copy of a pool that moved is NOT retired here: callers rewrite
+  # the vhost after this returns, and nginx may only reload at the end of a
+  # whole batch (update.sh's site refresh). php-fpm-legacy-prune does it once
+  # nginx is on the new socket.
   calculate_php_fpm_pool_tuning "$pool_file"
-  cat >"$pool_file" <<POOL
-[${pool_name}]
-user = ${user}
-group = ${user}
-listen = /run/php/${pool_name}.sock
-listen.owner = www-data
-listen.group = www-data
-listen.mode = 0660
-listen.backlog = 64
-; SPanel auto-tunes these values from RAM, CPU and managed pool count.
-; Optional overrides: SPANEL_PHP_FPM_WORKER_MB, SPANEL_PHP_FPM_MAX_CHILDREN,
-; SPANEL_PHP_FPM_IDLE_TIMEOUT, SPANEL_PHP_FPM_MAX_REQUESTS,
-; SPANEL_PHP_FPM_REQUEST_TERMINATE_TIMEOUT.
-pm = ${PHP_FPM_PM_MODE}
-pm.max_children = ${PHP_FPM_MAX_CHILDREN}
-pm.process_idle_timeout = ${PHP_FPM_PROCESS_IDLE_TIMEOUT}s
-pm.max_requests = ${PHP_FPM_MAX_REQUESTS}
-request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s
-request_slowlog_timeout = 5s
-slowlog = /var/log/php/spanel-slow-${pool_name}.log
-chdir = /
-php_admin_value[open_basedir] = ${target}:${sess_dir}:${upload_dir}:/usr/share/php
-php_admin_value[upload_tmp_dir] = ${upload_dir}
-php_admin_value[session.save_path] = ${sess_dir}
-POOL
+  install -d -m 0755 "$SPANEL_PHP_FPM_ROOT" "${SPANEL_PHP_FPM_ROOT}/${php_version}" "$user_dir" "${user_dir}/pool.d"
+  if [[ -f "$pool_file" ]]; then
+    previous="$(mktemp)"
+    cp -p -- "$pool_file" "$previous"
+  fi
+  render_php_pool_conf "$pool_name" "$user" "$target" "$(user_php_fpm_socket "$user" "$pool_name")" >"$pool_file"
+  chmod 0644 "$pool_file"
   apply_saved_user_limits_to_pool_file "$pool_file" "$user"
+  if sync_user_php_fpm_master "$php_version" "$user"; then
+    [[ -z "$previous" ]] || rm -f -- "$previous"
+    return 0
+  fi
+
+  if [[ -n "$previous" ]]; then
+    # The site was already served by this master and its vhost names the
+    # account socket: moving it now would point nginx at nothing. Put the
+    # pool back as it was and report.
+    mv -f -- "$previous" "$pool_file"
+    sync_user_php_fpm_master "$php_version" "$user" || true
+    deny "${unit} did not accept the updated pool ${pool_name}; the previous pool was restored (journalctl -u ${unit})"
+  fi
+
+  rm -f -- "$pool_file"
+  sync_user_php_fpm_master "$php_version" "$user" || true
+  logger -t spanel-helper -- "php-fpm: ${unit} did not start; ${pool_name} stays on php${php_version}-fpm" 2>/dev/null || true
+  echo "warning: ${unit} did not start; ${pool_name} is served by php${php_version}-fpm instead (journalctl -u ${unit})" >&2
+  render_php_pool_conf "$pool_name" "$user" "$target" "/run/php/${pool_name}.sock" >"$legacy_file"
+  chmod 0644 "$legacy_file"
+  apply_saved_user_limits_to_pool_file "$legacy_file" "$user"
   ensure_php_fpm_cgroup_dropin "$php_version"
   systemctl reload "php${php_version}-fpm"
   classify_all_tenant_workers
@@ -8319,10 +8794,10 @@ case "$cmd" in
     # keeps the old numbers until every site happens to be touched; this walks
     # them all and rewrites each one against the machine as it is now.
     [[ $# -eq 0 ]] || deny "usage: php-pools-retune"
-    shopt -s nullglob
     retuned=0
-    for pool_file in /etc/php/*/fpm/pool.d/spanel-*.conf; do
-      [[ -f "$pool_file" ]] || continue
+    pool_files="$(managed_php_pool_files)"
+    while IFS= read -r pool_file; do
+      [[ -n "$pool_file" && -f "$pool_file" ]] || continue
       calculate_php_fpm_pool_tuning "$pool_file"
       php_fpm_set_directive "$pool_file" "pm" "$PHP_FPM_PM_MODE"
       php_fpm_set_directive "$pool_file" "pm.max_children" "$PHP_FPM_MAX_CHILDREN"
@@ -8331,14 +8806,17 @@ case "$cmd" in
       php_fpm_set_directive "$pool_file" "request_terminate_timeout" "${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s"
       echo "$(basename "$pool_file"): pm.max_children=${PHP_FPM_MAX_CHILDREN} idle=${PHP_FPM_PROCESS_IDLE_TIMEOUT}s max_requests=${PHP_FPM_MAX_REQUESTS}"
       retuned=$((retuned + 1))
-    done
-    for fpm_version_dir in /etc/php/*/fpm; do
-      [[ -d "$fpm_version_dir" ]] || continue
-      fpm_version="$(basename "$(dirname "$fpm_version_dir")")"
-      systemctl reload "php${fpm_version}-fpm" 2>/dev/null || true
-    done
-    shopt -u nullglob
+    done <<<"$pool_files"
+    reload_php_pool_owners <<<"$pool_files"
     echo "retuned ${retuned} pool(s)"
+    ;;
+
+  php-fpm-legacy-prune)
+    # Run after vhosts were rewritten to the per-account sockets (update.sh
+    # does, right after its site refresh): drops the distro-master copies of
+    # pools that moved and that no vhost names any more.
+    [[ $# -eq 0 ]] || deny "usage: php-fpm-legacy-prune"
+    prune_legacy_php_pools
     ;;
 
   php-config-write)
@@ -9236,15 +9714,7 @@ EOF
     chown root:spanel "/etc/spanel/limits/${u_name}.env"
     chmod 0640 "/etc/spanel/limits/${u_name}.env"
 
-    root_dev="$(findmnt -no SOURCE / 2>/dev/null | head -n1 || true)"
-    if [[ "$root_dev" == /dev/nvme* || "$root_dev" == /dev/mmcblk* ]]; then
-      base_dev="$(echo "$root_dev" | sed -E 's/p[0-9]+$//')"
-    elif [[ "$root_dev" == /dev/* ]]; then
-      base_dev="$(echo "$root_dev" | sed -E 's/[0-9]+$//')"
-    else
-      base_dev=""
-    fi
-    [[ -b "$base_dev" ]] || base_dev=""
+    base_dev="$(tenant_io_base_device)"
 
     {
       echo "# Generated by SPanel Resource Limits for user ${u_name} (UID ${u_uid})"
@@ -9292,21 +9762,21 @@ EOF
       MemoryMax="$( (( mem_max > 0 )) && printf '%sM' "$mem_max" || printf 'infinity' )" \
       TasksMax="$( (( tasks_max > 0 )) && printf '%s' "$tasks_max" || printf 'infinity' )" >/dev/null 2>&1 || true
 
-    # Tune PHP-FPM pools owned by this user to respect persisted limits
-    shopt -s nullglob
-    fpm_versions_to_reload=()
-    for pool_file in /etc/php/*/fpm/pool.d/spanel-"${u_name}"-*.conf /etc/php/*/fpm/pool.d/spanel-"${u_name}".conf; do
+    # Tune PHP-FPM pools owned by this user to respect persisted limits. The
+    # account's own masters already run inside the slice limited above; pools
+    # still on a distro master get the classify hook below.
+    user_pool_files=""
+    for pool_file in "$SPANEL_PHP_FPM_ROOT"/*/"${u_name}"/pool.d/spanel-*.conf \
+      /etc/php/*/fpm/pool.d/spanel-"${u_name}"-*.conf /etc/php/*/fpm/pool.d/spanel-"${u_name}".conf; do
       [[ -f "$pool_file" ]] || continue
       calculate_php_fpm_pool_tuning "$pool_file"
       apply_saved_user_limits_to_pool_file "$pool_file" "$u_name"
-      fpm_ver="$(echo "$pool_file" | awk -F'/' '{print $4}')"
-      [[ -n "$fpm_ver" ]] && fpm_versions_to_reload+=("$fpm_ver")
+      if php_pool_file_is_legacy "$pool_file"; then
+        ensure_php_fpm_cgroup_dropin "$(php_pool_file_version "$pool_file")"
+      fi
+      user_pool_files+="${pool_file}"$'\n'
     done
-    shopt -u nullglob
-    for fpm_ver in $(printf '%s\n' "${fpm_versions_to_reload[@]}" | sort -u); do
-      ensure_php_fpm_cgroup_dropin "$fpm_ver"
-      systemctl reload "php${fpm_ver}-fpm" >/dev/null 2>&1 || true
-    done
+    reload_php_pool_owners <<<"$user_pool_files"
 
     # Enforce Linux filesystem disk quota (setquota) when usrquota is mounted on /home or /
     if command -v setquota >/dev/null 2>&1; then
@@ -9327,15 +9797,18 @@ EOF
       fi
     fi
 
-    # Classify all active processes of this user (including pre-spawned PHP-FPM pool workers)
-    # into user-<UID>.slice/spanel.scope so Cgroups v2 enforces hard CPU/RAM/IO limits.
+    # The account's own PHP-FPM masters already run in the slice. Whatever of
+    # this user still runs outside it (cron jobs, a pool left on a distro
+    # master) is moved into user-<UID>.slice/spanel.scope.
     classify_all_tenant_workers
     echo "Applied Cgroups v2 & PHP-FPM resource limits for ${u_name} (UID ${u_uid})"
     ;;
 
   cgroup-classify-workers)
-    # Classify all tenant PHP-FPM worker processes & user tasks into their respective
-    # Cgroups v2 user-<UID>.slice/spanel.scope so an attacked site cannot escape its slice.
+    # Move tenant processes running outside their account's slice (cron jobs,
+    # pools on a distro PHP-FPM master) into user-<UID>.slice/spanel.scope, so
+    # an attacked site cannot escape its limits. Processes already inside the
+    # slice - the account's own PHP-FPM master and its workers - stay put.
     [[ $# -eq 0 ]] || deny "usage: cgroup-classify-workers"
     classify_all_tenant_workers
     ;;

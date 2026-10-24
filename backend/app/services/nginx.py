@@ -1158,7 +1158,7 @@ def _replace_php_fpm_socket(content: str, php_version: str) -> str:
 
 
 def _replace_fastcgi_socket(content: str, socket_path: str) -> str:
-    if not re.fullmatch(r"/run/php/[A-Za-z0-9_.-]+\.sock", socket_path or ""):
+    if not site_users.is_valid_php_fpm_socket(socket_path):
         raise ValueError("Invalid PHP-FPM socket path")
     return re.sub(
         r"fastcgi_pass\s+unix:[^;]+;",
@@ -1465,6 +1465,8 @@ def render_vhost(
     }[app_type]
     template = env.get_template(template_name)
     php_fpm_socket = php_fpm_socket_override or _php_fpm_socket(php_version)
+    if not site_users.is_valid_php_fpm_socket(php_fpm_socket):
+        raise ValueError("Invalid PHP-FPM socket path")
     safe_http_flood_config = validate_http_flood_config(http_flood_config)
 
     resolved_bind_address = bind_address or get_website_ip(safe_domain)
