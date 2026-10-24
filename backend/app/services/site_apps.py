@@ -729,7 +729,11 @@ def install_dependencies(app: SiteApp) -> str:
 
 def webhook_token_for(app: SiteApp) -> str:
     """Deterministic HMAC-SHA256 webhook token for 1-Click Git Auto-Deploy."""
-    secret = (settings.secret_key or "spanel-default-secret").encode("utf-8")
+    # A hard-coded fallback would make every server's webhook tokens computable
+    # from this repository, so an empty SECRET_KEY is an error instead.
+    if not settings.secret_key:
+        raise RuntimeError("SECRET_KEY is empty; cannot derive webhook tokens")
+    secret = settings.secret_key.encode("utf-8")
     msg = f"site-app-webhook:{app.id}:{app.owner_id}:{app.name}".encode("utf-8")
     return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
 

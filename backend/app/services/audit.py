@@ -39,7 +39,12 @@ def _audit_hmac_key() -> bytes:
                 return raw.encode("utf-8")
     except OSError:
         pass
-    secret = settings.secret_key or "spanel-default-secret"
+    # No hard-coded fallback: a key anyone can read in this repository would let
+    # them recompute the whole chain. config.py already refuses a missing or
+    # default SECRET_KEY in production; this covers an empty one elsewhere.
+    secret = settings.secret_key
+    if not secret:
+        raise RuntimeError("SECRET_KEY is empty; cannot derive the audit chain key")
     return hmac.new(secret.encode("utf-8"), b"spanel-audit-hmac-v1", hashlib.sha256).digest()
 
 
