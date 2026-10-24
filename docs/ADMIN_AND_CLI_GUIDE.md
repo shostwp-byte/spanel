@@ -77,6 +77,18 @@ sudo -u spanel env HOME=/opt/spanel sudo -n /usr/local/sbin/spanel-helper mariad
 
 Bạn cũng có thể ghi đè thông số cố định trong `/opt/spanel/backend/.env` thông qua các biến `SPANEL_PHP_FPM_MAX_CHILDREN` và `SPANEL_MARIADB_BUFFER_POOL_SIZE`.
 
+### 4.1. PHP-FPM riêng cho từng tài khoản & cô lập tài nguyên
+
+- Mỗi tài khoản hosting có **một master PHP-FPM riêng cho mỗi phiên bản PHP**: unit systemd `spanel-php<ver>-fpm@<user>.service` (template `/etc/systemd/system/spanel-php<ver>-fpm@.service`, drop-in `…@<user>.service.d/10-spanel-slice.conf` đặt `Slice=user-<uid>.slice`). Master và mọi worker sinh ra đều nằm ngay trong slice của tài khoản, nên giới hạn CPU/RAM/tasks/IO của gói áp dụng tức thì.
+- Cấu hình: `/etc/spanel/php-fpm/<ver>/<user>/php-fpm.conf` và các pool trong `…/pool.d/`. Socket: `/run/spanel-php/<user>/<pool>.sock` (thư mục `root:www-data 0750`). `php.ini` và `conf.d` vẫn là của bản PHP hệ thống (`PHP_INI_SCAN_DIR`). Log: `/var/log/php/spanel-fpm-<user>-<ver>.log`, slowlog giữ tên cũ.
+- `php<ver>-fpm` của hệ thống vẫn chạy cho phpMyAdmin/công cụ panel, và tiếp tục phục vụ pool nào chưa chuyển được (nếu master riêng không khởi động được, site được giữ trên master hệ thống và ghi log).
+- Khi cập nhật, bước làm mới site chuyển từng site sang master riêng (không gián đoạn: master mới chạy song song, Nginx đổi socket, sau đó `spanel-helper php-fpm-legacy-prune` mới gỡ pool cũ).
+- Kiểm tra: `systemctl status 'spanel-php*-fpm@*'`, `systemd-cgls /user.slice/user-<uid>.slice`.
+
+**Quota đĩa của kernel (tùy chọn):** mặc định chỉ có kế toán dung lượng của panel (PHP/SFTP vẫn ghi vượt được). Bật quota kernel trong *Resource Monitor* hoặc khi cài/cập nhật với `SPANEL_DISK_QUOTA=kernel`: SPanel cài gói `quota` và thêm `usrjquota` (ext4) / `usrquota` (xfs) vào `/etc/fstab` (có bản sao lưu), **không bao giờ tự mount lại hay khởi động lại**. Sau khi bạn mount lại/khởi động lại, giới hạn dung lượng và số inode của từng gói được áp bằng `setquota`. Xem trạng thái: `spanel-helper quota-status`.
+
+**Giới hạn MySQL theo giờ:** gói có thêm `MAX_QUERIES_PER_HOUR`, `MAX_UPDATES_PER_HOUR`, `MAX_CONNECTIONS_PER_HOUR` (0 = không giới hạn), áp cho mọi user MariaDB của tài khoản.
+
 ---
 
 ## 5. Di chuyển Dữ liệu từ DirectAdmin & cPanel sang SPanel
