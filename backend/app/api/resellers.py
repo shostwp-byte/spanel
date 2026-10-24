@@ -344,10 +344,18 @@ def replay_webhook_delivery(delivery_id: str, db: Session = Depends(get_db), cur
 def whmcs_connection_diagnostic(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Comprehensive diagnostic for WHMCS, HostBill, Blesta & Perfex CRM integration."""
     ensure_role(current_user.role, Role.admin)
-    active_tokens = db.query(ApiToken).filter(ApiToken.is_active == True).all()  # noqa: E712
+    from datetime import datetime as _dt
+
+    from app.services.provisioning import has_scope
+
+    now = _dt.utcnow()
+    active_tokens = [
+        t for t in db.query(ApiToken).filter(ApiToken.is_active == True).all()  # noqa: E712
+        if t.revoked_at is None and (t.expires_at is None or t.expires_at > now)
+    ]
     write_tokens = [
         t for t in active_tokens
-        if "provisioning:write" in (t.scopes or "") and "provisioning:read" in (t.scopes or "")
+        if has_scope(t, "accounts:write") and has_scope(t, "accounts:read")
     ]
     packages_count = db.query(UserPackage).count()
     p_settings = panel_settings.current_settings()

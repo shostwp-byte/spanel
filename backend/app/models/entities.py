@@ -434,6 +434,37 @@ class ApiToken(Base):
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # NULL never expires, which is what every token issued before expiry
+    # existed keeps doing.
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Requests per minute; 0 means the panel default.
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, default=0)
+    # The administrator who issued it. Admin single sign-on logs in as this
+    # account and nobody else, so a token without one cannot use it.
+    created_by_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class ProvisioningIdempotencyKey(Base):
+    """A write request a billing system may retry with the same Idempotency-Key.
+
+    The response is kept (encrypted: it can carry a one-time SFTP password) so
+    a retry after a timeout gets the original answer instead of a second
+    account. Rows older than a day are purged.
+    """
+
+    __tablename__ = "provisioning_idempotency_keys"
+    __table_args__ = (UniqueConstraint("token_id", "idem_key", name="uq_provisioning_idempotency_token_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    token_id: Mapped[int] = mapped_column(Integer)
+    idem_key: Mapped[str] = mapped_column(String(255))
+    method: Mapped[str] = mapped_column(String(10), default="")
+    path: Mapped[str] = mapped_column(String(500), default="")
+    request_hash: Mapped[str] = mapped_column(String(64), default="")
+    # 0 while the first request is still running.
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    response_body: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class McpToken(Base):

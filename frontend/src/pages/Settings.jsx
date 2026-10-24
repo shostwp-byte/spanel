@@ -88,6 +88,8 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     name: 'WHMCS Billing',
     allowed_ips: '',
     scopes: 'provisioning:read,provisioning:write',
+    expires_in_days: '',
+    rate_limit_per_minute: '',
   });
   const [createdApiToken, setCreatedApiToken] = useState('');
   const [showEndpointsRef, setShowEndpointsRef] = useState(false);
@@ -402,6 +404,8 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
           name: newApiToken.name.trim(),
           scopes: newApiToken.scopes || 'provisioning:read,provisioning:write',
           allowed_ips: newApiToken.allowed_ips.trim(),
+          expires_in_days: Number(newApiToken.expires_in_days) > 0 ? Number(newApiToken.expires_in_days) : null,
+          rate_limit_per_minute: Number(newApiToken.rate_limit_per_minute) > 0 ? Number(newApiToken.rate_limit_per_minute) : 0,
         }),
       },
       t('Creating API token...')
@@ -434,6 +438,25 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     );
     if (data) {
       setNotice(`Đã thu hồi API token ${token.name}.`);
+      await loadApiTokens();
+    }
+  }
+
+  async function rotateApiToken(token) {
+    const graceInput = prompt(
+      `Xoay vòng (rotate) API token "${token.name}". Token cũ còn dùng được thêm bao nhiêu phút để kịp cập nhật WHMCS? (0 = ngừng ngay)`,
+      '60'
+    );
+    if (graceInput === null) return;
+    const grace = Math.max(0, Math.min(10080, parseInt(graceInput, 10) || 0));
+    const data = await request(
+      `/provisioning/v1/tokens/${token.id}/rotate`,
+      { method: 'POST', body: JSON.stringify({ grace_minutes: grace }) },
+      `Rotating ${token.name}...`
+    );
+    if (data) {
+      setCreatedApiToken(data.token || '');
+      setNotice(`Đã tạo token thay thế cho ${token.name}. Sao chép ngay, token chỉ hiển thị 1 lần.`);
       await loadApiTokens();
     }
   }
@@ -1059,7 +1082,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
             {/* Create Token Form */}
             <div style={{
               display: 'grid',
-              gridTemplateColumns: 'minmax(180px, 1.2fr) minmax(220px, 1.8fr) minmax(180px, 1fr) auto',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
               gap: '12px',
               alignItems: 'end',
               padding: '14px 16px',
@@ -1086,7 +1109,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                 <input
                   value={newApiToken.allowed_ips}
                   onChange={(e) => setNewApiToken((prev) => ({ ...prev, allowed_ips: e.target.value }))}
-                  placeholder="Tùy chọn: 103.1.2.3, 103.1.2.4"
+                  placeholder="Tùy chọn: 103.1.2.3, 103.1.2.0/24"
                 />
               </label>
 
@@ -1100,7 +1123,38 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                 >
                   <option value="provisioning:read,provisioning:write">Toàn quyền (Đọc & Ghi Provisioning)</option>
                   <option value="provisioning:read">Chỉ đọc (Đồng bộ Gói & Dung lượng)</option>
+                  <option value="plans:read,accounts:read,accounts:write,usage:read,sso">WHMCS chuẩn (phân quyền chi tiết)</option>
+                  <option value="plans:read,accounts:read,accounts:write,usage:read,sso,sso:admin">WHMCS + Đăng nhập Admin (Admin SSO)</option>
+                  <option value="accounts:read,usage:read">Chỉ đồng bộ tài khoản & dung lượng</option>
                 </select>
+              </label>
+
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                  Hết hạn sau (ngày, để trống = không hết hạn)
+                </span>
+                <input
+                  type="number"
+                  min="1"
+                  max="3650"
+                  value={newApiToken.expires_in_days}
+                  onChange={(e) => setNewApiToken((prev) => ({ ...prev, expires_in_days: e.target.value }))}
+                  placeholder="VD: 365"
+                />
+              </label>
+
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                  Giới hạn request/phút (để trống = 120)
+                </span>
+                <input
+                  type="number"
+                  min="1"
+                  max="6000"
+                  value={newApiToken.rate_limit_per_minute}
+                  onChange={(e) => setNewApiToken((prev) => ({ ...prev, rate_limit_per_minute: e.target.value }))}
+                  placeholder="120"
+                />
               </label>
 
               <button
@@ -1155,11 +1209,25 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                         }}>
                           {token.is_active ? 'Đang hoạt động' : 'Đã thu hồi'}
                         </span>
+                        {token.is_active && token.expires_at && (
+                          <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                            Hết hạn: {new Date(`${token.expires_at}${String(token.expires_at).endsWith('Z') ? '' : 'Z'}`).toLocaleString()}
+                          </div>
+                        )}
                       </td>
                       <td style={{ fontSize: '0.81rem', color: 'var(--text-muted)' }}>
                         {token.last_used_at ? new Date(token.last_used_at).toLocaleString() : 'Chưa từng gọi'}
                       </td>
-                      <td style={{ textAlign: 'right' }}>
+                      <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        <button
+                          type="button"
+                          className="secondary-light"
+                          style={{ padding: '6px 12px', fontSize: '0.78rem', marginRight: '6px' }}
+                          disabled={!!loading || !token.is_active}
+                          onClick={() => rotateApiToken(token)}
+                        >
+                          <RotateCcw size={14} /> Xoay vòng
+                        </button>
                         <button
                           type="button"
                           className="danger"

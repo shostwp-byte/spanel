@@ -1704,6 +1704,9 @@ class ProvisioningAccountOut(BaseModel):
     status: str
     panel_url: Optional[str] = None
     created_at: Optional[datetime] = None
+    # Only in the response to the create that set it: the account's own
+    # SFTP/SSH password, never stored readable by the panel.
+    sftp_password: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -1720,7 +1723,17 @@ class ProvisioningPackageChange(BaseModel):
 class ApiTokenCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     scopes: str = "provisioning:read,provisioning:write"
+    # Addresses and CIDR ranges, comma separated. Empty allows any address.
     allowed_ips: str = ""
+    # None keeps the token valid until revoked, as tokens always were.
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    # 0 uses the panel default.
+    rate_limit_per_minute: int = Field(default=0, ge=0, le=6000)
+
+class ApiTokenRotate(BaseModel):
+    # How long the old token keeps working after the new one is issued, so the
+    # billing system can be switched over without failed calls. 0 = at once.
+    grace_minutes: int = Field(default=0, ge=0, le=10080)
 
 class ApiTokenOut(BaseModel):
     id: int
@@ -1730,6 +1743,9 @@ class ApiTokenOut(BaseModel):
     is_active: bool
     last_used_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    rate_limit_per_minute: int = 0
 
     class Config:
         from_attributes = True

@@ -1,5 +1,4 @@
-import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -7,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role, is_admin_role
+from app.core.permissions import Role, ensure_role
 from app.core.rate_limit import enforce_rate_limit
 from app.core.security import hash_password
 from app.models.entities import ApiToken, DatabaseAccount, ProvisioningAccount, User, UserPackage, Website
@@ -15,6 +14,7 @@ from app.schemas.schemas import (
     ApiTokenCreate,
     ApiTokenCreatedResponse,
     ApiTokenOut,
+    ApiTokenRotate,
     ProvisioningAccountCreate,
     ProvisioningAccountOut,
     ProvisioningPackageChange,
@@ -22,41 +22,72 @@ from app.schemas.schemas import (
     ProvisioningSuspendRequest,
     ProvisioningUsageOut,
 )
-from app.services import mariadb, nginx, site_users, storage_quota, wordpress
+from app.services import mariadb, nginx, provisioning_idempotency as idempotency, site_users, storage_quota, wordpress
 from app.services.audit import log_action
 from app.services.provisioning import (
     account_to_dict,
     authenticate_token,
     check_ip_allowed,
     create_api_token,
+    discard_failed_account,
+    has_scope,
+    linux_user_exists,
+    normalize_allowed_ips,
+    normalize_scopes,
     panel_base_url,
+    rate_limit_for,
+    rotate_api_token,
     suspend_account,
     terminate_account,
+    undo_failed_create,
     unsuspend_account,
 )
 from app.services.sso_tokens import create_panel_login_token
 
 router = APIRouter(prefix="/provisioning/v1", tags=["provisioning"])
 
+# Failed authentications allowed per source address per minute before the
+# caller gets 429 instead of 401.
+_AUTH_FAILURES_PER_MINUTE = 20
+
+
+def _auth_failure(request: Request, status_code: int, detail: str) -> HTTPException:
+    enforce_rate_limit(request, "provisioning-auth-fail", max_requests=_AUTH_FAILURES_PER_MINUTE, window_seconds=60)
+    return HTTPException(status_code=status_code, detail=detail)
+
 
 def _get_provisioning_token(request: Request, db: Session) -> ApiToken:
     auth = request.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
+        raise _auth_failure(request, 401, "Missing Bearer token")
     raw = auth[7:].strip()
     token = authenticate_token(db, raw)
     if not token:
-        raise HTTPException(status_code=401, detail="Invalid or revoked token")
+        raise _auth_failure(request, 401, "Invalid, expired or revoked token")
     client_ip = (request.client.host if request.client else "").strip()
     if not check_ip_allowed(token, client_ip):
-        raise HTTPException(status_code=403, detail="IP not allowed")
+        raise _auth_failure(request, 403, "IP not allowed")
+    # Per token (and source address): a leaked or misbehaving billing
+    # integration cannot queue account creations faster than this.
+    enforce_rate_limit(
+        request,
+        "provisioning-api",
+        max_requests=rate_limit_for(token),
+        window_seconds=60,
+        key_suffix=f"token{token.id}",
+    )
     return token
 
 
 def _require_scope(token: ApiToken, scope: str) -> None:
-    scopes = {s.strip() for s in (token.scopes or "").split(",") if s.strip()}
-    if scope not in scopes:
+    if not has_scope(token, scope):
         raise HTTPException(status_code=403, detail=f"Missing scope: {scope}")
+
+
+def _authorize(request: Request, db: Session, scope: str) -> ApiToken:
+    token = _get_provisioning_token(request, db)
+    _require_scope(token, scope)
+    return token
 
 
 def _account_by_external_id(db: Session, external_id: str) -> ProvisioningAccount:
@@ -81,8 +112,7 @@ def _provisioning_app_type(payload: ProvisioningAccountCreate) -> str:
 
 @router.get("/plans")
 def list_plans(request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:read")
+    _authorize(request, db, "plans:read")
     packages = db.query(UserPackage).order_by(UserPackage.id.asc()).all()
     return [
         {
@@ -104,17 +134,28 @@ def list_plans(request: Request, db: Session = Depends(get_db)):
 
 # ── Accounts ─────────────────────────────────────────────────────────────
 
-@router.post("/accounts", response_model=ProvisioningAccountOut)
-def create_account(payload: ProvisioningAccountCreate, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
+def _record_failed_create(db: Session, payload: ProvisioningAccountCreate, message: str) -> None:
+    """Keep a visible "failed" record after everything else was rolled back."""
+    db.add(ProvisioningAccount(
+        external_id=payload.external_id,
+        package_id=payload.package_id,
+        status="failed",
+        last_action="create",
+        last_message=message[:2000],
+    ))
+    db.commit()
 
+
+def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Session) -> dict:
     existing = db.query(ProvisioningAccount).filter(ProvisioningAccount.external_id == payload.external_id).first()
     if existing:
         if existing.status in ("active", "pending") and existing.user:
             return account_to_dict(existing, db)
-        db.delete(existing)
-        db.commit()
+        if existing.status == "suspended" and existing.user:
+            raise HTTPException(status_code=409, detail="Account already exists and is suspended")
+        # failed or terminated: start over. A failed record from before
+        # creates were rolled back may still own a panel and Linux user.
+        discard_failed_account(db, existing)
 
     account_email = _provisioning_email(payload.username)
 
@@ -139,37 +180,52 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
     db.add(account)
     db.flush()
 
-    # Its own secret from the start: the panel password is not an SFTP password.
-    sftp_password = site_users.generate_login_password()
-    try:
-        linux_user = site_users.ensure_panel_user(payload.username, sftp_password)
-    except (ValueError, RuntimeError) as exc:
-        account.status = "failed"
-        account.last_message = str(exc)
-        db.commit()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    user = User(
-        username=payload.username,
-        email=account_email,
-        hashed_password=hash_password(payload.password),
-        role=Role.reseller if getattr(payload, "is_reseller", False) else Role.end_user,
-        package_id=package.id,
-        website_limit=package.website_limit,
-        storage_limit_mb=package.storage_limit_mb,
-        sftp_password_set_at=datetime.utcnow(),
-    )
-    db.add(user)
-    db.flush()
-    account.user_id = user.id
-
-    app_type_value = _provisioning_app_type(payload)
-    install_wp = payload.install_wordpress and app_type_value == "wordpress"
+    # Only a Linux account this request creates may be deleted when it fails:
+    # panel-user-ensure adopts one that already exists.
+    created_linux_user = not linux_user_exists(payload.username)
     db_info = None
+    website = None
 
-    if payload.domain:
-        root_path = site_users.site_root_for_panel_user(payload.username, payload.domain)
-        try:
+    def _fail(exc: Exception) -> HTTPException:
+        # Nothing of a failed create survives: the panel user, website and
+        # database rows go with the rollback, the system side is undone, and
+        # only a "failed" record remains so the billing system sees why.
+        db.rollback()
+        undo_failed_create(
+            username=payload.username,
+            domain=payload.domain,
+            db_info=db_info,
+            delete_linux_user=created_linux_user,
+        )
+        _record_failed_create(db, payload, str(exc))
+        if isinstance(exc, HTTPException):
+            return exc
+        return HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        # Its own secret from the start: the panel password is not an SFTP password.
+        sftp_password = site_users.generate_login_password()
+        linux_user = site_users.ensure_panel_user(payload.username, sftp_password)
+
+        user = User(
+            username=payload.username,
+            email=account_email,
+            hashed_password=hash_password(payload.password),
+            role=Role.reseller if getattr(payload, "is_reseller", False) else Role.end_user,
+            package_id=package.id,
+            website_limit=package.website_limit,
+            storage_limit_mb=package.storage_limit_mb,
+            sftp_password_set_at=datetime.utcnow(),
+        )
+        db.add(user)
+        db.flush()
+        account.user_id = user.id
+
+        app_type_value = _provisioning_app_type(payload)
+        install_wp = payload.install_wordpress and app_type_value == "wordpress"
+
+        if payload.domain:
+            root_path = site_users.site_root_for_panel_user(payload.username, payload.domain)
             if install_wp:
                 db_info = mariadb.create_database(payload.domain)
                 linux_user = site_users.ensure_site_runtime(payload.domain, root_path, payload.php_version, linux_user)
@@ -200,43 +256,44 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
                 document_root="public_html",
                 rewrite_mode=rewrite_mode,
             )
-        except (RuntimeError, ValueError, OSError) as exc:
-            if db_info:
-                mariadb.drop_database(db_info["db_name"], db_info["db_user"])
-            account.status = "failed"
-            account.last_message = str(exc)
-            db.commit()
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        website = Website(
-            domain=payload.domain,
-            owner_id=user.id,
-            root_path=root_path,
-            document_root="public_html",
-            linux_user=linux_user,
-            php_version=payload.php_version,
-            app_type=app_type_value,
-            nginx_rewrite_mode=rewrite_mode,
-            status="active",
-        )
-        db.add(website)
-        db.flush()
-
-        if db_info:
-            from app.core.secrets import encrypt
-            db.add(DatabaseAccount(
+            website = Website(
+                domain=payload.domain,
                 owner_id=user.id,
-                website_id=website.id,
-                db_name=db_info["db_name"],
-                db_user=db_info["db_user"],
-                db_password=encrypt(db_info["db_password"]),
-            ))
+                root_path=root_path,
+                document_root="public_html",
+                linux_user=linux_user,
+                php_version=payload.php_version,
+                app_type=app_type_value,
+                nginx_rewrite_mode=rewrite_mode,
+                status="active",
+            )
+            db.add(website)
+            db.flush()
 
-        account.primary_website_id = website.id
-    account.status = "active"
-    account.last_message = ""
+            if db_info:
+                from app.core.secrets import encrypt
+                db.add(DatabaseAccount(
+                    owner_id=user.id,
+                    website_id=website.id,
+                    db_name=db_info["db_name"],
+                    db_user=db_info["db_user"],
+                    db_password=encrypt(db_info["db_password"]),
+                ))
 
-    if payload.enable_ssl and payload.domain:
+            account.primary_website_id = website.id
+        account.status = "active"
+        account.last_message = ""
+        db.commit()
+    except HTTPException as exc:
+        raise _fail(exc)
+    except (RuntimeError, ValueError, OSError) as exc:
+        raise _fail(exc) from exc
+    except Exception as exc:  # noqa: BLE001 - roll back whatever went wrong, then let it surface
+        _fail(exc)
+        raise
+
+    if payload.enable_ssl and payload.domain and website is not None:
         from app.services import ssl as ssl_service
         try:
             result = ssl_service.issue_ssl(payload.domain)
@@ -245,17 +302,30 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
             website.ssl_enabled = True
             website.ssl_mode = "letsencrypt"
             website.ssl_updated_at = datetime.now(timezone.utc)
+            db.commit()
         except Exception:
-            pass
+            db.rollback()
 
-    db.commit()
     log_action(db, None, "provisioning_create", payload.external_id, detail=payload.domain or payload.username, request=request)
     if payload.domain:
         # DNS Manager: every domain on the server gets its DNS.
         from app.services import dns
 
-        dns.zone_for_new_domain(db, payload.domain, user.id)
-    return account_to_dict(account, db)
+        try:
+            dns.zone_for_new_domain(db, payload.domain, user.id)
+        except Exception:  # noqa: BLE001 - the account exists; DNS sync retries on start
+            db.rollback()
+    body = account_to_dict(account, db)
+    # Shown once: the billing system is the only thing that can hand the
+    # customer their SFTP password.
+    body["sftp_password"] = sftp_password
+    return body
+
+
+@router.post("/accounts", response_model=ProvisioningAccountOut)
+def create_account(payload: ProvisioningAccountCreate, request: Request, db: Session = Depends(get_db)):
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, payload, lambda: _create_account(payload, request, db))
 
 
 # Declared before /accounts/{external_id}: Starlette matches routes in order,
@@ -263,8 +333,7 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
 # usage call WHMCS's UsageUpdate makes used to be answered "Account not found".
 @router.get("/accounts/usage", response_model=List[ProvisioningUsageOut])
 def get_all_usage(request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:read")
+    _authorize(request, db, "usage:read")
 
     results = []
     accounts = db.query(ProvisioningAccount).all()
@@ -292,16 +361,14 @@ def get_all_usage(request: Request, db: Session = Depends(get_db)):
 
 @router.get("/accounts/{external_id}", response_model=ProvisioningAccountOut)
 def get_account(external_id: str, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:read")
+    _authorize(request, db, "accounts:read")
     account = _account_by_external_id(db, external_id)
     return account_to_dict(account, db)
 
 
 @router.post("/accounts/{external_id}/login")
 def create_login_url(external_id: str, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
+    _authorize(request, db, "sso")
     account = _account_by_external_id(db, external_id)
     if not account.user or not account.user.is_active:
         raise HTTPException(status_code=404, detail="Account user not found or inactive")
@@ -315,10 +382,7 @@ def create_login_url(external_id: str, request: Request, db: Session = Depends(g
     return {"login_url": absolute, "url": absolute, "path": path, "expires_in": 300}
 
 
-@router.post("/accounts/{external_id}/suspend")
-def suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
+def _suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Request, db: Session) -> dict:
     account = _account_by_external_id(db, external_id)
     if account.status == "suspended":
         return {"ok": True, "status": "suspended"}
@@ -329,10 +393,13 @@ def suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Requ
     return {"ok": True, "status": "suspended"}
 
 
-@router.post("/accounts/{external_id}/unsuspend")
-def unsuspend(external_id: str, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
+@router.post("/accounts/{external_id}/suspend")
+def suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Request, db: Session = Depends(get_db)):
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, payload, lambda: _suspend(external_id, payload, request, db))
+
+
+def _unsuspend(external_id: str, request: Request, db: Session) -> dict:
     account = _account_by_external_id(db, external_id)
     if account.status == "active":
         return {"ok": True, "status": "active"}
@@ -341,6 +408,25 @@ def unsuspend(external_id: str, request: Request, db: Session = Depends(get_db))
     unsuspend_account(db, account)
     log_action(db, None, "provisioning_unsuspend", external_id, request=request)
     return {"ok": True, "status": "active"}
+
+
+@router.post("/accounts/{external_id}/unsuspend")
+def unsuspend(external_id: str, request: Request, db: Session = Depends(get_db)):
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, None, lambda: _unsuspend(external_id, request, db))
+
+
+def _terminate(external_id: str, backup: bool, request: Request, db: Session) -> dict:
+    account = _account_by_external_id(db, external_id)
+    if account.status == "terminated":
+        return {"ok": True, "status": "terminated"}
+    deleted_domains = terminate_account(db, account, backup=backup)
+    log_action(db, None, "provisioning_terminate", external_id, detail=",".join(deleted_domains), request=request)
+    body = {"ok": True, "status": "terminated", "deleted_websites": deleted_domains}
+    if backup:
+        # "backup=<path>" or "backup failed: <reason>", set by terminate_account.
+        body["backup"] = account.last_message or ""
+    return body
 
 
 @router.delete("/accounts/{external_id}")
@@ -352,20 +438,11 @@ def terminate(external_id: str, request: Request, backup: bool = Query(default=F
     failure while the server kept working. Pass ``?backup=true`` when the
     caller can wait for a full account archive.
     """
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
-    account = _account_by_external_id(db, external_id)
-    if account.status == "terminated":
-        return {"ok": True, "status": "terminated"}
-    deleted_domains = terminate_account(db, account, backup=backup)
-    log_action(db, None, "provisioning_terminate", external_id, detail=",".join(deleted_domains), request=request)
-    return {"ok": True, "status": "terminated", "deleted_websites": deleted_domains}
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, None, lambda: _terminate(external_id, backup, request, db))
 
 
-@router.patch("/accounts/{external_id}/password")
-def change_password(external_id: str, payload: ProvisioningPasswordChange, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
+def _change_password(external_id: str, payload: ProvisioningPasswordChange, request: Request, db: Session) -> dict:
     account = _account_by_external_id(db, external_id)
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
@@ -392,10 +469,13 @@ def change_password(external_id: str, payload: ProvisioningPasswordChange, reque
     return body
 
 
-@router.patch("/accounts/{external_id}/package")
-def change_package(external_id: str, payload: ProvisioningPackageChange, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
+@router.patch("/accounts/{external_id}/password")
+def change_password(external_id: str, payload: ProvisioningPasswordChange, request: Request, db: Session = Depends(get_db)):
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, payload, lambda: _change_password(external_id, payload, request, db))
+
+
+def _change_package(external_id: str, payload: ProvisioningPackageChange, request: Request, db: Session) -> dict:
     account = _account_by_external_id(db, external_id)
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
@@ -412,10 +492,15 @@ def change_package(external_id: str, payload: ProvisioningPackageChange, request
     return {"ok": True, "package_id": package.id}
 
 
+@router.patch("/accounts/{external_id}/package")
+def change_package(external_id: str, payload: ProvisioningPackageChange, request: Request, db: Session = Depends(get_db)):
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, payload, lambda: _change_package(external_id, payload, request, db))
+
+
 @router.get("/accounts/{external_id}/usage", response_model=ProvisioningUsageOut)
 def get_usage(external_id: str, request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:read")
+    _authorize(request, db, "usage:read")
     account = _account_by_external_id(db, external_id)
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
@@ -435,6 +520,21 @@ def get_usage(external_id: str, request: Request, db: Session = Depends(get_db))
     }
 
 
+# ── Token self-service (Bearer auth) ─────────────────────────────────────
+
+@router.post("/token/rotate", response_model=ApiTokenCreatedResponse)
+def rotate_own_token(payload: ApiTokenRotate, request: Request, db: Session = Depends(get_db)):
+    """Replace the calling token. Needs the ``tokens:rotate`` scope."""
+    token = _authorize(request, db, "tokens:rotate")
+
+    def _rotate() -> dict:
+        raw, replacement = rotate_api_token(db, token, payload.grace_minutes)
+        log_action(db, None, "rotate_api_token", replacement.name, detail=f"self old={token.id} new={replacement.id}", request=request)
+        return {"token": raw, "info": ApiTokenOut.model_validate(replacement).model_dump()}
+
+    return idempotency.run(db, token, request, payload, _rotate)
+
+
 # ── API Tokens (admin-only, cookie auth) ─────────────────────────────────
 
 @router.get("/tokens", response_model=List[ApiTokenOut])
@@ -443,12 +543,53 @@ def list_tokens(db: Session = Depends(get_db), current_user: User = Depends(get_
     return db.query(ApiToken).order_by(ApiToken.id.desc()).all()
 
 
+@router.get("/scopes")
+def list_scopes(current_user: User = Depends(get_current_user)):
+    """The scope catalogue, for the token form."""
+    ensure_role(current_user.role, Role.admin)
+    from app.services.provisioning import LEGACY_SCOPES, SCOPES
+
+    return {
+        "scopes": [{"name": name, "description": desc} for name, desc in SCOPES.items()],
+        "legacy": {name: sorted(expanded) for name, expanded in LEGACY_SCOPES.items()},
+    }
+
+
 @router.post("/tokens", response_model=ApiTokenCreatedResponse)
 def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
-    raw, token = create_api_token(db, payload.name, payload.scopes, payload.allowed_ips)
-    log_action(db, current_user.id, "create_api_token", payload.name, request=request)
+    try:
+        scopes = normalize_scopes(payload.scopes)
+        allowed_ips = normalize_allowed_ips(payload.allowed_ips)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    expires_at = None
+    if payload.expires_in_days:
+        expires_at = datetime.utcnow() + timedelta(days=payload.expires_in_days)
+    raw, token = create_api_token(
+        db,
+        payload.name,
+        scopes,
+        allowed_ips,
+        expires_at=expires_at,
+        rate_limit_per_minute=payload.rate_limit_per_minute,
+        created_by_id=current_user.id,
+    )
+    log_action(db, current_user.id, "create_api_token", payload.name, detail=scopes, request=request)
     return {"token": raw, "info": token}
+
+
+@router.post("/tokens/{token_id}/rotate", response_model=ApiTokenCreatedResponse)
+def rotate_token(token_id: int, payload: ApiTokenRotate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
+    if not token:
+        raise HTTPException(status_code=404, detail="Token not found")
+    if not token.is_active or token.revoked_at is not None:
+        raise HTTPException(status_code=400, detail="A revoked token cannot be rotated")
+    raw, replacement = rotate_api_token(db, token, payload.grace_minutes)
+    log_action(db, current_user.id, "rotate_api_token", token.name, detail=f"old={token.id} new={replacement.id} grace={payload.grace_minutes}m", request=request)
+    return {"token": raw, "info": replacement}
 
 
 @router.delete("/tokens/{token_id}")

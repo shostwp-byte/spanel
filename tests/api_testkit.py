@@ -83,6 +83,8 @@ def make_user(db, username: str, role: str = "admin", **extra) -> entities.User:
     db.add(user)
     db.commit()
     db.refresh(user)
+    # Detached with its columns loaded, so later commits do not expire it.
+    db.expunge(user)
     return user
 
 
@@ -91,6 +93,7 @@ def make_package(db, name: str = "Basic", **extra) -> entities.UserPackage:
     db.add(package)
     db.commit()
     db.refresh(package)
+    db.expunge(package)
     return package
 
 
