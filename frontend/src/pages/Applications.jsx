@@ -382,6 +382,7 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
           <div><h2>{t('Installed')}</h2><p className="hint">{t('{n} application(s)', { n: siteApps.items.length })}</p></div>
         </div>
         {siteApps.items.length === 0 && <EmptyState icon={Server} message={t('No applications yet. Install one above.')} />}
+        {siteApps.items.some(app => app.webhook_path) && <p className="hint site-apps-note"><AlertCircle size={13}/> {t('Since v1.0.7 the Git webhook URL has changed and every push must be signed. A webhook set up before then is rejected: paste the new URL and the Webhook Secret into GitHub/GitLab again.')}</p>}
         <div className="site-app-list">
           {siteApps.items.map(app => <div className="site-app-item" key={app.id}>
             <div className="site-app-head">

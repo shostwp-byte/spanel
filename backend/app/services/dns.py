@@ -51,8 +51,19 @@ TIMEOUT = 10
 # 1 through every edit (seen on .88, 2026-09-29).
 SOA_EDIT_API = "DEFAULT"
 
-RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA")
-TYPE_ORDER = {name: index for index, name in enumerate(("NS", "A", "AAAA", "CNAME", "MX", "TXT", "SRV", "CAA"))}
+RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA",
+                "TLSA", "HTTPS", "SVCB", "PTR", "DS", "SSHFP", "NAPTR")
+TYPE_ORDER = {name: index for index, name in enumerate(("NS", "DS", "A", "AAAA", "CNAME", "PTR", "MX", "TXT", "SRV", "CAA",
+                                                        "HTTPS", "SVCB", "TLSA", "SSHFP", "NAPTR"))}
+# Types whose priority is a field of its own on the form (like MX), not part
+# of the value.
+PRIORITY_TYPES = ("MX", "SRV", "HTTPS", "SVCB")
+REVERSE_SUFFIXES = (".in-addr.arpa", ".ip6.arpa")
+_HEX_RE = re.compile(r"^(?:[0-9a-f]{2})+$")
+_SVC_KEY_RE = re.compile(r"^(mandatory|alpn|no-default-alpn|port|ipv4hint|ipv6hint|ech)(?:=(.*))?$")
+_ALPN_RE = re.compile(r"^[A-Za-z0-9._/-]{1,64}$")
+_B64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+_NAPTR_RE = re.compile(r'^(\d{1,5})\s+(\d{1,5})\s+"([A-Za-z0-9]*)"\s+"([A-Za-z0-9+:._-]*)"\s+"([^"\s]*)"\s+(\S+)$')
 DEFAULT_TTL = 3600
 MIN_TTL = 60
 MAX_TTL = 604800
@@ -188,14 +199,32 @@ def settings() -> dict:
     nameservers = [str(name) for name in (stored.get("nameservers") or []) if str(name).strip()]
     ttl = stored.get("ttl")
     template = stored.get("template")
+    package_templates = stored.get("package_templates")
     return {
         "nameservers": nameservers or default_nameservers(),
         "zone_ip": str(stored.get("zone_ip") or "") or default_zone_ip(),
         "ttl": ttl if isinstance(ttl, int) and MIN_TTL <= ttl <= MAX_TTL else DEFAULT_TTL,
         "auto_zone": stored.get("auto_zone", True) is not False,
         "template": template if isinstance(template, str) and template.strip() else DEFAULT_TEMPLATE,
+        # A hosting package may have records of its own for new zones.
+        "package_templates": {str(key): value for key, value in package_templates.items()
+                              if str(key).isdigit() and isinstance(value, str) and value.strip()}
+        if isinstance(package_templates, dict) else {},
+        "transfers": stored.get("transfers") is True,
         "spf": spf_record(),
     }
+
+
+def template_for_owner(db: Session, owner_id: int | None, config: dict | None = None) -> str:
+    """The records a new zone of this account gets: its package's template,
+    or the server's."""
+    config = config or settings()
+    if owner_id:
+        user = db.query(User).filter(User.id == owner_id).first()
+        package_id = getattr(user, "package_id", None) if user is not None else None
+        if package_id and str(package_id) in config["package_templates"]:
+            return config["package_templates"][str(package_id)]
+    return config["template"]
 
 
 def spf_record() -> str:
@@ -248,7 +277,8 @@ def check_template(template: str) -> str:
     return template + "\n"
 
 
-def save_settings(nameservers: list[str], zone_ip: str, ttl: int, auto_zone: bool, template: str | None = None) -> dict:
+def save_settings(nameservers: list[str], zone_ip: str, ttl: int, auto_zone: bool, template: str | None = None,
+                  package_templates: dict | None = None) -> dict:
     names = []
     for name in nameservers:
         name = (name or "").strip().lower().rstrip(".")
@@ -272,8 +302,21 @@ def save_settings(nameservers: list[str], zone_ip: str, ttl: int, auto_zone: boo
     previous = stored.get(SETTINGS_KEY) if isinstance(stored.get(SETTINGS_KEY), dict) else {}
     kept = previous.get("template") if template is None else None
     template = check_template(template) if template is not None else (kept or DEFAULT_TEMPLATE)
+    if package_templates is None:
+        packages = previous.get("package_templates") if isinstance(previous.get("package_templates"), dict) else {}
+    else:
+        packages = {}
+        for key, value in package_templates.items():
+            if not str(key).isdigit():
+                raise DnsInputError("A package template is keyed by the package's number.")
+            if str(value or "").strip():
+                try:
+                    packages[str(int(key))] = check_template(str(value))
+                except DnsInputError as exc:
+                    raise DnsInputError(f"Package {key}: {exc}") from exc
     stored[SETTINGS_KEY] = {"nameservers": names, "zone_ip": zone_ip, "ttl": int(ttl), "auto_zone": bool(auto_zone),
-                            "template": template}
+                            "template": template, "package_templates": packages,
+                            "transfers": previous.get("transfers") is True}
     panel_settings._write_raw(stored)
     return settings()
 
@@ -391,7 +434,7 @@ def to_pdns(zone: str, record: dict) -> tuple[str, str, int, str]:
     """A record as typed -> (absolute name, type, ttl, PowerDNS content)."""
     rtype = str(record.get("type") or "").upper()
     if rtype not in RECORD_TYPES:
-        raise DnsInputError("Choose a record type: A, AAAA, CNAME, MX, TXT, NS, SRV or CAA.")
+        raise DnsInputError("Choose a record type: " + ", ".join(RECORD_TYPES) + ".")
     name = _record_name(zone, str(record.get("name") or "@"))
     try:
         ttl = int(record.get("ttl") or DEFAULT_TTL)
@@ -426,7 +469,7 @@ def to_pdns(zone: str, record: dict) -> tuple[str, str, int, str]:
         if weight > 65535 or not 0 < port <= 65535:
             raise DnsInputError("An SRV value is weight, port and target, such as 5 5060 sip.example.com.")
         content = f"{_priority(priority)} {weight} {port} {_hostname(zone, parts[2])}"
-    else:  # CAA
+    elif rtype == "CAA":
         parts = value.split(None, 2)
         if len(parts) != 3 or not parts[0].isdigit() or int(parts[0]) > 255 or parts[1].lower() not in CAA_TAGS:
             raise DnsInputError("A CAA value is flags, tag and value, such as 0 issue letsencrypt.org.")
@@ -434,7 +477,115 @@ def to_pdns(zone: str, record: dict) -> tuple[str, str, int, str]:
         if not caa_value or '"' in caa_value:
             raise DnsInputError("A CAA value is flags, tag and value, such as 0 issue letsencrypt.org.")
         content = f'{int(parts[0])} {parts[1].lower()} "{caa_value}"'
+    else:
+        content = _more_types(zone, name, rtype, value, priority)
     return name, rtype, ttl, content
+
+
+def _numbers(parts: list[str], limits: list[int], message: str) -> list[int]:
+    if len(parts) < len(limits) or not all(part.isdigit() for part in parts[:len(limits)]):
+        raise DnsInputError(message)
+    numbers = [int(part) for part in parts[:len(limits)]]
+    if any(number > limit for number, limit in zip(numbers, limits)):
+        raise DnsInputError(message)
+    return numbers
+
+
+def _hex(text: str, message: str, length: int | None = None) -> str:
+    data = text.replace(" ", "").lower()
+    if not _HEX_RE.fullmatch(data) or (length is not None and len(data) != length) or len(data) > 4096:
+        raise DnsInputError(message)
+    return data
+
+
+def _svc_params(params: list[str], alias: bool) -> str:
+    """SVCB/HTTPS SvcParams (RFC 9460), each checked; at most one of each key."""
+    message = "The parameters are key=value pairs such as alpn=h2,h3 port=443 ipv4hint=192.0.2.1."
+    if alias and params:
+        raise DnsInputError("A priority 0 (alias) record has a target and no parameters.")
+    seen, out = set(), []
+    for param in params:
+        match = _SVC_KEY_RE.fullmatch(param.replace('"', ""))
+        if not match or match.group(1) in seen:
+            raise DnsInputError(message)
+        key, raw = match.group(1), match.group(2)
+        seen.add(key)
+        if key == "no-default-alpn":
+            if raw is not None:
+                raise DnsInputError(message)
+            out.append(key)
+            continue
+        if not raw:
+            raise DnsInputError(message)
+        items = raw.split(",")
+        if key == "alpn" and all(_ALPN_RE.fullmatch(item) for item in items):
+            pass
+        elif key == "port" and raw.isdigit() and 0 < int(raw) <= 65535:
+            pass
+        elif key == "mandatory" and all(item in ("alpn", "no-default-alpn", "port", "ipv4hint", "ipv6hint", "ech")
+                                        for item in items):
+            pass
+        elif key == "ipv4hint":
+            try:
+                items = [str(ipaddress.IPv4Address(item)) for item in items]
+            except ValueError as exc:
+                raise DnsInputError(message) from exc
+        elif key == "ipv6hint":
+            try:
+                items = [ipaddress.IPv6Address(item).compressed for item in items]
+            except ValueError as exc:
+                raise DnsInputError(message) from exc
+        elif key == "ech" and _B64_RE.fullmatch(raw) and len(raw) <= 4096:
+            pass
+        else:
+            raise DnsInputError(message)
+        out.append(f"{key}={','.join(items)}")
+    return " ".join(out)
+
+
+def _more_types(zone: str, name: str, rtype: str, value: str, priority) -> str:
+    """Content of the types beyond the everyday ones, checked field by field."""
+    parts = value.split()
+    if rtype == "PTR":
+        if not zone.endswith(REVERSE_SUFFIXES):
+            raise DnsInputError("PTR records belong in a reverse zone (in-addr.arpa or ip6.arpa).")
+        return _hostname(zone, value)
+    if rtype == "TLSA":
+        message = "A TLSA value is usage (0-3), selector (0-1), matching type (0-2) and the data in hex."
+        usage, selector, matching = _numbers(parts, [3, 1, 2], message)
+        length = {1: 64, 2: 128}.get(matching)
+        return f"{usage} {selector} {matching} {_hex(''.join(parts[3:]), message, length)}"
+    if rtype == "SSHFP":
+        message = "An SSHFP value is algorithm (1-4 or 6), fingerprint type (1 or 2) and the fingerprint in hex."
+        algorithm, kind = _numbers(parts, [6, 2], message)
+        if algorithm not in (1, 2, 3, 4, 6) or kind not in (1, 2):
+            raise DnsInputError(message)
+        return f"{algorithm} {kind} {_hex(''.join(parts[2:]), message, {1: 40, 2: 64}[kind])}"
+    if rtype == "DS":
+        message = "A DS value is key tag, algorithm, digest type (1, 2 or 4) and the digest in hex."
+        if name == _absolute(zone):
+            raise DnsInputError("A DS record goes in the parent zone; here it belongs to a delegated subdomain.")
+        tag, algorithm, digest = _numbers(parts, [65535, 255, 255], message)
+        if digest not in (1, 2, 4):
+            raise DnsInputError(message)
+        return f"{tag} {algorithm} {digest} {_hex(''.join(parts[3:]), message, {1: 40, 2: 64, 4: 96}[digest])}"
+    if rtype == "NAPTR":
+        match = _NAPTR_RE.fullmatch(value.strip())
+        if not match:
+            raise DnsInputError('A NAPTR value is order, preference, "flags", "service", "regexp" and replacement, '
+                                'such as 100 10 "S" "SIP+D2U" "" _sip._udp.example.com.')
+        order, preference, flags, service, regexp, replacement = match.groups()
+        if int(order) > 65535 or int(preference) > 65535:
+            raise DnsInputError("NAPTR order and preference are 0 to 65535.")
+        target = "." if replacement == "." else _hostname(zone, replacement)
+        return f'{int(order)} {int(preference)} "{flags.upper()}" "{service}" "{regexp}" {target}'
+    # SVCB and HTTPS: the priority is its own field; the value is the target and its parameters.
+    number = _priority(priority if priority not in (None, "") else 1)
+    if not parts:
+        raise DnsInputError("An HTTPS or SVCB value is a target (. for the name itself) and its parameters.")
+    target = "." if parts[0] == "." else _hostname(zone, parts[0])
+    params = _svc_params(parts[1:], alias=number == 0)
+    return f"{number} {target}" + (f" {params}" if params else "")
 
 
 def _priority(value) -> int:
@@ -465,6 +616,17 @@ def to_form(zone: str, name: str, rtype: str, ttl: int, content: str) -> dict:
         parts = content.split(None, 2)
         if len(parts) == 3:
             record["content"] = f"{parts[0]} {parts[1]} {parts[2].strip(chr(34))}"
+    elif rtype == "PTR":
+        record["content"] = content.rstrip(".")
+    elif rtype in ("HTTPS", "SVCB"):
+        number, _, rest = content.partition(" ")
+        if number.isdigit():
+            target, _, params = rest.partition(" ")
+            record.update(priority=int(number), content=" ".join(filter(None, [target if target == "." else target.rstrip("."),
+                                                                               params.replace('"', "")])))
+    elif rtype == "NAPTR":
+        head, _, target = content.rpartition(" ")
+        record["content"] = f"{head} {target if target == '.' else target.rstrip('.')}"
     return record
 
 
@@ -540,7 +702,7 @@ def create_zone(db: Session, name: str, owner_id: int | None, *, claim_existing:
     # zone, less what spanel does not run): records of one name and type
     # become one RRset.
     grouped: dict[tuple[str, str], list[str]] = {}
-    for record in template_records(config["template"], zone, config["zone_ip"], ttl):
+    for record in template_records(template_for_owner(db, owner_id, config), zone, config["zone_ip"], ttl):
         name, rtype, _, content = to_pdns(zone, record)
         if rtype == "NS" and name == apex:
             continue
@@ -717,6 +879,243 @@ def delete_record(zone: str, record: dict, *, admin: bool) -> None:
     _remove(data, zone, record, changes)
     _serial_follows_edits(zone, data)
     _patch(zone, changes)
+
+
+# --- zone files: BIND import and export ------------------------------------------------
+# A zone file is read with dnspython (no $INCLUDE), and every record goes
+# through to_form/to_pdns, the checks a record typed on the page gets. SOA and
+# the zone's own NS are the panel's (DNS settings) and are never imported.
+
+MAX_IMPORT_BYTES = 1_000_000
+MAX_IMPORT_RECORDS = 5000
+IMPORT_MODES = ("merge", "replace")
+
+
+def export_zone(zone: str) -> str:
+    """The zone as a BIND zone file: absolute names, one record a line, the
+    SOA first. A disabled record is written as a comment."""
+    data = _zone_data(zone)
+    apex = _absolute(zone)
+    order = {**TYPE_ORDER, "SOA": -2, "NS": -1}
+    rrsets = sorted(data.get("rrsets", []),
+                    key=lambda r: (r.get("name") != apex, r.get("name", ""), order.get(r.get("type"), 99)))
+    lines = [f"; {zone} - exported by SPanel DNS Manager", f"$ORIGIN {apex}", f"$TTL {settings()['ttl']}"]
+    for rrset in rrsets:
+        for item in rrset.get("records", []):
+            prefix = "; disabled: " if item.get("disabled") else ""
+            lines.append(f"{prefix}{rrset['name']}\t{rrset.get('ttl', DEFAULT_TTL)}\tIN\t{rrset['type']}\t{item['content']}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_zone_file(zone: str, text: str) -> dict:
+    """A zone file -> what an import would write. Returns {"records": [form
+    rows with "pdns" content], "skipped": [...], "errors": [...]}; raises
+    DnsInputError when the file cannot be read at all."""
+    import dns.exception
+    import dns.rdatatype
+    import dns.zone
+
+    zone = normalize_zone(zone)
+    if len((text or "").encode("utf-8")) > MAX_IMPORT_BYTES:
+        raise DnsInputError("A zone file of at most 1 MB.")
+    apex = _absolute(zone)
+    text = text or ""
+    if not re.search(r"^\$TTL\s", text, re.M):
+        # A file without $TTL (an export of a single record set, say) gets the default.
+        text = f"$TTL {DEFAULT_TTL}\n" + text
+    try:
+        parsed = dns.zone.from_text(text, origin=apex, relativize=False, check_origin=False,
+                                    allow_include=False)
+    except (dns.exception.DNSException, ValueError, UnicodeError) as exc:
+        raise DnsInputError(f"The zone file could not be read: {exc}") from exc
+    records, skipped, errors = [], [], []
+    for owner, node in sorted(parsed.nodes.items(), key=lambda item: item[0].to_text()):
+        name = owner.to_text().lower()
+        if name != apex and not name.endswith("." + apex):
+            skipped.append({"name": name, "type": "", "reason": f"outside {zone}"})
+            continue
+        for rdataset in node.rdatasets:
+            rtype = dns.rdatatype.to_text(rdataset.rdtype)
+            if rtype == "SOA" or (rtype == "NS" and name == apex):
+                skipped.append({"name": name, "type": rtype, "reason": "kept by the DNS settings"})
+                continue
+            if rtype not in RECORD_TYPES:
+                skipped.append({"name": name, "type": rtype, "reason": "not a type DNS Manager edits"})
+                continue
+            ttl = min(MAX_TTL, max(MIN_TTL, int(rdataset.ttl)))
+            for rdata in rdataset:
+                text_value = rdata.to_text()
+                form = to_form(zone, name, rtype, ttl, text_value)
+                try:
+                    absolute, _, _, content = to_pdns(zone, form)
+                except DnsInputError as exc:
+                    errors.append({"name": name, "type": rtype, "value": text_value[:300], "error": str(exc)})
+                    continue
+                records.append({**form, "fqdn": absolute.rstrip("."), "pdns": content})
+    if len(records) > MAX_IMPORT_RECORDS:
+        raise DnsInputError("A zone file of at most 5000 records.")
+    return {"records": records, "skipped": skipped, "errors": errors}
+
+
+def _import_changes(zone: str, data: dict, records: list[dict], mode: str, admin: bool) -> dict:
+    """The RRsets an import rewrites, with the zone's CNAME rules checked
+    against the result."""
+    if mode not in IMPORT_MODES:
+        raise DnsInputError("Import merges records into the zone or replaces the record sets the file has.")
+    grouped: dict[tuple[str, str], tuple[int, list[str]]] = {}
+    for record in records:
+        key = (_absolute(record["fqdn"]), record["type"])
+        _guard(zone, key[0], key[1], admin)
+        ttl, contents = grouped.get(key, (record["ttl"], []))
+        if not any(_same(record["pdns"], item) for item in contents):
+            contents.append(record["pdns"])
+        grouped[key] = (ttl, contents)
+    changes = {}
+    for key, (ttl, contents) in grouped.items():
+        existing = _contents(_rrset(data, *key))
+        wanted = contents if mode == "replace" else existing + [c for c in contents if not any(_same(c, e) for e in existing)]
+        if sorted(wanted) != sorted(existing) or (_rrset(data, *key) or {}).get("ttl") != ttl:
+            changes[key] = (ttl, wanted)
+    final: dict[tuple[str, str], list[str]] = {(r["name"], r["type"]): _contents(r) for r in data.get("rrsets", [])}
+    final.update({key: value[1] for key, value in changes.items()})
+    for (name, rtype), contents in final.items():
+        if rtype != "CNAME" or not contents:
+            continue
+        if name == _absolute(zone):
+            raise DnsInputError("The zone's own name cannot be a CNAME; use an A record.")
+        if len(contents) > 1 or any(other_name == name and other_type != "CNAME" and other
+                                    for (other_name, other_type), other in final.items()):
+            raise DnsInputError(f"{name.rstrip('.')} would have a CNAME beside other records.")
+    return changes
+
+
+def preview_import(zone: str, text: str, mode: str = "merge", *, admin: bool) -> dict:
+    parsed = parse_zone_file(zone, text)
+    data = _zone_data(zone)
+    for record in parsed["records"]:
+        existing = _contents(_rrset(data, _absolute(record["fqdn"]), record["type"]))
+        record["action"] = "exists" if any(_same(record["pdns"], item) for item in existing) else "add"
+    removed = []
+    if mode == "replace":
+        kept = {(_absolute(r["fqdn"]), r["type"]) for r in parsed["records"]}
+        for key in kept:
+            for item in _contents(_rrset(data, *key)):
+                if not any(_same(item, r["pdns"]) for r in parsed["records"]
+                           if (_absolute(r["fqdn"]), r["type"]) == key):
+                    removed.append(to_form(zone, key[0], key[1], (_rrset(data, *key) or {}).get("ttl", DEFAULT_TTL), item))
+    try:
+        changes = _import_changes(zone, data, parsed["records"], mode, admin)
+        problem = ""
+    except DnsInputError as exc:
+        changes, problem = {}, str(exc)
+    for record in parsed["records"]:
+        record.pop("pdns", None)
+    return {**parsed, "removed": removed, "rrsets": len(changes), "problem": problem, "mode": mode}
+
+
+def import_zone(zone: str, text: str, mode: str = "merge", *, admin: bool) -> dict:
+    """Write a zone file's records into the zone: merged with what is there,
+    or replacing the record sets the file holds. Nothing is written while any
+    record of the file is refused."""
+    parsed = parse_zone_file(zone, text)
+    if parsed["errors"]:
+        first = parsed["errors"][0]
+        raise DnsInputError(f"{len(parsed['errors'])} record(s) cannot be imported; first {first['name']} "
+                            f"{first['type']}: {first['error']}")
+    data = _zone_data(zone)
+    changes = _import_changes(zone, data, parsed["records"], mode, admin)
+    if changes:
+        _serial_follows_edits(zone, data)
+        _patch(zone, changes)
+    return {"rrsets": len(changes), "records": len(parsed["records"]), "skipped": len(parsed["skipped"])}
+
+
+# --- secondary nameservers: zone transfers and NOTIFY ----------------------------------
+# PowerDNS answers AXFR only to the addresses a zone's ALLOW-AXFR-FROM lists
+# (loopback otherwise), and sends NOTIFY to its ALSO-NOTIFY addresses; a zone
+# with either is made a primary ("Master") so PowerDNS notifies at all. The
+# server-wide switch (dns-transfers in the helper) turns AXFR on in pdns.conf.
+
+MAX_SECONDARIES = 10
+
+
+def _metadata(zone: str, kind: str) -> list[str]:
+    try:
+        data = _request("GET", f"/zones/{_absolute(zone)}/metadata/{kind}")
+    except DnsError as exc:
+        if exc.status in (404, 422):
+            return []
+        raise
+    return [str(item) for item in (data or {}).get("metadata") or []]
+
+
+def secondary_view(zone: str) -> dict:
+    zone = normalize_zone(zone)
+    data = _zone_data(zone)
+    return {"zone": zone, "kind": data.get("kind") or "Native", "also_notify": _metadata(zone, "ALSO-NOTIFY"),
+            "allow_axfr": _metadata(zone, "ALLOW-AXFR-FROM"), "transfers": settings()["transfers"]}
+
+
+def normalize_secondaries(also_notify, allow_axfr) -> tuple[list[str], list[str]]:
+    notify, allow = [], []
+    for value in also_notify or []:
+        try:
+            address = str(ipaddress.ip_address(str(value).strip()))
+        except ValueError as exc:
+            raise DnsInputError("NOTIFY goes to IP addresses of the secondary nameservers.") from exc
+        if address not in notify:
+            notify.append(address)
+    for value in allow_axfr or []:
+        try:
+            network = ipaddress.ip_network(str(value).strip(), strict=False)
+        except ValueError as exc:
+            raise DnsInputError("Zone transfers are allowed to IP addresses or networks such as 192.0.2.0/24.") from exc
+        if network.prefixlen == 0:
+            raise DnsInputError("Allow zone transfers to the secondaries' addresses, not to everyone.")
+        text = str(network.network_address) if network.num_addresses == 1 else str(network)
+        if text not in allow:
+            allow.append(text)
+    if len(notify) > MAX_SECONDARIES or len(allow) > MAX_SECONDARIES:
+        raise DnsInputError("At most 10 addresses each.")
+    return notify, allow
+
+
+def _transfers_on() -> None:
+    """Turn AXFR on server-wide (once): the helper rewrites pdns.conf."""
+    stored = panel_settings._read_raw()
+    current = stored.get(SETTINGS_KEY) if isinstance(stored.get(SETTINGS_KEY), dict) else {}
+    if current.get("transfers") is True:
+        return
+    result = shell.privileged("dns-transfers", helper_args=["on"], check=False, fallback=["true"], timeout=120)
+    if result.returncode != 0:
+        raise DnsError("PowerDNS could not be set up for zone transfers: " + (result.stderr or "").strip()[-300:])
+    current["transfers"] = True
+    stored[SETTINGS_KEY] = current
+    panel_settings._write_raw(stored)
+
+
+def set_secondaries(zone: str, also_notify, allow_axfr) -> dict:
+    zone = normalize_zone(zone)
+    notify, allow = normalize_secondaries(also_notify, allow_axfr)
+    if notify or allow:
+        _transfers_on()
+    apex = _absolute(zone)
+    for kind, values in (("ALSO-NOTIFY", notify), ("ALLOW-AXFR-FROM", allow)):
+        if values:
+            _request("PUT", f"/zones/{apex}/metadata/{kind}", {"kind": kind, "metadata": values})
+        else:
+            try:
+                _request("DELETE", f"/zones/{apex}/metadata/{kind}")
+            except DnsError as exc:
+                if exc.status not in (404, 422):
+                    raise
+    _request("PUT", f"/zones/{apex}", {"kind": "Master" if (notify or allow) else "Native"})
+    if notify:
+        try:
+            _request("PUT", f"/zones/{apex}/notify")
+        except DnsError as exc:
+            logger.warning("NOTIFY for %s not sent: %s", zone, exc)
+    return secondary_view(zone)
 
 
 # --- every domain on the server -------------------------------------------------------
@@ -996,7 +1395,9 @@ def restore_defaults(db: Session, zone: str) -> None:
             return any(_untxt(item).lower().startswith("v=spf1") for item in _contents(_rrset(data, name, "TXT")))
         return bool(_rrset(data, name, rtype))
 
-    for record in template_records(config["template"], zone, config["zone_ip"], ttl):
+    zone_row = _row(db, zone)
+    template = template_for_owner(db, zone_row.owner_id if zone_row is not None else None, config)
+    for record in template_records(template, zone, config["zone_ip"], ttl):
         name, rtype, _, content = to_pdns(zone, record)
         if rtype == "TXT" and not _untxt(content).lower().startswith("v=spf1"):
             if content in _contents(_rrset(data, name, "TXT")):

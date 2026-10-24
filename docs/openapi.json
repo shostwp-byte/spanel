@@ -1,0 +1,1681 @@
+{
+  "components": {
+    "schemas": {
+      "ApiTokenCreate": {
+        "properties": {
+          "allowed_ips": {
+            "default": "",
+            "title": "Allowed Ips",
+            "type": "string"
+          },
+          "expires_in_days": {
+            "anyOf": [
+              {
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Days"
+          },
+          "name": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "rate_limit_per_minute": {
+            "default": 0,
+            "maximum": 6000.0,
+            "minimum": 0.0,
+            "title": "Rate Limit Per Minute",
+            "type": "integer"
+          },
+          "scopes": {
+            "default": "provisioning:read,provisioning:write",
+            "title": "Scopes",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ApiTokenCreate",
+        "type": "object"
+      },
+      "ApiTokenCreatedResponse": {
+        "properties": {
+          "info": {
+            "$ref": "#/components/schemas/ApiTokenOut"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "info"
+        ],
+        "title": "ApiTokenCreatedResponse",
+        "type": "object"
+      },
+      "ApiTokenOut": {
+        "properties": {
+          "allowed_ips": {
+            "title": "Allowed Ips",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "is_active": {
+            "title": "Is Active",
+            "type": "boolean"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "rate_limit_per_minute": {
+            "default": 0,
+            "title": "Rate Limit Per Minute",
+            "type": "integer"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "scopes": {
+            "title": "Scopes",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "scopes",
+          "allowed_ips",
+          "is_active"
+        ],
+        "title": "ApiTokenOut",
+        "type": "object"
+      },
+      "ApiTokenRotate": {
+        "properties": {
+          "grace_minutes": {
+            "default": 0,
+            "maximum": 10080.0,
+            "minimum": 0.0,
+            "title": "Grace Minutes",
+            "type": "integer"
+          }
+        },
+        "title": "ApiTokenRotate",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ProvisioningAccountCreate": {
+        "properties": {
+          "app_type": {
+            "default": "php",
+            "enum": [
+              "wordpress",
+              "php",
+              "static"
+            ],
+            "title": "App Type",
+            "type": "string"
+          },
+          "domain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "format": "email",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "enable_ssl": {
+            "default": false,
+            "title": "Enable Ssl",
+            "type": "boolean"
+          },
+          "external_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "External Id",
+            "type": "string"
+          },
+          "install_wordpress": {
+            "default": false,
+            "title": "Install Wordpress",
+            "type": "boolean"
+          },
+          "is_reseller": {
+            "default": false,
+            "title": "Is Reseller",
+            "type": "boolean"
+          },
+          "limits": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProvisioningLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "package_id": {
+            "minimum": 1.0,
+            "title": "Package Id",
+            "type": "integer"
+          },
+          "password": {
+            "maxLength": 72,
+            "minLength": 12,
+            "title": "Password",
+            "type": "string"
+          },
+          "php_version": {
+            "default": "8.4",
+            "title": "Php Version",
+            "type": "string"
+          },
+          "reseller_package_id": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reseller Package Id"
+          },
+          "username": {
+            "maxLength": 32,
+            "minLength": 3,
+            "pattern": "^[a-z_][a-z0-9_-]{2,31}$",
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "external_id",
+          "username",
+          "password",
+          "package_id"
+        ],
+        "title": "ProvisioningAccountCreate",
+        "type": "object"
+      },
+      "ProvisioningAccountList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProvisioningAccountOut"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "title": "Per Page",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "per_page"
+        ],
+        "title": "ProvisioningAccountList",
+        "type": "object"
+      },
+      "ProvisioningAccountOut": {
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "domain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain"
+          },
+          "email": {
+            "default": "",
+            "title": "Email",
+            "type": "string"
+          },
+          "external_id": {
+            "title": "External Id",
+            "type": "string"
+          },
+          "is_reseller": {
+            "default": false,
+            "title": "Is Reseller",
+            "type": "boolean"
+          },
+          "last_action": {
+            "default": "",
+            "title": "Last Action",
+            "type": "string"
+          },
+          "package_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Id"
+          },
+          "package_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Name"
+          },
+          "panel_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Panel Url"
+          },
+          "reseller_package_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reseller Package Id"
+          },
+          "service_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Label"
+          },
+          "sftp_password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sftp Password"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "username": {
+            "default": "",
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "external_id",
+          "status"
+        ],
+        "title": "ProvisioningAccountOut",
+        "type": "object"
+      },
+      "ProvisioningLimits": {
+        "description": "Per-account overrides of the package limits, e.g. from WHMCS\nconfigurable options. Each field left out keeps the package value; 0 means\nunlimited, as it does on the package.",
+        "properties": {
+          "bandwidth_limit_mb": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bandwidth Limit Mb"
+          },
+          "storage_limit_mb": {
+            "anyOf": [
+              {
+                "maximum": 100000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Storage Limit Mb"
+          },
+          "website_limit": {
+            "anyOf": [
+              {
+                "maximum": 100000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Website Limit"
+          }
+        },
+        "title": "ProvisioningLimits",
+        "type": "object"
+      },
+      "ProvisioningPackageChange": {
+        "properties": {
+          "limits": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProvisioningLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "package_id": {
+            "minimum": 1.0,
+            "title": "Package Id",
+            "type": "integer"
+          },
+          "reseller_package_id": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reseller Package Id"
+          }
+        },
+        "required": [
+          "package_id"
+        ],
+        "title": "ProvisioningPackageChange",
+        "type": "object"
+      },
+      "ProvisioningPasswordChange": {
+        "properties": {
+          "password": {
+            "maxLength": 72,
+            "minLength": 12,
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "password"
+        ],
+        "title": "ProvisioningPasswordChange",
+        "type": "object"
+      },
+      "ProvisioningSuspendRequest": {
+        "properties": {
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "ProvisioningSuspendRequest",
+        "type": "object"
+      },
+      "ProvisioningUsageOut": {
+        "properties": {
+          "bandwidth_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bandwidth Limit Bytes"
+          },
+          "bandwidth_used_bytes": {
+            "default": 0,
+            "title": "Bandwidth Used Bytes",
+            "type": "integer"
+          },
+          "database_count": {
+            "title": "Database Count",
+            "type": "integer"
+          },
+          "external_id": {
+            "title": "External Id",
+            "type": "string"
+          },
+          "storage_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Storage Limit Bytes"
+          },
+          "storage_percent": {
+            "title": "Storage Percent",
+            "type": "number"
+          },
+          "storage_used_bytes": {
+            "title": "Storage Used Bytes",
+            "type": "integer"
+          },
+          "user_count": {
+            "default": 0,
+            "title": "User Count",
+            "type": "integer"
+          },
+          "website_count": {
+            "title": "Website Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "external_id",
+          "storage_used_bytes",
+          "storage_percent",
+          "website_count",
+          "database_count"
+        ],
+        "title": "ProvisioningUsageOut",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "description": "Provisioning API token (bp_...)",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Billing-system API for creating and managing hosting accounts. Authenticate with `Authorization: Bearer <token>`; write calls accept an `Idempotency-Key` header. See docs/API_AND_WHMCS.md.",
+    "title": "SPanel Provisioning API",
+    "version": "1.0.7"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/provisioning/v1/accounts": {
+      "get": {
+        "description": "Accounts this panel provisioned, for WHMCS ListAccounts / GetUserCount.\n\nWithout ``status`` the list holds the accounts that exist on the server\n(active, suspended, pending); ``status=all`` adds failed and terminated\nrecords.",
+        "operationId": "list_accounts_api_provisioning_v1_accounts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Per Page",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "active, suspended, pending, failed, terminated, or all",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "default": "",
+              "description": "active, suspended, pending, failed, terminated, or all",
+              "maxLength": 32,
+              "title": "Status",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Substring of external_id or username",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "description": "Substring of external_id or username",
+              "maxLength": 255,
+              "title": "Q",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningAccountList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Accounts",
+        "tags": [
+          "provisioning"
+        ]
+      },
+      "post": {
+        "operationId": "create_account_api_provisioning_v1_accounts_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisioningAccountCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningAccountOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Account",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/usage": {
+      "get": {
+        "operationId": "get_all_usage_api_provisioning_v1_accounts_usage_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProvisioningUsageOut"
+                  },
+                  "title": "Response Get All Usage Api Provisioning V1 Accounts Usage Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get All Usage",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}": {
+      "delete": {
+        "description": "Delete a provisioned account.\n\n``backup`` defaults to off: the backup runs inside this request, and a\nbilling module that gives the call a short HTTP timeout would report a\nfailure while the server kept working. Pass ``?backup=true`` when the\ncaller can wait for a full account archive.",
+        "operationId": "terminate_api_provisioning_v1_accounts__external_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "backup",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Backup",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Terminate",
+        "tags": [
+          "provisioning"
+        ]
+      },
+      "get": {
+        "operationId": "get_account_api_provisioning_v1_accounts__external_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningAccountOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Account",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/backup": {
+      "post": {
+        "description": "Queue a full backup of the account. It runs in the background; the\noutcome lands on the account (``last_action=backup``) and in the audit log.",
+        "operationId": "create_backup_api_provisioning_v1_accounts__external_id__backup_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Backup",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/login": {
+      "post": {
+        "operationId": "create_login_url_api_provisioning_v1_accounts__external_id__login_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Login Url",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/package": {
+      "patch": {
+        "operationId": "change_package_api_provisioning_v1_accounts__external_id__package_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisioningPackageChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Package",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/password": {
+      "patch": {
+        "operationId": "change_password_api_provisioning_v1_accounts__external_id__password_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisioningPasswordChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Password",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/sftp-password": {
+      "post": {
+        "description": "Give the account's SFTP/SSH login a new random password and return it.",
+        "operationId": "reset_sftp_password_api_provisioning_v1_accounts__external_id__sftp_password_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Sftp Password",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/suspend": {
+      "post": {
+        "operationId": "suspend_api_provisioning_v1_accounts__external_id__suspend_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisioningSuspendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Suspend",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/unsuspend": {
+      "post": {
+        "operationId": "unsuspend_api_provisioning_v1_accounts__external_id__unsuspend_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unsuspend",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/accounts/{external_id}/usage": {
+      "get": {
+        "operationId": "get_usage_api_provisioning_v1_accounts__external_id__usage_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "external_id",
+            "required": true,
+            "schema": {
+              "title": "External Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningUsageOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Usage",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/admin/login": {
+      "post": {
+        "description": "A one-time login link for the administrator who issued this token.\n\nOnly with the ``sso:admin`` scope, which no legacy token has and which must\nbe granted explicitly: whoever holds such a token can open the panel as\nthat administrator, so it belongs only on a billing server trusted as much.",
+        "operationId": "create_admin_login_url_api_provisioning_v1_admin_login_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Admin Login Url",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/plans": {
+      "get": {
+        "operationId": "list_plans_api_provisioning_v1_plans_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Plans",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/reseller-plans": {
+      "get": {
+        "operationId": "list_reseller_plans_api_provisioning_v1_reseller_plans_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Reseller Plans",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/scopes": {
+      "get": {
+        "description": "The scope catalogue, for the token form.",
+        "operationId": "list_scopes_api_provisioning_v1_scopes_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "spanel_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Spanel Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "List Scopes",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/token/rotate": {
+      "post": {
+        "description": "Replace the calling token. Needs the ``tokens:rotate`` scope.",
+        "operationId": "rotate_own_token_api_provisioning_v1_token_rotate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiTokenRotate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenCreatedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rotate Own Token",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/tokens": {
+      "get": {
+        "operationId": "list_tokens_api_provisioning_v1_tokens_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "spanel_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Spanel Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ApiTokenOut"
+                  },
+                  "title": "Response List Tokens Api Provisioning V1 Tokens Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "List Tokens",
+        "tags": [
+          "provisioning"
+        ]
+      },
+      "post": {
+        "operationId": "create_token_api_provisioning_v1_tokens_post",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "spanel_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Spanel Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiTokenCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenCreatedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Create Token",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/tokens/{token_id}": {
+      "delete": {
+        "operationId": "revoke_token_api_provisioning_v1_tokens__token_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "title": "Token Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "spanel_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Spanel Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Revoke Token",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/provisioning/v1/tokens/{token_id}/rotate": {
+      "post": {
+        "operationId": "rotate_token_api_provisioning_v1_tokens__token_id__rotate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "title": "Token Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "spanel_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Spanel Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiTokenRotate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenCreatedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "summary": "Rotate Token",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ]
+}

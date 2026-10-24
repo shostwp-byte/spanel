@@ -8,7 +8,13 @@ STATE_FILE="${UPDATE_STATE_FILE:-/var/lib/spanel/update-status.json}"
 SOURCE_CONFIG_FILE="${UPDATE_SOURCE_FILE:-/var/lib/spanel/update-source.json}"
 APP_DIR="${APP_DIR:-/opt/spanel}"
 SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+HELPER_BIN="/usr/local/sbin/spanel-helper"
 ROLLBACK_SNAPSHOT_ID=""
+# Set once update.sh starts changing the server. A failure before that
+# (download, checksum, validation) has changed nothing, so there is nothing
+# to roll back.
+APPLY_STARTED=0
+AUTO_ROLLBACK="true"
 WORK_DIR=""
 CURL_CFG=""
 
@@ -80,14 +86,36 @@ check_panel_health() {
   return 1
 }
 
+# The restore arguments the installed helper understands. A helper from
+# before database rollback takes only the snapshot id.
+snapshot_restore_args() {
+  if grep -q 'panel-snapshot-restore <snapshot-id> \[--restore-db\] \[--now\]' "$HELPER_BIN" 2>/dev/null; then
+    # The snapshot's database was taken before update.sh ran any migration;
+    # restoring it is what undoes them. The current database is kept beside
+    # it as spanel.db.pre-restore-<time>.
+    echo "--restore-db --now"
+  fi
+}
+
 trigger_auto_rollback() {
   local reason
   reason="$(sanitize_msg "${1:-Update failed}")"
   log_step "PHÁT HIỆN SỰ CỐ: ${reason}"
-  if [[ -n "$ROLLBACK_SNAPSHOT_ID" && -x "/usr/local/sbin/spanel-helper" ]]; then
+  if [[ "$APPLY_STARTED" -ne 1 ]]; then
+    update_state "failed" "failed" 100 "${reason}"
+    exit 1
+  fi
+  if [[ "$AUTO_ROLLBACK" != "true" ]]; then
+    log_step "Auto-rollback đang tắt; giữ nguyên trạng thái hiện tại để kiểm tra thủ công."
+    update_state "failed" "failed" 100 "${reason} (auto-rollback disabled; snapshot ${ROLLBACK_SNAPSHOT_ID:-none} can be restored from Updates)"
+    exit 1
+  fi
+  if [[ -n "$ROLLBACK_SNAPSHOT_ID" && -x "$HELPER_BIN" ]]; then
     log_step "Đang kích hoạt AUTO-ROLLBACK về điểm khôi phục ${ROLLBACK_SNAPSHOT_ID}..."
     update_state "rolling_back" "rolling_back" 95 "Phát hiện lỗi cập nhật! Đang tự động khôi phục về bản sao lưu ${ROLLBACK_SNAPSHOT_ID}..."
-    if env SUDO_USER=spanel /usr/local/sbin/spanel-helper panel-snapshot-restore "$ROLLBACK_SNAPSHOT_ID" >/dev/null 2>&1; then
+    local -a restore_args=()
+    read -r -a restore_args <<<"$(snapshot_restore_args)"
+    if env SUDO_USER=spanel "$HELPER_BIN" panel-snapshot-restore "$ROLLBACK_SNAPSHOT_ID" "${restore_args[@]}" >/dev/null 2>&1; then
       if check_panel_health; then
         log_step "AUTO-ROLLBACK THÀNH CÔNG: Hệ thống đã được khôi phục an toàn về ${ROLLBACK_SNAPSHOT_ID}."
         update_state "rolled_back" "rolled_back" 100 "Cập nhật gặp sự cố (${reason}). Hệ thống đã tự động Rollback an toàn về bản ${ROLLBACK_SNAPSHOT_ID}."
@@ -128,8 +156,15 @@ auth_token = (src.get("auth_token") or os.environ.get("SPANEL_UPDATE_TOKEN") or 
 download_url = (st.get("download_url") or "").strip()
 expected_sha256 = (st.get("expected_sha256") or "").strip()
 latest_tag = (st.get("latest_tag") or "").strip()
+auto_rollback = src.get("auto_rollback_enabled", True) is not False
+try:
+    snapshot_keep = max(1, min(20, int(src.get("snapshot_keep") or 5)))
+except (TypeError, ValueError):
+    snapshot_keep = 5
 
 print(json.dumps({
+    "auto_rollback": "true" if auto_rollback else "false",
+    "snapshot_keep": snapshot_keep,
     "server_url": server_url,
     "channel": channel,
     "auth_token": auth_token,
@@ -146,6 +181,11 @@ print(json.dumps({
   download_url="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("download_url",""))' "$cfg_json" 2>/dev/null || echo "")"
   expected_sha256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("expected_sha256",""))' "$cfg_json" 2>/dev/null || echo "")"
   latest_tag="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("latest_tag",""))' "$cfg_json" 2>/dev/null || echo "")"
+  AUTO_ROLLBACK="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("auto_rollback","true"))' "$cfg_json" 2>/dev/null || echo "true")"
+  [[ "$AUTO_ROLLBACK" == "false" ]] || AUTO_ROLLBACK="true"
+  local snapshot_keep
+  snapshot_keep="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("snapshot_keep",5))' "$cfg_json" 2>/dev/null || echo 5)"
+  [[ "$snapshot_keep" =~ ^[0-9]{1,2}$ ]] || snapshot_keep=5
 
   local branch="${BRANCH:-main}"
   local tag="${RELEASE_TAG:-}"
@@ -173,8 +213,12 @@ print(json.dumps({
     trigger_auto_rollback "Không đủ dung lượng ổ cứng trống tối thiểu (cần >= 300MB) để cập nhật an toàn."
   fi
 
-  if [[ -x "/usr/local/sbin/spanel-helper" ]]; then
-    ROLLBACK_SNAPSHOT_ID="$(env SUDO_USER=spanel /usr/local/sbin/spanel-helper panel-snapshot-create pre-update 2>/dev/null | tail -n 1 || true)"
+  if [[ -x "$HELPER_BIN" ]]; then
+    ROLLBACK_SNAPSHOT_ID="$(env SUDO_USER=spanel "$HELPER_BIN" panel-snapshot-create pre-update "$snapshot_keep" 2>/dev/null | tail -n 1 || true)"
+    if [[ -z "$ROLLBACK_SNAPSHOT_ID" ]]; then
+      # A helper from before configurable retention takes the reason only.
+      ROLLBACK_SNAPSHOT_ID="$(env SUDO_USER=spanel "$HELPER_BIN" panel-snapshot-create pre-update 2>/dev/null | tail -n 1 || true)"
+    fi
   fi
   if [[ -n "$ROLLBACK_SNAPSHOT_ID" ]]; then
     log_step "Đã tạo điểm khôi phục an toàn: ${ROLLBACK_SNAPSHOT_ID}"
@@ -274,6 +318,7 @@ print(json.dumps({
   update_state "running" "applying" 80 "Đang áp dụng bản cập nhật ${ref} và nâng cấp dịch vụ..."
 
   local rc=0
+  APPLY_STARTED=1
   local joined_args=" ${args[*]:-} "
   if [[ "$joined_args" != *" --tag "* && "$joined_args" != *" --branch "* && "$channel" != "branch" ]]; then
     /bin/bash "$script" --tag "$ref" "${args[@]}" 2>&1 | sed -u -E 's#https?://[^[:space:]"<>]+#[PROTECTED-UPDATE-SERVER]#g' || rc=$?

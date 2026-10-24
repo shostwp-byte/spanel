@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
+import { MaintenanceWindowCard } from '../components/MaintenanceWindowCard.jsx';
 
 const UPDATE_STEPS = [
   { key: 'snapshot', label: '1. Tạo Snapshot Dự phòng', minPct: 10 },
@@ -70,6 +71,7 @@ export function UpdatesPage({ request, isAdmin }) {
     auto_update_enabled: false,
     auto_update_window: '02:00',
     auto_rollback_enabled: true,
+    snapshot_keep: 5,
   });
 
   const [osAutoUpdate, setOsAutoUpdate] = useState({
@@ -112,6 +114,7 @@ export function UpdatesPage({ request, isAdmin }) {
         auto_update_enabled: !!src.auto_update_enabled,
         auto_update_window: src.auto_update_window || '02:00',
         auto_rollback_enabled: src.auto_rollback_enabled !== false,
+        snapshot_keep: src.snapshot_keep || 5,
       }));
     }
     const pg = data?.php_smart_guard;
@@ -185,12 +188,21 @@ export function UpdatesPage({ request, isAdmin }) {
     ) {
       return;
     }
+    // The snapshot's database is from before that update's migrations.
+    // Restoring it undoes them, and loses what changed in the panel since.
+    const restoreDb =
+      snap.has_db !== false &&
+      window.confirm(
+        t(
+          'Also restore the panel database as it was when this snapshot was taken? Choose this when rolling back across a schema change. Changes made in the panel since then are lost (the current database is kept on the server as spanel.db.pre-restore-*).'
+        )
+      );
     setRollingBackId(snap.id);
     const res = await request(
       `/updates/snapshots/${encodeURIComponent(snap.id)}/restore`,
       {
         method: 'POST',
-        body: JSON.stringify({ restore_db: false }),
+        body: JSON.stringify({ restore_db: restoreDb }),
       },
       t('Rolling back Panel to snapshot {id}...', { id: snap.id })
     );
@@ -1189,6 +1201,8 @@ export function UpdatesPage({ request, isAdmin }) {
         )}
       </div>
 
+      <MaintenanceWindowCard request={request} setNotice={setNotice} loading={loading} />
+
       {/* 4D. Smart Core Infrastructure Auto-Patch Card */}
       {coreServices.length > 0 && (
         <div
@@ -1952,6 +1966,18 @@ export function UpdatesPage({ request, isAdmin }) {
                       }}
                     />
                     <span style={{ margin: 0, display: 'inline' }}>{t('Automatic Rollback on failed healthcheck')}</span>
+                  </label>
+
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', margin: 0, fontSize: '13px' }}>
+                    {t('Recovery snapshots to keep')}
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={sourceForm.snapshot_keep}
+                      onChange={e => setSourceForm(prev => ({ ...prev, snapshot_keep: Number(e.target.value) || 5 }))}
+                      style={{ width: '70px' }}
+                    />
                   </label>
                 </div>
               </div>

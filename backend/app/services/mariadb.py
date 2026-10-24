@@ -248,6 +248,38 @@ def set_database_write_lock(db_name: str, db_user: str, locked: bool) -> None:
     _run_sql(sql, check=False)
 
 
+def account_lock_sql(db_user: str, locked: bool, client_host: str = "localhost") -> str:
+    """ALTER USER ... ACCOUNT LOCK/UNLOCK (MariaDB >= 10.4.2, MySQL >= 5.7.6)."""
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    clause = "ACCOUNT LOCK" if locked else "ACCOUNT UNLOCK"
+    return f"ALTER USER {_quote_sql_string(safe_user)}@{_quote_sql_string(client_host)} {clause};\n"
+
+
+def set_account_locked(db_user: str, locked: bool) -> None:
+    """Lock or unlock a customer's MariaDB account for suspend/unsuspend.
+
+    ACCOUNT LOCK only refuses new logins, so on lock the sessions the account
+    already has open are killed too - otherwise a suspended site's persistent
+    connections keep working until they happen to reconnect.
+    """
+    safe_user = _validate_identifier(db_user)
+    result = _run_sql(account_lock_sql(safe_user, locked), check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not {'lock' if locked else 'unlock'} MariaDB account '{safe_user}': {(result.stderr or '').strip()}"
+        )
+    if not locked or settings.command_dry_run:
+        return
+    res = _run_sql(
+        f"SELECT ID FROM information_schema.PROCESSLIST WHERE USER = {_quote_sql_string(safe_user)};\n",
+        check=False,
+    )
+    kills = [f"KILL CONNECTION {line.strip()};" for line in (res.stdout or "").splitlines() if line.strip().isdigit()]
+    if kills:
+        _run_sql("\n".join(kills) + "\n", check=False)
+
+
 def get_database_tables_breakdown(db_name: str) -> list[dict]:
     """Return top tables by size (data + index bytes) inside a specific database."""
     safe_db = _validate_identifier(db_name)
@@ -322,6 +354,61 @@ def enforce_db_user_resource_limits(
             check=False,
         )
 
+
+
+MAX_HOURLY_LIMIT = 1_000_000_000
+
+
+def _hourly_value(value) -> int:
+    """0 (or less, or junk) is "no limit", which is also MariaDB's 0."""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(MAX_HOURLY_LIMIT, number))
+
+
+def hourly_limits_sql(
+    db_user: str,
+    max_queries_per_hour: int = 0,
+    max_updates_per_hour: int = 0,
+    max_connections_per_hour: int = 0,
+) -> str:
+    """ALTER USER setting the three per-hour resource limits of one account.
+
+    All three are always set, so lowering a package to "no limit" lifts a
+    limit set earlier instead of leaving it behind. MAX_USER_CONNECTIONS and
+    MAX_STATEMENT_TIME (enforce_db_user_resource_limits) are left as they are.
+    """
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    return (
+        f"ALTER USER {_quote_sql_string(safe_user)}@'localhost' WITH"
+        f" MAX_QUERIES_PER_HOUR {_hourly_value(max_queries_per_hour)}"
+        f" MAX_UPDATES_PER_HOUR {_hourly_value(max_updates_per_hour)}"
+        f" MAX_CONNECTIONS_PER_HOUR {_hourly_value(max_connections_per_hour)};\n"
+    )
+
+
+def owner_hourly_limits(owner) -> tuple[int, int, int]:
+    """The hourly limits a panel user's package gave them."""
+    return (
+        _hourly_value(getattr(owner, "mysql_max_queries_per_hour", 0)),
+        _hourly_value(getattr(owner, "mysql_max_updates_per_hour", 0)),
+        _hourly_value(getattr(owner, "mysql_max_connections_per_hour", 0)),
+    )
+
+
+def enforce_db_user_hourly_limits(
+    db_user: str,
+    max_queries_per_hour: int = 0,
+    max_updates_per_hour: int = 0,
+    max_connections_per_hour: int = 0,
+) -> bool:
+    sql = hourly_limits_sql(db_user, max_queries_per_hour, max_updates_per_hour, max_connections_per_hour)
+    if settings.command_dry_run:
+        return True
+    return _run_sql(sql, check=False).returncode == 0
 
 
 def ensure_mysql_governor_settings() -> None:

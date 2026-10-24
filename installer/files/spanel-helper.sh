@@ -19,6 +19,14 @@ fi
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# sudo keeps the caller's working directory, which for the API is the
+# spanel-owned backend/. `python3 - <<PY` puts the working directory first
+# on sys.path, so a planted json.py there would run as root. Start every
+# command from / and tell Python 3.11+ not to add the directory at all.
+cd /
+PYTHONSAFEPATH=1
+export PYTHONSAFEPATH
+
 ALLOWED_SERVICES=(nginx mariadb redis-server fail2ban clamav-daemon exim4 dovecot rspamd pdns maldet docker php5.6-fpm php7.4-fpm php8.0-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm spanel-api)
 ALLOWED_ACTIONS=(start stop restart reload status is-active is-enabled)
 HOME_ROOT="/home"
@@ -93,6 +101,24 @@ NGINX_HTTP_FLOOD_ZONES="${NGINX_BLOCKLIST_DIR}/http-flood-zones.conf"
 NGINX_HTTP_FLOOD_SERVER_CONF="${NGINX_BLOCKLIST_DIR}/http-flood-server.conf"
 PHP_FPM_DEFAULT_WORKER_MB=128
 PHP_FPM_DEFAULT_REQUEST_TERMINATE_TIMEOUT=300
+# Per-account PHP-FPM masters. Every hosting account gets one php-fpm master
+# per PHP version, run as spanel-php<ver>-fpm@<user>.service with
+# Slice=user-<uid>.slice, so the master and every worker it forks are born
+# under the account's CPU/memory/IO/tasks limits instead of being moved there
+# by a later scan. Pools live in ${SPANEL_PHP_FPM_ROOT}/<ver>/<user>/pool.d and
+# listen on ${SPANEL_PHP_RUN_ROOT}/<user>/<pool>.sock. The distro php<ver>-fpm
+# master stays for phpMyAdmin and the panel tools, and still serves any pool in
+# /etc/php/<ver>/fpm/pool.d that has not moved (or could not move) yet.
+# backend/app/services/site_users.py names the same paths; a test holds the two
+# together.
+SPANEL_PHP_FPM_ROOT="/etc/spanel/php-fpm"
+SPANEL_PHP_RUN_ROOT="/run/spanel-php"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+PHP_ETC_ROOT="/etc/php"
+PHP_LOG_DIR="/var/log/php"
+PHP_FPM_SBIN_DIR="/usr/sbin"
+# Both socket layouts, as they appear in a vhost's fastcgi_pass.
+PHP_FPM_SOCKET_GREP='(/run/php/[A-Za-z0-9._-]+|/run/spanel-php/[a-z0-9_-]+/[A-Za-z0-9._-]+)\.sock'
 MARIADB_TUNING_CONF="/etc/mysql/mariadb.conf.d/90-spanel-tuning.cnf"
 
 deny() { echo "spanel-helper: $*" >&2; exit 1; }
@@ -320,10 +346,108 @@ server {
 }
 NGINX
   sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${api_scheme}://127.0.0.1:${port}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
-  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
+  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php /etc/phpmyadmin/conf.d/spanel-remote-servers.php 2>/dev/null || true
   [[ -n "$host" ]] && sed -i -E "/PmaAbsoluteUri/s#'https?://[^']+/phpmyadmin/'#'${tools_scheme}://${host}/phpmyadmin/'#" /etc/phpmyadmin/conf.d/spanel-signon.php 2>/dev/null || true
   nginx -t
   systemctl reload nginx || true
+}
+
+# phpMyAdmin servers 2..99 are the panel's remote MySQL hosts (server 1 is the
+# local MariaDB, configured by spanel-signon.php). The panel sends the list as
+# INDEX,HOST,PORT,TLS,CA tuples; nothing free-form reaches the PHP file.
+PMA_CONF_DIR="/etc/phpmyadmin/conf.d"
+PMA_REMOTE_SERVERS_CONF="${PMA_CONF_DIR}/spanel-remote-servers.php"
+PMA_REMOTE_CA_DIR="/etc/phpmyadmin/spanel-remote-ca"
+PMA_REMOTE_SPEC_RE='^([0-9]{1,2}),([A-Za-z0-9][A-Za-z0-9.:-]{0,252}),([0-9]{1,5}),([01]),([01])$'
+
+write_phpmyadmin_remote_ca() {
+  # CA bundle for one remote host, PEM on stdin. Only what openssl parses as
+  # certificates is written back out, so nothing else sent here reaches disk.
+  local index="$1" payload out
+  [[ -d "$PMA_CONF_DIR" ]] || deny "phpMyAdmin is not installed"
+  payload="$(mktemp)"
+  head -c 65536 >"$payload"
+  install -d -o root -g www-data -m 0750 "$PMA_REMOTE_CA_DIR"
+  out="$(mktemp "${PMA_REMOTE_CA_DIR}/.ca-${index}.XXXXXX")"
+  if ! openssl crl2pkcs7 -nocrl -certfile "$payload" 2>/dev/null | openssl pkcs7 -print_certs -out "$out" 2>/dev/null \
+      || ! grep -q -- "-----BEGIN CERTIFICATE-----" "$out"; then
+    rm -f "$payload" "$out"
+    deny "phpmyadmin-remote-ca: stdin is not a PEM certificate"
+  fi
+  rm -f "$payload"
+  chown root:www-data "$out"
+  chmod 0640 "$out"
+  mv -f "$out" "${PMA_REMOTE_CA_DIR}/${index}.pem"
+}
+
+write_phpmyadmin_remote_servers() {
+  local spec index host port tls ca secure tmp name f
+  local -a keep=()
+  if [[ ! -d "$PMA_CONF_DIR" ]]; then
+    echo "phpMyAdmin is not installed; nothing to configure"
+    return 0
+  fi
+  secure="false"
+  grep -Eq "'secure' => true" "${PMA_CONF_DIR}/spanel-signon.php" 2>/dev/null && secure="true"
+  tmp="$(mktemp "${PMA_CONF_DIR}/.spanel-remote-servers.XXXXXX")"
+  printf '%s\n' "<?php" "// Managed by SPanel (spanel-helper phpmyadmin-remote-servers): the panel's" \
+    "// remote MySQL hosts. Server 1 is the local MariaDB. Do not edit." >"$tmp"
+  for spec in "$@"; do
+    if [[ ! "$spec" =~ $PMA_REMOTE_SPEC_RE ]]; then
+      rm -f "$tmp"; deny "phpmyadmin-remote-servers: invalid server spec"
+    fi
+    # Decimal, so "08" can neither become a bad PHP octal literal nor miss 8.pem.
+    index="$((10#${BASH_REMATCH[1]}))"; host="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[3]}"
+    tls="${BASH_REMATCH[4]}"; ca="${BASH_REMATCH[5]}"
+    if (( 10#$index < 2 || 10#$index > 99 || 10#$port < 1 || 10#$port > 65535 )); then
+      rm -f "$tmp"; deny "phpmyadmin-remote-servers: index or port out of range"
+    fi
+    cat >>"$tmp" <<PHP
+\$cfg['Servers'][${index}] = [
+    'verbose' => 'Remote MySQL ${host}:${port}',
+    'host' => '${host}',
+    'port' => '${port}',
+    'auth_type' => 'signon',
+    'SignonSession' => 'SPanelPmaSignon',
+    'SignonURL' => '/phpmyadmin/spanel-signon.php',
+    'SignonCookieParams' => [
+        'lifetime' => 0,
+        'path' => '/',
+        'domain' => '',
+        'secure' => ${secure},
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ],
+    'AllowNoPassword' => false,
+PHP
+    if [[ "$tls" == "1" ]]; then
+      printf '%s\n' "    'ssl' => true," "    'ssl_verify' => true," >>"$tmp"
+      if [[ "$ca" == "1" ]]; then
+        if [[ ! -f "${PMA_REMOTE_CA_DIR}/${index}.pem" ]]; then
+          rm -f "$tmp"; deny "phpmyadmin-remote-servers: no CA for server ${index}; send it with phpmyadmin-remote-ca first"
+        fi
+        printf '%s\n' "    'ssl_ca' => '${PMA_REMOTE_CA_DIR}/${index}.pem'," >>"$tmp"
+        keep+=("${index}.pem")
+      else
+        printf '%s\n' "    'ssl_ca_path' => '/etc/ssl/certs'," >>"$tmp"
+      fi
+    fi
+    printf '%s\n' "];" >>"$tmp"
+  done
+  if command -v php >/dev/null 2>&1 && ! php -l "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; deny "phpmyadmin-remote-servers: generated config does not parse"
+  fi
+  chown root:www-data "$tmp"
+  chmod 0640 "$tmp"
+  mv -f "$tmp" "$PMA_REMOTE_SERVERS_CONF"
+  if [[ -d "$PMA_REMOTE_CA_DIR" ]]; then
+    for f in "$PMA_REMOTE_CA_DIR"/*.pem; do
+      [[ -e "$f" ]] || continue
+      name="$(basename -- "$f")"
+      [[ " ${keep[*]:-} " == *" ${name} "* ]] || rm -f -- "$f"
+    done
+  fi
+  echo "phpMyAdmin remote servers: $#"
 }
 
 configure_unattended_upgrades() {
@@ -405,19 +529,96 @@ run_os_update() {
   echo "OS update started in background. Log: /var/log/spanel-os-update.log"
 }
 
+CORE_STACK_BLACKLIST_FILE="/etc/apt/apt.conf.d/52spanel-core-stack-blacklist"
+
+# The unit to reload after a core stack package changed version. Empty where
+# the package's own postinst already restarts the daemon (MariaDB, Redis,
+# PowerDNS) or there is no daemon (openssl).
+core_stack_reload_unit() {
+  case "$1" in
+    nginx) echo nginx ;;
+    exim4-daemon-heavy) echo exim4 ;;
+    dovecot-core) echo dovecot ;;
+    rspamd) echo rspamd ;;
+    fail2ban) echo fail2ban ;;
+    *) echo "" ;;
+  esac
+}
+
+# Package-Blacklist entries for one core stack package: the binary packages
+# that come from the same source and move together. unattended-upgrades
+# matches each entry as a Python regex anchored at the start of the name.
+core_stack_blacklist_patterns() {
+  case "$1" in
+    nginx) printf '%s\n' '^nginx$' '^nginx-(common|core|full|light|extras)$' '^libnginx-mod-' ;;
+    mariadb-server) printf '%s\n' '^mariadb-' '^libmariadb' '^mysql-common$' ;;
+    redis-server) printf '%s\n' '^redis-(server|tools)$' ;;
+    pdns-server) printf '%s\n' '^pdns-' ;;
+    exim4-daemon-heavy) printf '%s\n' '^exim4' ;;
+    dovecot-core) printf '%s\n' '^dovecot-' ;;
+    rspamd) printf '%s\n' '^rspamd$' ;;
+    openssl) printf '%s\n' '^openssl$' '^libssl3' ;;
+    fail2ban) printf '%s\n' '^fail2ban$' ;;
+    *) return 1 ;;
+  esac
+}
+
+# The apt.conf.d snippet that keeps unattended-upgrades off the packages the
+# panel patches itself, so exactly one mechanism upgrades them: the panel's,
+# inside its maintenance window and with nginx -t before and after.
+render_core_blacklist() {
+  local pkg pattern
+  echo "// Managed by SPanel. These packages are patched by the panel's scheduled"
+  echo "// core stack patching (maintenance window, nginx -t before and after);"
+  echo "// turning that off in Updates removes this file."
+  echo "Unattended-Upgrade::Package-Blacklist {"
+  for pkg in "$@"; do
+    while IFS= read -r pattern; do
+      [[ -n "$pattern" ]] && printf '    "%s";\n' "$pattern"
+    done < <(core_stack_blacklist_patterns "$pkg")
+  done
+  echo "};"
+}
+
+set_core_stack_blacklist() {
+  local mode="${1:-}" pkg tmp
+  shift || true
+  case "$mode" in
+    off)
+      [[ $# -eq 0 ]] || deny "usage: updates-core-blacklist off"
+      rm -f "$CORE_STACK_BLACKLIST_FILE"
+      echo "core stack blacklist removed"
+      ;;
+    on)
+      [[ $# -ge 1 ]] || deny "usage: updates-core-blacklist on <pkg> [pkg...]"
+      for pkg in "$@"; do
+        core_stack_blacklist_patterns "$pkg" >/dev/null || deny "core stack package not allowed: $pkg"
+      done
+      install -d -m 0755 /etc/apt/apt.conf.d
+      tmp="$(mktemp "${CORE_STACK_BLACKLIST_FILE}.XXXXXX")"
+      render_core_blacklist "$@" >"$tmp"
+      chmod 0644 "$tmp"
+      mv -f "$tmp" "$CORE_STACK_BLACKLIST_FILE"
+      echo "core stack blacklist written: $*"
+      ;;
+    *)
+      deny "usage: updates-core-blacklist <on|off> [pkg...]"
+      ;;
+  esac
+}
+
 upgrade_core_stack_packages() {
   export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
-  local valid_pkgs=() pkg need_nginx_check=0 hold_after=0
+  local valid_pkgs=() pkg need_nginx_check=0 unit after
+  local changed=() reloaded=()
+  declare -A before=()
   for pkg in "$@"; do
     case "$pkg" in
-      --hold)
-        hold_after=1
-        ;;
       nginx)
         valid_pkgs+=("nginx")
         need_nginx_check=1
         ;;
-      mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|postfix|dovecot-core|rspamd|openssl|fail2ban)
+      mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|dovecot-core|rspamd|openssl|fail2ban)
         valid_pkgs+=("$pkg")
         ;;
       *)
@@ -431,22 +632,46 @@ upgrade_core_stack_packages() {
     nginx -t >/dev/null 2>&1 || deny "nginx -t pre-upgrade configuration test failed"
   fi
 
+  for pkg in "${valid_pkgs[@]}"; do
+    before[$pkg]="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+  done
+
+  # Holds are not used any more (they block security updates too); undo any
+  # an older panel left behind so --only-upgrade can move these packages.
   apt-mark unhold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
   apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true
   local upgrade_rc=0
-  apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
-  if [[ "$hold_after" -eq 1 ]]; then
-    apt-mark hold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
-  fi
-
+  apt-get install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
   [[ "$upgrade_rc" -eq 0 ]] || deny "apt-get --only-upgrade failed for core stack packages"
 
+  for pkg in "${valid_pkgs[@]}"; do
+    after="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+    if [[ -n "${before[$pkg]}" && "$after" != "${before[$pkg]}" ]]; then
+      changed+=("$pkg")
+    fi
+  done
+  echo "upgraded=$(IFS=,; echo "${changed[*]:-}")"
+
   if [[ "$need_nginx_check" -eq 1 ]] && command -v nginx >/dev/null 2>&1; then
-    nginx -t >/dev/null 2>&1 || deny "nginx -t post-upgrade configuration test failed"
-    systemctl reload nginx >/dev/null 2>&1 || true
+    if ! nginx -t >/dev/null 2>&1; then
+      # Leave the running nginx alone: a reload with a config the new
+      # binary rejects would take every site down.
+      echo "post_check=failed:nginx"
+      deny "nginx -t post-upgrade configuration test failed; nginx was not reloaded"
+    fi
   fi
 
-  echo "Core stack packages selectively upgraded: ${valid_pkgs[*]}"
+  for pkg in "${changed[@]:-}"; do
+    [[ -n "$pkg" ]] || continue
+    unit="$(core_stack_reload_unit "$pkg")"
+    [[ -n "$unit" ]] || continue
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      systemctl reload "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || true
+      reloaded+=("$unit")
+    fi
+  done
+  echo "reloaded=$(IFS=,; echo "${reloaded[*]:-}")"
+  echo "post_check=ok"
 }
 
 ensure_cron_jail_binary() {
@@ -459,6 +684,28 @@ ensure_cron_jail_binary() {
 
 
 PANEL_SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+PANEL_DB_BACKUP_DIR="${SPANEL_DATA_DIR}/db-backups"
+DEFAULT_SNAPSHOT_KEEP=5
+# The units that open spanel.db. All of them are stopped while the file is
+# swapped: a oneshot still holding the old file would write into a WAL that
+# no longer belongs to the database on disk.
+SPANEL_DB_TIMERS=(spanel-backup-scheduler.timer spanel-malware-scheduler.timer spanel-notify.timer spanel-watchdog.timer spanel-maintenance.timer)
+SPANEL_DB_ONESHOTS=(spanel-backup-scheduler.service spanel-malware-scheduler.service spanel-notify.service spanel-watchdog.service spanel-maintenance.service)
+# What spanel-update rewrites outside the code tree, relative to /. A rollback
+# that restores the code but keeps the new units or the new tools vhost is
+# half a rollback.
+PANEL_SNAPSHOT_SYSTEM_GLOBS=(
+  "etc/systemd/system/spanel-*.service"
+  "etc/systemd/system/spanel-*.timer"
+  "etc/systemd/system/spanel-api.service.d"
+  "etc/nginx/conf.d/00-spanel-*.conf"
+  "etc/sudoers.d/spanel"
+  "usr/local/sbin/spanel"
+  "usr/local/sbin/spanel-api-start"
+  "usr/local/sbin/spanel-memory-guard"
+  "usr/local/sbin/spanel-change-ip"
+  "usr/local/bin/spanel-cron-jail"
+)
 
 panel_current_version() {
   local ver="1.0.0"
@@ -468,11 +715,135 @@ panel_current_version() {
   [[ -n "$ver" ]] && echo "$ver" || echo "1.0.0"
 }
 
+# The panel's SQLite file, from DATABASE_URL in .env. Only an absolute
+# sqlite:/// path with plain characters is accepted.
+panel_db_path() {
+  local url path
+  url="$(env_get DATABASE_URL)"
+  if [[ "$url" =~ ^sqlite:///(/[A-Za-z0-9._/-]+\.db)$ ]]; then
+    path="${BASH_REMATCH[1]}"
+  else
+    path="${APP_DIR}/backend/spanel.db"
+  fi
+  [[ "$path" != *..* ]] || deny "invalid database path"
+  echo "$path"
+}
+
+# The system python and its stdlib only (-I: no user site, no cwd on the path).
+# Never the panel's venv: that would be panel-writable code running as root.
+sqlite_online_copy() {
+  /usr/bin/python3 -I - "$1" "$2" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+PY
+}
+
+sqlite_integrity_ok() {
+  /usr/bin/python3 -I - "$1" <<'PY'
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+    row = conn.execute("PRAGMA integrity_check").fetchone()
+    tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+    conn.close()
+except sqlite3.Error as exc:
+    print(f"integrity_check: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not row or row[0] != "ok" or tables == 0:
+    print(f"integrity_check: {row[0] if row else 'no answer'} ({tables} tables)", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+sqlite_alembic_revision() {
+  /usr/bin/python3 -I - "$1" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    print(",".join(r[0] for r in conn.execute("SELECT version_num FROM alembic_version")))
+except sqlite3.Error:
+    pass
+PY
+}
+
+# Replace the panel database with <src>, safely:
+#   1. integrity_check the replacement before anything is stopped;
+#   2. stop the API and every timer/oneshot that opens the database;
+#   3. keep the current database (read through its WAL) as
+#      <db>.pre-restore-<ts>, so nothing is ever lost by a restore;
+#   4. drop -wal/-shm (they belong to the old file) and move the copy in;
+#   5. start what was running again.
+swap_panel_db() {
+  local src="$1" db ts timer tmp
+  local -a active_timers=()
+  db="$(panel_db_path)"
+  [[ -f "$src" ]] || deny "database copy not found"
+  sqlite_integrity_ok "$src" || deny "the database copy failed PRAGMA integrity_check; nothing was changed"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  tmp="${db}.restore-${ts}"
+  install -m 0640 -o spanel -g spanel "$src" "$tmp"
+
+  for timer in "${SPANEL_DB_TIMERS[@]}"; do
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then
+      active_timers+=("$timer")
+    fi
+  done
+  systemctl stop "${SPANEL_DB_TIMERS[@]}" >/dev/null 2>&1 || true
+  systemctl stop spanel-api >/dev/null 2>&1 || true
+  # A oneshot already running is given a minute to finish, never killed: the
+  # maintenance runner may be half-way through apt, the backup runner through
+  # an archive. One still running after that keeps the old file open and
+  # writes there - a lost status line, not a damaged database (SQLite locks
+  # by inode, and the copy moved in below is a new one).
+  local deadline=$((SECONDS + 60)) unit
+  for unit in "${SPANEL_DB_ONESHOTS[@]}"; do
+    while systemctl is-active --quiet "$unit" 2>/dev/null && (( SECONDS < deadline )); do
+      sleep 2
+    done
+  done
+
+  if [[ -f "$db" ]]; then
+    sqlite_online_copy "$db" "${db}.pre-restore-${ts}" || cp -a "$db" "${db}.pre-restore-${ts}"
+    chown spanel:spanel "${db}.pre-restore-${ts}" 2>/dev/null || true
+    chmod 0640 "${db}.pre-restore-${ts}" 2>/dev/null || true
+  fi
+  rm -f "${db}-wal" "${db}-shm"
+  mv -f "$tmp" "$db"
+  # Keep the three newest pre-restore copies.
+  ls -1t "${db}".pre-restore-* 2>/dev/null | tail -n +4 | xargs -r rm -f || true
+
+  systemctl start spanel-api >/dev/null 2>&1 || true
+  for timer in "${active_timers[@]:-}"; do
+    [[ -n "$timer" ]] && systemctl start "$timer" >/dev/null 2>&1 || true
+  done
+  echo "database_restored=${db} previous=${db}.pre-restore-${ts}"
+}
+
+panel_snapshot_prune() {
+  local keep="$1" s
+  local old_snaps=()
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && old_snaps+=("$s")
+  done < <(ls -1t "${PANEL_SNAPSHOT_DIR}"/snapshot-*.tar.gz 2>/dev/null | tail -n +"$((keep + 1))" || true)
+  for s in "${old_snaps[@]:-}"; do
+    [[ -n "$s" ]] || continue
+    rm -f "$s" "${s%.tar.gz}.json" 2>/dev/null || true
+  done
+}
+
 panel_snapshot_create() {
-  local reason="${1:-manual}"
+  local reason="${1:-manual}" keep="${2:-$DEFAULT_SNAPSHOT_KEEP}"
   [[ "$reason" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || reason="manual"
+  [[ "$keep" =~ ^[0-9]{1,2}$ ]] || deny "snapshot keep must be a number"
+  (( keep >= 1 && keep <= 20 )) || deny "snapshot keep must be between 1 and 20"
   install -d -o root -g spanel -m 0750 "$PANEL_SNAPSHOT_DIR"
-  local ver ts snap_id work tar_path meta_path size_bytes
+  local ver ts snap_id work tar_path meta_path size_bytes db revision="" glob path
+  local -a system_paths=()
   ver="$(panel_current_version)"
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   snap_id="snapshot-v${ver}-${ts}"
@@ -488,12 +859,31 @@ panel_snapshot_create() {
   [[ -f "/usr/local/sbin/spanel-helper" ]] && cp -a "/usr/local/sbin/spanel-helper" "$work/sbin/spanel-helper"
   [[ -f "/usr/local/sbin/spanel-update" ]] && cp -a "/usr/local/sbin/spanel-update" "$work/sbin/spanel-update"
 
-  if [[ -f "${APP_DIR}/backend/spanel.db" ]]; then
-    if command -v sqlite3 >/dev/null 2>&1; then
-      sqlite3 "${APP_DIR}/backend/spanel.db" ".backup '${work}/backend/spanel.db.bak'" 2>/dev/null || cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    else
-      cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    fi
+  # The database through SQLite's online backup API, which reads committed
+  # pages from the WAL too: a plain cp of a WAL-mode file can miss them.
+  # Taken before spanel-update runs any migration, so restoring it is what
+  # reverses one (Alembic downgrades are not written for this schema).
+  db="$(panel_db_path)"
+  if [[ -f "$db" ]]; then
+    sqlite_online_copy "$db" "$work/backend/spanel.db.bak" || cp -a "$db" "$work/backend/spanel.db.bak"
+    revision="$(sqlite_alembic_revision "$work/backend/spanel.db.bak")"
+  fi
+
+  # The virtualenv is ~160 MB, too much to keep five copies of. Its exact
+  # package set is recorded instead; a rollback reinstalls it when it differs.
+  if [[ -x "${APP_DIR}/backend/.venv/bin/python" ]]; then
+    "${APP_DIR}/backend/.venv/bin/python" -m pip freeze --all >"$work/backend/pip-freeze.txt" 2>/dev/null || rm -f "$work/backend/pip-freeze.txt"
+  fi
+
+  shopt -s nullglob
+  for glob in "${PANEL_SNAPSHOT_SYSTEM_GLOBS[@]}"; do
+    for path in /$glob; do
+      [[ -e "$path" && ! -L "$path" ]] && system_paths+=("${path#/}")
+    done
+  done
+  shopt -u nullglob
+  if [[ ${#system_paths[@]} -gt 0 ]]; then
+    tar -C / -cpf "$work/system.tar" "${system_paths[@]}" 2>/dev/null || rm -f "$work/system.tar"
   fi
 
   tar -czf "$tar_path" -C "$work" .
@@ -508,30 +898,131 @@ panel_snapshot_create() {
   "version": "${ver}",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "size_bytes": ${size_bytes},
-  "reason": "${reason}"
+  "reason": "${reason}",
+  "db_revision": "${revision}",
+  "has_db": $([[ -n "$revision" || -f "$db" ]] && echo true || echo false),
+  "has_system_files": $([[ ${#system_paths[@]} -gt 0 ]] && echo true || echo false)
 }
 EOF
   chmod 0640 "$meta_path"
   chown root:spanel "$meta_path" 2>/dev/null || true
 
-  # Prune old snapshots beyond the newest 5
-  local old_snaps=() s
-  while IFS= read -r s; do
-    [[ -n "$s" ]] && old_snaps+=("$s")
-  done < <(ls -1t "${PANEL_SNAPSHOT_DIR}"/snapshot-*.tar.gz 2>/dev/null | tail -n +6 || true)
-  for s in "${old_snaps[@]:-}"; do
-    [[ -n "$s" ]] || continue
-    rm -f "$s" "${s%.tar.gz}.json" 2>/dev/null || true
-  done
-
+  panel_snapshot_prune "$keep"
   echo "${snap_id}"
 }
 
+# Put the system files of a snapshot back. The current versions are kept
+# aside first; if nginx refuses the restored set, they go back.
+panel_snapshot_restore_system() {
+  local work="$1" saved path
+  local -a paths=()
+  [[ -f "$work/system.tar" ]] || return 0
+  while IFS= read -r path; do
+    [[ -n "$path" && "$path" != /* && "$path" != *..* ]] && paths+=("$path")
+  done < <(tar -tf "$work/system.tar" 2>/dev/null)
+  [[ ${#paths[@]} -gt 0 ]] || return 0
+  saved="$work/system-current.tar"
+  tar -C / -cpf "$saved" --ignore-failed-read "${paths[@]}" 2>/dev/null || true
+  tar -C / -xpf "$work/system.tar"
+  # Units the newer release added and the snapshot's release does not know:
+  # left in place they would start code that is no longer there.
+  local unit_file unit
+  local -A in_snapshot=()
+  for path in "${paths[@]}"; do
+    in_snapshot["$path"]=1
+  done
+  # Only when the snapshot did record units, and never the API itself.
+  if [[ -n "${in_snapshot[etc/systemd/system/spanel-api.service]:-}" ]]; then
+    shopt -s nullglob
+    for unit_file in /etc/systemd/system/spanel-*.service /etc/systemd/system/spanel-*.timer; do
+      [[ "$unit_file" == /etc/systemd/system/spanel-api.service ]] && continue
+      if [[ -z "${in_snapshot[${unit_file#/}]:-}" ]]; then
+        unit="$(basename "$unit_file")"
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        rm -f "$unit_file"
+      fi
+    done
+    shopt -u nullglob
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    echo "restored nginx files fail nginx -t; keeping the current ones" >&2
+    [[ -f "$saved" ]] && tar -C / -xpf "$saved" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  visudo -c -f /etc/sudoers.d/spanel >/dev/null 2>&1 || {
+    [[ -f "$saved" ]] && tar -C / -xpf "$saved" etc/sudoers.d/spanel 2>/dev/null || true
+  }
+}
+
+panel_snapshot_restore_venv() {
+  local work="$1" current
+  [[ -f "$work/backend/pip-freeze.txt" && -x "${APP_DIR}/backend/.venv/bin/python" ]] || return 0
+  current="$(mktemp)"
+  "${APP_DIR}/backend/.venv/bin/python" -m pip freeze --all >"$current" 2>/dev/null || true
+  if ! cmp -s "$current" "$work/backend/pip-freeze.txt"; then
+    echo "Python packages differ from the snapshot; reinstalling the recorded set" >&2
+    "${APP_DIR}/backend/.venv/bin/python" -m pip install --no-input -q -r "$work/backend/pip-freeze.txt" >&2 \
+      || echo "pip could not reinstall the recorded packages; the panel may need: spanel-update" >&2
+  fi
+  rm -f "$current"
+}
+
+# Record the outcome of a restore that ran detached from the API, so the
+# Updates page does not show "rolling back" forever. The directory belongs to
+# the panel account: never follow a link it planted, write a fresh file and
+# rename it over the old name.
+panel_update_state_set() {
+  local status="$1" message="$2" snap="$3"
+  /usr/bin/python3 -I - "${SPANEL_DATA_DIR}/update-status.json" "$status" "$message" "$snap" <<'PY' || true
+import json, os, sys, tempfile, time
+path, status, message, snap = sys.argv[1:5]
+state = {}
+if os.path.isfile(path) and not os.path.islink(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = {}
+state.update({"last_update_status": status, "progress_phase": status, "progress_percent": 100,
+              "progress_message": message, "last_update_message": message, "rollback_snapshot_id": snap,
+              "last_update_finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".update-status.")
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(state, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+PY
+  chown spanel:spanel "${SPANEL_DATA_DIR}/update-status.json" 2>/dev/null || true
+}
+
 panel_snapshot_restore() {
-  local snap_id="${1:-}"
+  local snap_id="${1:-}" restore_db="" now="" arg
   [[ "$snap_id" =~ ^snapshot-[A-Za-z0-9._-]+$ ]] || deny "invalid snapshot id: $snap_id"
+  shift || true
+  for arg in "$@"; do
+    case "$arg" in
+      --restore-db) restore_db=1 ;;
+      --now) now=1 ;;
+      *) deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db] [--now]" ;;
+    esac
+  done
   local tar_path="${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz"
   [[ -f "$tar_path" ]] || deny "snapshot not found: $snap_id"
+
+  # From the API this runs inside spanel-api's own cgroup, and stopping
+  # spanel-api (to swap the database, or to restart it) would kill this
+  # very process half-way. Run the restore in a unit of its own instead.
+  if [[ -z "$now" ]] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --unit="spanel-snapshot-restore-$(date +%s)" --collect \
+      --description="SPanel snapshot restore ${snap_id}" \
+      --on-active=2s \
+      --setenv=SUDO_USER=spanel \
+      /usr/local/sbin/spanel-helper panel-snapshot-restore "$snap_id" ${restore_db:+--restore-db} --now >/dev/null
+    echo "scheduled=${snap_id}"
+    return 0
+  fi
 
   local work
   work="$(mktemp -d /tmp/spanel-restore.XXXXXX)"
@@ -568,15 +1059,20 @@ panel_snapshot_restore() {
     chown root:root "/usr/local/sbin/spanel-update.new" 2>/dev/null || true
     mv -f "/usr/local/sbin/spanel-update.new" "/usr/local/sbin/spanel-update"
   fi
-  if [[ -f "$work/backend/spanel.db.bak" && "${2:-}" == "--restore-db" ]]; then
-    cp -a "$work/backend/spanel.db.bak" "${APP_DIR}/backend/spanel.db"
-    chown spanel:spanel "${APP_DIR}/backend/spanel.db" 2>/dev/null || true
+  panel_snapshot_restore_system "$work"
+  panel_snapshot_restore_venv "$work"
+
+  if [[ -n "$restore_db" && -f "$work/backend/spanel.db.bak" ]]; then
+    # swap_panel_db stops and starts spanel-api itself.
+    swap_panel_db "$work/backend/spanel.db.bak"
+  else
+    systemctl restart spanel-api >/dev/null 2>&1 || true
   fi
 
   rm -rf "$work"
   rm -rf /var/lib/spanel/update-state 2>/dev/null || true
-  systemctl restart spanel-api >/dev/null 2>&1 || true
   systemctl reload nginx >/dev/null 2>&1 || true
+  panel_update_state_set "rolled_back" "Restored snapshot ${snap_id}${restore_db:+ (database included)}." "$snap_id"
   echo "restored=${snap_id}"
 }
 
@@ -585,6 +1081,283 @@ panel_snapshot_delete() {
   [[ "$snap_id" =~ ^snapshot-[A-Za-z0-9._-]+$ ]] || deny "invalid snapshot id: $snap_id"
   rm -f "${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz" "${PANEL_SNAPSHOT_DIR}/${snap_id}.json" 2>/dev/null || true
   echo "deleted=${snap_id}"
+}
+
+# ---- panel self-backup (disaster recovery) ----------------------------------
+# One encrypted archive of everything that makes this server this panel and is
+# not in the per-account backups: the panel database and .env (SECRET_KEY
+# decrypts every stored secret), /etc/spanel, certificates, the nginx/PHP/mail
+# configuration the panel wrote, DKIM keys and the PowerDNS zones.
+#
+# It is encrypted here, as root, with a passphrase only root can read
+# (PANEL_DR_KEY_FILE). The panel account uploads the result but cannot open
+# it: the archive holds secrets - the audit key, DKIM private keys - that the
+# panel account itself is not meant to be able to read back from a bucket.
+PANEL_DR_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-dr"
+PANEL_DR_KEY_FILE="/etc/spanel/dr-passphrase"
+PANEL_DR_KEEP_LOCAL=3
+# Relative to /. Globs are expanded; what does not exist is skipped.
+PANEL_DR_PATHS=(
+  "opt/spanel/backend/.env"
+  "etc/spanel"
+  "var/lib/spanel"
+  "etc/nginx/nginx.conf"
+  "etc/nginx/conf.d"
+  "etc/nginx/spanel"
+  "etc/php/*/fpm/pool.d"
+  "etc/php/*/fpm/conf.d/*spanel*"
+  "etc/php/*/cli/conf.d/*spanel*"
+  "etc/exim4"
+  "etc/dovecot"
+  "etc/rspamd/local.d"
+  "etc/rspamd/override.d"
+  "etc/spanel-mail-tls"
+  "etc/powerdns"
+  "etc/letsencrypt"
+  "etc/mysql/mariadb.conf.d/90-spanel-tuning.cnf"
+  "etc/ssh/sshd_config.d"
+  "etc/sudoers.d/spanel"
+  "etc/systemd/system/spanel-*.service"
+  "etc/systemd/system/spanel-*.timer"
+  "var/spool/cron/crontabs"
+)
+# Never in the archive: the passphrase that encrypts it, bulky caches and
+# copies that are themselves backups.
+PANEL_DR_EXCLUDES=(
+  "etc/spanel/dr-passphrase"
+  "var/lib/spanel/db-backups"
+  "var/lib/spanel/geoip"
+  "var/lib/spanel/malware-scan-jobs"
+  "var/lib/spanel/da-import"
+  "var/lib/spanel/import-stage"
+  "*.sock"
+)
+
+# The include list, relative to <root> (/ on a server; a test points it at a
+# fixture tree). The app directory is taken from APP_DIR when it differs.
+panel_dr_include_paths() {
+  local root="${1:-/}" glob path app_rel
+  app_rel="${APP_DIR#/}"
+  shopt -s nullglob
+  for glob in "${PANEL_DR_PATHS[@]}"; do
+    glob="${glob/opt\/spanel/$app_rel}"
+    for path in "${root%/}"/$glob; do
+      [[ -e "$path" && ! -L "$path" ]] || continue
+      printf '%s\n' "${path#"${root%/}"/}"
+    done
+  done
+  shopt -u nullglob
+}
+
+panel_dr_fingerprint() {
+  /usr/bin/python3 -I - "$PANEL_DR_KEY_FILE" <<'PY'
+import hashlib, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = handle.readline().strip()
+print(hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16])
+PY
+}
+
+panel_dr_key_status() {
+  if [[ -s "$PANEL_DR_KEY_FILE" ]]; then
+    echo "initialised=yes"
+    echo "fingerprint=$(panel_dr_fingerprint)"
+  else
+    echo "initialised=no"
+  fi
+}
+
+# Generate the passphrase and print it, once. It is not printed again by
+# anything: the panel shows it to the administrator, who must keep a copy
+# off this server - without it the archive cannot be opened on a new one.
+panel_dr_key_init() {
+  local mode="${1:-}" tmp
+  if [[ -s "$PANEL_DR_KEY_FILE" && "$mode" != "--rotate" ]]; then
+    deny "the panel self-backup passphrase is already set; rotate it explicitly"
+  fi
+  [[ -z "$mode" || "$mode" == "--rotate" ]] || deny "usage: panel-dr-key-init [--rotate]"
+  install -d -o root -g spanel -m 0750 /etc/spanel
+  tmp="$(mktemp /etc/spanel/.dr-passphrase.XXXXXX)"
+  chmod 0600 "$tmp"
+  /usr/bin/python3 -I -c 'import secrets; print(secrets.token_urlsafe(30))' >"$tmp"
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; deny "could not generate a passphrase"; }
+  chown root:root "$tmp"
+  mv -f "$tmp" "$PANEL_DR_KEY_FILE"
+  echo "passphrase=$(head -n 1 "$PANEL_DR_KEY_FILE")"
+  echo "fingerprint=$(panel_dr_fingerprint)"
+}
+
+# Encrypt <plain> to <out> in the panel's backup format: OpenSSL
+# AES-256-CBC with PBKDF2-HMAC-SHA256 (100000 rounds, "Salted__" header),
+# then an SPNLMAC1 + HMAC-SHA256 trailer over header and ciphertext, keyed
+# with bytes 48-80 of the same PBKDF2 output. backup.decrypt_backup_archive
+# and `spanelctl dr-restore` both open it. The passphrase never appears on a
+# command line: openssl reads it from the root-only file.
+panel_dr_encrypt() {
+  local plain="$1" out="$2"
+  openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -md sha256 \
+    -pass file:"$PANEL_DR_KEY_FILE" -in "$plain" -out "$out"
+  /usr/bin/python3 -I - "$out" "$PANEL_DR_KEY_FILE" <<'PY'
+import hashlib, hmac, sys
+path, keyfile = sys.argv[1], sys.argv[2]
+with open(keyfile, encoding="utf-8") as handle:
+    secret = handle.readline().strip()
+with open(path, "rb") as handle:
+    header = handle.read(16)
+    if header[:8] != b"Salted__":
+        sys.exit("openssl did not write a salted header")
+    key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), header[8:16], 100000, dklen=80)
+    mac = hmac.new(key[48:80], digestmod=hashlib.sha256)
+    mac.update(header)
+    while chunk := handle.read(1024 * 1024):
+        mac.update(chunk)
+with open(path, "ab") as handle:
+    handle.write(b"SPNLMAC1" + mac.digest())
+PY
+}
+
+# PowerDNS data the way its backend holds it, plus a plain zone-file export
+# that any backend can load (pdnsutil load-zone).
+panel_dr_dump_pdns() {
+  local out="$1" dbname zone
+  mkdir -p "$out/zones"
+  if [[ -f "$PDNS_DB" ]]; then
+    sqlite_online_copy "$PDNS_DB" "$out/pdns.sqlite3" && echo "gsqlite3" >"$out/backend"
+  elif grep -qs '^launch=.*gmysql' /etc/powerdns/pdns.conf /etc/powerdns/pdns.d/*.conf 2>/dev/null; then
+    dbname="$(awk -F= '/^gmysql-dbname=/{print $2; exit}' /etc/powerdns/pdns.conf /etc/powerdns/pdns.d/*.conf 2>/dev/null || true)"
+    dbname="${dbname:-pdns}"
+    [[ "$dbname" =~ ^[A-Za-z0-9_]{1,64}$ ]] || dbname="pdns"
+    if mysqldump --single-transaction --routines "$dbname" >"$out/pdns.sql" 2>/dev/null; then
+      echo "gmysql:${dbname}" >"$out/backend"
+    else
+      rm -f "$out/pdns.sql"
+    fi
+  fi
+  if command -v pdnsutil >/dev/null 2>&1; then
+    while IFS= read -r zone; do
+      zone="${zone%.}"
+      is_domain "$zone" || continue
+      pdnsutil list-zone "$zone" >"$out/zones/${zone}.zone" 2>/dev/null || rm -f "$out/zones/${zone}.zone"
+    done < <(pdnsutil list-all-zones 2>/dev/null)
+  fi
+}
+
+panel_dr_archive() {
+  [[ -s "$PANEL_DR_KEY_FILE" ]] || deny "set the panel self-backup passphrase first (panel-dr-key-init)"
+  local host ts work name plain out manifest db exclude
+  local -a includes=() tar_excludes=()
+  host="$(hostname -f 2>/dev/null || hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9.-' '-' | cut -c1-63)"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  name="panel-dr-${host}-${ts}"
+  install -d -o root -g spanel -m 0750 "$PANEL_DR_DIR"
+  work="$(mktemp -d /var/tmp/spanel-dr.XXXXXX)"
+  chmod 0700 "$work"
+  PANEL_DR_WORK="$work"   # removed by the EXIT trap set in the command case
+
+  mkdir -p "$work/db" "$work/pdns"
+  db="$(panel_db_path)"
+  [[ -f "$db" ]] && sqlite_online_copy "$db" "$work/db/spanel.db"
+  panel_dr_dump_pdns "$work/pdns"
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && includes+=("$path")
+  done < <(panel_dr_include_paths /)
+  for exclude in "${PANEL_DR_EXCLUDES[@]}"; do
+    tar_excludes+=("--exclude=${exclude}")
+  done
+  # The live database is in db/ as an online copy; the file itself may be
+  # mid-write.
+  tar_excludes+=("--exclude=${db#/}" "--exclude=${db#/}-wal" "--exclude=${db#/}-shm")
+  if [[ ${#includes[@]} -gt 0 ]]; then
+    tar -C / -cpf "$work/files.tar" "${tar_excludes[@]}" --ignore-failed-read "${includes[@]}" 2>/dev/null || true
+  fi
+
+  /usr/bin/python3 -I - "$work" "$host" "$(panel_current_version)" "${includes[@]}" <<'PY'
+import json, os, sqlite3, sys, time
+work, host, version, includes = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+revision = ""
+db = os.path.join(work, "db", "spanel.db")
+if os.path.isfile(db):
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        revision = ",".join(r[0] for r in conn.execute("SELECT version_num FROM alembic_version"))
+        conn.close()
+    except sqlite3.Error:
+        pass
+backend = ""
+backend_file = os.path.join(work, "pdns", "backend")
+if os.path.isfile(backend_file):
+    backend = open(backend_file, encoding="utf-8").read().strip()
+zones = sorted(f[:-5] for f in os.listdir(os.path.join(work, "pdns", "zones")) if f.endswith(".zone")) \
+    if os.path.isdir(os.path.join(work, "pdns", "zones")) else []
+manifest = {
+    "kind": "spanel_panel_dr",
+    "format": 1,
+    "hostname": host,
+    "panel_version": version,
+    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "db_revision": revision,
+    "has_database": os.path.isfile(db),
+    "pdns_backend": backend,
+    "dns_zones": len(zones),
+    "paths": includes,
+}
+with open(os.path.join(work, "manifest.json"), "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+PY
+
+  plain="$work/${name}.tar.gz"
+  tar -C "$work" -czf "$plain" manifest.json db pdns $([[ -f "$work/files.tar" ]] && echo files.tar)
+  out="${PANEL_DR_DIR}/${name}.spdr"
+  manifest="${PANEL_DR_DIR}/${name}.json"
+  panel_dr_encrypt "$plain" "$out.tmp"
+  mv -f "$out.tmp" "$out"
+  # The manifest beside the archive is plain and holds no secret: what is in
+  # it, for the page and for a person choosing which archive to restore.
+  /usr/bin/python3 -I - "$work/manifest.json" "$out" "$manifest" <<'PY'
+import hashlib, json, os, sys
+src, archive, dst = sys.argv[1:4]
+data = json.load(open(src, encoding="utf-8"))
+digest = hashlib.sha256()
+with open(archive, "rb") as handle:
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+data.update({"archive": os.path.basename(archive), "size": os.path.getsize(archive), "sha256": digest.hexdigest()})
+with open(dst, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+PY
+  chown root:spanel "$out" "$manifest"
+  chmod 0640 "$out" "$manifest"
+
+  ls -1t "${PANEL_DR_DIR}"/panel-dr-*.spdr 2>/dev/null | tail -n +"$((PANEL_DR_KEEP_LOCAL + 1))" | while IFS= read -r old; do
+    rm -f "$old" "${old%.spdr}.json"
+  done || true
+  echo "archive=${out}"
+  echo "manifest=${manifest}"
+}
+
+# Hot database backups (taken by the watchdog every 6 h and on demand) live
+# in PANEL_DB_BACKUP_DIR as spanel-<UTC stamp>-<reason>.db.
+panel_db_restore() {
+  local name="${1:-}" mode="${2:-}" src
+  [[ "$name" =~ ^spanel-[0-9]{8}T[0-9]{6}Z-[a-z0-9_-]{1,24}\.db$ ]] || deny "invalid database backup name"
+  src="${PANEL_DB_BACKUP_DIR}/${name}"
+  [[ -f "$src" && ! -L "$src" ]] || deny "database backup not found: $name"
+  sqlite_integrity_ok "$src" || deny "the backup failed PRAGMA integrity_check; nothing was changed"
+  if [[ "$mode" == "--now" ]] || ! command -v systemd-run >/dev/null 2>&1; then
+    swap_panel_db "$src"
+    return 0
+  fi
+  [[ -z "$mode" ]] || deny "usage: panel-db-restore <backup-name> [--now]"
+  # Same reason as panel-snapshot-restore: stopping spanel-api from inside
+  # spanel-api's cgroup would kill this process before the swap.
+  systemd-run --unit="spanel-db-restore-$(date +%s)" --collect \
+    --description="SPanel database restore ${name}" \
+    --on-active=2s \
+    --setenv=SUDO_USER=spanel \
+    /usr/local/sbin/spanel-helper panel-db-restore "$name" --now >/dev/null
+  echo "scheduled=${name}"
 }
 
 run_panel_update() {
@@ -712,7 +1485,7 @@ cleanup_orphans() {
   # certainty, and an admin who removed a site by accident should be able to get
   # it back. Nothing here is ever deleted without a copy.
   local mode="${1:-clean}" live_file stamp archive panel_domain name base
-  local sock vhost_socks php_version
+  local sock vhost_socks php_version removed_pools
   local -i certs=0 rules=0 baks=0 manual=0 sni=0 pools=0
   live_file="$(mktemp)"
   orphan_live_domains >"$live_file"
@@ -817,14 +1590,15 @@ cleanup_orphans() {
   #    sites and had been cut to 6 workers per site because of it.
   vhost_socks="$(mktemp)"
   cat /etc/nginx/conf.d/*.conf 2>/dev/null \
-    | grep -oE '/run/php/[A-Za-z0-9._-]+\.sock' | sort -u >"$vhost_socks"
+    | grep -oE "$PHP_FPM_SOCKET_GREP" | sort -u >"$vhost_socks" || true
+  removed_pools=""
   # No sockets at all means nginx is unconfigured or unreadable, not that every
   # pool is dead. Same refusal as the empty live-domain list above.
   if [[ -s "$vhost_socks" ]]; then
-    for f in /etc/php/*/fpm/pool.d/spanel-*.conf; do
+    while IFS= read -r f; do
       [[ -f "$f" ]] || continue
-      sock="$(grep -m1 -E '^[[:space:]]*listen[[:space:]]*=' "$f" | sed -E 's/.*=[[:space:]]*//')"
-      [[ "$sock" == /run/php/*.sock ]] || continue
+      sock="$(php_pool_listen "$f" || true)"
+      [[ "$sock" == /run/php/*.sock || "$sock" == "$SPANEL_PHP_RUN_ROOT"/*.sock ]] || continue
       grep -qxF "$sock" "$vhost_socks" && continue
       base="$(basename "$f")"
       echo "php-pool	${base}"
@@ -833,8 +1607,9 @@ cleanup_orphans() {
         install -d -m 0700 "${archive}/php-pools"
         cp -a "$f" "${archive}/php-pools/" 2>/dev/null || true
         rm -f "$f"
+        removed_pools+="${f}"$'\n'
       fi
-    done
+    done <<<"$(managed_php_pool_files)"
   fi
   rm -f "$vhost_socks"
 
@@ -844,11 +1619,8 @@ cleanup_orphans() {
       systemctl reload nginx >/dev/null 2>&1 || true
     fi
     if (( pools > 0 )); then
-      for dir in /etc/php/*/fpm/pool.d; do
-        [[ -d "$dir" ]] || continue
-        php_version="$(echo "$dir" | awk -F/ '{print $4}')"
-        systemctl reload "php${php_version}-fpm" 2>/dev/null || true
-      done
+      # Distro masters reload; an account master whose last pool went stops.
+      reload_php_pool_owners <<<"$removed_pools"
       # The pool count is an input to pm.max_children, so the sites that are
       # left are entitled to the share the dead pools were holding.
       retune_php_fpm_pools >/dev/null 2>&1 || true
@@ -1555,6 +2327,58 @@ dns_api_answers() {
   curl -fsS -m 3 -H "X-API-Key: $1" "http://127.0.0.1:${PDNS_API_PORT}/api/v1/servers/localhost" >/dev/null 2>&1
 }
 
+# Zone transfers to secondary nameservers: off unless the panel turned them
+# on (dns-transfers). On, PowerDNS sends NOTIFY for primary zones and answers
+# AXFR only to the addresses a zone's ALLOW-AXFR-FROM lists, loopback else.
+PDNS_TRANSFERS_STATE="/etc/powerdns/spanel-transfers"
+
+dns_transfer_lines() {
+  if [[ "$1" == "on" ]]; then
+    printf '%s\n' "# Zone transfers: only to each zone's ALLOW-AXFR-FROM (set in the panel)." \
+      "disable-axfr=no" "allow-axfr-ips=127.0.0.1/32,::1/128" "primary=yes"
+  else
+    printf '%s\n' "# Authoritative only: no zone transfers." "disable-axfr=yes"
+  fi
+}
+
+dns_transfers() {
+  # dns-transfers <on|off>: rewrite the transfer lines of pdns.conf and
+  # restart PowerDNS; the previous file comes back if it does not start.
+  local state="$1" backup key
+  [[ "$state" == "on" || "$state" == "off" ]] || deny "usage: dns-transfers <on|off>"
+  [[ -f "$PDNS_CONF" ]] || deny "DNS Manager is not installed"
+  backup="$(mktemp)"
+  cp -a "$PDNS_CONF" "$backup"
+  python3 - "$PDNS_CONF" <<'PY' || { rm -f "$backup"; deny "could not rewrite ${PDNS_CONF}"; }
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    lines = handle.read().splitlines()
+drop = ("disable-axfr=", "allow-axfr-ips=", "primary=", "master=", "# Zone transfers:", "# Authoritative only:")
+kept = [line for line in lines if not line.startswith(drop)]
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(kept) + "\n")
+PY
+  dns_transfer_lines "$state" >>"$PDNS_CONF"
+  if ! systemctl restart pdns 2>/dev/null; then
+    cp -a "$backup" "$PDNS_CONF"
+    rm -f "$backup"
+    systemctl restart pdns 2>/dev/null || true
+    deny "PowerDNS did not start with zone transfers ${state}; the previous configuration is back"
+  fi
+  rm -f "$backup"
+  printf '%s\n' "$state" >"$PDNS_TRANSFERS_STATE"
+  key="$(tr -d '[:space:]' <"$PDNS_API_KEY_FILE" 2>/dev/null || true)"
+  local waited=0
+  while (( waited < 20 )); do
+    dns_api_answers "$key" && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "Zone transfers ${state}."
+}
+
 install_dns() {
   export DEBIAN_FRONTEND=noninteractive
   local others
@@ -1648,9 +2472,8 @@ webserver=yes
 webserver-address=127.0.0.1
 webserver-port=${PDNS_API_PORT}
 webserver-allow-from=127.0.0.1/32
-# Authoritative only: no zone transfers and no version string.
-disable-axfr=yes
 version-string=anonymous
+$(dns_transfer_lines "$(cat "$PDNS_TRANSFERS_STATE" 2>/dev/null || echo off)")
 EOF
   chown root:pdns "$PDNS_CONF"
   chmod 0640 "$PDNS_CONF"
@@ -1742,6 +2565,15 @@ MAIL_SIEVE_DIR="/etc/dovecot/spanel-sieve"
 MAIL_SETTINGS_FILE="/etc/exim4/spanel/settings.json"
 MAIL_UNBOUND_PORT="5335"
 MAIL_UNBOUND_CONF="/etc/unbound/unbound.conf.d/spanel-mail.conf"
+# Renders and checks what the Email commands below write (installer/files/
+# spanel_mailtool.py, installed root-owned by install.sh and update.sh).
+MAIL_TOOL_DIR="/usr/local/lib/spanel"
+MAIL_TOOL="${MAIL_TOOL_DIR}/spanel_mailtool.py"
+# A mailbox's autoresponder, written by mail-sync into the mailbox's home.
+MAIL_VACATION_SCRIPT="spanel-vacation.sieve"
+# Messages moved in and out of Junk wait here for Rspamd to learn them.
+MAIL_LEARN_SPOOL="/var/spool/spanel-learn"
+MAIL_QUOTA_WARNING="${MAIL_TOOL_DIR}/mail-quota-warning"
 
 mail_port_taken() {
   # "<port> (<program>)" for each mail port some other program already holds.
@@ -1788,37 +2620,51 @@ mail_write_tls_script() {
   cat >"$MAIL_TLS_SCRIPT" <<'SCRIPT'
 #!/usr/bin/env bash
 # Installed by SPanel (Email addon). Copies the panel's certificate to where
-# Exim, Dovecot and the webmail port read it, and reloads them when it changed.
+# Exim, Dovecot and the webmail port read it, then the certificates of the
+# mail domains' own hosts (mail.<domain>, answered by SNI), and reloads what
+# needs it when anything changed. Also certbot's deploy hook for those.
 set -euo pipefail
 env_file="/opt/spanel/backend/.env"
 tls_dir="/etc/spanel-mail-tls"
 value() { sed -nE "s/^$1=//p" "$env_file" 2>/dev/null | tail -n1 | tr -d '"'; }
+reload=no
+status=0
 cert="$(value PANEL_SSL_CERT)"
 key="$(value PANEL_SSL_KEY)"
 if [[ "$cert" != /* || "$key" != /* || ! -f "$cert" || ! -f "$key" ]]; then
   echo "spanel-mail-tls: the panel has no certificate configured" >&2
-  exit 1
+  status=1
+elif cmp -s "$cert" "$tls_dir/fullchain.pem" && cmp -s "$key" "$tls_dir/privkey.pem"; then
+  :
+else
+  # The panel replaces the certificate and then the key. Caught between the
+  # two, the pair does not match: wait for the key rather than break TLS.
+  cert_pub="$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null || true)"
+  key_pub="$(openssl pkey -in "$key" -pubout 2>/dev/null || true)"
+  if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
+    echo "spanel-mail-tls: certificate and key do not match yet; leaving the current pair" >&2
+  else
+    install -d -o root -g Debian-exim -m 0750 "$tls_dir"
+    install -m 0640 -o root -g Debian-exim "$cert" "$tls_dir/fullchain.pem.new"
+    install -m 0640 -o root -g Debian-exim "$key" "$tls_dir/privkey.pem.new"
+    mv -f "$tls_dir/fullchain.pem.new" "$tls_dir/fullchain.pem"
+    mv -f "$tls_dir/privkey.pem.new" "$tls_dir/privkey.pem"
+    echo "spanel-mail-tls: now using ${cert}"
+    reload=yes
+  fi
 fi
-if cmp -s "$cert" "$tls_dir/fullchain.pem" && cmp -s "$key" "$tls_dir/privkey.pem"; then
-  exit 0
+# The mail domains' own certificates (mail-hosts-apply registers them).
+if [[ -f /etc/exim4/spanel/tls_hosts && -f /usr/local/lib/spanel/spanel_mailtool.py ]]; then
+  sni="$(python3 -I /usr/local/lib/spanel/spanel_mailtool.py sni-apply /etc/exim4/spanel/tls_hosts \
+    /etc/letsencrypt/live "$tls_dir" /etc/exim4/spanel /etc/dovecot/spanel/sni.conf || echo failed)"
+  if [[ "$sni" == "changed" ]]; then reload=yes; fi
 fi
-# The panel replaces the certificate and then the key. Caught between the two,
-# the pair does not match: wait for the key rather than break TLS.
-cert_pub="$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null || true)"
-key_pub="$(openssl pkey -in "$key" -pubout 2>/dev/null || true)"
-if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
-  echo "spanel-mail-tls: certificate and key do not match yet; leaving the current pair" >&2
-  exit 0
-fi
-install -d -o root -g Debian-exim -m 0750 "$tls_dir"
-install -m 0640 -o root -g Debian-exim "$cert" "$tls_dir/fullchain.pem.new"
-install -m 0640 -o root -g Debian-exim "$key" "$tls_dir/privkey.pem.new"
-mv -f "$tls_dir/fullchain.pem.new" "$tls_dir/fullchain.pem"
-mv -f "$tls_dir/privkey.pem.new" "$tls_dir/privkey.pem"
 # Exim reads the files for each connection; Dovecot and nginx need a reload.
-if systemctl is-active --quiet dovecot; then systemctl reload dovecot || true; fi
-if systemctl is-active --quiet nginx && nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
-echo "spanel-mail-tls: now using ${cert}"
+if [[ "$reload" == "yes" ]]; then
+  if systemctl is-active --quiet dovecot; then systemctl reload dovecot || true; fi
+  if systemctl is-active --quiet nginx && nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
+fi
+exit "$status"
 SCRIPT
   chmod 0755 "$MAIL_TLS_SCRIPT"
 
@@ -1883,11 +2729,12 @@ mail_write_exim_conf() {
   # mailboxes, forwarders and routes exist is in the maps mail-sync writes.
   local tmp
   tmp="$(mktemp "${MAIL_EXIM_CONF}.XXXXXX")"
-  python3 - "$MAIL_SETTINGS_FILE" "$MAIL_EXIM_DIR" "$MAIL_TLS_DIR" "$tmp" <<'PY' || { rm -f "$tmp"; deny "could not write the Exim configuration"; }
+  [[ -f "$MAIL_TOOL" ]] || deny "${MAIL_TOOL} is missing - run the SPanel update again"
+  python3 - "$MAIL_SETTINGS_FILE" "$MAIL_EXIM_DIR" "$MAIL_TLS_DIR" "$tmp" "$MAIL_TOOL_DIR" <<'PY' || { rm -f "$tmp"; deny "could not write the Exim configuration"; }
 import json
 import sys
 
-settings_path, M, tls_dir, out_path = sys.argv[1:5]
+settings_path, M, tls_dir, out_path, tool_dir = sys.argv[1:6]
 try:
     with open(settings_path, encoding="utf-8") as handle:
         raw = json.load(handle)
@@ -1914,8 +2761,11 @@ spam = raw.get("spam_enabled", True) is not False
 # The domain a message is sent for: the one it is DKIM-signed for, else the
 # envelope sender's. The relay is chosen by it.
 SEND = "${if def:acl_m_dkim{$acl_m_dkim}{${lc:$sender_address_domain}}}"
-DKIM = r"""  dkim_domain = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{$value}{}}
-  dkim_selector = spanel
+# dkim_domains maps a domain to its signing key's file (dkim/<value>.pem),
+# dkim_selectors to the selector that key is published under: the two change
+# together when a DKIM rotation switches keys (mail-sync).
+DKIM = r"""  dkim_domain = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{$acl_m_dkim}{}}
+  dkim_selector = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_selectors}{$value}{spanel}}
   dkim_private_key = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{@@M@@/dkim/$value.pem}{0}}
   dkim_canon = relaxed
   dkim_strict = false
@@ -1950,8 +2800,11 @@ spamd_address = 127.0.0.1 11333 variant=rspamd
 daemon_smtp_ports = 25 : 465 : 587
 tls_on_connect_ports = 465
 tls_advertise_hosts = *
-tls_certificate = @@TLS@@/fullchain.pem
-tls_privatekey = @@TLS@@/privkey.pem
+# A client that asks for mail.<domain> by SNI gets that domain's own
+# certificate (tls_certs and tls_keys, written by spanel-mail-tls); anyone
+# else the panel's. A lookup, never a path built from what the client sent.
+tls_certificate = ${lookup{${lc:$tls_in_sni}}lsearch{@@M@@/tls_certs}{$value}{@@TLS@@/fullchain.pem}}
+tls_privatekey = ${lookup{${lc:$tls_in_sni}}lsearch{@@M@@/tls_keys}{$value}{@@TLS@@/privkey.pem}}
 
 never_users = root
 host_lookup =
@@ -2011,6 +2864,7 @@ acl_check_rcpt:
   accept
 
 acl_check_data:
+@@HOLD@@
   # The From: address must be on one of the account's domains too; a message
   # that passes is DKIM-signed for that domain on its way out.
   deny    message = The From address is not one of your mail domains
@@ -2202,26 +3056,13 @@ relay_login:
   client_send = <; ; @@USER@@ ; @@PASS@@
 """
 
-auth_block = ""
-if auth_rate:
-    auth_block = (
-        "\n  deny    message = Sending limit reached: at most %d recipients an hour for each mailbox\n"
-        "          authenticated = *\n"
-        "          ratelimit = %d / 1h / per_rcpt / $authenticated_id\n" % (auth_rate, auth_rate)
-    )
-if domain_rate:
-    auth_block += (
-        "\n  deny    message = Domain sending limit reached for ${lc:$sender_address_domain}\n"
-        "          authenticated = *\n"
-        "          ratelimit = ${lookup{${lc:$sender_address_domain}}lsearch*{/etc/exim4/spanel_ratelimits}{$value}{%d}} / 1h / per_rcpt / dom:${lc:$sender_address_domain}\n" % domain_rate
-    )
-local_block = ""
-if local_rate:
-    local_block = (
-        "  deny    message = Sending limit reached: at most %d messages an hour\n"
-        "          !condition = ${if eq{$sender_ident}{root}}\n"
-        "          ratelimit = %d / 1h / per_mail / $sender_ident\n" % (local_rate, local_rate)
-    )
+# The sending limits, refusing or (auto-hold) freezing: the mail tool's.
+sys.path.insert(0, tool_dir)
+import spanel_mailtool  # noqa: E402
+
+rate_acls = spanel_mailtool.render_rate_acls(auth_rate, local_rate, domain_rate,
+                                             raw.get("auto_hold_on_rate_exceed", True) is not False)
+auth_block, local_block, hold_block = rate_acls["rcpt"], rate_acls["not_smtp"], rate_acls["data"]
 spam_block = ""
 if spam:
     spam_block = r"""
@@ -2243,6 +3084,7 @@ if spam:
 """
 
 conf = (conf.replace("@@AUTHRATE@@", auth_block)
+            .replace("@@HOLD@@", hold_block)
             .replace("@@LOCALRATE@@", local_block)
             .replace("@@SPAM@@", spam_block)
             .replace("@@DKIM@@", DKIM)
@@ -2271,8 +3113,9 @@ mail_ensure_maps() {
   install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR" "$MAIL_EXIM_DIR/dkim"
   install -d -o root -g dovecot -m 0750 "$MAIL_DOVECOT_DIR"
   local list
-  for list in domains mailboxes aliases catchall senders local_senders dkim_domains \
-      relay_routes relay_hosts relay_transports relay_auth relay_credentials ratelimits; do
+  for list in domains mailboxes aliases catchall senders local_senders dkim_domains dkim_selectors \
+      relay_routes relay_hosts relay_transports relay_auth relay_credentials ratelimits \
+      tls_hosts tls_certs tls_keys; do
     [[ -f "$MAIL_EXIM_DIR/$list" ]] || install -m 0640 -o root -g Debian-exim /dev/null "$MAIL_EXIM_DIR/$list"
   done
   [[ -f /etc/exim4/spanel_ratelimits ]] || install -m 0640 -o root -g Debian-exim /dev/null /etc/exim4/spanel_ratelimits
@@ -2436,11 +3279,41 @@ plugin {
   quota_grace = 10%%
   # Mail the spam filter marked goes to Junk, before anything of the mailbox's own.
   sieve_before = ${MAIL_SIEVE_DIR}/spam-to-junk.sieve
+  # Then the mailbox's autoresponder, which mail-sync writes into its home
+  # from the panel's list; a mailbox without one has no such file.
+  sieve_before2 = ~/${MAIL_VACATION_SCRIPT}
+
+  # Spam training: moved into Junk is spam, moved out of it (not to Trash) ham.
+  sieve_plugins = sieve_imapsieve sieve_extprograms
+  sieve_global_extensions = +vnd.dovecot.pipe +vnd.dovecot.environment
+  sieve_pipe_bin_dir = ${MAIL_SIEVE_DIR}/bin
+  imapsieve_mailbox1_name = Junk
+  imapsieve_mailbox1_causes = COPY APPEND
+  imapsieve_mailbox1_before = file:${MAIL_SIEVE_DIR}/learn-spam.sieve
+  imapsieve_mailbox2_name = *
+  imapsieve_mailbox2_from = Junk
+  imapsieve_mailbox2_causes = COPY
+  imapsieve_mailbox2_before = file:${MAIL_SIEVE_DIR}/learn-ham.sieve
+
+  # The mailbox is told when it is filling up.
+  quota_warning = storage=95%% quota-warning 95 %u
+  quota_warning2 = storage=80%% quota-warning 80 %u
 }
 
 protocol imap {
-  mail_plugins = \$mail_plugins imap_quota
+  mail_plugins = \$mail_plugins imap_quota imap_sieve
   mail_max_userip_connections = 20
+}
+
+# Run as user dovecot. Every mailbox's processes run as its owner, so the
+# socket is open to all; the script checks what it is asked and warns a
+# mailbox at most once a day per level.
+service quota-warning {
+  executable = script ${MAIL_QUOTA_WARNING}
+  user = dovecot
+  unix_listener quota-warning {
+    mode = 0666
+  }
 }
 protocol lmtp {
   postmaster_address = postmaster@%d
@@ -2479,6 +3352,10 @@ service pop3-login {
     ssl = yes
   }
 }
+
+# The certificate of each mail domain's own host (mail.<domain>), by SNI;
+# written by spanel-mail-tls.
+!include_try ${MAIL_DOVECOT_DIR}/sni.conf
 EOF
   chmod 0644 "$tmp"
   if ! doveconf -c "$tmp" -n >/dev/null 2>>"$MAIL_INSTALL_LOG"; then
@@ -2674,7 +3551,9 @@ install_mail() {
 
   mail_write_exim_conf
   mail_write_sieve
+  mail_write_quota_warning
   mail_write_dovecot_conf
+  mail_write_learn_service
   mail_write_unbound_conf
   mail_write_rspamd_conf
   mail_install_webmail
@@ -2724,6 +3603,7 @@ remove_mail() {
   systemctl disable --now exim4 >/dev/null 2>&1 || true
   systemctl disable --now dovecot >/dev/null 2>&1 || true
   systemctl disable --now spanel-mail-tls.path >/dev/null 2>&1 || true
+  systemctl disable --now spanel-mail-learn.timer >/dev/null 2>&1 || true
   for conf in /etc/nginx/conf.d/00-spanel-webmail*.conf; do
     [[ -f "$conf" ]] || continue
     mv -f "$conf" "${conf}.off"
@@ -2768,26 +3648,36 @@ mail_sync() {
   #    "forwarders": [{"address", "to": [...]}],
   #    "senders": {mailbox: [domains it may send as]},
   #    "local_senders": {linux user: [domains its PHP mail is signed for]},
-  #    "relay_routes": {domain: relay id or "direct"}, "default_relay": id}
+  #    "relay_routes": {domain: relay id or "direct"}, "default_relay": id,
+  #    "autoresponders": [{"address", "subject", "body", "start", "end", "days"}]}
   # Every field is checked again here and nothing is written unless all of it
   # passes. Writes what Exim and Dovecot read, makes missing mail directories
-  # and DKIM keys, and prints each domain's DKIM public key. Neither service
+  # and DKIM keys, writes each mailbox's autoresponder (a Sieve vacation in
+  # its home), and prints each domain's DKIM public key. Neither service
   # needs a reload: both notice a changed file on the next lookup.
   [[ -f "$MAIL_EXIM_CONF" ]] || deny "the Email addon is not installed"
   local payload status=0
+  # The maps below name each domain's DKIM key by file and selector; an Exim
+  # configuration from before that would sign with the wrong domain.
+  if ! grep -q 'dkim_selectors' "$MAIL_EXIM_CONF"; then
+    mail_ensure_maps
+    mail_write_exim_conf
+    mail_exim_reload || true
+  fi
   payload="$(mktemp)"
   head -c 8000000 >"$payload"
-  python3 - "$payload" "$MAIL_EXIM_DIR" "$MAIL_DOVECOT_DIR" <<'PY' || status=$?
+  python3 - "$payload" "$MAIL_EXIM_DIR" "$MAIL_DOVECOT_DIR" "$MAIL_TOOL_DIR" "$MAIL_VACATION_SCRIPT" <<'PY' || status=$?
 import base64
 import grp
 import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 
-payload_path, exim_dir, dovecot_dir = sys.argv[1:4]
+payload_path, exim_dir, dovecot_dir, tool_dir, vacation_name = sys.argv[1:6]
 
 DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 LOCAL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
@@ -2847,7 +3737,13 @@ def domain_list(values, owner):
     return clean
 
 
-domains, catchall = [], {}
+sys.path.insert(0, tool_dir)
+try:
+    import spanel_mailtool
+except ImportError:
+    fail(f"{tool_dir}/spanel_mailtool.py is missing - run the SPanel update again")
+
+domains, catchall, selectors = [], {}, {}
 for item in data.get("domains") or []:
     name = str((item or {}).get("domain") or "").strip().lower()
     if not DOMAIN_RE.fullmatch(name):
@@ -2858,6 +3754,12 @@ for item in data.get("domains") or []:
     target = str(item.get("catch_all") or "").strip()
     if target:
         catchall[name] = remote(target)
+    # The selector its mail is signed with; "spanel" is the key every domain
+    # had before DKIM rotation.
+    try:
+        selectors[name] = spanel_mailtool.check_selector(item.get("dkim_selector") or "spanel")
+    except spanel_mailtool.ToolError as exc:
+        fail(str(exc))
 domain_set = set(domains)
 
 boxes, seen = [], set()
@@ -2923,6 +3825,17 @@ if default_relay:
         fail(f"invalid default relay {default_relay!r}")
     routes.append(f"*: {default_relay}")
 
+# Autoresponders, rendered (and checked again) by the mail tool.
+vacations = {}
+if data.get("autoresponders"):
+    try:
+        vacations = spanel_mailtool.vacation_scripts(data.get("autoresponders"))
+    except spanel_mailtool.ToolError as exc:
+        fail(str(exc))
+    for address in vacations:
+        if address not in seen:
+            fail(f"autoresponder for {address}, which is not a mailbox")
+
 exim_gid = grp.getgrnam("Debian-exim").gr_gid
 dovecot_gid = grp.getgrnam("dovecot").gr_gid
 spanel_gid = grp.getgrnam("spanel").gr_gid
@@ -2946,6 +3859,47 @@ def open_dir(parent_fd, name, uid, gid, mode):
     return fd
 
 
+def put_vacation(box_fd, box):
+    """The mailbox's autoresponder script, or none. The mailbox directory is
+    its owner's, who could plant a link or a FIFO under either name: nothing
+    is followed or read that is not a plain file, and a failure is that
+    mailbox's alone - it never stops the sync of everyone else."""
+    script = vacations.get(box["address"])
+    try:
+        if script is None:
+            for name in (vacation_name, vacation_name[:-len(".sieve")] + ".svbin"):
+                try:
+                    os.unlink(name, dir_fd=box_fd)
+                except FileNotFoundError:
+                    pass
+            return
+        wanted = script.encode()
+        try:
+            fd = os.open(vacation_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=box_fd)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode) and os.read(fd, len(wanted) + 1) == wanted:
+                    return
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        tmp = "." + vacation_name + ".new"
+        try:
+            os.unlink(tmp, dir_fd=box_fd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o640, dir_fd=box_fd)
+        try:
+            os.fchown(fd, box["uid"], spanel_gid)
+            os.fchmod(fd, 0o640)
+            os.write(fd, wanted)
+        finally:
+            os.close(fd)
+        os.replace(tmp, vacation_name, src_dir_fd=box_fd, dst_dir_fd=box_fd)
+    except OSError as exc:
+        print(f"spanel-helper: mail-sync: autoresponder of {box['address']} not written: {exc}", file=sys.stderr)
+
+
 for box in boxes:
     # /home/<user> is root's (the SFTP chroot); mail/ and mail/<domain>/ are
     # root's too, so the customer cannot rearrange them. From the mailbox down
@@ -2960,13 +3914,18 @@ for box in boxes:
         fds.append(open_dir(fds[-1], "Maildir", box["uid"], spanel_gid, 0o2750))
         for part in ("cur", "new", "tmp"):
             os.close(open_dir(fds[-1], part, box["uid"], spanel_gid, 0o2750))
+        put_vacation(fds[3], box)
     finally:
         for fd in reversed(fds):
             os.close(fd)
 
 dkim = {}
 for domain in domains:
-    key_path = os.path.join(exim_dir, "dkim", f"{domain}.pem")
+    # "spanel" is dkim/<domain>.pem, as before rotation; another selector's
+    # key is dkim/<selector>/<domain>.pem.
+    key_path = os.path.join(exim_dir, "dkim", spanel_mailtool.dkim_key_name(domain, selectors[domain]) + ".pem")
+    os.makedirs(os.path.dirname(key_path), mode=0o750, exist_ok=True)
+    os.chown(os.path.dirname(key_path), 0, exim_gid)
     if not os.path.exists(key_path):
         fd = os.open(key_path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
         os.fchown(fd, 0, exim_gid)
@@ -3010,7 +3969,9 @@ write(E("aliases"), [f"{a}: {', '.join(t)}" for a, t in sorted(aliases.items())]
 write(E("catchall"), [f"{d}: {t}" for d, t in sorted(catchall.items())], exim_gid)
 write(E("senders"), [f"{a}: {' : '.join(d)}" for a, d in sorted(senders.items()) if d], exim_gid)
 write(E("local_senders"), [f"{u}: {' : '.join(d)}" for u, d in sorted(local_senders.items()) if d], exim_gid)
-write(E("dkim_domains"), [f"{d}: {d}" for d in sorted(dkim)], exim_gid)
+dkim_domain_lines, dkim_selector_lines = spanel_mailtool.dkim_maps({d: selectors[d] for d in dkim})
+write(E("dkim_domains"), dkim_domain_lines, exim_gid)
+write(E("dkim_selectors"), dkim_selector_lines, exim_gid)
 write(E("relay_routes"), sorted(routes), exim_gid)
 
 users, denied = [], []
@@ -3034,7 +3995,8 @@ for line in denied:
     if address not in previously_denied:
         subprocess.run(["doveadm", "kick", address], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
-print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim}))
+print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim,
+                  "autoresponders": len(vacations)}))
 PY
   rm -f "$payload"
   [[ $status -eq 0 ]] || exit "$status"
@@ -3054,10 +4016,84 @@ if header :contains "X-Spam-Status" "Yes" {
 }
 SIEVE
   chmod 0644 "$MAIL_SIEVE_DIR/spam-to-junk.sieve"
+  # Spam training (IMAPSieve): a message moved into Junk is learnt as spam,
+  # one moved out of it (anywhere but Trash) as ham. The pipe programs run as
+  # the mailbox's owner and only queue the message for spanel-mail-learn.
+  cat >"$MAIL_SIEVE_DIR/learn-spam.sieve" <<'SIEVE'
+# Managed by SPanel (Email addon). Moved into Junk: Rspamd learns it as spam.
+require ["vnd.dovecot.pipe", "copy", "imapsieve"];
+pipe :copy "spanel-learn-spam";
+SIEVE
+  cat >"$MAIL_SIEVE_DIR/learn-ham.sieve" <<'SIEVE'
+# Managed by SPanel (Email addon). Moved out of Junk: Rspamd learns it as ham,
+# unless it went to Trash.
+require ["vnd.dovecot.pipe", "copy", "imapsieve", "environment", "variables"];
+if environment :matches "imap.mailbox" "*" {
+  set "mailbox" "${1}";
+}
+if string "${mailbox}" "Trash" {
+  stop;
+}
+pipe :copy "spanel-learn-ham";
+SIEVE
+  install -d -o root -g root -m 0755 "$MAIL_SIEVE_DIR/bin"
+  local kind
+  for kind in spam ham; do
+    printf '#!/bin/sh\n# Managed by SPanel (Email addon). Runs as the mailbox owner: queues the message.\nexec /usr/bin/python3 -I %s learn-enqueue %s\n' \
+      "$MAIL_TOOL" "$kind" >"$MAIL_SIEVE_DIR/bin/spanel-learn-${kind}"
+    chmod 0755 "$MAIL_SIEVE_DIR/bin/spanel-learn-${kind}"
+  done
+  chmod 0644 "$MAIL_SIEVE_DIR"/learn-spam.sieve "$MAIL_SIEVE_DIR"/learn-ham.sieve
   # Compiled here, as root: the mailbox owners could not write the result.
   sievec "$MAIL_SIEVE_DIR/spam-to-junk.sieve" >>"$MAIL_INSTALL_LOG" 2>&1 \
     || deny "could not compile the spam Sieve script (see ${MAIL_INSTALL_LOG})"
   chmod 0644 "$MAIL_SIEVE_DIR"/spam-to-junk.svbin
+  # The learn scripts need the pipe extension, which only the IMAPSieve
+  # configuration enables: Dovecot compiles them itself when first used.
+  rm -f "$MAIL_SIEVE_DIR"/learn-spam.svbin "$MAIL_SIEVE_DIR"/learn-ham.svbin
+}
+
+mail_write_learn_service() {
+  # The spool mailbox owners queue messages into (they can add files but not
+  # list or read anyone else's), and the root service that hands them to
+  # Rspamd's controller with its key.
+  install -d -o root -g root -m 1733 "$MAIL_LEARN_SPOOL"
+  cat >/etc/systemd/system/spanel-mail-learn.service <<UNIT
+[Unit]
+Description=SPanel: hand messages moved in and out of Junk to Rspamd
+After=rspamd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I ${MAIL_TOOL} learn-process ${MAIL_LEARN_SPOOL} ${MAIL_RSPAMD_KEY_FILE}
+UNIT
+  # Every minute rather than on a change of the directory: a file a mailbox
+  # owner leaves there must not make the service run back to back.
+  cat >/etc/systemd/system/spanel-mail-learn.timer <<UNIT
+[Unit]
+Description=SPanel: hand the spam-training queue to Rspamd every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  rm -f /etc/systemd/system/spanel-mail-learn.path
+  systemctl daemon-reload
+  systemctl enable --now spanel-mail-learn.timer >/dev/null 2>&1 || true
+}
+
+mail_write_quota_warning() {
+  # Dovecot runs this as user dovecot when a mailbox crosses 80% or 95% of its
+  # quota; the mail tool checks the mailbox exists and mails it once a day.
+  install -d -o root -g root -m 0755 "$MAIL_TOOL_DIR"
+  printf '#!/bin/sh\n# Managed by SPanel (Email addon): warns a mailbox that is filling up.\nexec /usr/bin/python3 -I %s quota-warning "$@"\n' \
+    "$MAIL_TOOL" >"$MAIL_QUOTA_WARNING"
+  chmod 0755 "$MAIL_QUOTA_WARNING"
+  install -d -o dovecot -g dovecot -m 0750 /var/lib/spanel-mail /var/lib/spanel-mail/quota-warnings
 }
 
 mail_rspamd_group() {
@@ -3552,15 +4588,57 @@ PY
   echo "Mail settings applied."
 }
 
+mail_reconfigure() {
+  # An update brought a newer helper: Exim's and Dovecot's configuration and
+  # the Sieve scripts are written again from what is saved, so a server
+  # installed before a feature gets it without reinstalling the addon.
+  # Nothing to do where the addon was never installed.
+  if [[ ! -f "$MAIL_EXIM_CONF" ]] || ! grep -qF "$MAIL_MARKER" "$MAIL_EXIM_CONF"; then
+    echo "The Email addon is not installed; nothing to reconfigure."
+    return 0
+  fi
+  mail_ensure_maps
+  mail_write_tls_script
+  "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
+  mail_write_exim_conf
+  mail_write_sieve
+  mail_write_quota_warning
+  mail_write_dovecot_conf
+  mail_write_learn_service
+  if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
+  if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
+  echo "Mail configuration rewritten."
+}
+
+require_dkim_selector() {
+  [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || deny "invalid DKIM selector: $1"
+}
+
+mail_dkim_key() {
+  # The key file of a domain's selector: "spanel" is dkim/<domain>.pem, the
+  # key every domain had before rotation; any other is dkim/<selector>/<domain>.pem.
+  if [[ "$2" == "spanel" ]]; then
+    printf '%s/dkim/%s.pem' "$MAIL_EXIM_DIR" "$1"
+  else
+    printf '%s/dkim/%s/%s.pem' "$MAIL_EXIM_DIR" "$2" "$1"
+  fi
+}
+
+mail_dkim_active_selector() {
+  awk -F': ' -v d="$1" '$1 == d { print $2; exit }' "$MAIL_EXIM_DIR/dkim_selectors" 2>/dev/null || true
+}
+
 mail_dkim() {
-  # The domain's DKIM public key (base64, one line) for its DNS record, making
-  # the key pair first when there is none - or always, with "rotate".
-  local domain="$1" mode="${2:-}" key tmp
+  # The DKIM public key (base64, one line) of a domain's selector for its DNS
+  # record, making the key pair first when there is none. A rotation makes
+  # the next selector's key this way, long before Exim signs with it.
+  local domain="$1" selector="${2:-spanel}" key tmp
   require_domain "$domain"
-  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim"
-  key="$MAIL_EXIM_DIR/dkim/${domain}.pem"
-  if [[ ! -f "$key" || "$mode" == "rotate" ]]; then
-    tmp="$(mktemp "$MAIL_EXIM_DIR/dkim/.${domain}.XXXXXX")"
+  require_dkim_selector "$selector"
+  key="$(mail_dkim_key "$domain" "$selector")"
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim" "$(dirname "$key")"
+  if [[ ! -f "$key" ]]; then
+    tmp="$(mktemp "$(dirname "$key")/.${domain}.XXXXXX")"
     chown root:Debian-exim "$tmp"
     chmod 0640 "$tmp"
     openssl genrsa -out "$tmp" 2048 >/dev/null 2>&1 || { rm -f "$tmp"; deny "could not create a DKIM key for ${domain}"; }
@@ -3568,6 +4646,79 @@ mail_dkim() {
     chmod 0640 "$tmp"
     mv -f "$tmp" "$key"
   fi
+  openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | base64 -w0
+  echo
+}
+
+mail_dkim_drop() {
+  # A retired (or abandoned) selector's key goes. Never the one Exim signs with.
+  local domain="$1" selector="$2" key
+  require_domain "$domain"
+  require_dkim_selector "$selector"
+  if [[ "$(mail_dkim_active_selector "$domain")" == "$selector" ]] \
+     || { [[ "$selector" == "spanel" ]] && [[ -z "$(mail_dkim_active_selector "$domain")" ]]; }; then
+    deny "${selector} is the key ${domain} is signed with"
+  fi
+  key="$(mail_dkim_key "$domain" "$selector")"
+  rm -f -- "$key"
+  # A selector's own directory goes once empty; never dkim/ itself.
+  if [[ "$selector" != "spanel" ]]; then rmdir -- "$(dirname "$key")" 2>/dev/null || true; fi
+  echo "removed DKIM key ${selector} of ${domain}"
+}
+
+mail_dkim_export() {
+  # Every DKIM key of a domain, for its owner's backup: {"selector": "PEM"}.
+  local domain="$1"
+  require_domain "$domain"
+  python3 - "$MAIL_EXIM_DIR/dkim" "$domain" <<'PY'
+import json
+import os
+import re
+import sys
+
+base, domain = sys.argv[1:3]
+SELECTOR_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+keys = {}
+candidates = [("spanel", os.path.join(base, f"{domain}.pem"))]
+try:
+    names = sorted(os.listdir(base))
+except OSError:
+    names = []
+for name in names:
+    if SELECTOR_RE.fullmatch(name) and os.path.isdir(os.path.join(base, name)):
+        candidates.append((name, os.path.join(base, name, f"{domain}.pem")))
+for selector, path in candidates:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        continue
+    with os.fdopen(fd, encoding="ascii", errors="replace") as handle:
+        text = handle.read(20000)
+    if "PRIVATE KEY-----" in text:
+        keys[selector] = text
+print(json.dumps(keys))
+PY
+}
+
+mail_dkim_import() {
+  # A DKIM private key from a backup, PEM on stdin, for a domain's selector:
+  # checked to be an RSA key of 1024 to 4096 bits, then put in place and its
+  # public key printed, as mail-dkim does.
+  local domain="$1" selector="$2" key tmp bits
+  require_domain "$domain"
+  require_dkim_selector "$selector"
+  key="$(mail_dkim_key "$domain" "$selector")"
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim" "$(dirname "$key")"
+  tmp="$(mktemp "$(dirname "$key")/.${domain}.XXXXXX")"
+  chown root:Debian-exim "$tmp"
+  chmod 0640 "$tmp"
+  head -c 16384 >"$tmp"
+  bits="$(openssl rsa -in "$tmp" -noout -text 2>/dev/null | sed -nE 's/^Private-Key: \(([0-9]+) bit.*/\1/p' | head -n1 || true)"
+  if [[ ! "$bits" =~ ^[0-9]+$ ]] || (( bits < 1024 || bits > 4096 )) || ! openssl rsa -in "$tmp" -check -noout >/dev/null 2>&1; then
+    rm -f "$tmp"
+    deny "not an RSA private key of 1024 to 4096 bits"
+  fi
+  mv -f "$tmp" "$key"
   openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | base64 -w0
   echo
 }
@@ -3580,6 +4731,51 @@ mail_log_tail() {
 
 mail_queue_count() {
   exim4 -bpc 2>/dev/null || echo 0
+}
+
+require_queue_id() {
+  # Exim's message ids: the 4.97+ form (Ubuntu 24.04) and the older one.
+  [[ "$1" =~ ^[0-9A-Za-z]{6}-([0-9A-Za-z]{11}-[0-9A-Za-z]{4}|[0-9A-Za-z]{6}-[0-9A-Za-z]{2})$ ]] \
+    || deny "invalid message id: $1"
+}
+
+mail_queue_list() {
+  # The queue as `exim -bp` prints it, at most 4 MB of it; the panel parses it.
+  exim4 -bp 2>/dev/null | head -c 4000000 || true
+}
+
+mail_queue_show() {
+  # One message's envelope and headers (exim -Mvh), never its body.
+  require_queue_id "$1"
+  exim4 -Mvh "$1" 2>/dev/null | head -c 200000 || deny "no message ${1} in the queue"
+}
+
+mail_queue_action() {
+  # retry | freeze | thaw | delete, for up to 100 messages.
+  local action="$1" id flag
+  shift
+  [[ $# -ge 1 && $# -le 100 ]] || deny "usage: mail-queue-action <retry|freeze|thaw|delete> <id>..."
+  for id in "$@"; do require_queue_id "$id"; done
+  case "$action" in
+    freeze) flag=-Mf ;;
+    thaw) flag=-Mt ;;
+    delete) flag=-Mrm ;;
+    retry)
+      # A delivery can take minutes: in the background, as exim4 -qf does.
+      setsid timeout 600 exim4 -M "$@" >/dev/null 2>&1 < /dev/null &
+      echo "retrying $# message(s)"
+      return 0
+      ;;
+    *) deny "invalid queue action: $action" ;;
+  esac
+  # Exim says per message what it did (or that the message is gone).
+  exim4 "$flag" "$@" 2>&1 | head -c 20000 || true
+}
+
+mail_queue_retry_all() {
+  # Every message, frozen ones included, tried again now.
+  setsid timeout 1800 exim4 -qff >/dev/null 2>&1 < /dev/null &
+  echo "retrying the whole queue"
 }
 
 mail_rspamd_log() {
@@ -3601,7 +4797,7 @@ mail_purge_domain() {
   elif [[ -d "$dir" ]]; then
     rm -rf --one-file-system -- "$dir"
   fi
-  rm -f -- "$MAIL_EXIM_DIR/dkim/${domain}.pem"
+  rm -f -- "$MAIL_EXIM_DIR/dkim/${domain}.pem" "$MAIL_EXIM_DIR"/dkim/*/"${domain}.pem"
   echo "mail data removed: ${domain}"
 }
 
@@ -3788,6 +4984,127 @@ mail_webmail_hosts() {
     domain="${conf#/etc/nginx/conf.d/00-spanel-webmail-}"
     printf '%s\n' "${domain%.conf}"
   done
+}
+
+# ---- A mail domain's own hosts: mail., mta-sts., autoconfig., autodiscover. ----
+# One Let's Encrypt certificate named mail.<domain> covers the hosts the panel
+# turned on (the same webroot flow as webmail.<domain>). nginx serves them;
+# Exim and Dovecot answer mail.<domain> with it by SNI (tls_hosts, read by
+# spanel-mail-tls, which certbot also runs on every renewal).
+MAIL_HOSTS_DOCS="/var/www/spanel-mailhosts"
+MAIL_TLS_HOSTS="${MAIL_EXIM_DIR}/tls_hosts"
+
+mail_hosts_conf() {
+  printf '/etc/nginx/conf.d/00-spanel-mailhosts-%s.conf' "$1"
+}
+
+mail_cert_covers() {
+  # Whether the live certificate <name> covers every host in the comma list.
+  local cert="/etc/letsencrypt/live/$1/fullchain.pem" host answer
+  [[ -f "$cert" ]] || return 1
+  for host in ${2//,/ }; do
+    answer="$(openssl x509 -in "$cert" -noout -checkhost "$host" 2>/dev/null || true)"
+    [[ "$answer" == *"does match"* ]] || return 1
+  done
+}
+
+mail_hosts_register() {
+  # "<host>: <certificate name>" in tls_hosts, or the host taken out ("" name).
+  local host="$1" name="$2" tmp
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR"
+  [[ -f "$MAIL_TLS_HOSTS" ]] || install -m 0640 -o root -g Debian-exim /dev/null "$MAIL_TLS_HOSTS"
+  tmp="$(mktemp "${MAIL_TLS_HOSTS}.XXXXXX")"
+  awk -F': ' -v h="$host" '$1 != h' "$MAIL_TLS_HOSTS" >"$tmp" || true
+  [[ -z "$name" ]] || printf '%s: %s\n' "$host" "$name" >>"$tmp"
+  chown root:Debian-exim "$tmp"
+  chmod 0640 "$tmp"
+  mv -f "$tmp" "$MAIL_TLS_HOSTS"
+}
+
+mail_hosts_apply() {
+  # A mail domain's hosts, as JSON on stdin (checked by the mail tool):
+  #   {"domain", "hosts": ["mail", "mta-sts", "autoconfig", "autodiscover"], "email",
+  #    "mta_sts": {"mode": "testing"|"enforce"|"none", "max_age"} or null}
+  # Issues (or extends) the certificate, writes what the hosts serve and the
+  # nginx server blocks, and registers mail.<domain> for SNI. Prints the
+  # names served.
+  [[ -f "$WEBMAIL_NGINX" ]] || deny "the Email addon is not installed"
+  [[ -f "$MAIL_TOOL" ]] || deny "${MAIL_TOOL} is missing - run the SPanel update again"
+  local payload domain cert_name email names conf docs tmp host rc=0 had_tls=no
+  local -a args
+  payload="$(mktemp)"
+  head -c 200000 >"$payload"
+  # The tool's own sentence says what is wrong with the request.
+  read -r domain cert_name email names < <(python3 -I "$MAIL_TOOL" mail-hosts-fields <"$payload") \
+    || { rm -f "$payload"; exit 1; }
+  require_domain "$domain"
+  conf="$(mail_hosts_conf "$domain")"
+  docs="${MAIL_HOSTS_DOCS}/${domain}"
+  install -d -o root -g spanel -m 0755 /var/www/spanel-acme/.well-known/acme-challenge
+  install -d -o root -g root -m 0755 "$MAIL_HOSTS_DOCS" "$docs"
+  [[ -f "$conf" ]] && grep -q 'listen 443 ssl' "$conf" && had_tls=yes
+  tmp="$(mktemp)"
+  if ! mail_cert_covers "$cert_name" "$names"; then
+    # Port 80 for the challenge first, for every name.
+    python3 -I "$MAIL_TOOL" mailhosts-nginx "$docs" http <"$payload" >"$tmp" || { rm -f "$payload" "$tmp"; deny "could not write the mail hosts' server block"; }
+    [[ "$had_tls" == "yes" ]] && cp -a "$conf" "${conf}.previous"
+    install -m 0644 "$tmp" "$conf"
+    nginx_ipv6_apply >/dev/null 2>&1 || true
+    if ! nginx -t >/dev/null 2>&1; then
+      if [[ "$had_tls" == "yes" ]]; then mv -f "${conf}.previous" "$conf"; else rm -f "$conf"; fi
+      rm -f "$payload" "$tmp"
+      deny "nginx refused the server block for the mail hosts of ${domain}"
+    fi
+    systemctl reload nginx
+    args=(certonly --webroot -w /var/www/spanel-acme --cert-name "$cert_name" --expand
+          --non-interactive --agree-tos --keep-until-expiring --deploy-hook "$MAIL_TLS_SCRIPT")
+    for host in ${names//,/ }; do args+=(-d "$host"); done
+    if [[ "$email" != "-" ]]; then
+      require_email "$email"
+      args+=(--email "$email")
+    else
+      args+=(--register-unsafely-without-email)
+    fi
+    certbot "${args[@]}" >>"$MAIL_INSTALL_LOG" 2>&1 || rc=$?
+    if ! mail_cert_covers "$cert_name" "$names"; then
+      if [[ "$had_tls" == "yes" ]]; then mv -f "${conf}.previous" "$conf"; else rm -f "$conf"; fi
+      nginx -t >/dev/null 2>&1 && systemctl reload nginx
+      rm -f "$payload" "$tmp"
+      deny "no certificate for ${names//,/, } (certbot exited ${rc}) - point each of them at this server first"
+    fi
+    rm -f "${conf}.previous"
+  fi
+  # What the hosts serve: the MTA-STS policy, autoconfig and autodiscover.
+  python3 -I "$MAIL_TOOL" mailhost-docs "$docs" <"$payload" >/dev/null || { rm -f "$payload" "$tmp"; exit 1; }
+  python3 -I "$MAIL_TOOL" mailhosts-nginx "$docs" https <"$payload" >"$tmp" || { rm -f "$payload" "$tmp"; deny "could not write the mail hosts' server block"; }
+  cp -a "$conf" "${conf}.previous" 2>/dev/null || true
+  install -m 0644 "$tmp" "$conf"
+  rm -f "$payload" "$tmp"
+  nginx_ipv6_apply >/dev/null 2>&1 || true
+  if ! nginx -t >/dev/null 2>&1; then
+    if [[ -f "${conf}.previous" ]]; then mv -f "${conf}.previous" "$conf"; else rm -f "$conf"; fi
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+    deny "nginx refused the server block for the mail hosts of ${domain}"
+  fi
+  rm -f "${conf}.previous"
+  systemctl reload nginx
+  mail_hosts_register "mail.${domain}" "$cert_name"
+  "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
+  printf '%s\n' "${names//,/ }"
+}
+
+mail_hosts_remove() {
+  # The hosts of a mail domain stop being served; their certificate goes.
+  local domain="$1"
+  require_domain "$domain"
+  rm -f "$(mail_hosts_conf "$domain")" "$(mail_hosts_conf "$domain").previous"
+  rm -rf --one-file-system -- "${MAIL_HOSTS_DOCS:?}/${domain}"
+  if [[ -f "$MAIL_TLS_HOSTS" ]]; then mail_hosts_register "mail.${domain}" ""; fi
+  certbot delete --non-interactive --cert-name "mail.${domain}" >>"$MAIL_INSTALL_LOG" 2>&1 || true
+  rm -rf --one-file-system -- "${MAIL_TLS_DIR:?}/mail.${domain}"
+  "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
+  if nginx -t >/dev/null 2>&1; then systemctl reload nginx; fi
+  echo "mail hosts of ${domain} removed"
 }
 
 fail2ban_status() {
@@ -4104,6 +5421,7 @@ install_php_extension() {
     deny "$pkg is installed but PHP ${version} cannot load it"
   fi
   systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "$pkg is ready; php${version}-fpm reloaded."
 }
 
@@ -4188,6 +5506,7 @@ upgrade_php_version() {
   else
     systemctl start "php${version}-fpm" 2>/dev/null || true
   fi
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} packages safely upgraded and php${version}-fpm reloaded"
 }
 
@@ -4204,6 +5523,7 @@ harden_php_security() {
         "php-fpm${version}" -t >/dev/null 2>&1 || true
       fi
       systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm" 2>/dev/null || true
+      reload_user_php_fpm_masters "$version"
       echo "PHP ${version} anti-PHP2SHELL hardening disabled"
       return 0
       ;;
@@ -4236,6 +5556,7 @@ INI
   if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
     systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
   fi
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} anti-PHP2SHELL hardening (${mode}) applied: ${target}"
 }
 
@@ -4251,13 +5572,22 @@ uninstall_php_version() {
     return 0
   fi
   shopt -s nullglob
-  local pools=(/etc/php/"$version"/fpm/pool.d/spanel-*.conf)
+  local pools=(/etc/php/"$version"/fpm/pool.d/spanel-*.conf "$SPANEL_PHP_FPM_ROOT/$version"/*/pool.d/spanel-*.conf)
   shopt -u nullglob
   if [[ ${#pools[@]} -gt 0 ]]; then
     deny "cannot uninstall PHP ${version}: ${#pools[@]} website pool(s) still use this PHP version"
   fi
   echo "Stopping php${version}-fpm..."
   systemctl disable --now "php${version}-fpm" 2>/dev/null || true
+  # Per-account masters of this version have no pool left (checked above);
+  # anything still registered is leftover.
+  local leftover
+  for leftover in "$SPANEL_PHP_FPM_ROOT/$version"/*/; do
+    [[ -d "$leftover" ]] || continue
+    systemctl disable --now "$(user_php_fpm_unit "$version" "$(basename "$leftover")")" >/dev/null 2>&1 || true
+  done
+  rm -rf -- "${SPANEL_PHP_FPM_ROOT:?}/${version}" "${SYSTEMD_UNIT_DIR}/spanel-php${version}-fpm@.service" "${SYSTEMD_UNIT_DIR}/spanel-php${version}-fpm@"*.service.d
+  systemctl daemon-reload >/dev/null 2>&1 || true
   echo "Removing PHP $version packages..."
   local installed_pkgs=() pkg
   while IFS= read -r pkg; do
@@ -4419,6 +5749,7 @@ write_php_tune() {
     install -m 0644 -o root -g root "$target" "/etc/php/${version}/cli/conf.d/95-spanel-tune.ini"
   fi
   systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} tuned: ${target}"
 }
 
@@ -4443,6 +5774,7 @@ INI
     install -m 0644 -o root -g root "$target" "/etc/php/${version}/cli/conf.d/96-spanel-opcache.ini"
   fi
   systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "OPcache PHP ${version}: $([[ "$enabled" == "1" ]] && echo enabled || echo disabled)"
 }
 
@@ -4467,6 +5799,7 @@ write_php_config() {
   chmod 0644 "$tmp"
   mv -f -- "$tmp" "$target"
   systemctl restart "php${version}-fpm"
+  reload_user_php_fpm_masters "$version"
   echo "PHP ${version} config updated: ${target}"
 }
 
@@ -6475,6 +7808,10 @@ is_allowed_service() {
     php_version="${BASH_REMATCH[1]}"
     [[ -f "/etc/php/${php_version}/fpm/php-fpm.conf" ]] && return 0
   fi
+  # A hosting account's own PHP-FPM master, once SPanel has set it up.
+  if [[ "$service" =~ ^spanel-php(5\.6|7\.4|8\.[0-5])-fpm@([a-z_][a-z0-9_-]{2,31})$ ]]; then
+    [[ -f "${SPANEL_PHP_FPM_ROOT}/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/php-fpm.conf" ]] && return 0
+  fi
   return 1
 }
 
@@ -6964,6 +8301,17 @@ delete_panel_user_runtime() {
       systemctl reload "php${php_version}-fpm" 2>/dev/null || true
     done
   done
+  # The account's own PHP-FPM masters, one per PHP version it used.
+  local user_fpm_dir user_fpm_ver user_fpm_unit
+  for user_fpm_dir in "$SPANEL_PHP_FPM_ROOT"/*/"$user"; do
+    [[ -d "$user_fpm_dir" ]] || continue
+    user_fpm_ver="$(basename "$(dirname "$user_fpm_dir")")"
+    user_fpm_unit="$(user_php_fpm_unit "$user_fpm_ver" "$user")"
+    systemctl disable --now "$user_fpm_unit" >/dev/null 2>&1 || true
+    rm -rf -- "$user_fpm_dir" "${SYSTEMD_UNIT_DIR}/${user_fpm_unit}.d"
+    rmdir -- "$(dirname "$user_fpm_dir")" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  done
   crontab -r -u "$user" 2>/dev/null || true
   rm -f "/etc/cron.d/spanel-user-${user}" 2>/dev/null || true
   local old_uid
@@ -7154,13 +8502,358 @@ delete_sftp_account() {
   userdel -f "$sub" 2>/dev/null || true
 }
 
+site_root_hash() {
+  printf '%s' "$1" | sha256sum | awk '{print substr($1, 1, 12)}'
+}
+
 site_php_pool_glob() {
   local user="$1" target="$2"
   require_linux_user "$user"
   target=$(readlink -m "$target") || deny "cannot resolve $target"
-  local site_hash
-  site_hash="$(printf '%s' "$target" | sha256sum | awk '{print substr($1, 1, 12)}')"
-  printf 'spanel-%s-%s-*' "$user" "$site_hash"
+  printf 'spanel-%s-%s-*' "$user" "$(site_root_hash "$target")"
+}
+
+# --- PHP-FPM pool naming (site_users.php_fpm_pool_name / php_fpm_socket) -----
+php_pool_name() {
+  # php_pool_name <user> <resolved-site-root> <php-version>
+  printf 'spanel-%s-%s-%s\n' "$1" "$(site_root_hash "$2")" "${3//./_}"
+}
+
+user_php_fpm_unit() {
+  # user_php_fpm_unit <php-version> <user>
+  printf 'spanel-php%s-fpm@%s.service\n' "$1" "$2"
+}
+
+user_php_fpm_dir() {
+  # user_php_fpm_dir <php-version> <user>
+  printf '%s/%s/%s\n' "$SPANEL_PHP_FPM_ROOT" "$1" "$2"
+}
+
+user_php_fpm_socket() {
+  # user_php_fpm_socket <user> <pool-name>
+  printf '%s/%s/%s.sock\n' "$SPANEL_PHP_RUN_ROOT" "$1" "$2"
+}
+
+legacy_php_pool_file() {
+  # legacy_php_pool_file <php-version> <pool-name>
+  printf '%s/%s/fpm/pool.d/%s.conf\n' "$PHP_ETC_ROOT" "$1" "$2"
+}
+
+# Every SPanel pool file on the box, one per line: pools of the per-account
+# masters first, then pools the distro master still serves.
+managed_php_pool_files() {
+  local f
+  for f in "$SPANEL_PHP_FPM_ROOT"/*/*/pool.d/spanel-*.conf "$PHP_ETC_ROOT"/*/fpm/pool.d/spanel-*.conf; do
+    [[ -f "$f" ]] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+php_pool_file_is_legacy() {
+  [[ "$1" == "$PHP_ETC_ROOT"/* ]]
+}
+
+php_pool_file_version() {
+  local f="$1"
+  if php_pool_file_is_legacy "$f"; then
+    f="${f#"$PHP_ETC_ROOT"/}"
+  else
+    f="${f#"$SPANEL_PHP_FPM_ROOT"/}"
+  fi
+  printf '%s\n' "${f%%/*}"
+}
+
+php_pool_file_user() {
+  awk -F= '/^[[:space:]]*user[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$1"
+}
+
+php_pool_listen() {
+  awk -F= '/^[[:space:]]*listen[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$1"
+}
+
+# The systemd unit serving a pool file: the distro master for a legacy pool,
+# the account's own master otherwise.
+php_pool_file_unit() {
+  local f="$1" ver user
+  ver="$(php_pool_file_version "$f")"
+  if php_pool_file_is_legacy "$f"; then
+    printf 'php%s-fpm.service\n' "$ver"
+    return 0
+  fi
+  user="${f#"$SPANEL_PHP_FPM_ROOT"/"$ver"/}"
+  user="${user%%/*}"
+  user_php_fpm_unit "$ver" "$user"
+}
+
+# Pool names, counted once. A pool that is moving between the two layouts
+# exists in both for a moment and is still one pool to size against.
+php_fpm_unique_pool_count() {
+  managed_php_pool_files | awk -F/ '{print $NF}' | sort -u | grep -c . || true
+}
+
+# Writes stdin to <path> when it differs from what is there; prints "changed"
+# when it wrote, so callers know whether systemd needs a daemon-reload.
+write_file_if_changed() {
+  local path="$1" mode="$2" tmp
+  tmp="$(mktemp "${path%/*}/.spanel-write.XXXXXX")" || deny "cannot write ${path}"
+  cat >"$tmp"
+  if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 0
+  fi
+  chmod "$mode" "$tmp"
+  mv -f -- "$tmp" "$path"
+  echo changed
+}
+
+render_user_php_fpm_unit() {
+  # render_user_php_fpm_unit <php-version>: the template, one per PHP version.
+  # No RuntimeDirectory=: two versions of one account share the socket
+  # directory, and systemd would delete it under the other when one stops.
+  local ver="$1"
+  cat <<UNIT
+# Generated by SPanel. One PHP ${ver} FPM master per hosting account; the
+# instance name is the Linux user. Slice=user-<uid>.slice comes from the
+# instance drop-in, so the master and its workers start inside the account's
+# resource limits. The distro php${ver}-fpm.service is left alone.
+[Unit]
+Description=SPanel PHP ${ver} FastCGI Process Manager for %i
+Documentation=man:php-fpm${ver}(8)
+After=network.target
+ConditionPathExists=${SPANEL_PHP_FPM_ROOT}/${ver}/%i/php-fpm.conf
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+Environment=PHP_INI_SCAN_DIR=${PHP_ETC_ROOT}/${ver}/fpm/conf.d
+ExecStartPre=/usr/bin/install -d -m 0755 -o root -g root ${SPANEL_PHP_RUN_ROOT}
+ExecStartPre=/usr/bin/install -d -m 0750 -o root -g www-data ${SPANEL_PHP_RUN_ROOT}/%i
+ExecStartPre=${PHP_FPM_SBIN_DIR}/php-fpm${ver} --test --fpm-config ${SPANEL_PHP_FPM_ROOT}/${ver}/%i/php-fpm.conf
+ExecStart=${PHP_FPM_SBIN_DIR}/php-fpm${ver} --nodaemonize --fpm-config ${SPANEL_PHP_FPM_ROOT}/${ver}/%i/php-fpm.conf
+ExecReload=/bin/kill -USR2 \$MAINPID
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+render_user_php_fpm_slice_dropin() {
+  # render_user_php_fpm_slice_dropin <uid>
+  cat <<DROPIN
+# Generated by SPanel: run this account's PHP inside its own slice.
+[Service]
+Slice=user-${1}.slice
+DROPIN
+}
+
+render_user_php_fpm_conf() {
+  # render_user_php_fpm_conf <php-version> <user>
+  local ver="$1" user="$2" dir
+  dir="$(user_php_fpm_dir "$ver" "$user")"
+  cat <<CONF
+; Generated by SPanel: PHP ${ver} FPM master for ${user}.
+; Pools are the files in ${dir}/pool.d. php.ini and conf.d are the
+; distro's (PHP_INI_SCAN_DIR in the unit), so PHP settings stay server-wide.
+[global]
+pid = ${SPANEL_PHP_RUN_ROOT}/${user}/php${ver}-fpm.pid
+error_log = ${PHP_LOG_DIR}/spanel-fpm-${user}-${ver}.log
+log_level = notice
+emergency_restart_threshold = 10
+emergency_restart_interval = 1m
+process_control_timeout = 10s
+include = ${dir}/pool.d/*.conf
+CONF
+}
+
+render_php_pool_conf() {
+  # render_php_pool_conf <pool-name> <user> <site-root> <listen-socket>
+  # Sizing comes from calculate_php_fpm_pool_tuning, which must run first.
+  local pool_name="$1" user="$2" target="$3" listen="$4"
+  # Per-user dirs for sessions/uploads. Sharing /tmp across pools lets one
+  # site read another's session files (mode 0600 helps but only inside the
+  # same uid; uploads land world-writable on tmpfs). Using 0700 dirs owned
+  # by the pool's Linux user contains the data inside the site's trust
+  # boundary - and, being owned by that user, counts against its disk quota.
+  local sess_dir="/var/lib/php/sessions/${user}"
+  local upload_dir="/var/lib/php/uploads/${user}"
+  cat <<POOL
+[${pool_name}]
+user = ${user}
+group = ${user}
+listen = ${listen}
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+listen.backlog = 64
+; SPanel auto-tunes these values from RAM, CPU and managed pool count.
+; Optional overrides: SPANEL_PHP_FPM_WORKER_MB, SPANEL_PHP_FPM_MAX_CHILDREN,
+; SPANEL_PHP_FPM_IDLE_TIMEOUT, SPANEL_PHP_FPM_MAX_REQUESTS,
+; SPANEL_PHP_FPM_REQUEST_TERMINATE_TIMEOUT.
+pm = ${PHP_FPM_PM_MODE}
+pm.max_children = ${PHP_FPM_MAX_CHILDREN}
+pm.process_idle_timeout = ${PHP_FPM_PROCESS_IDLE_TIMEOUT}s
+pm.max_requests = ${PHP_FPM_MAX_REQUESTS}
+request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s
+request_slowlog_timeout = 5s
+slowlog = /var/log/php/spanel-slow-${pool_name}.log
+chdir = /
+php_admin_value[open_basedir] = ${target}:${sess_dir}:${upload_dir}:/usr/share/php
+php_admin_value[upload_tmp_dir] = ${upload_dir}
+php_admin_value[session.save_path] = ${sess_dir}
+POOL
+}
+
+ensure_php_fpm_logrotate() {
+  # The per-account masters log beside the slowlogs, which never had a rule.
+  # copytruncate: nothing to signal, and one rule covers every master.
+  local rule
+  rule="$(cat <<ROTATE
+# Managed by SPanel.
+${PHP_LOG_DIR}/spanel-fpm-*.log ${PHP_LOG_DIR}/spanel-slow-*.log {
+    su root root
+    weekly
+    rotate 4
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+ROTATE
+)"
+  [[ -d /etc/logrotate.d ]] || return 0
+  printf '%s\n' "$rule" | write_file_if_changed /etc/logrotate.d/spanel-php-fpm 0644 >/dev/null
+}
+
+# Brings the account's master for one PHP version in line with its pool.d:
+# stopped and removed when there is no pool left, otherwise written, tested
+# and started or reloaded. Returns non-zero when the master is not serving,
+# which the caller turns into a fallback to the distro master.
+sync_user_php_fpm_master() {
+  local ver="$1" user="$2" dir unit dropin_dir uid daemon_reload=0 needs_restart=0
+  local pools=()
+  dir="$(user_php_fpm_dir "$ver" "$user")"
+  unit="$(user_php_fpm_unit "$ver" "$user")"
+  dropin_dir="${SYSTEMD_UNIT_DIR}/${unit}.d"
+  shopt -s nullglob
+  pools=("$dir"/pool.d/*.conf)
+  shopt -u nullglob
+  if (( ${#pools[@]} == 0 )); then
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    rm -rf -- "$dir" "$dropin_dir"
+    rmdir -- "${SPANEL_PHP_FPM_ROOT}/${ver}" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    return 0
+  fi
+  [[ -x "${PHP_FPM_SBIN_DIR}/php-fpm${ver}" ]] || return 1
+  uid="$(id -u "$user" 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  (( uid >= 1000 )) || return 1
+  install -d -m 0755 "$dropin_dir"
+  if [[ "$(render_user_php_fpm_unit "$ver" | write_file_if_changed "${SYSTEMD_UNIT_DIR}/spanel-php${ver}-fpm@.service" 0644)" == changed ]]; then
+    daemon_reload=1
+  fi
+  if [[ "$(render_user_php_fpm_slice_dropin "$uid" | write_file_if_changed "${dropin_dir}/10-spanel-slice.conf" 0644)" == changed ]]; then
+    # Slice= only takes effect on a fresh start.
+    daemon_reload=1
+    needs_restart=1
+  fi
+  render_user_php_fpm_conf "$ver" "$user" | write_file_if_changed "${dir}/php-fpm.conf" 0644 >/dev/null
+  ensure_php_fpm_logrotate || true
+  if (( daemon_reload )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  # Test before touching a running master: USR2 with a broken config takes
+  # down every site of the account, a refused test takes down none.
+  PHP_INI_SCAN_DIR="${PHP_ETC_ROOT}/${ver}/fpm/conf.d" \
+    "${PHP_FPM_SBIN_DIR}/php-fpm${ver}" --test --fpm-config "${dir}/php-fpm.conf" >/dev/null 2>&1 || return 1
+  if systemctl is-active --quiet "$unit" 2>/dev/null; then
+    if (( needs_restart )); then
+      systemctl restart "$unit" >/dev/null 2>&1 || return 1
+    else
+      systemctl reload "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || return 1
+    fi
+  else
+    systemctl enable "$unit" >/dev/null 2>&1 || true
+    # restart, not start: it also clears a failed state left by an earlier try.
+    systemctl restart "$unit" >/dev/null 2>&1 || return 1
+  fi
+  systemctl is-active --quiet "$unit" 2>/dev/null
+}
+
+# Reloads every running per-account master of one PHP version, for changes
+# they share with the distro master: php.ini, conf.d, extensions, binaries.
+reload_user_php_fpm_masters() {
+  local ver="$1" dir user unit
+  for dir in "$SPANEL_PHP_FPM_ROOT/$ver"/*/; do
+    [[ -f "${dir}php-fpm.conf" ]] || continue
+    user="$(basename "$dir")"
+    unit="$(user_php_fpm_unit "$ver" "$user")"
+    systemctl is-active --quiet "$unit" 2>/dev/null || continue
+    systemctl reload "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+# Reload (or for per-account masters, re-sync) the units serving the pool
+# files named on stdin, each once.
+reload_php_pool_owners() {
+  local f unit ver user seen=" "
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    unit="$(php_pool_file_unit "$f")"
+    [[ "$seen" == *" ${unit} "* ]] && continue
+    seen+="${unit} "
+    ver="$(php_pool_file_version "$f")"
+    if php_pool_file_is_legacy "$f"; then
+      systemctl reload "php${ver}-fpm" 2>/dev/null || true
+    else
+      user="${unit#spanel-php"${ver}"-fpm@}"
+      user="${user%.service}"
+      sync_user_php_fpm_master "$ver" "$user" || \
+        echo "warning: ${unit} is not running; see journalctl -u ${unit}" >&2
+    fi
+  done
+  return 0
+}
+
+# Pools still in the distro pool.d whose site already runs on its account's
+# master, once no vhost points at the old socket any more. Until the vhost is
+# rewritten the old pool is what serves the site, so it stays.
+prune_legacy_php_pools() {
+  local refs f name ver user sock versions=" " removed=0
+  refs="$(mktemp)"
+  cat "$NGINX_CONF_DIR"/*.conf 2>/dev/null | grep -oE "$PHP_FPM_SOCKET_GREP" | sort -u >"$refs" || true
+  # No sockets at all means nginx is unconfigured or unreadable, not that no
+  # site needs its pool. Same refusal as the orphan cleanup.
+  if [[ ! -s "$refs" ]]; then
+    rm -f -- "$refs"
+    return 0
+  fi
+  for f in "$PHP_ETC_ROOT"/*/fpm/pool.d/spanel-*.conf; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f" .conf)"
+    ver="$(php_pool_file_version "$f")"
+    user="$(php_pool_file_user "$f" || true)"
+    [[ -n "$user" ]] || continue
+    [[ -f "$(user_php_fpm_dir "$ver" "$user")/pool.d/${name}.conf" ]] || continue
+    sock="$(php_pool_listen "$f" || true)"
+    if [[ -n "$sock" ]] && grep -qxF "$sock" "$refs"; then
+      continue
+    fi
+    rm -f -- "$f"
+    echo "retired legacy pool ${name} (PHP ${ver})"
+    removed=$((removed + 1))
+    [[ "$versions" == *" ${ver} "* ]] || versions+="${ver} "
+  done
+  rm -f -- "$refs"
+  for ver in $versions; do
+    systemctl reload "php${ver}-fpm" 2>/dev/null || true
+  done
+  return 0
 }
 
 positive_int_or_default() {
@@ -7201,14 +8894,14 @@ php_fpm_cpu_count() {
 }
 
 php_fpm_pool_count() {
-  local current_pool="${1:-}" count=0 pool_file
-  shopt -s nullglob
-  for pool_file in /etc/php/*/fpm/pool.d/spanel-*.conf; do
-    [[ -f "$pool_file" ]] || continue
-    count=$((count + 1))
-  done
-  shopt -u nullglob
-  if [[ -n "$current_pool" && ! -f "$current_pool" ]]; then
+  local current_pool="${1:-}" count files
+  count="$(php_fpm_unique_pool_count)"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  # A pool about to be written counts too - unless it is already on disk in
+  # either layout under the same name. Read whole, then matched: `| grep -q`
+  # under pipefail turns an early match into a failure.
+  files="$(managed_php_pool_files)"
+  if [[ -n "$current_pool" && ! -f "$current_pool" && $'\n'"$files"$'\n' != *"/$(basename "$current_pool")"$'\n'* ]]; then
     count=$((count + 1))
   fi
   if (( count < 1 )); then
@@ -7363,8 +9056,8 @@ apply_saved_user_limits_to_pool_file() {
 ensure_php_fpm_cgroup_dropin() {
   local fpm_ver="$1" dropin_dir
   [[ "$fpm_ver" =~ ^[0-9]+\.[0-9]+$ ]] || return 0
-  dropin_dir="/etc/systemd/system/php${fpm_ver}-fpm.service.d"
-  install -d -o root -g root -m 0755 "$dropin_dir"
+  dropin_dir="${SYSTEMD_UNIT_DIR}/php${fpm_ver}-fpm.service.d"
+  install -d -m 0755 "$dropin_dir"
   cat >"${dropin_dir}/50-spanel-cgroup.conf" <<'DROPIN'
 [Service]
 ExecStartPost=-/usr/local/sbin/spanel-helper cgroup-classify-workers
@@ -7373,11 +9066,65 @@ DROPIN
   chmod 0644 "${dropin_dir}/50-spanel-cgroup.conf"
 }
 
+# Whole disk under / ("/dev/sda" for "/dev/sda1"), or nothing when / is not
+# on a plain block device (LVM, a container overlay). cgroup IO limits are
+# per device, and the panel's limits mean "the disk the sites live on".
+tenant_io_base_device() {
+  local root_dev base_dev
+  root_dev="$(findmnt -no SOURCE / 2>/dev/null | head -n1 || true)"
+  if [[ "$root_dev" == /dev/nvme* || "$root_dev" == /dev/mmcblk* ]]; then
+    base_dev="$(echo "$root_dev" | sed -E 's/p[0-9]+$//')"
+  elif [[ "$root_dev" == /dev/* ]]; then
+    base_dev="$(echo "$root_dev" | sed -E 's/[0-9]+$//')"
+  else
+    base_dev=""
+  fi
+  [[ -n "$base_dev" && -b "$base_dev" ]] || base_dev=""
+  printf '%s\n' "$base_dev"
+}
+
+# io.max line for a cgroup: "<maj:min> rbps=.. wbps=.. riops=.. wiops=..",
+# MB/s and IOPS from the limits file, 0 meaning no limit ("max").
+render_io_max_line() {
+  local majmin="$1" r_mbps="${2:-0}" w_mbps="${3:-0}" r_iops="${4:-0}" w_iops="${5:-0}" v
+  for v in r_mbps w_mbps r_iops w_iops; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || printf -v "$v" '0'
+  done
+  [[ "$majmin" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s rbps=%s wbps=%s riops=%s wiops=%s\n' "$majmin" \
+    "$( (( r_mbps > 0 )) && echo $(( r_mbps * 1048576 )) || echo max )" \
+    "$( (( w_mbps > 0 )) && echo $(( w_mbps * 1048576 )) || echo max )" \
+    "$( (( r_iops > 0 )) && echo "$r_iops" || echo max )" \
+    "$( (( w_iops > 0 )) && echo "$w_iops" || echo max )"
+}
+
+# Whether a process with this /proc/<pid>/cgroup content still needs moving
+# into user-<uid>.slice/spanel.scope. A process already anywhere inside the
+# account's slice - its own PHP-FPM master and workers, an SSH session - is
+# under the slice's limits; moving it out of a systemd unit's cgroup would
+# only leave systemd with a unit it no longer controls.
+tenant_process_needs_scope() {
+  local cg_current="$1" uid="$2"
+  [[ "$cg_current" == *"spanel-app-"* ]] && return 1
+  [[ "$cg_current" == *"/user-${uid}.slice/"* ]] && return 1
+  return 0
+}
+
+# What still runs outside the account's slice gets moved in after the fact:
+# pools left on the distro php-fpm master, cron jobs (cron.service), anything
+# started by root on the account's behalf. PHP served by the per-account
+# masters never needs this - it starts inside the slice.
 classify_all_tenant_workers() {
   [[ -d /sys/fs/cgroup/user.slice ]] || return 0
   echo "+cpu +memory +io +pids" >/sys/fs/cgroup/user.slice/cgroup.subtree_control 2>/dev/null || true
-  local pid uid uname comm slice_unit cg_slice cg_scope cg_current limits_file
-  local cpu_pct mem_high mem_max tasks_max
+  local pid uid uname comm slice_unit cg_slice cg_scope cg_current limits_file io_dev io_majmin io_line
+  local cpu_pct mem_high mem_max tasks_max io_r io_w iops_r iops_w
+  local prepared=" "
+  io_dev="$(tenant_io_base_device)"
+  io_majmin=""
+  if [[ -n "$io_dev" ]]; then
+    io_majmin="$(lsblk -dno MAJ:MIN "$io_dev" 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
   while read -r pid uid uname comm; do
     [[ "$pid" =~ ^[0-9]+$ && "$uid" =~ ^[0-9]+$ ]] || continue
     (( uid >= 1000 && uid < 65000 )) || continue
@@ -7390,65 +9137,84 @@ classify_all_tenant_workers() {
       esac
     fi
     cg_current="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
-    [[ "$cg_current" == *"spanel-app-"* ]] && continue
+    tenant_process_needs_scope "$cg_current" "$uid" || continue
     slice_unit="user-${uid}.slice"
     cg_slice="/sys/fs/cgroup/user.slice/${slice_unit}"
-    if [[ ! -d "$cg_slice" ]]; then
-      systemctl start "$slice_unit" >/dev/null 2>&1 || mkdir -p "$cg_slice" 2>/dev/null || true
-    fi
-    echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
     cg_scope="${cg_slice}/spanel.scope"
-    mkdir -p "$cg_scope" 2>/dev/null || true
-    if [[ -f "$limits_file" ]]; then
-      cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-      if [[ "$cpu_pct" =~ ^[0-9]+$ ]] && (( cpu_pct > 0 )); then
-        echo "$(( cpu_pct * 1000 )) 100000" >"${cg_scope}/cpu.max" 2>/dev/null || true
+    # Limits are written once per account per scan, not once per process.
+    if [[ "$prepared" != *" ${uid} "* ]]; then
+      prepared+="${uid} "
+      if [[ ! -d "$cg_slice" ]]; then
+        systemctl start "$slice_unit" >/dev/null 2>&1 || mkdir -p "$cg_slice" 2>/dev/null || true
       fi
-      if [[ "$mem_high" =~ ^[0-9]+$ ]] && (( mem_high > 0 )); then
-        echo "$(( mem_high * 1048576 ))" >"${cg_scope}/memory.high" 2>/dev/null || true
-      fi
-      if [[ "$mem_max" =~ ^[0-9]+$ ]] && (( mem_max > 0 )); then
-        echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
-      fi
-      if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
-        echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
+      echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
+      mkdir -p "$cg_scope" 2>/dev/null || true
+      if [[ -f "$limits_file" ]]; then
+        cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        io_r="$(awk -F= '$1=="IO_READ_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        io_w="$(awk -F= '$1=="IO_WRITE_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        iops_r="$(awk -F= '$1=="IOPS_READ"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        iops_w="$(awk -F= '$1=="IOPS_WRITE"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+        if [[ "$cpu_pct" =~ ^[0-9]+$ ]] && (( cpu_pct > 0 )); then
+          echo "$(( cpu_pct * 1000 )) 100000" >"${cg_scope}/cpu.max" 2>/dev/null || true
+        fi
+        if [[ "$mem_high" =~ ^[0-9]+$ ]] && (( mem_high > 0 )); then
+          echo "$(( mem_high * 1048576 ))" >"${cg_scope}/memory.high" 2>/dev/null || true
+        fi
+        if [[ "$mem_max" =~ ^[0-9]+$ ]] && (( mem_max > 0 )); then
+          echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
+        fi
+        if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
+          echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
+        fi
+        if [[ -n "$io_majmin" ]] && io_line="$(render_io_max_line "$io_majmin" "$io_r" "$io_w" "$iops_r" "$iops_w")"; then
+          echo "$io_line" >"${cg_scope}/io.max" 2>/dev/null || true
+        fi
       fi
     fi
-    [[ "$cg_current" == *"${slice_unit}/spanel.scope"* ]] && continue
     if [[ -w "${cg_scope}/cgroup.procs" ]]; then
       echo "$pid" >"${cg_scope}/cgroup.procs" 2>/dev/null || true
     fi
   done < <(ps -eo pid=,uid=,user:32=,comm= 2>/dev/null || true)
 }
 
+# The distro masters only need the classify hook while they still serve a
+# tenant pool; the per-account masters start in the slice on their own.
+legacy_php_pool_versions() {
+  local f ver versions=" "
+  for f in "$PHP_ETC_ROOT"/*/fpm/pool.d/spanel-*.conf; do
+    [[ -f "$f" ]] || continue
+    ver="$(php_pool_file_version "$f")"
+    [[ "$versions" == *" ${ver} "* ]] || versions+="${ver} "
+  done
+  printf '%s\n' "$versions"
+}
+
 retune_php_fpm_pools() {
-  local pool_file php_version pool_user count=0 versions=""
-  shopt -s nullglob
-  for pool_file in /etc/php/*/fpm/pool.d/spanel-*.conf; do
-    [[ -f "$pool_file" ]] || continue
+  local pool_file php_version pool_user count=0 files
+  files="$(managed_php_pool_files)"
+  while IFS= read -r pool_file; do
+    [[ -n "$pool_file" && -f "$pool_file" ]] || continue
     calculate_php_fpm_pool_tuning "$pool_file"
     apply_php_fpm_tuning_to_pool_file "$pool_file"
-    pool_user="$(awk -F= '/^[[:space:]]*user[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$pool_file")"
+    pool_user="$(php_pool_file_user "$pool_file" || true)"
     if [[ -n "$pool_user" ]]; then
       ensure_php_runtime_dirs "$pool_user"
       apply_saved_user_limits_to_pool_file "$pool_file" "$pool_user"
       usermod -aG "$pool_user" www-data 2>/dev/null || true
     fi
     count=$((count + 1))
-    php_version="$(echo "$pool_file" | awk -F/ '{print $4}')"
-    case " $versions " in
-      *" $php_version "*) ;;
-      *) versions="${versions} ${php_version}" ;;
-    esac
-  done
-  shopt -u nullglob
-  for php_version in $versions; do
+  done <<<"$files"
+  for php_version in $(legacy_php_pool_versions); do
     ensure_php_fpm_cgroup_dropin "$php_version"
-    systemctl reload "php${php_version}-fpm" 2>/dev/null || true
   done
+  reload_php_pool_owners <<<"$files"
+  # Boot runs this too, which makes it the place a pool left behind by an
+  # interrupted move is finally retired.
+  prune_legacy_php_pools >/dev/null || true
   classify_all_tenant_workers
   echo "Retuned ${count} SPanel PHP-FPM pool(s)."
 }
@@ -7601,6 +9367,206 @@ retune_mariadb() {
   echo "Retuned MariaDB: innodb_buffer_pool_size=${MARIADB_INNODB_BUFFER_POOL_SIZE}, max_connections=${MARIADB_MAX_CONNECTIONS}, table_open_cache=${MARIADB_TABLE_OPEN_CACHE}."
 }
 
+# --- disk quota ---------------------------------------------------------------
+# Kernel user quota on the filesystem that holds /home. The panel's own
+# accounting (storage_quota.py) measures what it can see and refuses panel
+# uploads past the limit; it cannot stop PHP or SFTP writing. A kernel quota
+# can, and counts every file the account owns on that filesystem - its sites,
+# and its PHP session/upload directories when /var/lib/php is on the same one.
+#
+# Turning it on installs the quota tools and adds the mount options to
+# /etc/fstab. It never remounts and never reboots: options added to fstab take
+# effect at the administrator's next remount or reboot, and the status says so.
+QUOTA_HOME="/home"
+FSTAB_FILE="/etc/fstab"
+
+quota_mount_field() {
+  findmnt -no "$1" -T "$QUOTA_HOME" 2>/dev/null | head -n1 | tr -d '[:space:]' || true
+}
+
+# Whether a mount option string turns user quota on.
+quota_options_active() {
+  [[ ",$1," =~ ,(usrquota|usrjquota=[^,]+|uquota|uqnoenforce|quota), ]]
+}
+
+quota_wanted_options() {
+  # quota_wanted_options <fstype>: journaled quota on ext4 (no quotacheck after
+  # a crash), plain user quota on xfs.
+  case "$1" in
+    ext4) echo "usrjquota=aquota.user,jqfmt=vfsv1" ;;
+    xfs) echo "usrquota" ;;
+    *) return 1 ;;
+  esac
+}
+
+fstab_quota_options() {
+  # fstab_quota_options <fstab> <mountpoint>: the options column of its entry.
+  awk -v mp="$2" '$1 !~ /^#/ && $2 == mp { print $4; exit }' "$1"
+}
+
+fstab_with_quota_options() {
+  # fstab_with_quota_options <fstab> <mountpoint> <fstype>: the fstab with the
+  # quota options added to that entry, on stdout. Exit 2 when the mount point
+  # has no entry (nothing is guessed), 0 otherwise; idempotent.
+  local fstab="$1" mp="$2" opts
+  opts="$(quota_wanted_options "$3")" || return 1
+  awk -v mp="$mp" -v add="$opts" '
+    BEGIN { found = 0 }
+    $1 !~ /^#/ && $2 == mp && NF >= 4 && !found {
+      found = 1
+      if ("," $4 "," !~ /,(usrquota|usrjquota=[^,]+|uquota|quota),/) {
+        $4 = ($4 == "defaults" ? "defaults," add : $4 "," add)
+        line = $1
+        for (i = 2; i <= NF; i++) line = line "\t" $i
+        print line
+        next
+      }
+    }
+    { print }
+    END { if (!found) exit 2 }
+  ' "$fstab"
+}
+
+quota_state() {
+  # quota_state <fstype> <mountpoint> <options-active:yes|no> <in-fstab:yes|no> <quota-on:yes|no>
+  local fstype="$1" mp="$2" active="$3" fstab="$4" on="$5"
+  case "$fstype" in
+    ext4|xfs) ;;
+    *) echo unsupported; return 0 ;;
+  esac
+  if [[ "$active" == yes ]]; then
+    if [[ "$fstype" == xfs || "$on" == yes ]]; then
+      echo active
+    else
+      echo needs-quotaon
+    fi
+    return 0
+  fi
+  # XFS takes quota options only at mount time, and for / that is the kernel
+  # command line, not fstab.
+  if [[ "$fstype" == xfs && "$mp" == / ]]; then
+    echo kernel-cmdline-required
+  elif [[ "$fstab" == yes ]]; then
+    echo remount-required
+  else
+    echo not-configured
+  fi
+}
+
+quota_status() {
+  local mp fstype device options active=no fstab=no on=no tools=no state hint=""
+  mp="$(quota_mount_field TARGET)"
+  fstype="$(quota_mount_field FSTYPE)"
+  device="$(quota_mount_field SOURCE)"
+  options="$(quota_mount_field OPTIONS)"
+  quota_options_active "$options" && active=yes
+  if [[ -n "$mp" && -f "$FSTAB_FILE" ]] && quota_options_active "$(fstab_quota_options "$FSTAB_FILE" "$mp")"; then
+    fstab=yes
+  fi
+  command -v setquota >/dev/null 2>&1 && tools=yes
+  if [[ "$tools" == yes && "$active" == yes && "$fstype" == ext4 ]]; then
+    [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" == *" is on"* ]] && on=yes
+  fi
+  state="$(quota_state "$fstype" "$mp" "$active" "$fstab" "$on")"
+  case "$state" in
+    active) hint="Kernel quota enforces each account's disk and inode limits on ${mp}." ;;
+    needs-quotaon) hint="Quota options are mounted on ${mp}; enable kernel quota again to build the quota files and switch it on." ;;
+    remount-required) hint="Quota options are in /etc/fstab for ${mp}. Remount it (mount -o remount ${mp}) or reboot, then enable again." ;;
+    kernel-cmdline-required) hint="/ is XFS: add rootflags=uquota to GRUB_CMDLINE_LINUX in /etc/default/grub, run update-grub and reboot." ;;
+    not-configured) hint="Only the panel's own accounting applies; PHP and SFTP can write past the limit." ;;
+    unsupported) hint="Kernel quota needs ext4 or xfs; ${mp:-/home} is on ${fstype:-an unknown filesystem}." ;;
+  esac
+  printf 'mode=%s\n' "$([[ "$state" == active ]] && echo kernel || echo app)"
+  printf 'state=%s\nmount=%s\nfstype=%s\ndevice=%s\ntools=%s\nmounted_options=%s\nfstab_options=%s\nquota_on=%s\nhint=%s\n' \
+    "$state" "$mp" "$fstype" "$device" "$tools" "$active" "$fstab" "$on" "$hint"
+}
+
+quota_enable() {
+  local mp fstype options state backup tmp
+  mp="$(quota_mount_field TARGET)"
+  fstype="$(quota_mount_field FSTYPE)"
+  options="$(quota_mount_field OPTIONS)"
+  [[ -n "$mp" ]] || deny "cannot find the filesystem holding ${QUOTA_HOME}"
+  case "$fstype" in
+    ext4|xfs) ;;
+    *) deny "kernel quota needs ext4 or xfs; ${mp} is ${fstype:-unknown}" ;;
+  esac
+  if ! command -v setquota >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y quota >/dev/null || deny "apt-get could not install the quota tools"
+  fi
+  if ! quota_options_active "$options"; then
+    if [[ "$fstype" == xfs && "$mp" == / ]]; then
+      quota_status
+      return 0
+    fi
+    if ! quota_options_active "$(fstab_quota_options "$FSTAB_FILE" "$mp")"; then
+      tmp="$(mktemp)"
+      local rc=0
+      fstab_with_quota_options "$FSTAB_FILE" "$mp" "$fstype" >"$tmp" || rc=$?
+      if (( rc != 0 )); then
+        rm -f -- "$tmp"
+        (( rc == 2 )) && deny "${mp} has no entry in ${FSTAB_FILE}; add the quota options by hand"
+        deny "could not prepare ${FSTAB_FILE}"
+      fi
+      # Refuse anything findmnt cannot parse: a broken fstab is a server that
+      # does not boot.
+      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]] && ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+        rm -f -- "$tmp"
+        deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+      fi
+      backup="${FSTAB_FILE}.spanel-$(date +%Y%m%d%H%M%S)"
+      cp -p -- "$FSTAB_FILE" "$backup"
+      cat "$tmp" >"$FSTAB_FILE"
+      rm -f -- "$tmp"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      logger -t spanel-helper -- "quota: added user quota options for ${mp} to ${FSTAB_FILE} (backup ${backup})" 2>/dev/null || true
+      echo "backup=${backup}"
+    fi
+    quota_status
+    return 0
+  fi
+  if [[ "$fstype" == ext4 ]]; then
+    # Journaled quota: build the quota file once, then switch it on. -m keeps
+    # the filesystem mounted read-write while it is counted.
+    if [[ ! -f "${mp%/}/aquota.user" ]]; then
+      quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
+    fi
+    if [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
+      quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
+    fi
+  fi
+  quota_status
+}
+
+quota_limits() {
+  # quota_limits <storage_mb> <inode_limit>: "block-soft block-hard inode-soft
+  # inode-hard" for setquota. Blocks are KiB; soft is 95% of hard, so the
+  # account is warned (grace period) before writes start failing. 0 = no limit.
+  local mb="${1:-0}" inodes="${2:-0}" bhard bsoft ihard isoft
+  [[ "$mb" =~ ^[0-9]+$ ]] || mb=0
+  [[ "$inodes" =~ ^[0-9]+$ ]] || inodes=0
+  bhard=$(( mb * 1024 ))
+  bsoft=$(( bhard * 95 / 100 ))
+  ihard="$inodes"
+  isoft=$(( ihard * 95 / 100 ))
+  printf '%s %s %s %s\n' "$bsoft" "$bhard" "$isoft" "$ihard"
+}
+
+apply_kernel_quota() {
+  # apply_kernel_quota <user> <storage_mb> <inode_limit>: no-op unless user
+  # quota is mounted on the filesystem holding /home.
+  local user="$1" mp limits
+  command -v setquota >/dev/null 2>&1 || return 0
+  quota_options_active "$(quota_mount_field OPTIONS)" || return 0
+  mp="$(quota_mount_field TARGET)"
+  [[ -n "$mp" ]] || return 0
+  limits="$(quota_limits "$2" "$3")"
+  # shellcheck disable=SC2086 # four numbers, split on purpose
+  setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
+    echo "warning: setquota failed for ${user} on ${mp}" >&2
+}
+
 # --- clock --------------------------------------------------------------------
 # Cheap VPS hosts routinely block outbound UDP 123, so systemd-timesyncd and
 # chrony never converge and the clock drifts until TOTP logins stop matching.
@@ -7653,66 +9619,75 @@ time_sync() {
 }
 
 delete_site_php_pools() {
-  local user="$1" target="$2" glob
+  local user="$1" target="$2" glob dir pool_file php_version removed=""
   glob="$(site_php_pool_glob "$user" "$target")"
-  for dir in /etc/php/*/fpm/pool.d; do
+  # Pools of the account's own masters, then any the distro master still has.
+  for dir in "$SPANEL_PHP_FPM_ROOT"/*/"$user"/pool.d "$PHP_ETC_ROOT"/*/fpm/pool.d; do
     [[ -d "$dir" ]] || continue
     for pool_file in "$dir"/$glob.conf; do
       [[ -f "$pool_file" ]] || continue
       rm -f "$pool_file"
-      local php_version
-      php_version="$(echo "$dir" | awk -F/ '{print $4}')"
-      systemctl reload "php${php_version}-fpm" 2>/dev/null || true
+      removed+="${pool_file}"$'\n'
     done
   done
+  # A master whose last pool went is stopped and removed by the re-sync.
+  [[ -n "$removed" ]] && reload_php_pool_owners <<<"$removed"
+  return 0
 }
 
+# Writes the site's pool for its account's own master and brings that master
+# up. When the master cannot serve a pool that is new to it - a new site, a
+# PHP version change, or the move of an existing site off the distro master -
+# the pool goes to the distro master instead, as before per-account masters,
+# and site_users.php_fpm_socket() follows: it names the account socket only
+# while the account's pool file exists.
 ensure_php_pool() {
   local user="$1" target="$2" php_version="$3"
   [[ "$php_version" != "none" ]] || return 0
   require_linux_user "$user"
   require_php_version "$php_version"
   target=$(readlink -m "$target") || deny "cannot resolve $target"
-  local pool_suffix="${php_version//./_}"
-  local site_hash
-  site_hash="$(printf '%s' "$target" | sha256sum | awk '{print substr($1, 1, 12)}')"
-  local pool_name="spanel-${user}-${site_hash}-${pool_suffix}"
-  local pool_file="/etc/php/${php_version}/fpm/pool.d/${pool_name}.conf"
-  # Per-user dirs for sessions/uploads. Sharing /tmp across pools lets one
-  # site read another's session files (mode 0600 helps but only inside the
-  # same uid; uploads land world-writable on tmpfs). Using 0700 dirs owned
-  # by the pool's Linux user contains the data inside the site's trust
-  # boundary.
-  local sess_dir="/var/lib/php/sessions/${user}"
-  local upload_dir="/var/lib/php/uploads/${user}"
+  local pool_name user_dir pool_file legacy_file unit previous=""
+  pool_name="$(php_pool_name "$user" "$target" "$php_version")"
+  user_dir="$(user_php_fpm_dir "$php_version" "$user")"
+  pool_file="${user_dir}/pool.d/${pool_name}.conf"
+  legacy_file="$(legacy_php_pool_file "$php_version" "$pool_name")"
+  unit="$(user_php_fpm_unit "$php_version" "$user")"
   ensure_php_runtime_dirs "$user"
+  # The distro copy of a pool that moved is NOT retired here: callers rewrite
+  # the vhost after this returns, and nginx may only reload at the end of a
+  # whole batch (update.sh's site refresh). php-fpm-legacy-prune does it once
+  # nginx is on the new socket.
   calculate_php_fpm_pool_tuning "$pool_file"
-  cat >"$pool_file" <<POOL
-[${pool_name}]
-user = ${user}
-group = ${user}
-listen = /run/php/${pool_name}.sock
-listen.owner = www-data
-listen.group = www-data
-listen.mode = 0660
-listen.backlog = 64
-; SPanel auto-tunes these values from RAM, CPU and managed pool count.
-; Optional overrides: SPANEL_PHP_FPM_WORKER_MB, SPANEL_PHP_FPM_MAX_CHILDREN,
-; SPANEL_PHP_FPM_IDLE_TIMEOUT, SPANEL_PHP_FPM_MAX_REQUESTS,
-; SPANEL_PHP_FPM_REQUEST_TERMINATE_TIMEOUT.
-pm = ${PHP_FPM_PM_MODE}
-pm.max_children = ${PHP_FPM_MAX_CHILDREN}
-pm.process_idle_timeout = ${PHP_FPM_PROCESS_IDLE_TIMEOUT}s
-pm.max_requests = ${PHP_FPM_MAX_REQUESTS}
-request_terminate_timeout = ${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s
-request_slowlog_timeout = 5s
-slowlog = /var/log/php/spanel-slow-${pool_name}.log
-chdir = /
-php_admin_value[open_basedir] = ${target}:${sess_dir}:${upload_dir}:/usr/share/php
-php_admin_value[upload_tmp_dir] = ${upload_dir}
-php_admin_value[session.save_path] = ${sess_dir}
-POOL
+  install -d -m 0755 "$SPANEL_PHP_FPM_ROOT" "${SPANEL_PHP_FPM_ROOT}/${php_version}" "$user_dir" "${user_dir}/pool.d"
+  if [[ -f "$pool_file" ]]; then
+    previous="$(mktemp)"
+    cp -p -- "$pool_file" "$previous"
+  fi
+  render_php_pool_conf "$pool_name" "$user" "$target" "$(user_php_fpm_socket "$user" "$pool_name")" >"$pool_file"
+  chmod 0644 "$pool_file"
   apply_saved_user_limits_to_pool_file "$pool_file" "$user"
+  if sync_user_php_fpm_master "$php_version" "$user"; then
+    [[ -z "$previous" ]] || rm -f -- "$previous"
+    return 0
+  fi
+
+  if [[ -n "$previous" ]]; then
+    # The site was already served by this master and its vhost names the
+    # account socket: moving it now would point nginx at nothing. Put the
+    # pool back as it was and report.
+    mv -f -- "$previous" "$pool_file"
+    sync_user_php_fpm_master "$php_version" "$user" || true
+    deny "${unit} did not accept the updated pool ${pool_name}; the previous pool was restored (journalctl -u ${unit})"
+  fi
+
+  rm -f -- "$pool_file"
+  sync_user_php_fpm_master "$php_version" "$user" || true
+  logger -t spanel-helper -- "php-fpm: ${unit} did not start; ${pool_name} stays on php${php_version}-fpm" 2>/dev/null || true
+  echo "warning: ${unit} did not start; ${pool_name} is served by php${php_version}-fpm instead (journalctl -u ${unit})" >&2
+  render_php_pool_conf "$pool_name" "$user" "$target" "/run/php/${pool_name}.sock" >"$legacy_file"
+  chmod 0644 "$legacy_file"
+  apply_saved_user_limits_to_pool_file "$legacy_file" "$user"
   ensure_php_fpm_cgroup_dropin "$php_version"
   systemctl reload "php${php_version}-fpm"
   classify_all_tenant_workers
@@ -7901,6 +9876,11 @@ case "$cmd" in
     upgrade_core_stack_packages "$@"
     ;;
 
+  updates-core-blacklist)
+    [[ $# -ge 1 ]] || deny "usage: updates-core-blacklist <on|off> [pkg...]"
+    set_core_stack_blacklist "$@"
+    ;;
+
   updates-os-auto)
     [[ $# -eq 3 ]] || deny "usage: updates-os-auto <on|off> <security|all> <on|off>"
     configure_unattended_upgrades "$1" "$2" "$3"
@@ -7911,17 +9891,40 @@ case "$cmd" in
     ;;
 
   panel-snapshot-create)
-    panel_snapshot_create "${1:-manual}"
+    [[ $# -le 2 ]] || deny "usage: panel-snapshot-create [reason] [keep]"
+    panel_snapshot_create "${1:-manual}" "${2:-$DEFAULT_SNAPSHOT_KEEP}"
     ;;
 
   panel-snapshot-restore)
-    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db]"
-    panel_snapshot_restore "$1" "${2:-}"
+    [[ $# -ge 1 && $# -le 3 ]] || deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db] [--now]"
+    panel_snapshot_restore "$@"
     ;;
 
   panel-snapshot-delete)
     [[ $# -eq 1 ]] || deny "usage: panel-snapshot-delete <snapshot-id>"
     panel_snapshot_delete "$1"
+    ;;
+
+  panel-db-restore)
+    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: panel-db-restore <backup-name> [--now]"
+    panel_db_restore "$1" "${2:-}"
+    ;;
+
+  panel-dr-key-status)
+    [[ $# -eq 0 ]] || deny "usage: panel-dr-key-status"
+    panel_dr_key_status
+    ;;
+
+  panel-dr-key-init)
+    [[ $# -le 1 ]] || deny "usage: panel-dr-key-init [--rotate]"
+    panel_dr_key_init "${1:-}"
+    ;;
+
+  panel-dr-archive)
+    [[ $# -eq 0 ]] || deny "usage: panel-dr-archive"
+    PANEL_DR_WORK=""
+    trap '[[ -n "${PANEL_DR_WORK:-}" ]] && rm -rf "$PANEL_DR_WORK"' EXIT
+    panel_dr_archive
     ;;
 
   # ---- WAF --------------------------------------------------------------
@@ -7963,6 +9966,11 @@ case "$cmd" in
   dns-status)
     [[ $# -eq 0 ]] || deny "usage: dns-status"
     dns_status
+    ;;
+
+  dns-transfers)
+    [[ $# -eq 1 ]] || deny "usage: dns-transfers <on|off>"
+    dns_transfers "$1"
     ;;
 
   # ---- Email (Exim + Dovecot + webmail, optional) -------------------------
@@ -8011,15 +10019,44 @@ case "$cmd" in
     mail_webmail_hosts
     ;;
 
+  mail-hosts-apply)
+    [[ $# -eq 0 ]] || deny "usage: mail-hosts-apply < hosts.json"
+    mail_hosts_apply
+    ;;
+
+  mail-hosts-remove)
+    [[ $# -eq 1 ]] || deny "usage: mail-hosts-remove <domain>"
+    mail_hosts_remove "$1"
+    ;;
+
   mail-configure)
     [[ $# -eq 0 ]] || deny "usage: mail-configure < settings.json"
     mail_configure
     ;;
 
+  mail-reconfigure)
+    [[ $# -eq 0 ]] || deny "usage: mail-reconfigure"
+    mail_reconfigure
+    ;;
+
   mail-dkim)
-    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: mail-dkim <domain> [rotate]"
-    [[ $# -eq 1 || "$2" == "rotate" ]] || deny "usage: mail-dkim <domain> [rotate]"
-    mail_dkim "$1" "${2:-}"
+    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: mail-dkim <domain> [selector]"
+    mail_dkim "$1" "${2:-spanel}"
+    ;;
+
+  mail-dkim-drop)
+    [[ $# -eq 2 ]] || deny "usage: mail-dkim-drop <domain> <selector>"
+    mail_dkim_drop "$1" "$2"
+    ;;
+
+  mail-dkim-export)
+    [[ $# -eq 1 ]] || deny "usage: mail-dkim-export <domain>"
+    mail_dkim_export "$1"
+    ;;
+
+  mail-dkim-import)
+    [[ $# -eq 2 ]] || deny "usage: mail-dkim-import <domain> <selector> < key.pem"
+    mail_dkim_import "$1" "$2"
     ;;
 
   mail-log)
@@ -8030,6 +10067,26 @@ case "$cmd" in
   mail-queue)
     [[ $# -eq 0 ]] || deny "usage: mail-queue"
     mail_queue_count
+    ;;
+
+  mail-queue-list)
+    [[ $# -eq 0 ]] || deny "usage: mail-queue-list"
+    mail_queue_list
+    ;;
+
+  mail-queue-show)
+    [[ $# -eq 1 ]] || deny "usage: mail-queue-show <id>"
+    mail_queue_show "$1"
+    ;;
+
+  mail-queue-action)
+    [[ $# -ge 2 ]] || deny "usage: mail-queue-action <retry|freeze|thaw|delete> <id>..."
+    mail_queue_action "$@"
+    ;;
+
+  mail-queue-retry-all)
+    [[ $# -eq 0 ]] || deny "usage: mail-queue-retry-all"
+    mail_queue_retry_all
     ;;
 
   mail-rspamd-log)
@@ -8319,10 +10376,10 @@ case "$cmd" in
     # keeps the old numbers until every site happens to be touched; this walks
     # them all and rewrites each one against the machine as it is now.
     [[ $# -eq 0 ]] || deny "usage: php-pools-retune"
-    shopt -s nullglob
     retuned=0
-    for pool_file in /etc/php/*/fpm/pool.d/spanel-*.conf; do
-      [[ -f "$pool_file" ]] || continue
+    pool_files="$(managed_php_pool_files)"
+    while IFS= read -r pool_file; do
+      [[ -n "$pool_file" && -f "$pool_file" ]] || continue
       calculate_php_fpm_pool_tuning "$pool_file"
       php_fpm_set_directive "$pool_file" "pm" "$PHP_FPM_PM_MODE"
       php_fpm_set_directive "$pool_file" "pm.max_children" "$PHP_FPM_MAX_CHILDREN"
@@ -8331,14 +10388,17 @@ case "$cmd" in
       php_fpm_set_directive "$pool_file" "request_terminate_timeout" "${PHP_FPM_REQUEST_TERMINATE_TIMEOUT}s"
       echo "$(basename "$pool_file"): pm.max_children=${PHP_FPM_MAX_CHILDREN} idle=${PHP_FPM_PROCESS_IDLE_TIMEOUT}s max_requests=${PHP_FPM_MAX_REQUESTS}"
       retuned=$((retuned + 1))
-    done
-    for fpm_version_dir in /etc/php/*/fpm; do
-      [[ -d "$fpm_version_dir" ]] || continue
-      fpm_version="$(basename "$(dirname "$fpm_version_dir")")"
-      systemctl reload "php${fpm_version}-fpm" 2>/dev/null || true
-    done
-    shopt -u nullglob
+    done <<<"$pool_files"
+    reload_php_pool_owners <<<"$pool_files"
     echo "retuned ${retuned} pool(s)"
+    ;;
+
+  php-fpm-legacy-prune)
+    # Run after vhosts were rewritten to the per-account sockets (update.sh
+    # does, right after its site refresh): drops the distro-master copies of
+    # pools that moved and that no vhost names any more.
+    [[ $# -eq 0 ]] || deny "usage: php-fpm-legacy-prune"
+    prune_legacy_php_pools
     ;;
 
   php-config-write)
@@ -9205,13 +11265,14 @@ PY
   user-limits-apply)
     # Apply Linux Cgroups v2 (systemd user-<UID>.slice & spanel-user-<user>.slice),
     # PHP-FPM pool limits, and optional Linux filesystem disk quota for a tenant account.
-    [[ $# -eq 9 || $# -eq 10 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write> [storage_limit_mb]"
+    [[ $# -ge 9 && $# -le 11 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write> [storage_limit_mb] [inode_limit]"
     u_name="$1"
     cpu_pct="$2"; mem_high="$3"; mem_max="$4"; tasks_max="$5"
     io_r="$6"; io_w="$7"; iops_r="$8"; iops_w="$9"
     storage_mb="${10:-0}"
+    inode_limit="${11:-0}"
     require_linux_user "$u_name"
-    for num_arg in "$cpu_pct" "$mem_high" "$mem_max" "$tasks_max" "$io_r" "$io_w" "$iops_r" "$iops_w" "$storage_mb"; do
+    for num_arg in "$cpu_pct" "$mem_high" "$mem_max" "$tasks_max" "$io_r" "$io_w" "$iops_r" "$iops_w" "$storage_mb" "$inode_limit"; do
       [[ "$num_arg" =~ ^[0-9]{1,9}$ ]] || deny "invalid numeric resource limit: $num_arg"
     done
     ensure_panel_user_home "$u_name"
@@ -9232,19 +11293,12 @@ IO_WRITE_MBPS=${io_w}
 IOPS_READ=${iops_r}
 IOPS_WRITE=${iops_w}
 STORAGE_MB=${storage_mb}
+INODE_LIMIT=${inode_limit}
 EOF
     chown root:spanel "/etc/spanel/limits/${u_name}.env"
     chmod 0640 "/etc/spanel/limits/${u_name}.env"
 
-    root_dev="$(findmnt -no SOURCE / 2>/dev/null | head -n1 || true)"
-    if [[ "$root_dev" == /dev/nvme* || "$root_dev" == /dev/mmcblk* ]]; then
-      base_dev="$(echo "$root_dev" | sed -E 's/p[0-9]+$//')"
-    elif [[ "$root_dev" == /dev/* ]]; then
-      base_dev="$(echo "$root_dev" | sed -E 's/[0-9]+$//')"
-    else
-      base_dev=""
-    fi
-    [[ -b "$base_dev" ]] || base_dev=""
+    base_dev="$(tenant_io_base_device)"
 
     {
       echo "# Generated by SPanel Resource Limits for user ${u_name} (UID ${u_uid})"
@@ -9292,50 +11346,51 @@ EOF
       MemoryMax="$( (( mem_max > 0 )) && printf '%sM' "$mem_max" || printf 'infinity' )" \
       TasksMax="$( (( tasks_max > 0 )) && printf '%s' "$tasks_max" || printf 'infinity' )" >/dev/null 2>&1 || true
 
-    # Tune PHP-FPM pools owned by this user to respect persisted limits
-    shopt -s nullglob
-    fpm_versions_to_reload=()
-    for pool_file in /etc/php/*/fpm/pool.d/spanel-"${u_name}"-*.conf /etc/php/*/fpm/pool.d/spanel-"${u_name}".conf; do
+    # Tune PHP-FPM pools owned by this user to respect persisted limits. The
+    # account's own masters already run inside the slice limited above; pools
+    # still on a distro master get the classify hook below.
+    user_pool_files=""
+    for pool_file in "$SPANEL_PHP_FPM_ROOT"/*/"${u_name}"/pool.d/spanel-*.conf \
+      /etc/php/*/fpm/pool.d/spanel-"${u_name}"-*.conf /etc/php/*/fpm/pool.d/spanel-"${u_name}".conf; do
       [[ -f "$pool_file" ]] || continue
       calculate_php_fpm_pool_tuning "$pool_file"
       apply_saved_user_limits_to_pool_file "$pool_file" "$u_name"
-      fpm_ver="$(echo "$pool_file" | awk -F'/' '{print $4}')"
-      [[ -n "$fpm_ver" ]] && fpm_versions_to_reload+=("$fpm_ver")
-    done
-    shopt -u nullglob
-    for fpm_ver in $(printf '%s\n' "${fpm_versions_to_reload[@]}" | sort -u); do
-      ensure_php_fpm_cgroup_dropin "$fpm_ver"
-      systemctl reload "php${fpm_ver}-fpm" >/dev/null 2>&1 || true
-    done
-
-    # Enforce Linux filesystem disk quota (setquota) when usrquota is mounted on /home or /
-    if command -v setquota >/dev/null 2>&1; then
-      quota_mnt=""
-      if findmnt -no OPTIONS /home 2>/dev/null | grep -qE 'usrj?quota|quota'; then
-        quota_mnt="/home"
-      elif findmnt -no OPTIONS / 2>/dev/null | grep -qE 'usrj?quota|quota'; then
-        quota_mnt="/"
+      if php_pool_file_is_legacy "$pool_file"; then
+        ensure_php_fpm_cgroup_dropin "$(php_pool_file_version "$pool_file")"
       fi
-      if [[ -n "$quota_mnt" ]]; then
-        if (( storage_mb > 0 )); then
-          hard_kb=$(( storage_mb * 1024 ))
-          soft_kb=$(( hard_kb * 95 / 100 ))
-          setquota -u "$u_name" "$soft_kb" "$hard_kb" 0 0 "$quota_mnt" >/dev/null 2>&1 || true
-        else
-          setquota -u "$u_name" 0 0 0 0 "$quota_mnt" >/dev/null 2>&1 || true
-        fi
-      fi
-    fi
+      user_pool_files+="${pool_file}"$'\n'
+    done
+    reload_php_pool_owners <<<"$user_pool_files"
 
-    # Classify all active processes of this user (including pre-spawned PHP-FPM pool workers)
-    # into user-<UID>.slice/spanel.scope so Cgroups v2 enforces hard CPU/RAM/IO limits.
+    # Disk space and inode limits through kernel quota, when quota-enable has
+    # turned it on for the filesystem holding /home (see quota-status).
+    apply_kernel_quota "$u_name" "$storage_mb" "$inode_limit"
+
+    # The account's own PHP-FPM masters already run in the slice. Whatever of
+    # this user still runs outside it (cron jobs, a pool left on a distro
+    # master) is moved into user-<UID>.slice/spanel.scope.
     classify_all_tenant_workers
     echo "Applied Cgroups v2 & PHP-FPM resource limits for ${u_name} (UID ${u_uid})"
     ;;
 
+  quota-status)
+    [[ $# -eq 0 ]] || deny "usage: quota-status"
+    quota_status
+    ;;
+
+  quota-enable)
+    # Installs the quota tools and adds user quota to /etc/fstab for the
+    # filesystem holding /home; once that is mounted, builds the quota file
+    # and switches it on. Never remounts or reboots.
+    [[ $# -eq 0 ]] || deny "usage: quota-enable"
+    quota_enable
+    ;;
+
   cgroup-classify-workers)
-    # Classify all tenant PHP-FPM worker processes & user tasks into their respective
-    # Cgroups v2 user-<UID>.slice/spanel.scope so an attacked site cannot escape its slice.
+    # Move tenant processes running outside their account's slice (cron jobs,
+    # pools on a distro PHP-FPM master) into user-<UID>.slice/spanel.scope, so
+    # an attacked site cannot escape its limits. Processes already inside the
+    # slice - the account's own PHP-FPM master and its workers - stay put.
     [[ $# -eq 0 ]] || deny "usage: cgroup-classify-workers"
     classify_all_tenant_workers
     ;;
@@ -9373,6 +11428,19 @@ EOF
         [[ "$sz" =~ ^[0-9]+$ ]] && printf '%s\t%s\n' "$sz" "$db_base"
       done
     fi
+    ;;
+
+  phpmyadmin-remote-ca)
+    # CA certificate (PEM on stdin) for phpMyAdmin server <index>, a remote MySQL host.
+    [[ $# -eq 1 && "$1" =~ ^[0-9]{1,2}$ ]] || deny "usage: phpmyadmin-remote-ca <server-index>"
+    (( 10#$1 >= 2 && 10#$1 <= 99 )) || deny "phpmyadmin-remote-ca: server index out of range"
+    write_phpmyadmin_remote_ca "$((10#$1))"
+    ;;
+
+  phpmyadmin-remote-servers)
+    # The full list of remote MySQL hosts phpMyAdmin offers, INDEX,HOST,PORT,TLS,CA each.
+    [[ $# -le 98 ]] || deny "usage: phpmyadmin-remote-servers [INDEX,HOST,PORT,TLS,CA ...]"
+    write_phpmyadmin_remote_servers "$@"
     ;;
 
   panel-user-password)
@@ -9581,6 +11649,12 @@ EOF
       tmp_cron="$(mktemp /etc/cron.d/.spanel-cron.XXXXXX)"
       chmod 0644 "$tmp_cron"
       chown root:root "$tmp_cron"
+      # Same grammar as JAILED_COMMAND_ARG_RE in backend/app/services/cron.py:
+      #   ^'[^']*('(\\'|"'")'[^']*)*'$
+      # and a % after an even run of backslashes, which cron would cut at.
+      q="'"
+      jailed_arg_re="^${q}[^${q}]*(${q}(\\\\${q}|\"${q}\")${q}[^${q}]*)*${q}\$"
+      unescaped_pct_re='(^|[^\])(\\\\)*%'
       {
         echo "# Managed by SPanel — root-enforced Mount Namespace Jail for ${user}"
         echo "SHELL=/bin/sh"
@@ -9590,9 +11664,11 @@ EOF
           [[ "$line" =~ ^[[:space:]]*# ]] && continue
           [[ "$line" =~ ^[[:space:]]*(SHELL|PATH)= ]] && continue
           if [[ "$line" =~ ^([0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+)[[:space:]]+root[[:space:]]+/usr/local/bin/spanel-cron-jail[[:space:]]+(\'?[a-z_][a-z0-9_-]{0,31}\'?)[[:space:]]+(\'[^\']+\'|/[A-Za-z0-9._/-]+)[[:space:]]+--[[:space:]]+/bin/sh[[:space:]]+-c[[:space:]]+(\'.*\')[[:space:]]+(#[[:space:]]*spanel:[a-z0-9.-]{3,253})[[:space:]]*$ ]]; then
+            # Copy every capture now: the next regex test resets them.
             sched="${BASH_REMATCH[1]}"
             line_user="${BASH_REMATCH[2]//\'/}"
-            line_cwd="${BASH_REMATCH[3]//\'/}"
+            cwd_word="${BASH_REMATCH[3]}"
+            line_cwd="${cwd_word//\'/}"
             quoted_cmd="${BASH_REMATCH[4]}"
             marker="${BASH_REMATCH[5]}"
             if [[ "$line_user" != "$user" ]]; then
@@ -9604,14 +11680,18 @@ EOF
               rm -f "$tmp_cron"
               deny "cron-write: working directory outside ${resolved_home}: ${line_cwd}"
             fi
-            # Ensure quoted_cmd has no unquoted shell operators outside single quotes (supports both '\'' and '"'"')
-            stripped_escapes="$(sed -E "s/'\"'\"'//g; s/'\\\\''//g" <<<"$quoted_cmd")"
-            if [[ ! "$stripped_escapes" =~ ^\'[^\']*\'$ ]]; then
+            # quoted_cmd must be one shell word: single-quoted segments joined
+            # only by '\'' or '"'"', so root's shell sees nothing unquoted.
+            if [[ ! "$quoted_cmd" =~ $jailed_arg_re ]]; then
               rm -f "$tmp_cron"
               deny "cron-write: unquoted shell tokens outside /bin/sh -c string refused"
             fi
+            if [[ "$quoted_cmd" =~ $unescaped_pct_re ]]; then
+              rm -f "$tmp_cron"
+              deny "cron-write: unescaped % in /bin/sh -c string refused"
+            fi
             printf '%s root /usr/local/bin/spanel-cron-jail %s %s -- /bin/sh -c %s %s\n' \
-              "$sched" "$line_user" "${BASH_REMATCH[3]}" "$quoted_cmd" "$marker"
+              "$sched" "$line_user" "$cwd_word" "$quoted_cmd" "$marker"
           else
             rm -f "$tmp_cron"
             deny "cron-write: rejected unconfined or malformed cron line for ${user}"
@@ -10277,6 +12357,16 @@ EOF
     fi
     if [[ -d "/proc/${target_pid}" ]] && [[ ! -s "/proc/${target_pid}/cmdline" ]] && [[ ! -e "/proc/${target_pid}/exe" ]]; then
       deny "refusing to kill kernel thread: $target_pid"
+    fi
+    # Only hosting accounts' processes: anything owned by root or a system
+    # account is a service, and those are restarted from System Services.
+    target_uid="$(awk '$1=="Uid:"{print $2; exit}' "/proc/${target_pid}/status" 2>/dev/null || true)"
+    [[ "$target_uid" =~ ^[0-9]+$ ]] || deny "No such process: $target_pid"
+    if (( target_uid < 1000 || target_uid >= 65000 )); then
+      deny "refusing to kill process of system account (uid ${target_uid}): $target_pid"
+    fi
+    if [[ "$(getent passwd "$target_uid" | cut -d: -f1)" == "spanel" ]]; then
+      deny "refusing to kill SPanel process: $target_pid"
     fi
     target_comm="$(tr -d '\0\n' <"/proc/${target_pid}/comm" 2>/dev/null || true)"
     case "$target_comm" in

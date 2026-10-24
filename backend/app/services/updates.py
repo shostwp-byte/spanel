@@ -29,6 +29,7 @@ SNAPSHOT_DIR = Path(os.environ.get("BACKUP_ROOT") or "/var/backups/spanel") / "p
 DEFAULT_REPO_URL = os.environ.get("SPANEL_REPO_URL") or os.environ.get("spanel_REPO_URL") or "https://github.com/shostwp-byte/spanel.git"
 DEFAULT_MANIFEST_URL = os.environ.get("SPANEL_UPDATE_MANIFEST_URL") or ""
 
+DEFAULT_SNAPSHOT_KEEP = 5
 SEMVER_TAG_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 URL_REDACT_RE = re.compile(r"""(?:https?://|git@)[^\s"'<>]+""", re.IGNORECASE)
 PATH_REDACT_RE = re.compile(r"""(?:/var/lib/spanel/update-[^\s"'<>]+|/etc/spanel/update-[^\s"'<>]+)""")
@@ -105,6 +106,7 @@ def get_update_source_config() -> dict:
         "auto_update_enabled": False,
         "auto_update_window": "02:00",
         "auto_rollback_enabled": True,
+        "snapshot_keep": DEFAULT_SNAPSHOT_KEEP,
     }
     try:
         if UPDATE_SOURCE_FILE.exists():
@@ -150,6 +152,12 @@ def save_update_source_config(payload: dict) -> dict:
         except (ValueError, TypeError):
             pass
 
+    if "snapshot_keep" in payload and payload["snapshot_keep"] is not None:
+        try:
+            current["snapshot_keep"] = max(1, min(20, int(payload["snapshot_keep"])))
+        except (ValueError, TypeError):
+            pass
+
     if "auto_update_window" in payload and payload["auto_update_window"]:
         win = str(payload["auto_update_window"]).strip()
         if re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", win):
@@ -185,6 +193,7 @@ def get_masked_source_info() -> dict:
         "auto_update_enabled": bool(cfg.get("auto_update_enabled", False)),
         "auto_update_window": cfg.get("auto_update_window", "02:00"),
         "auto_rollback_enabled": bool(cfg.get("auto_rollback_enabled", True)),
+        "snapshot_keep": int(cfg.get("snapshot_keep") or DEFAULT_SNAPSHOT_KEEP),
     }
 
 
@@ -488,6 +497,9 @@ def list_snapshots() -> list[dict]:
                 "size_bytes": size_bytes,
                 "size_mb": round(size_bytes / (1024 * 1024), 2),
                 "reason": meta.get("reason") or "pre-update",
+                "db_revision": meta.get("db_revision") or "",
+                "has_db": bool(meta.get("has_db", True)),
+                "has_system_files": bool(meta.get("has_system_files", False)),
             })
     except Exception:
         return []
@@ -497,9 +509,10 @@ def list_snapshots() -> list[dict]:
 def create_snapshot(reason: str = "manual") -> dict:
     """Create a recovery snapshot of the current Panel code, frontend dist, helper, and SQLite DB."""
     safe_reason = re.sub(r"[^a-zA-Z0-9_-]", "", reason or "manual")[:32] or "manual"
+    keep = int(get_update_source_config().get("snapshot_keep") or DEFAULT_SNAPSHOT_KEEP)
     res = shell.privileged(
         "panel-snapshot-create",
-        helper_args=[safe_reason],
+        helper_args=[safe_reason, str(max(1, min(20, keep)))],
         check=False,
         fallback=["bash", "-lc", f"echo snapshot-v{APP_VERSION}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"],
     )
@@ -518,7 +531,14 @@ def create_snapshot(reason: str = "manual") -> dict:
 
 
 def rollback_to_snapshot(snapshot_id: str, restore_db: bool = False) -> dict:
-    """Restore the panel to a specific snapshot and restart spanel-api."""
+    """Restore the panel to a snapshot: code, frontend, helper, the system
+    files the updater rewrites, the recorded Python packages and, with
+    restore_db, the database as it was before that update's migrations.
+
+    The helper runs the restore in a unit of its own (it has to stop
+    spanel-api, which would otherwise kill it half-way) and records the
+    outcome in the update state when it is done.
+    """
     if not re.fullmatch(r"snapshot-[A-Za-z0-9._-]+", snapshot_id or ""):
         raise ValueError("Invalid snapshot ID")
     args = [snapshot_id]
@@ -541,7 +561,14 @@ def rollback_to_snapshot(snapshot_id: str, restore_db: bool = False) -> dict:
         fallback=["bash", "-lc", f"echo restored={snapshot_id}"],
     )
     if res.returncode != 0:
+        state = _read_update_state()
+        state.update({"last_update_status": "failed", "progress_phase": "failed",
+                      "progress_message": sanitize_update_text(res.stderr or res.stdout or "Could not restore snapshot")})
+        _write_update_state(state)
         raise RuntimeError(sanitize_update_text(res.stderr or res.stdout or "Could not restore snapshot"))
+
+    if "scheduled=" in (res.stdout or ""):
+        return {"restored": snapshot_id, "status": "rolling_back", "restore_db": restore_db}
 
     state = _read_update_state()
     state.update({
@@ -553,7 +580,7 @@ def rollback_to_snapshot(snapshot_id: str, restore_db: bool = False) -> dict:
         "rollback_snapshot_id": snapshot_id,
     })
     _write_update_state(state)
-    return {"restored": snapshot_id, "status": "rolled_back"}
+    return {"restored": snapshot_id, "status": "rolled_back", "restore_db": restore_db}
 
 
 def delete_snapshot(snapshot_id: str) -> dict:
@@ -681,8 +708,39 @@ def check_core_stack_updates() -> dict:
     }
 
 
-def upgrade_core_stack_packages(packages: Optional[list[str]] = None, hold_packages: bool = False) -> dict:
-    """Safely upgrade selected (or all) Core Infrastructure Stack packages using --only-upgrade, pre/post syntax check and zero-downtime reload."""
+CORE_STACK_RESULT_RE = re.compile(r"^(upgraded|post_check|reloaded)=([A-Za-z0-9.,:+_-]*)$")
+
+
+def parse_core_stack_output(stdout: str) -> dict:
+    """What the helper says it did: `upgraded=a,b`, `post_check=ok|failed:...`,
+    `reloaded=a,b`, one per line. Anything else is apt's own chatter."""
+    found: dict = {"upgraded": [], "reloaded": [], "post_check": ""}
+    for line in (stdout or "").splitlines():
+        match = CORE_STACK_RESULT_RE.match(line.strip())
+        if not match:
+            continue
+        key, value = match.groups()
+        if key == "post_check":
+            found["post_check"] = value
+        else:
+            found[key] = [item for item in value.split(",") if item]
+    return found
+
+
+def upgrade_core_stack_packages(packages: Optional[list[str]] = None, trigger: str = "manual") -> dict:
+    """Upgrade selected (or all) core stack packages through the helper.
+
+    Everything that needs root happens there in one place: nginx -t before
+    apt is touched, `apt-get install --only-upgrade`, nginx -t again, and a
+    reload of each service whose package version actually changed. These
+    checks used to run here as the panel account, where `systemctl reload`
+    is refused and `nginx -t` cannot read the certificates - so every run
+    reported a warning whatever happened.
+
+    Packages are no longer put on hold afterwards: a hold also stops security
+    updates, and unattended-upgrades is kept away from these packages by a
+    Package-Blacklist instead (see set_core_stack_blacklist).
+    """
     allowed_map = {item["pkg"]: item for item in CORE_STACK_SERVICES}
     if packages:
         target_pkgs = [p for p in packages if p in allowed_map]
@@ -691,92 +749,69 @@ def upgrade_core_stack_packages(packages: Optional[list[str]] = None, hold_packa
     if not target_pkgs:
         raise ValueError("Không có gói hạ tầng hợp lệ để cập nhật.")
 
-    is_linux = os.name != "nt" and Path("/usr/bin/apt-get").exists()
-    upgraded_labels = [allowed_map[p]["label"] for p in target_pkgs]
-
-    if is_linux:
-        # 1. Pre-upgrade configuration validation before touching any packages
-        for p in target_pkgs:
-            svc = allowed_map[p]
-            if svc["precheck"]:
-                pre_res = subprocess.run(
-                    ["bash", "-lc", svc["precheck"]],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=10,
-                )
-                if pre_res.returncode != 0:
-                    err_detail = (pre_res.stderr or pre_res.stdout or "syntax error").strip()[:200]
-                    raise RuntimeError(f"Kiểm tra cấu hình trước cập nhật thất bại cho {svc['label']}: {err_detail}")
-
-        # 2. Selective upgrade via helper (`updates-core-stack-patch`) with apt-mark unhold -> --only-upgrade
-        pkg_str = " ".join(target_pkgs)
-        hold_cmd = f"apt-mark hold {pkg_str} >/dev/null 2>&1 || true; " if hold_packages else ""
-        cmd = (
-            f"apt-mark unhold {pkg_str} >/dev/null 2>&1 || true; "
-            f"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
-            f"DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "
-            f"-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold {pkg_str}; "
-            f"rc=$?; {hold_cmd}exit $rc"
-        )
-        helper_args = (["--hold"] if hold_packages else []) + target_pkgs
-        res = shell.privileged(
-            "updates-core-stack-patch",
-            helper_args=helper_args,
-            check=False,
-            fallback=["bash", "-lc", cmd],
-        )
-        rc = res.returncode
-
-        # 3. Post-upgrade configuration validation & zero-downtime reload
-        if rc == 0:
-            for p in target_pkgs:
-                svc = allowed_map[p]
-                if svc["precheck"]:
-                    post_res = subprocess.run(
-                        ["bash", "-lc", svc["precheck"]],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=10,
-                    )
-                    if post_res.returncode != 0:
-                        rc = post_res.returncode
-                        continue
-                if svc["reload"]:
-                    reload_res = subprocess.run(
-                        ["bash", "-lc", svc["reload"]],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=10,
-                    )
-                    if reload_res.returncode != 0 and rc == 0:
-                        rc = reload_res.returncode
+    res = shell.privileged(
+        "updates-core-stack-patch",
+        helper_args=target_pkgs,
+        check=False,
+        fallback=["bash", "-lc", "echo upgraded=; echo post_check=ok"],
+        timeout=3600,
+    )
+    parsed = parse_core_stack_output(res.stdout)
+    ok = res.returncode == 0 and not parsed["post_check"].startswith("failed")
+    upgraded = [p for p in parsed["upgraded"] if p in allowed_map]
+    labels = [allowed_map[p]["label"] for p in upgraded]
+    if not ok:
+        lines = (res.stderr or res.stdout or "").strip().splitlines()
+        detail = parsed["post_check"] or sanitize_update_text(lines[-1] if lines else "helper failed")
+        summary = f"Cập nhật Core Stack thất bại: {detail[:300]}"
+    elif upgraded:
+        summary = (f"Đã cập nhật an toàn {len(upgraded)} thành phần Core Stack: "
+                   f"{', '.join(labels[:4])}{'...' if len(labels) > 4 else ''}.")
     else:
-        rc = 0
+        summary = "Không có bản cập nhật mới cho các gói Core Stack đã chọn."
 
-    summary = f"Đã cập nhật & đồng bộ an toàn (Zero-Downtime) cho {len(target_pkgs)} thành phần Core Stack: {', '.join(upgraded_labels[:4])}{'...' if len(upgraded_labels) > 4 else ''}."
     state = _read_update_state()
     history = state.get("core_stack_history") if isinstance(state.get("core_stack_history"), list) else []
     history.insert(0, {
         "id": f"core-{int(time.time())}",
         "timestamp": _utc_now(),
         "packages": target_pkgs,
-        "apt_hold_enforced": bool(hold_packages),
+        "upgraded": upgraded,
+        "reloaded": parsed["reloaded"],
+        "trigger": trigger if trigger in {"manual", "scheduled"} else "manual",
         "summary": summary,
-        "status": "completed" if rc == 0 else "warning",
+        "status": "completed" if ok else "failed",
     })
     state["core_stack_history"] = history[:20]
     _write_update_state(state)
 
     return {
-        "status": "completed" if rc == 0 else "warning",
-        "apt_hold_enforced": bool(hold_packages),
+        "status": "completed" if ok else "failed",
+        "upgraded": upgraded,
+        "reloaded": parsed["reloaded"],
         "summary": summary,
         "core_stack": check_core_stack_updates(),
     }
+
+
+def set_core_stack_blacklist(enabled: bool, packages: Optional[list[str]] = None):
+    """Keep unattended-upgrades off the packages the panel patches itself.
+
+    Two mechanisms upgrading nginx is one too many: unattended-upgrades does
+    not run nginx -t and does not know the panel's window. While scheduled
+    core stack patching is on, the helper writes a Package-Blacklist for the
+    selected packages; turning it off removes the file and hands them back.
+    """
+    allowed = {item["pkg"] for item in CORE_STACK_SERVICES}
+    selected = [p for p in (packages or []) if p in allowed]
+    if enabled and not selected:
+        enabled = False
+    return shell.privileged(
+        "updates-core-blacklist",
+        helper_args=(["on", *selected] if enabled else ["off"]),
+        check=False,
+        fallback=["bash", "-lc", "echo core stack blacklist unchanged (no helper)"],
+    )
 
 
 def run_os_update():

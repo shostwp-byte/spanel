@@ -36,12 +36,19 @@ def set_auto_update(enabled: bool, window: str = "02:00", auto_check: bool = Tru
 
 
 def _auto_update_worker() -> None:
+    """Release checks and PHP hardening, in the background of the API.
+
+    Applying anything at a set hour is not done here any more: panel
+    auto-update, windowed PHP auto-patch and core stack patching run from
+    spanel-maintenance.timer (app.services.maintenance_window), which keeps
+    its "already ran in this window" marker on disk. This thread only fired
+    if a check happened to land inside the window hour, and forgot what it
+    had done on every restart.
+    """
     # Initial delay so startup is never slowed down
     time.sleep(45)
     last_check_ts = 0.0
-    last_auto_update_day = ""
     last_php_check_ts = 0.0
-    last_php_patch_day = ""
 
     while True:
         try:
@@ -50,17 +57,8 @@ def _auto_update_worker() -> None:
             now = time.time()
 
             if cfg.get("auto_check_enabled", True) and (now - last_check_ts >= interval_sec):
-                rel = updates.panel_release_status(force_refresh=True)
+                updates.panel_release_status(force_refresh=True)
                 last_check_ts = now
-
-                if cfg.get("auto_update_enabled", False) and rel.get("update_available"):
-                    current_hhmm = time.strftime("%H:%M", time.localtime())
-                    today_str = time.strftime("%Y-%m-%d", time.localtime())
-                    target_win = cfg.get("auto_update_window") or "02:00"
-                    # Trigger within the maintenance hour or once per day
-                    if today_str != last_auto_update_day and current_hhmm[:2] == target_win[:2]:
-                        last_auto_update_day = today_str
-                        updates.run_panel_update()
         except Exception:
             pass
 
@@ -77,17 +75,12 @@ def _auto_update_worker() -> None:
                 php.apply_php2shell_hardening()
                 php_state = php.check_php_updates(force_refresh=False)
 
-            if php_state.get("auto_patch_enabled", True) and int(php_state.get("updates_available_count") or 0) > 0:
-                pref_win = str(php_state.get("preferred_window") or "03:00").strip().lower()
-                current_hhmm = time.strftime("%H:%M", time.localtime())
-                today_str = time.strftime("%Y-%m-%d", time.localtime())
-                should_patch = (
-                    pref_win == "immediate"
-                    or (today_str != last_php_patch_day and current_hhmm[:2] == pref_win[:2])
-                )
-                if should_patch:
-                    last_php_patch_day = today_str
-                    php.upgrade_php_packages(trigger="auto")
+            # A set hour belongs to the maintenance window; only "immediate"
+            # is applied from here.
+            pref_win = str(php_state.get("preferred_window") or "03:00").strip().lower()
+            if (php_state.get("auto_patch_enabled", True) and pref_win == "immediate"
+                    and int(php_state.get("updates_available_count") or 0) > 0):
+                php.upgrade_php_packages(trigger="auto")
         except Exception:
             pass
 

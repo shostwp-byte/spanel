@@ -45,6 +45,7 @@ from app.schemas.schemas import (
 from app.services import (
     addons,
     backup,
+    backup_remote,
     backup_s3,
     cron,
     file_manager,
@@ -495,6 +496,12 @@ def upload_archive_to_target(
             return target.name, result["remote_file"]
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if (target.kind or "sftp") in backup_remote.FTP_KINDS:
+        try:
+            where = backup_remote.upload(target, archive, Path(archive).name, subpath, db=db)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return target.name, where.split(":", 1)[1]
     try:
         result = backup.upload_to_sftp(
             archive,
@@ -1269,6 +1276,11 @@ def create_sftp_target(
         try:
             backup_s3.check(target)
         except backup_s3.S3Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif payload.kind in backup_remote.FTP_KINDS:
+        try:
+            backup_remote.check(target)
+        except backup_remote.RemoteError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     db.add(target)

@@ -75,6 +75,12 @@ PHP_DEFAULT="${PHP_DEFAULT:-8.4}"
 PHP_VERSIONS="${PHP_VERSIONS:-8.3 8.4}"
 APP_DIR="${APP_DIR:-/opt/spanel}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/spanel}"
+# Opt-in: SPANEL_DISK_QUOTA=kernel turns on kernel user quota (disk space and
+# inodes per account) for the filesystem holding /home. The installer only
+# edits /etc/fstab; when the options are not mounted yet it says a remount or
+# reboot is needed and does neither itself. Without it the panel's own
+# accounting applies, which PHP and SFTP can write past.
+SPANEL_DISK_QUOTA="${SPANEL_DISK_QUOTA:-}"
 ADMIN_PASSWORD=""
 
 # `dpkg -s` exits 0 for a package that was removed but kept its config files
@@ -689,6 +695,11 @@ install_privileged_helper() {
   if [[ -f "${SCRIPT_DIR}/files/spanel-cron-jail.sh" ]]; then
     install -m 0755 -o root -g root "${SCRIPT_DIR}/files/spanel-cron-jail.sh" /usr/local/bin/spanel-cron-jail
   fi
+  # The Email addon's renderer: root's, read by the helper only.
+  if [[ -f "${SCRIPT_DIR}/files/spanel_mailtool.py" ]]; then
+    install -d -m 0755 -o root -g root /usr/local/lib/spanel
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel_mailtool.py" /usr/local/lib/spanel/spanel_mailtool.py
+  fi
   if [[ -f "${SCRIPT_DIR}/files/spanel_webshells.yar" ]]; then
     install -d -m 0755 -o root -g spanel /etc/spanel/yara
     install -m 0644 -o root -g spanel "${SCRIPT_DIR}/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
@@ -1078,6 +1089,11 @@ SERVICE
     sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-watchdog.service
     install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-watchdog.timer" /etc/systemd/system/spanel-watchdog.timer
   fi
+  if [[ -f "${SCRIPT_DIR}/files/spanel-maintenance.service" && -f "${SCRIPT_DIR}/files/spanel-maintenance.timer" ]]; then
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-maintenance.service" /etc/systemd/system/spanel-maintenance.service
+    sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-maintenance.service
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-maintenance.timer" /etc/systemd/system/spanel-maintenance.timer
+  fi
 
   systemctl daemon-reload
   systemctl disable --now spanel-auto-update.timer 2>/dev/null || true
@@ -1089,6 +1105,7 @@ SERVICE
   systemctl enable --now spanel-malware-scheduler.timer
   systemctl enable --now spanel-notify.timer
   systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
+  systemctl enable --now spanel-maintenance.timer >/dev/null 2>&1 || true
   systemctl enable spanel-autotune.service >/dev/null 2>&1 || true
   systemctl start spanel-autotune.service >/dev/null 2>&1 || true
   systemctl enable spanel-timesync.timer >/dev/null 2>&1 || true
@@ -1156,7 +1173,7 @@ NGINX
   host="${PANEL_DOMAIN:-$SERVER_IP}"
   [[ -n "$host" ]] || host="$(detect_server_ip)"
   sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${api_scheme}://127.0.0.1:${PANEL_PORT}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
-  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
+  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php /etc/phpmyadmin/conf.d/spanel-remote-servers.php 2>/dev/null || true
   sed -i -E "/PmaAbsoluteUri/s#'https?://[^']+/phpmyadmin/'#'${tools_scheme}://${host}/phpmyadmin/'#" /etc/phpmyadmin/conf.d/spanel-signon.php 2>/dev/null || true
 }
 
@@ -1196,73 +1213,9 @@ setup_phpmyadmin_sso() {
 \$cfg['PmaAbsoluteUri'] = '${pma_scheme}://${pma_host}/phpmyadmin/';
 PHP
 
-  cat >/usr/share/phpmyadmin/spanel-signon.php <<'PHP'
-<?php
-declare(strict_types=1);
-
-session_save_path('/var/lib/php/sessions');
-ini_set('session.use_cookies', 'true');
-session_set_cookie_params([
-    'lifetime' => 0,
-    'path' => '/',
-    'domain' => '',
-    'secure' => __SPANEL_PMA_COOKIE_SECURE__,
-    'httponly' => true,
-    'samesite' => 'Lax',
-]);
-session_name('SPanelPmaSignon');
-if (!session_start()) {
-    http_response_code(500);
-    exit('Cannot start signon session');
-}
-
-$token = $_GET['spanel_sso'] ?? '';
-if (!preg_match('/^[A-Za-z0-9_-]{20,}$/', $token)) {
-    http_response_code(403);
-    exit('Invalid token');
-}
-
-$apiUrl = '__SPANEL_API_BASE__' . rawurlencode($token);
-$ch = curl_init($apiUrl);
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => 5,
-    CURLOPT_SSL_VERIFYPEER => false,
-    CURLOPT_SSL_VERIFYHOST => false,
-    CURLOPT_HTTPHEADER => ['Accept: application/json'],
-]);
-$response = curl_exec($ch);
-$status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-curl_close($ch);
-
-if ($status !== 200 || !$response) {
-    http_response_code(403);
-    exit('Expired token');
-}
-
-$data = json_decode($response, true);
-if (!is_array($data) || empty($data['db_user']) || empty($data['db_password'])) {
-    http_response_code(403);
-    exit('Invalid signon data');
-}
-
-session_regenerate_id(true);
-$_SESSION = [];
-$_SESSION['PMA_single_signon_user'] = $data['db_user'];
-$_SESSION['PMA_single_signon_password'] = $data['db_password'];
-$_SESSION['PMA_single_signon_host'] = 'localhost';
-$_SESSION['PMA_single_signon_port'] = '';
-$_SESSION['PMA_single_signon_cfgupdate'] = [
-    'only_db' => $data['db_name'] ?? '',
-];
-$_SESSION['PMA_single_signon_HMAC_secret'] = bin2hex(random_bytes(16));
-session_write_close();
-
-header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-header('Pragma: no-cache');
-header('Location: /phpmyadmin/index.php?server=1');
-exit;
-PHP
+  # Picks the phpMyAdmin server (local MariaDB or a remote MySQL host) from
+  # the SSO token; update.sh installs the same file.
+  install -m 0644 -o root -g root "${SCRIPT_DIR}/files/phpmyadmin-spanel-signon.php" /usr/share/phpmyadmin/spanel-signon.php
 
   local api_scheme="http"
   if [[ "$ENABLE_SSL" == "yes" ]]; then
@@ -1619,6 +1572,12 @@ main() {
   # usually not installed yet and install_clamav_engine tunes it when it is.
   if [[ -f /etc/clamav/clamd.conf ]]; then
     sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper clamav-tune >/dev/null ||       log "  (warning: could not raise clamd's scan limits; large uploads stay unscanned)"
+  fi
+
+  if [[ "$SPANEL_DISK_QUOTA" == "kernel" ]]; then
+    log "Enabling kernel disk quota (SPANEL_DISK_QUOTA=kernel)"
+    sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper quota-enable | sed -n -E 's/^(state|hint|backup)=/  \1: /p' || \
+      log "  (warning: could not enable kernel disk quota; the panel's own accounting still applies)"
   fi
 
   log "Configuring SSL"

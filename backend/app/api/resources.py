@@ -7,7 +7,8 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.models.entities import DatabaseAccount, User, UserPackage, Website
-from app.services import mariadb, resource_monitor, storage_quota
+from app.services import db_backends, disk_quota, resource_monitor, storage_quota
+from app.services.remote_mysql import RemoteDatabaseError
 from app.services.audit import log_action
 
 router = APIRouter(prefix="/resources", tags=["resources"])
@@ -30,6 +31,9 @@ class UserResourceLimitsUpdate(BaseModel):
     tasks_max: Optional[int] = Field(default=None, ge=0, le=1000000)
     mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
     mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
+    mysql_max_queries_per_hour: Optional[int] = Field(default=None, ge=0, le=1000000000)
+    mysql_max_updates_per_hour: Optional[int] = Field(default=None, ge=0, le=1000000000)
+    mysql_max_connections_per_hour: Optional[int] = Field(default=None, ge=0, le=1000000000)
 
 
 class DatabaseWriteLockToggle(BaseModel):
@@ -144,6 +148,9 @@ def _build_user_resource_row(
         "effective_mysql_limit_bytes": effective_mysql_limit_bytes,
         "mysql_percent": min(999.0, mysql_pct),
         "mysql_max_db_size_mb": int(getattr(user, "mysql_max_db_size_mb", 0) or 0),
+        "mysql_max_queries_per_hour": int(getattr(user, "mysql_max_queries_per_hour", 0) or 0),
+        "mysql_max_updates_per_hour": int(getattr(user, "mysql_max_updates_per_hour", 0) or 0),
+        "mysql_max_connections_per_hour": int(getattr(user, "mysql_max_connections_per_hour", 0) or 0),
         "largest_db_bytes": max_single_db_bytes,
         "web_used_bytes": web_and_mail_bytes,
         "storage_used_bytes": total_storage_bytes,
@@ -396,6 +403,9 @@ def update_user_resource_limits(
         user.tasks_max = getattr(pkg, "tasks_max", 512)
         user.mysql_storage_limit_mb = getattr(pkg, "mysql_storage_limit_mb", 0)
         user.mysql_max_db_size_mb = getattr(pkg, "mysql_max_db_size_mb", 0)
+        user.mysql_max_queries_per_hour = getattr(pkg, "mysql_max_queries_per_hour", 0)
+        user.mysql_max_updates_per_hour = getattr(pkg, "mysql_max_updates_per_hour", 0)
+        user.mysql_max_connections_per_hour = getattr(pkg, "mysql_max_connections_per_hour", 0)
     else:
         for field in [
             "storage_limit_mb",
@@ -412,6 +422,9 @@ def update_user_resource_limits(
             "tasks_max",
             "mysql_storage_limit_mb",
             "mysql_max_db_size_mb",
+            "mysql_max_queries_per_hour",
+            "mysql_max_updates_per_hour",
+            "mysql_max_connections_per_hour",
         ]:
             val = getattr(payload, field, None)
             if val is not None:
@@ -441,7 +454,10 @@ def toggle_database_write_lock(
     if current_user.role == Role.reseller and (not owner or owner.reseller_id != current_user.id):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    mariadb.set_database_write_lock(item.db_name, item.db_user, payload.locked)
+    try:
+        db_backends.backend_for(item).set_write_lock(item.db_name, item.db_user, payload.locked)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     item.write_locked = payload.locked
     item.write_locked_reason = (
         (payload.reason or f"MANUAL: Locked by {current_user.username}")
@@ -480,7 +496,10 @@ def inspect_database_tables(
         if current_user.role == Role.reseller and (not owner or owner.reseller_id != current_user.id):
             raise HTTPException(status_code=403, detail="Access denied")
 
-    tables = mariadb.get_database_tables_breakdown(item.db_name)
+    try:
+        tables = db_backends.backend_for(item).tables_breakdown(item.db_name)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {
         "id": item.id,
         "db_name": item.db_name,
@@ -507,7 +526,10 @@ def optimize_database_endpoint(
         if current_user.role == Role.reseller and (not owner or owner.reseller_id != current_user.id):
             raise HTTPException(status_code=403, detail="Access denied")
 
-    result = mariadb.optimize_database(item.db_name)
+    try:
+        result = db_backends.backend_for(item).optimize(item.db_name)
+    except RemoteDatabaseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     resource_monitor.collect_and_enforce_mysql_quotas(db)
     storage_quota.forget_user_storage(item.owner_id)
     log_action(db, current_user.id, "optimize_database", item.db_name, request=request)
@@ -546,6 +568,36 @@ def get_slow_bottlenecks(
         allowed_user_ids=allowed_ids,
         limit=max(5, min(100, int(limit or 30))),
     )
+
+
+@router.get("/disk-quota")
+def get_disk_quota_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    current = disk_quota.status()
+    # Kernel quota turns up after the remount/reboot that quota-enable asked
+    # for; that is when every account's limit has to be set once.
+    current["accounts_queued"] = disk_quota.reconcile_account_limits(db, current)
+    return current
+
+
+@router.post("/disk-quota/enable")
+def enable_disk_quota(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    try:
+        current = disk_quota.enable()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    current["accounts_queued"] = disk_quota.reconcile_account_limits(db, current)
+    log_action(db, current_user.id, "enable_kernel_disk_quota", current.get("mount") or "/home",
+               detail=f"state={current.get('state')}", request=request)
+    return current
 
 
 @router.get("/domain-traffic")
