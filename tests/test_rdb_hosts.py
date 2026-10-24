@@ -166,3 +166,46 @@ def test_cluster_overview_lists_hosts_from_the_table(monkeypatch):
     overview = multi_server.get_cluster_overview(db)
     assert [h["name"] for h in overview["remote_db_hosts"]] == ["db1"]
     assert overview["summary"]["remote_db_count"] == 1
+
+
+def test_admin_api_edits_hosts_and_refuses_deleting_one_in_use(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from app.api import remote_mysql as api
+    from app.models.entities import DatabaseAccount
+    from app.services import remote_mysql
+
+    db = make_session()
+    admin = make_user(db, username="admin1", role="admin")
+    customer = make_user(db, username="bob")
+    synced = []
+    monkeypatch.setattr(api, "log_action", lambda *a, **k: None)
+    monkeypatch.setattr(remote_mysql, "test_host", lambda db, host_id: remote_mysql.get_host(db, host_id))
+    monkeypatch.setattr(remote_mysql, "sync_phpmyadmin_servers", lambda db: synced.append(True) or True)
+    req = SimpleNamespace()
+
+    created = api.create_remote_db_host(
+        api.RemoteDbHostIn(name="db1", host="10.0.0.5", admin_password="pw"), request=req, db=db, current_user=admin
+    )["host"]
+    updated = api.update_remote_db_host(
+        created["id"], api.RemoteDbHostUpdateIn(name="db one", allowed_client_hosts="10.0.0.10"),
+        request=req, db=db, current_user=admin,
+    )["host"]
+    assert updated["name"] == "db one" and updated["allowed_client_hosts"] == "10.0.0.10" and updated["has_password"]
+    assert len(synced) == 2
+
+    db.add(DatabaseAccount(owner_id=customer.id, db_name="shop", db_user="shop", db_password="x", db_host_id=created["id"]))
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        api.delete_remote_db_host(created["id"], request=req, db=db, current_user=admin)
+    assert exc.value.status_code == 409
+    with pytest.raises(HTTPException) as exc:
+        api.list_remote_db_hosts(db=db, current_user=customer)
+    assert exc.value.status_code == 403
+
+    paths = {(route.path, tuple(sorted(route.methods))) for route in api.router.routes}
+    assert ("/multi-server/remote-db/{host_id}", ("PUT",)) in paths
+    assert ("/multi-server/remote-db/{host_id}/test", ("POST",)) in paths
+    main_text = (REPO_ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+    assert "app.include_router(remote_mysql_api.router" in main_text

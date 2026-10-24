@@ -12,7 +12,10 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
     copyText, generateRandomPassword, copiedField, setCopiedField,
   } = useAppContext();
   const [dbSearching, setDbSearching] = useState(false);
-  const [newDatabase, setNewDatabase] = useState({ db_name: '', db_user: '', db_password: '' });
+  const [newDatabase, setNewDatabase] = useState({ db_name: '', db_user: '', db_password: '', db_host_id: '' });
+  // Where a new database can go: localhost first, then any remote MySQL
+  // host the administrator has enabled. The picker only shows with a choice.
+  const [dbHosts, setDbHosts] = useState([]);
   const [createdDbInfo, setCreatedDbInfo] = useState(null);
   const [tableModal, setTableModal] = useState(null);
 
@@ -39,6 +42,10 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
   React.useEffect(() => {
     loadDatabases(dbSearch, false);
   }, [dbSearch]);
+
+  React.useEffect(() => {
+    request('/databases/hosts', { silent: true }).then(data => { if (data?.hosts) setDbHosts(data.hosts); });
+  }, []);
 
   async function loadDatabases(search = dbSearch, showLoading = false) {
     const query = String(search || '').trim();
@@ -79,11 +86,12 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
       db_name: dbName,
       db_user: dbUser || null,
       db_password: dbPass || null,
+      db_host_id: newDatabase.db_host_id ? Number(newDatabase.db_host_id) : null,
     };
     const data = await request('/databases', { method: 'POST', body: JSON.stringify(body) }, t('Creating database...'));
     if (data) {
-      setCreatedDbInfo({ db_name: data.db_name, db_user: data.db_user, db_password: data.db_password });
-      setNewDatabase({ db_name: '', db_user: '', db_password: '' });
+      setCreatedDbInfo({ db_name: data.db_name, db_user: data.db_user, db_password: data.db_password, db_host_address: data.db_host_address || 'localhost' });
+      setNewDatabase({ db_name: '', db_user: '', db_password: '', db_host_id: '' });
       await loadDatabases();
       await refreshAll();
     }
@@ -153,6 +161,11 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
           {/* new-password, or the browser offers the panel's own password here. */}
           <input name="new-db-password" autoComplete="new-password" value={newDatabase.db_password} onChange={e => setNewDatabase(prev => ({ ...prev, db_password: e.target.value }))} placeholder={t('password (min 12 chars)')} />
           <button type="button" className="mini secondary-light" title={t('Generate random password')} onClick={() => setNewDatabase(prev => ({ ...prev, db_password: generateRandomPassword() }))}><Dices size={13}/></button>
+          {dbHosts.length > 1 && (
+            <select name="new-db-host" value={newDatabase.db_host_id} onChange={e => setNewDatabase(prev => ({ ...prev, db_host_id: e.target.value }))} aria-label={t('Database server')} title={t('Database server')}>
+              {dbHosts.map(h => <option key={h.id ?? 'local'} value={h.id ?? ''}>{h.id == null ? t('This server (localhost)') : `${h.name} (${h.address})`}</option>)}
+            </select>
+          )}
           <button disabled={!!loading || !newDatabase.db_name.trim()} onClick={createDatabase}><Plus size={15}/>{t('Create database')}</button>
         </div>
       </div>}
@@ -174,6 +187,7 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
         <div className="db-created-grid">
           <label>{t('Database')}</label><span>{createdDbInfo.db_name} <button className="mini secondary-light" title={copiedField === 'db_name' ? 'Copied!' : 'Copy'} onClick={() => copyToClipboard(createdDbInfo.db_name, 'db_name')}>{copiedField === 'db_name' ? <Check size={12} style={{color:'var(--green)'}}/> : <Copy size={12}/>}</button></span>
           <label>{t('User')}</label><span>{createdDbInfo.db_user} <button className="mini secondary-light" title={copiedField === 'db_user' ? 'Copied!' : 'Copy'} onClick={() => copyToClipboard(createdDbInfo.db_user, 'db_user')}>{copiedField === 'db_user' ? <Check size={12} style={{color:'var(--green)'}}/> : <Copy size={12}/>}</button></span>
+          <label>{t('Host')}</label><span><code>{createdDbInfo.db_host_address}</code></span>
           <label>{t('Password')}</label><span><code>{createdDbInfo.db_password}</code> <button className="mini secondary-light" title={copiedField === 'db_password' ? 'Copied!' : 'Copy'} onClick={() => copyToClipboard(createdDbInfo.db_password, 'db_password')}>{copiedField === 'db_password' ? <Check size={12} style={{color:'var(--green)'}}/> : <Copy size={12}/>}</button></span>
         </div>
       </div>}
@@ -188,6 +202,11 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
             <strong>{db.db_name}</strong>
             {dbSite && <small className="db-owner">{dbSite.domain}</small>}
             <span className="badge">{fmtDbSize(db.size_bytes)}</span>
+            {db.db_host_id && (
+              <span className="badge" title={`${t('Database server')}: ${db.db_host_address}`}>
+                <Server size={11} style={{ marginRight: '4px' }} />{db.db_host_name}
+              </span>
+            )}
             {db.write_locked && (
               <span className="badge danger" title={db.write_locked_reason || t('Database write-locked due to quota limit')}>
                 <Lock size={11} style={{ marginRight: '4px' }} />
