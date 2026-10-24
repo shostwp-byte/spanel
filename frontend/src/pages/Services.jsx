@@ -212,32 +212,41 @@ export function ServicesPage({ request, isAdmin }) {
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '14px', fontSize: '0.84rem' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start', gap: '10px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '9px 12px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
                 <input
                   type="checkbox"
                   checked={selfHealing?.enabled !== false}
                   disabled={busyWatchdog}
                   onChange={(e) => toggleSelfHealingOption('enabled', e.target.checked)}
+                  style={{ width: '16px', minWidth: '16px', height: '16px', minHeight: '16px', margin: '2px 0 0 0', padding: 0, flexShrink: 0, accentColor: 'var(--primary)', cursor: busyWatchdog ? 'not-allowed' : 'pointer' }}
                 />
-                <span>Tự động khởi động lại dịch vụ cốt lõi (Nginx, MariaDB, Redis, PHP-FPM, Fail2ban) khi bị dừng</span>
+                <span style={{ flex: 1, minWidth: 0, color: 'var(--text)', fontWeight: 500, textAlign: 'left' }}>
+                  Tự động khởi động lại dịch vụ cốt lõi (Nginx, MariaDB, Redis, PHP-FPM, Fail2ban) khi bị dừng
+                </span>
               </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start', gap: '10px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '9px 12px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
                 <input
                   type="checkbox"
                   checked={selfHealing?.validate_config_before_restart !== false}
                   disabled={busyWatchdog}
                   onChange={(e) => toggleSelfHealingOption('validate_config_before_restart', e.target.checked)}
+                  style={{ width: '16px', minWidth: '16px', height: '16px', minHeight: '16px', margin: '2px 0 0 0', padding: 0, flexShrink: 0, accentColor: 'var(--primary)', cursor: busyWatchdog ? 'not-allowed' : 'pointer' }}
                 />
-                <span>Kiểm tra an toàn cú pháp (<code>nginx -t</code>, <code>php-fpm -t</code>) trước khi restart để tránh crash-loop</span>
+                <span style={{ flex: 1, minWidth: 0, color: 'var(--text)', fontWeight: 500, textAlign: 'left' }}>
+                  Kiểm tra an toàn cú pháp (<code>nginx -t</code>, <code>php-fpm -t</code>) trước khi restart để tránh crash-loop
+                </span>
               </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+              <label style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start', gap: '10px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '9px 12px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
                 <input
                   type="checkbox"
                   checked={selfHealing?.auto_db_backup_enabled !== false}
                   disabled={busyWatchdog}
                   onChange={(e) => toggleSelfHealingOption('auto_db_backup_enabled', e.target.checked)}
+                  style={{ width: '16px', minWidth: '16px', height: '16px', minHeight: '16px', margin: '2px 0 0 0', padding: 0, flexShrink: 0, accentColor: 'var(--primary)', cursor: busyWatchdog ? 'not-allowed' : 'pointer' }}
                 />
-                <span>Tự động sao lưu nóng cơ sở dữ liệu Panel (SQLite Online Hot-Backup) định kỳ mỗi 6 giờ</span>
+                <span style={{ flex: 1, minWidth: 0, color: 'var(--text)', fontWeight: 500, textAlign: 'left' }}>
+                  Tự động sao lưu nóng cơ sở dữ liệu Panel (SQLite Online Hot-Backup) định kỳ mỗi 6 giờ
+                </span>
               </label>
             </div>
 
