@@ -697,16 +697,18 @@ migrate_site_cron_php_binary() {
   local py_bin="$APP_DIR/backend/.venv/bin/python"
   [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
 
-  local backup_dir="/var/backups/spanel/cron-spool-backup"
+  local backup_dir
+  backup_dir="/var/backups/spanel/cron-spool-backup/$(date +%Y%m%d%H%M%S)"
   install -d -m 0700 -o root -g root "$backup_dir"
-  local spool_json
+  local spool_json dumped_users
   spool_json="$(mktemp /run/spanel-cron-spool.XXXXXX.json)"
   chown root:spanel "$spool_json"
   chmod 0640 "$spool_json"
 
   # Stage 1 (root, isolated /usr/bin/python3 -I — never imports from $APP_DIR):
-  # Back up and dump legacy /var/spool/cron/crontabs entries to JSON.
-  /usr/bin/python3 -I - "$backup_dir" "$spool_json" <<'PY_DUMP'
+  # Back up and dump legacy /var/spool/cron/crontabs entries to JSON. Prints
+  # the users it dumped; only those can be cleaned up in stage 3.
+  dumped_users="$(/usr/bin/python3 -I - "$backup_dir" "$spool_json" <<'PY_DUMP'
 import json
 import shutil
 import sys
@@ -731,12 +733,16 @@ if spool_dir.is_dir():
         try:
             shutil.copy2(spool, bak_path)
             bak_path.chmod(0o600)
-        except OSError:
-            pass
+        except OSError as exc:
+            # No copy, no migration: cron-write drops the user's crontab.
+            print(f"WARNING: cron migration skipped user={spool.name}: backup failed: {exc}", file=sys.stderr)
+            continue
         payload[spool.name] = raw_text.splitlines()
+        print(spool.name)
 
 spool_json.write_text(json.dumps(payload), encoding="utf-8")
 PY_DUMP
+  )" || dumped_users=""
 
   # Stage 2 (unprivileged spanel account via sudo -u spanel + SPANEL_USE_HELPER=true):
   # Migrate legacy spool lines and enforce spanel-cron-jail across all sites.
@@ -801,14 +807,24 @@ PY_MIGRATE
   )" || true
   rm -f "$spool_json"
 
-  # Stage 3 (root): Only remove legacy spool crontab when 100% of # spanel: lines for that user succeeded.
+  # Stage 3 (root): remove a legacy spool crontab once all of its # spanel:
+  # lines were migrated. Stage 2 ran as spanel, so its output only selects
+  # among the users stage 1 dumped; it can never name root or anyone else.
   local line migrated_user
   while IFS= read -r line; do
     if [[ "$line" =~ ^MIGRATED_USER_OK:([a-z_][a-z0-9_-]{0,31})$ ]]; then
       migrated_user="${BASH_REMATCH[1]}"
+      grep -qxF -- "$migrated_user" <<<"$dumped_users" || continue
       crontab -r -u "$migrated_user" 2>/dev/null || true
     fi
   done <<<"$mig_out"
+  if [[ -n "$dumped_users" ]]; then
+    # cron-write also drops a user's crontab on its first successful write,
+    # so a line that failed above survives only in this copy.
+    log "Legacy tenant crontabs backed up to ${backup_dir}"
+  else
+    rmdir "$backup_dir" 2>/dev/null || true
+  fi
 }
 
 ensure_terminal_tools() {
@@ -1979,8 +1995,6 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # This file is the list of what the helper needs from the sandbox. The jail was
 # added without adding its requirement here, which is how it shipped broken.
 RestrictNamespaces=mnt
-ProtectProc=default
-ProcSubset=all
 SERVICE
 systemctl daemon-reload
 systemctl restart spanel-api

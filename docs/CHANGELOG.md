@@ -4,6 +4,34 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
+## [v1.0.7] — 2026-10-24
+
+### ⚠️ Lưu ý khi nâng cấp từ v1.0.6
+- **Webhook Git Auto-Deploy phải cấu hình lại.** URL webhook đã đổi công thức và mọi lần push phải có chữ ký (`X-Hub-Signature-256` của GitHub hoặc `X-Gitlab-Token` của GitLab) bằng **Webhook Secret** riêng. Webhook cài trước v1.0.7 bị từ chối với thông báo "Legacy pre-v1.0.7 webhook URL". Vào **Applications**, sao chép lại **Webhook URL** và **Webhook Secret** rồi dán vào GitHub/GitLab.
+- **Đổi khoá webhook:** đặt `WEBHOOK_SECRET_KEY` trong `.env` để đổi toàn bộ URL và secret webhook mà không đụng tới `SECRET_KEY`.
+- **Mã hoá backup theo lịch:** đặt `SPANEL_BACKUP_PASSPHRASE` (tối thiểu 12 ký tự) trong `.env` để mọi bản backup tự động được mã hoá AES-256. Không có giao diện nhập passphrase cho từng lịch.
+- **Cron của khách hàng** được chuyển sang `/etc/cron.d/spanel-user-<user>` và chạy trong `spanel-cron-jail`. Bản sao crontab cũ được lưu ở `/var/backups/spanel/cron-spool-backup/<thời điểm>/`; dòng nào không chuyển được sẽ có cảnh báo trong log cập nhật.
+- **Process Monitor** chỉ cho kill tiến trình của tài khoản hosting (uid 1000–64999). Dịch vụ hệ thống khởi động lại tại **System Services**.
+
+### 🔒 Bảo mật
+- Cron khách hàng: toàn bộ lệnh và chuyển hướng nằm trong một chuỗi `/bin/sh -c '...'` chạy sau `runuser`. Backend và `cron-write` dùng chung một ngữ pháp kiểm tra; dấu `%` chưa escape bị từ chối.
+- Bước chuyển đổi cron trong `update.sh` không còn chạy mã của panel bằng root.
+- `spanel-api` giữ `ProtectProc=invisible`; Process Monitor đọc tiến trình qua `spanel-helper`.
+- Khoá audit riêng `/etc/spanel/audit-hmac.key`, anchor chuỗi audit do root ghi.
+- Tắt cấp phát cơ sở dữ liệu trên MySQL từ xa cho tới khi hoàn thiện vòng đời.
+
+### 🛠️ Sửa lỗi
+- Backup theo lịch chạy lại được (lỗi `TypeError` ở mọi lần chạy trong bản thử nghiệm).
+- Cron giữ đúng thư mục làm việc khi ghi vào `/etc/cron.d`.
+- Watchdog timer chạy được; bỏ `apt-mark hold` tự động và gỡ hold cũ.
+- `Alt-Svc` chỉ gửi một lần và chỉ khi nginx có HTTP/3; `reuseport` của QUIC được chuyển cho vhost khác (kể cả vhost dùng IP riêng) khi xoá vhost đang giữ nó.
+- Giải nén archive: quét đồng bộ có giới hạn, phần vượt giới hạn được đưa vào hàng đợi quét nền.
+
+### 🧪 Kiểm thử
+- Khôi phục thư mục `tests/` và thêm CI GitHub Actions (backend, migration, cú pháp shell, build frontend, chặn PR xoá code hàng loạt).
+
+---
+
 ## [v1.0.6] — 2026-10-20
 
 ### 🛠️ Khắc phục Lỗi Triển khai VPS & Cơ sở Dữ liệu (Deployment & Migration Hotfixes)

@@ -91,11 +91,7 @@ test_ssh.py
 setup.sh
 change_IP.sh
 
-# Test files & internal audit/plan reports
-tests/
-backend/tests/
-test_*.py
-*_test.py
+# Internal audit/plan reports (tests/ is tracked: CI runs it)
 plan-report/
 BAO_CAO_DANH_GIA_ENTERPRISE_SPANEL.doc
 

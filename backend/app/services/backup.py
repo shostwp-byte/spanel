@@ -635,12 +635,8 @@ def create_user_backup(
     remote_name_mode: Optional[str] = None,
     full_every_n: int = 7,
     passphrase: Optional[str] = None,
-    encryption_passphrase: Optional[str] = None,
 ) -> str:
     from app.services import backup_s3
-
-    if passphrase is None and encryption_passphrase is not None:
-        passphrase = encryption_passphrase
 
     stamp_dt = datetime.utcnow()
     stamp = stamp_dt.strftime("%Y%m%d%H%M%S")

@@ -78,13 +78,23 @@ def _is_php_interpreter(arg: str) -> bool:
     return bool(PHP_INTERPRETER_RE.fullmatch(Path(arg).name))
 
 
+# cron ends the command at a % that follows an even number of backslashes
+# (a "\\" pair is kept as is) and turns the "\%" ending an odd run into "%".
+_UNESCAPED_PERCENT_RE = re.compile(r"(?<!\\)((?:\\\\)*)%")
+_ESCAPED_PERCENT_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\%")
+# The one shell word allowed after "/bin/sh -c" in a jailed line: single-quoted
+# segments joined only by '\'' or '"'"'. Same grammar as jailed_arg_re in the
+# helper's cron-write, which is what actually guards root's cron.d files.
+JAILED_COMMAND_ARG_RE = re.compile(r"""'[^']*(?:'(?:\\'|"'")'[^']*)*'""")
+
+
 def _escape_percent(command: str) -> str:
     """crontab turns an unescaped % into a newline fed to the job's stdin."""
-    return re.sub(r"(?<!\\)%", r"\\%", command)
+    return _UNESCAPED_PERCENT_RE.sub(r"\1\\%", command)
 
 
 def _unescape_percent(command: str) -> str:
-    return command.replace("\\%", "%")
+    return _ESCAPED_PERCENT_RE.sub(r"\1%", command)
 
 
 def _split_redirection(args: list[str]) -> tuple[list[str], list[str]]:
@@ -383,8 +393,9 @@ def validate_cron_write_line(cron_user: str, line: str) -> bool:
     if len(after_sh_c) != 2:
         return False
     quoted_arg = after_sh_c[1].strip()
-    stripped_escapes = quoted_arg.replace("'\"'\"'", "").replace("'\\''", "")
-    if not re.fullmatch(r"'[^']*'", stripped_escapes):
+    if not JAILED_COMMAND_ARG_RE.fullmatch(quoted_arg):
+        return False
+    if _UNESCAPED_PERCENT_RE.search(quoted_arg):
         return False
     return True
 
