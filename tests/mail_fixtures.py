@@ -103,8 +103,9 @@ def make_user(db, name: str = "mailtuser", role: str = "end_user"):
 def make_domain(db, owner, name: str = "example.com", **values):
     from app.models.entities import MailDomain
 
-    row = MailDomain(domain=name, owner_id=owner.id, catch_all="", dkim_public="A" * 300, webmail_host=False,
-                     relay="", **values)
+    fields = {"catch_all": "", "dkim_public": "A" * 300, "webmail_host": False, "relay": ""}
+    fields.update(values)
+    row = MailDomain(domain=name, owner_id=owner.id, **fields)
     db.add(row)
     db.commit()
     db.refresh(row)

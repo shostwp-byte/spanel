@@ -132,6 +132,8 @@ class MailSettingsIn(BaseModel):
     spam_subject_tag: str | None = Field(default=None, max_length=32)
     greylisting: bool | None = None
     default_quota_mb: int | None = Field(default=None, ge=1, le=mail.MAX_USER_QUOTA_MB)
+    dkim_rotate_days: int | None = Field(default=None, ge=0, le=3650)
+    dkim_retire_days: int | None = Field(default=None, ge=1, le=60)
     allow: list[str] | None = Field(default=None, max_length=mail.MAX_ALLOW)
     block: list[str] | None = Field(default=None, max_length=mail.MAX_ALLOW)
 
@@ -209,10 +211,36 @@ def put_domain_relay(domain_id: int, payload: DomainRelayIn, request: Request, d
 @router.post("/domains/{domain_id}/dkim/rotate")
 def post_rotate_dkim(domain_id: int, request: Request, db: Session = Depends(get_db),
                      current_user: User = Depends(get_current_user)):
+    """Start a DKIM key rotation: the next key is published under a selector
+    of its own; mail is signed with it only once DNS shows it."""
     ensure_role(current_user.role, Role.end_user)
     row = _answer(lambda: mail.rotate_dkim(db, current_user, domain_id))
-    log_action(db, current_user.id, "mail_dkim_rotate", row.domain, "", request=request)
-    return {"domain": row.domain, "records": mail.dns_records(row)}
+    log_action(db, current_user.id, "mail_dkim_rotate", row.domain, row.dkim_next_selector, request=request)
+    return mail.dns_view(db, row, current_user)
+
+
+@router.post("/domains/{domain_id}/dkim/advance")
+def post_advance_dkim(domain_id: int, request: Request, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    """Check DNS and take the rotation's next step now: switch signing to the
+    new key once DNS shows it, or retire the previous key early."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.get_domain(db, current_user, domain_id))
+    step = _answer(lambda: mail.advance_dkim(db, row, manual=True))
+    if step == "wait" and row.dkim_state == "publishing":
+        raise HTTPException(status_code=409, detail="Public DNS does not show the new DKIM record yet. Publish it, then try again in a while.")
+    log_action(db, current_user.id, "mail_dkim_advance", row.domain, step, request=request)
+    return {"step": step, **mail.dns_view(db, row, current_user)}
+
+
+@router.post("/domains/{domain_id}/dkim/cancel")
+def post_cancel_dkim(domain_id: int, request: Request, db: Session = Depends(get_db),
+                     current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.get_domain(db, current_user, domain_id))
+    _answer(lambda: mail.cancel_dkim_rotation(db, row))
+    log_action(db, current_user.id, "mail_dkim_cancel", row.domain, "", request=request)
+    return mail.dns_view(db, row, current_user)
 
 
 @router.post("/domains/{domain_id}/webmail-host")

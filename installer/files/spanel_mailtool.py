@@ -128,6 +128,42 @@ def vacation_scripts(items) -> dict[str, str]:
     return scripts
 
 
+# --- DKIM: keys by selector -------------------------------------------------------------------
+
+SELECTOR_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+LEGACY_SELECTOR = "spanel"
+
+
+def check_selector(value) -> str:
+    selector = str(value or "")
+    if not SELECTOR_RE.fullmatch(selector):
+        raise ToolError(f"invalid DKIM selector: {selector!r}")
+    return selector
+
+
+def dkim_key_name(domain: str, selector: str) -> str:
+    """A key's file under /etc/exim4/spanel/dkim, less ".pem". The "spanel"
+    key is <domain>.pem, where every domain's key was before rotation; any
+    other selector has a directory, so no domain name can be read as another
+    domain's selector."""
+    if not DOMAIN_RE.fullmatch(str(domain or "")):
+        raise ToolError(f"invalid domain: {domain!r}")
+    selector = check_selector(selector)
+    return domain if selector == LEGACY_SELECTOR else f"{selector}/{domain}"
+
+
+def dkim_maps(selectors: dict) -> tuple[list[str], list[str]]:
+    """Exim's dkim_domains (domain -> key file) and dkim_selectors (domain ->
+    selector) lines: the two always change together, so a switch of keys is
+    one mail-sync."""
+    domains, chosen = [], []
+    for domain in sorted(selectors):
+        selector = check_selector(selectors[domain])
+        domains.append(f"{domain}: {dkim_key_name(domain, selector)}")
+        chosen.append(f"{domain}: {selector}")
+    return domains, chosen
+
+
 # --- command line -------------------------------------------------------------------------
 
 def _read_json_stdin(limit: int = 8_000_000):

@@ -1920,8 +1920,11 @@ spam = raw.get("spam_enabled", True) is not False
 # The domain a message is sent for: the one it is DKIM-signed for, else the
 # envelope sender's. The relay is chosen by it.
 SEND = "${if def:acl_m_dkim{$acl_m_dkim}{${lc:$sender_address_domain}}}"
-DKIM = r"""  dkim_domain = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{$value}{}}
-  dkim_selector = spanel
+# dkim_domains maps a domain to its signing key's file (dkim/<value>.pem),
+# dkim_selectors to the selector that key is published under: the two change
+# together when a DKIM rotation switches keys (mail-sync).
+DKIM = r"""  dkim_domain = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{$acl_m_dkim}{}}
+  dkim_selector = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_selectors}{$value}{spanel}}
   dkim_private_key = ${lookup{$acl_m_dkim}lsearch{@@M@@/dkim_domains}{@@M@@/dkim/$value.pem}{0}}
   dkim_canon = relaxed
   dkim_strict = false
@@ -2277,7 +2280,7 @@ mail_ensure_maps() {
   install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR" "$MAIL_EXIM_DIR/dkim"
   install -d -o root -g dovecot -m 0750 "$MAIL_DOVECOT_DIR"
   local list
-  for list in domains mailboxes aliases catchall senders local_senders dkim_domains \
+  for list in domains mailboxes aliases catchall senders local_senders dkim_domains dkim_selectors \
       relay_routes relay_hosts relay_transports relay_auth relay_credentials ratelimits; do
     [[ -f "$MAIL_EXIM_DIR/$list" ]] || install -m 0640 -o root -g Debian-exim /dev/null "$MAIL_EXIM_DIR/$list"
   done
@@ -2786,6 +2789,13 @@ mail_sync() {
   # needs a reload: both notice a changed file on the next lookup.
   [[ -f "$MAIL_EXIM_CONF" ]] || deny "the Email addon is not installed"
   local payload status=0
+  # The maps below name each domain's DKIM key by file and selector; an Exim
+  # configuration from before that would sign with the wrong domain.
+  if ! grep -q 'dkim_selectors' "$MAIL_EXIM_CONF"; then
+    mail_ensure_maps
+    mail_write_exim_conf
+    mail_exim_reload || true
+  fi
   payload="$(mktemp)"
   head -c 8000000 >"$payload"
   python3 - "$payload" "$MAIL_EXIM_DIR" "$MAIL_DOVECOT_DIR" "$MAIL_TOOL_DIR" "$MAIL_VACATION_SCRIPT" <<'PY' || status=$?
@@ -2859,7 +2869,13 @@ def domain_list(values, owner):
     return clean
 
 
-domains, catchall = [], {}
+sys.path.insert(0, tool_dir)
+try:
+    import spanel_mailtool
+except ImportError:
+    fail(f"{tool_dir}/spanel_mailtool.py is missing - run the SPanel update again")
+
+domains, catchall, selectors = [], {}, {}
 for item in data.get("domains") or []:
     name = str((item or {}).get("domain") or "").strip().lower()
     if not DOMAIN_RE.fullmatch(name):
@@ -2870,6 +2886,12 @@ for item in data.get("domains") or []:
     target = str(item.get("catch_all") or "").strip()
     if target:
         catchall[name] = remote(target)
+    # The selector its mail is signed with; "spanel" is the key every domain
+    # had before DKIM rotation.
+    try:
+        selectors[name] = spanel_mailtool.check_selector(item.get("dkim_selector") or "spanel")
+    except spanel_mailtool.ToolError as exc:
+        fail(str(exc))
 domain_set = set(domains)
 
 boxes, seen = [], set()
@@ -2938,11 +2960,6 @@ if default_relay:
 # Autoresponders, rendered (and checked again) by the mail tool.
 vacations = {}
 if data.get("autoresponders"):
-    sys.path.insert(0, tool_dir)
-    try:
-        import spanel_mailtool
-    except ImportError:
-        fail(f"{tool_dir}/spanel_mailtool.py is missing - run the SPanel update again")
     try:
         vacations = spanel_mailtool.vacation_scripts(data.get("autoresponders"))
     except spanel_mailtool.ToolError as exc:
@@ -3036,7 +3053,11 @@ for box in boxes:
 
 dkim = {}
 for domain in domains:
-    key_path = os.path.join(exim_dir, "dkim", f"{domain}.pem")
+    # "spanel" is dkim/<domain>.pem, as before rotation; another selector's
+    # key is dkim/<selector>/<domain>.pem.
+    key_path = os.path.join(exim_dir, "dkim", spanel_mailtool.dkim_key_name(domain, selectors[domain]) + ".pem")
+    os.makedirs(os.path.dirname(key_path), mode=0o750, exist_ok=True)
+    os.chown(os.path.dirname(key_path), 0, exim_gid)
     if not os.path.exists(key_path):
         fd = os.open(key_path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
         os.fchown(fd, 0, exim_gid)
@@ -3080,7 +3101,9 @@ write(E("aliases"), [f"{a}: {', '.join(t)}" for a, t in sorted(aliases.items())]
 write(E("catchall"), [f"{d}: {t}" for d, t in sorted(catchall.items())], exim_gid)
 write(E("senders"), [f"{a}: {' : '.join(d)}" for a, d in sorted(senders.items()) if d], exim_gid)
 write(E("local_senders"), [f"{u}: {' : '.join(d)}" for u, d in sorted(local_senders.items()) if d], exim_gid)
-write(E("dkim_domains"), [f"{d}: {d}" for d in sorted(dkim)], exim_gid)
+dkim_domain_lines, dkim_selector_lines = spanel_mailtool.dkim_maps({d: selectors[d] for d in dkim})
+write(E("dkim_domains"), dkim_domain_lines, exim_gid)
+write(E("dkim_selectors"), dkim_selector_lines, exim_gid)
 write(E("relay_routes"), sorted(routes), exim_gid)
 
 users, denied = [], []
@@ -3641,15 +3664,35 @@ mail_reconfigure() {
   echo "Mail configuration rewritten."
 }
 
+require_dkim_selector() {
+  [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || deny "invalid DKIM selector: $1"
+}
+
+mail_dkim_key() {
+  # The key file of a domain's selector: "spanel" is dkim/<domain>.pem, the
+  # key every domain had before rotation; any other is dkim/<selector>/<domain>.pem.
+  if [[ "$2" == "spanel" ]]; then
+    printf '%s/dkim/%s.pem' "$MAIL_EXIM_DIR" "$1"
+  else
+    printf '%s/dkim/%s/%s.pem' "$MAIL_EXIM_DIR" "$2" "$1"
+  fi
+}
+
+mail_dkim_active_selector() {
+  awk -F': ' -v d="$1" '$1 == d { print $2; exit }' "$MAIL_EXIM_DIR/dkim_selectors" 2>/dev/null
+}
+
 mail_dkim() {
-  # The domain's DKIM public key (base64, one line) for its DNS record, making
-  # the key pair first when there is none - or always, with "rotate".
-  local domain="$1" mode="${2:-}" key tmp
+  # The DKIM public key (base64, one line) of a domain's selector for its DNS
+  # record, making the key pair first when there is none. A rotation makes
+  # the next selector's key this way, long before Exim signs with it.
+  local domain="$1" selector="${2:-spanel}" key tmp
   require_domain "$domain"
-  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim"
-  key="$MAIL_EXIM_DIR/dkim/${domain}.pem"
-  if [[ ! -f "$key" || "$mode" == "rotate" ]]; then
-    tmp="$(mktemp "$MAIL_EXIM_DIR/dkim/.${domain}.XXXXXX")"
+  require_dkim_selector "$selector"
+  key="$(mail_dkim_key "$domain" "$selector")"
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim" "$(dirname "$key")"
+  if [[ ! -f "$key" ]]; then
+    tmp="$(mktemp "$(dirname "$key")/.${domain}.XXXXXX")"
     chown root:Debian-exim "$tmp"
     chmod 0640 "$tmp"
     openssl genrsa -out "$tmp" 2048 >/dev/null 2>&1 || { rm -f "$tmp"; deny "could not create a DKIM key for ${domain}"; }
@@ -3657,6 +3700,78 @@ mail_dkim() {
     chmod 0640 "$tmp"
     mv -f "$tmp" "$key"
   fi
+  openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | base64 -w0
+  echo
+}
+
+mail_dkim_drop() {
+  # A retired (or abandoned) selector's key goes. Never the one Exim signs with.
+  local domain="$1" selector="$2" key
+  require_domain "$domain"
+  require_dkim_selector "$selector"
+  if [[ "$(mail_dkim_active_selector "$domain")" == "$selector" ]] \
+     || { [[ "$selector" == "spanel" ]] && [[ -z "$(mail_dkim_active_selector "$domain")" ]]; }; then
+    deny "${selector} is the key ${domain} is signed with"
+  fi
+  key="$(mail_dkim_key "$domain" "$selector")"
+  rm -f -- "$key"
+  rmdir -- "$(dirname "$key")" 2>/dev/null || true
+  echo "removed DKIM key ${selector} of ${domain}"
+}
+
+mail_dkim_export() {
+  # Every DKIM key of a domain, for its owner's backup: {"selector": "PEM"}.
+  local domain="$1"
+  require_domain "$domain"
+  python3 - "$MAIL_EXIM_DIR/dkim" "$domain" <<'PY'
+import json
+import os
+import re
+import sys
+
+base, domain = sys.argv[1:3]
+SELECTOR_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+keys = {}
+candidates = [("spanel", os.path.join(base, f"{domain}.pem"))]
+try:
+    names = sorted(os.listdir(base))
+except OSError:
+    names = []
+for name in names:
+    if SELECTOR_RE.fullmatch(name) and os.path.isdir(os.path.join(base, name)):
+        candidates.append((name, os.path.join(base, name, f"{domain}.pem")))
+for selector, path in candidates:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        continue
+    with os.fdopen(fd, encoding="ascii", errors="replace") as handle:
+        text = handle.read(20000)
+    if "PRIVATE KEY-----" in text:
+        keys[selector] = text
+print(json.dumps(keys))
+PY
+}
+
+mail_dkim_import() {
+  # A DKIM private key from a backup, PEM on stdin, for a domain's selector:
+  # checked to be an RSA key of 1024 to 4096 bits, then put in place and its
+  # public key printed, as mail-dkim does.
+  local domain="$1" selector="$2" key tmp bits
+  require_domain "$domain"
+  require_dkim_selector "$selector"
+  key="$(mail_dkim_key "$domain" "$selector")"
+  install -d -o root -g Debian-exim -m 0750 "$MAIL_EXIM_DIR/dkim" "$(dirname "$key")"
+  tmp="$(mktemp "$(dirname "$key")/.${domain}.XXXXXX")"
+  chown root:Debian-exim "$tmp"
+  chmod 0640 "$tmp"
+  head -c 16384 >"$tmp"
+  bits="$(openssl rsa -in "$tmp" -noout -text 2>/dev/null | sed -nE 's/^Private-Key: \(([0-9]+) bit.*/\1/p' | head -n1)"
+  if [[ ! "$bits" =~ ^[0-9]+$ ]] || (( bits < 1024 || bits > 4096 )) || ! openssl rsa -in "$tmp" -check -noout >/dev/null 2>&1; then
+    rm -f "$tmp"
+    deny "not an RSA private key of 1024 to 4096 bits"
+  fi
+  mv -f "$tmp" "$key"
   openssl rsa -in "$key" -pubout -outform DER 2>/dev/null | base64 -w0
   echo
 }
@@ -3690,7 +3805,7 @@ mail_purge_domain() {
   elif [[ -d "$dir" ]]; then
     rm -rf --one-file-system -- "$dir"
   fi
-  rm -f -- "$MAIL_EXIM_DIR/dkim/${domain}.pem"
+  rm -f -- "$MAIL_EXIM_DIR/dkim/${domain}.pem" "$MAIL_EXIM_DIR"/dkim/*/"${domain}.pem"
   echo "mail data removed: ${domain}"
 }
 
@@ -8111,9 +8226,23 @@ case "$cmd" in
     ;;
 
   mail-dkim)
-    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: mail-dkim <domain> [rotate]"
-    [[ $# -eq 1 || "$2" == "rotate" ]] || deny "usage: mail-dkim <domain> [rotate]"
-    mail_dkim "$1" "${2:-}"
+    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: mail-dkim <domain> [selector]"
+    mail_dkim "$1" "${2:-spanel}"
+    ;;
+
+  mail-dkim-drop)
+    [[ $# -eq 2 ]] || deny "usage: mail-dkim-drop <domain> <selector>"
+    mail_dkim_drop "$1" "$2"
+    ;;
+
+  mail-dkim-export)
+    [[ $# -eq 1 ]] || deny "usage: mail-dkim-export <domain>"
+    mail_dkim_export "$1"
+    ;;
+
+  mail-dkim-import)
+    [[ $# -eq 2 ]] || deny "usage: mail-dkim-import <domain> <selector> < key.pem"
+    mail_dkim_import "$1" "$2"
     ;;
 
   mail-log)

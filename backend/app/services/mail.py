@@ -48,7 +48,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -70,7 +70,9 @@ SSO_KEY_FILE = Path("/etc/spanel/webmail-sso.key")
 RSPAMD_KEY_FILE = Path("/etc/spanel/rspamd-controller.key")
 RSPAMD_CONTROLLER = "http://127.0.0.1:11334"
 SETTINGS_KEY = "mail"
+# The selector of every domain's first key; a rotation moves to s<date>.
 DKIM_SELECTOR = "spanel"
+DKIM_SELECTOR_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 WEBMAIL_PORT = 2096
 SSO_TOKEN_SECONDS = 60
 DEFAULT_QUOTA_MB = 1024
@@ -102,6 +104,10 @@ SETTINGS_DEFAULTS = {
     "spam_subject_tag": "[SPAM]",
     "greylisting": True,
     "default_quota_mb": DEFAULT_QUOTA_MB,
+    # DKIM keys rotate on their own every so many days (0: only by hand),
+    # and a replaced key stays published this long.
+    "dkim_rotate_days": 0,
+    "dkim_retire_days": 7,
 }
 PORTS = {"imap": 993, "pop3": 995, "smtps": 465, "submission": 587}
 
@@ -177,7 +183,9 @@ def after_install(db: Session) -> None:
     made again; the records shown follow. Then every domain is served again."""
     for row in db.query(MailDomain).all():
         try:
-            row.dkim_public = _dkim_public(row.domain)
+            row.dkim_public = _dkim_public(row.domain, row.dkim_selector or DKIM_SELECTOR)
+            if row.dkim_next_selector:
+                row.dkim_next_public = _dkim_public(row.domain, row.dkim_next_selector)
         except MailError:
             continue
     db.commit()
@@ -401,9 +409,12 @@ def box_path(owner: User, account: MailAccount) -> str:
 
 # --- mail domains -------------------------------------------------------------------------
 
-def _dkim_public(domain: str, rotate: bool = False) -> str:
-    args = [domain, "rotate"] if rotate else [domain]
-    result = _helper("mail-dkim", *args)
+def _dkim_public(domain: str, selector: str = DKIM_SELECTOR) -> str:
+    """The public key of a domain's selector, the helper making the key pair
+    first if there is none."""
+    if not DKIM_SELECTOR_RE.fullmatch(selector or ""):
+        raise MailError("That is not a DKIM selector.")
+    result = _helper("mail-dkim", domain, selector)
     key = (result.stdout or "").strip().splitlines()[-1:] if (result.stdout or "").strip() else []
     if not key or not re.fullmatch(r"[A-Za-z0-9+/=]{200,1000}", key[0]):
         if app_settings.command_dry_run or not shell_uses_helper():
@@ -501,13 +512,10 @@ def set_catch_all(db: Session, actor: User, domain_id: int, target: str) -> Mail
 
 
 def rotate_dkim(db: Session, actor: User, domain_id: int) -> MailDomain:
+    """The "New DKIM key" button: a two-selector rotation, never a key
+    replaced in place (see DKIM rotation below)."""
     _require_active()
-    row = get_domain(db, actor, domain_id)
-    row.dkim_public = _dkim_public(row.domain, rotate=True)
-    db.commit()
-    sync(db)
-    publish_dns_quietly(db, row)
-    return row
+    return start_dkim_rotation(db, get_domain(db, actor, domain_id))
 
 
 def set_webmail_host(db: Session, actor: User, domain_id: int, enabled: bool) -> MailDomain:
@@ -550,6 +558,8 @@ def domain_out(db: Session, row: MailDomain, owners: dict[int, User] | None = No
         "webmail_host": bool(row.webmail_host),
         "webmail_url": webmail_url(row) + "/",
         "relay": row.relay or "",
+        "dkim_selector": row.dkim_selector or DKIM_SELECTOR,
+        "dkim_state": row.dkim_state or "",
         "mailboxes": db.query(MailAccount).filter(MailAccount.domain == row.domain).count(),
         "forwarders": db.query(MailForwarder).filter(MailForwarder.domain == row.domain).count(),
         "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -1008,10 +1018,17 @@ def dns_records(row: MailDomain) -> list[dict]:
         records.append({"key": "mx", "type": "MX", "name": domain, "value": _hostname_or_blank(), "priority": 10})
     records += [
         {"key": "spf", "type": "TXT", "name": domain, "value": suggested_spf(relay)},
-        {"key": "dkim", "type": "TXT", "name": f"{DKIM_SELECTOR}._domainkey.{domain}",
+        {"key": "dkim", "type": "TXT", "name": f"{row.dkim_selector or DKIM_SELECTOR}._domainkey.{domain}",
          "value": f"v=DKIM1; k=rsa; p={row.dkim_public}"},
-        {"key": "dmarc", "type": "TXT", "name": f"_dmarc.{domain}", "value": DEFAULT_DMARC},
     ]
+    # A rotation publishes the next key before mail is signed with it, and
+    # keeps the previous one until mail signed with it has been checked.
+    for key, selector, public in (("dkim-next", row.dkim_next_selector, row.dkim_next_public),
+                                  ("dkim-old", row.dkim_old_selector, row.dkim_old_public)):
+        if selector and public:
+            records.append({"key": key, "type": "TXT", "name": f"{selector}._domainkey.{domain}",
+                            "value": f"v=DKIM1; k=rsa; p={public}"})
+    records.append({"key": "dmarc", "type": "TXT", "name": f"_dmarc.{domain}", "value": DEFAULT_DMARC})
     if relay:
         for index, item in enumerate(relay.get("dns_records") or []):
             records.append({
@@ -1051,6 +1068,13 @@ def _resolve(name: str, rtype: str) -> list[str] | None:
         else:
             out.append(item.to_text())
     return out
+
+
+DKIM_KEYS = ("dkim", "dkim-next", "dkim-old")
+
+
+def _dkim_record_public(row: MailDomain, key: str) -> str:
+    return {"dkim": row.dkim_public, "dkim-next": row.dkim_next_public, "dkim-old": row.dkim_old_public}.get(key) or ""
 
 
 def _zone_lookup(zone_name: str):
@@ -1096,9 +1120,10 @@ def check_dns(row: MailDomain, lookup=None, zone_name: str = "") -> list[dict]:
             txt = lookup(name, "TXT")
             found = None if txt is None else [t for t in txt if t.lower().startswith("v=spf1")]
             ok = bool(found) and len(found) == 1 and spf_covers(found[0], relay)
-        elif key == "dkim":
+        elif key in DKIM_KEYS:
+            public = _dkim_record_public(row, key)
             found = lookup(name, "TXT")
-            ok = found is not None and any(row.dkim_public and row.dkim_public in t.replace(" ", "") for t in found)
+            ok = found is not None and any(public and public in t.replace(" ", "") for t in found)
         elif key == "dmarc":
             txt = lookup(name, "TXT")
             found = None if txt is None else [t for t in txt if t.upper().startswith("V=DMARC1")]
@@ -1158,6 +1183,7 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
     return {
         "domain": row.domain,
         "records": records,
+        "dkim": dkim_view(row),
         "hosted_zone": zone.name if zone else "",
         "relay": {
             "choice": row.relay or "",
@@ -1214,8 +1240,8 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
         else:
             content = record["value"]
         existing = current(name, rtype)
-        if key == "dkim" or record.get("source") == "relay":
-            if rtype == "TXT" and key != "dkim":
+        if key in DKIM_KEYS or record.get("source") == "relay":
+            if rtype == "TXT" and key not in DKIM_KEYS:
                 # Another TXT of the same name (a verification string, say) stays.
                 wanted = [item for item in existing if dns._untxt(item) != record["value"]] + [content]
                 if sorted(wanted) != sorted(existing):
@@ -1272,6 +1298,259 @@ def publish_all_quietly(db: Session, zone_name: str = "") -> list[str]:
     return written
 
 
+def withdraw_dns(db: Session, row: MailDomain, name: str, rtype: str, value: str) -> bool:
+    """Take one record the panel published out of the domain's zone here,
+    leaving anything else at that name. True when it was there."""
+    from app.services import dns
+
+    zone = _hosted_zone(db, row)
+    if zone is None:
+        return False
+    data = dns._zone_data(zone.name)
+    absolute = dns._absolute(name)
+    rrset = dns._rrset(data, absolute, rtype)
+    contents = dns._contents(rrset)
+
+    def matches(content: str) -> bool:
+        text = dns._untxt(content) if rtype == "TXT" else content
+        return _squash(text) == _squash(value)
+
+    kept = [content for content in contents if not matches(content)]
+    if len(kept) == len(contents):
+        return False
+    dns._serial_follows_edits(zone.name, data)
+    dns._patch(zone.name, {(absolute, rtype): ((rrset or {}).get("ttl", dns.DEFAULT_TTL), kept)})
+    return True
+
+
+def withdraw_dns_quietly(db: Session, row: MailDomain, name: str, rtype: str, value: str) -> bool:
+    from app.services import dns
+
+    try:
+        return withdraw_dns(db, row, name, rtype, value)
+    except (MailError, dns.DnsError, dns.DnsInputError) as exc:
+        logger.warning("Mail record %s %s not withdrawn: %s", name, rtype, exc)
+        return False
+
+
+# --- DKIM rotation ------------------------------------------------------------------------------
+# Two selectors, so no signature ever fails: the next key is published under
+# a selector of its own (s<date>) while mail is still signed with the current
+# one. Exim switches only once public DNS shows the new record - or when it
+# does not show the current one either, so the switch breaks nothing - and
+# the previous key stays published for DKIM_RETIRE_DAYS, until mail signed
+# with it has been checked, before it and its record go. The maintenance
+# loop moves each domain along; an administrator may also have it rotate on
+# its own every dkim_rotate_days.
+
+DKIM_MIN_PUBLISH = 3600
+DKIM_RETIRE_DAYS = 7
+DKIM_STATES = ("", "publishing", "retiring")
+
+
+def new_dkim_selector(row: MailDomain, now: datetime) -> str:
+    base = "s" + now.strftime("%Y%m%d")
+    taken = {row.dkim_selector or DKIM_SELECTOR, row.dkim_next_selector, row.dkim_old_selector}
+    selector, number = base, 1
+    while selector in taken:
+        number += 1
+        selector = f"{base}-{number}"
+    return selector
+
+
+def dkim_next_step(row: MailDomain, now: datetime, *, current_status: str = "", next_status: str = "",
+                   rotate_days: int = 0, retire_days: int = DKIM_RETIRE_DAYS, manual: bool = False) -> str:
+    """What a domain's DKIM rotation does next: "switch", "retire", "start",
+    "wait" or "none". The DNS statuses are check_dns's (ok, missing,
+    different, unknown) for the current and the next selector's record."""
+    state = row.dkim_state or ""
+    since = row.dkim_state_at or now
+    if state == "publishing":
+        if next_status == "unknown":
+            return "wait"
+        safe = next_status == "ok" or current_status in ("missing", "different")
+        if safe and (manual or (now - since).total_seconds() >= DKIM_MIN_PUBLISH):
+            return "switch"
+        return "wait"
+    if state == "retiring":
+        if manual or (now - since).total_seconds() >= max(1, retire_days) * 86400:
+            return "retire"
+        return "wait"
+    if rotate_days > 0:
+        last = row.dkim_rotated_at or row.created_at
+        if last is not None and (now - last).total_seconds() >= rotate_days * 86400:
+            return "start"
+    return "none"
+
+
+def start_dkim_rotation(db: Session, row: MailDomain, now: datetime | None = None) -> MailDomain:
+    """Make and publish the next key; mail stays signed with the current one."""
+    if (row.dkim_state or "") != "":
+        raise MailError("A DKIM key rotation is already under way for this domain.", status=409)
+    now = now or datetime.utcnow()
+    selector = new_dkim_selector(row, now)
+    public = _dkim_public(row.domain, selector)
+    row.dkim_next_selector, row.dkim_next_public = selector, public
+    row.dkim_state, row.dkim_state_at = "publishing", now
+    db.commit()
+    publish_dns_quietly(db, row)
+    return row
+
+
+def _dkim_statuses(db: Session, row: MailDomain) -> tuple[str, str]:
+    """check_dns's status of the current and the next selector's record in
+    public DNS: what receiving servers see."""
+    statuses = {record["key"]: record["status"] for record in check_dns(row) if record["key"] in DKIM_KEYS}
+    return statuses.get("dkim", "unknown"), statuses.get("dkim-next", "unknown")
+
+
+def _switch_dkim(db: Session, row: MailDomain, now: datetime) -> None:
+    previous = (row.dkim_selector or DKIM_SELECTOR, row.dkim_public or "")
+    row.dkim_selector, row.dkim_public = row.dkim_next_selector, row.dkim_next_public
+    row.dkim_old_selector, row.dkim_old_public = previous
+    row.dkim_next_selector, row.dkim_next_public = "", ""
+    row.dkim_state, row.dkim_state_at, row.dkim_rotated_at = "retiring", now, now
+    db.flush()
+    try:
+        sync(db)
+    except MailError:
+        db.rollback()
+        raise
+    db.commit()
+    publish_dns_quietly(db, row)
+
+
+def _retire_dkim(db: Session, row: MailDomain) -> None:
+    selector, public = row.dkim_old_selector, row.dkim_old_public
+    if selector:
+        result = shell.privileged("mail-dkim-drop", helper_args=[row.domain, selector], check=False,
+                                  fallback=["true"])
+        if result.returncode != 0:
+            logger.warning("DKIM key %s of %s not removed: %s", selector, row.domain, result.stderr)
+        if public:
+            withdraw_dns_quietly(db, row, f"{selector}._domainkey.{row.domain}", "TXT", f"v=DKIM1; k=rsa; p={public}")
+    row.dkim_old_selector, row.dkim_old_public = "", ""
+    row.dkim_state, row.dkim_state_at = "", None
+    db.commit()
+
+
+def cancel_dkim_rotation(db: Session, row: MailDomain) -> MailDomain:
+    """Drop the next key before mail was ever signed with it."""
+    if row.dkim_state != "publishing":
+        raise MailError("There is no new DKIM key waiting to be used.", status=409)
+    selector, public = row.dkim_next_selector, row.dkim_next_public
+    if selector:
+        shell.privileged("mail-dkim-drop", helper_args=[row.domain, selector], check=False, fallback=["true"])
+        if public:
+            withdraw_dns_quietly(db, row, f"{selector}._domainkey.{row.domain}", "TXT", f"v=DKIM1; k=rsa; p={public}")
+    row.dkim_next_selector, row.dkim_next_public = "", ""
+    row.dkim_state, row.dkim_state_at = "", None
+    db.commit()
+    return row
+
+
+def advance_dkim(db: Session, row: MailDomain, *, now: datetime | None = None, manual: bool = False) -> str:
+    """Take one step of the domain's rotation if it is due; returns the step."""
+    now = now or datetime.utcnow()
+    settings = current_settings()
+    current_status = next_status = ""
+    if row.dkim_state == "publishing":
+        current_status, next_status = _dkim_statuses(db, row)
+    step = dkim_next_step(row, now, current_status=current_status, next_status=next_status,
+                          rotate_days=int(settings.get("dkim_rotate_days") or 0),
+                          retire_days=int(settings.get("dkim_retire_days") or DKIM_RETIRE_DAYS), manual=manual)
+    if step == "switch":
+        _switch_dkim(db, row, now)
+    elif step == "retire":
+        _retire_dkim(db, row)
+    elif step == "start" and not manual:
+        start_dkim_rotation(db, row, now)
+    return step
+
+
+MAINTENANCE_SECONDS = 900
+_maintenance_started = False
+
+
+def maintenance_tick(db: Session, now: datetime | None = None) -> dict[str, str]:
+    """One pass of the background work every mail domain may have due: the
+    next step of its DKIM rotation. A domain that fails is logged and left
+    for the next pass. Returns {domain: step} for the steps taken."""
+    if not active():
+        return {}
+    done = {}
+    for row in db.query(MailDomain).order_by(MailDomain.domain).all():
+        try:
+            step = advance_dkim(db, row, now=now)
+        except Exception:  # noqa: BLE001 - one domain never stops the others
+            logger.warning("DKIM rotation step failed for %s", row.domain, exc_info=True)
+            db.rollback()
+            continue
+        if step not in ("none", "wait"):
+            done[row.domain] = step
+            logger.info("DKIM rotation of %s: %s", row.domain, step)
+    return done
+
+
+def _maintenance_lock():
+    """An exclusive lock, so of several API workers one does the pass."""
+    try:
+        import fcntl
+    except ImportError:  # not Linux: tests and development
+        return None
+    path = panel_settings.SETTINGS_DIR / "mail-maintenance.lock"
+    try:
+        handle = open(path, "a")  # noqa: SIM115 - held for the pass
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return handle
+
+
+def start_maintenance_daemon() -> None:
+    global _maintenance_started
+    if _maintenance_started:
+        return
+    _maintenance_started = True
+
+    def loop() -> None:
+        from app.core.database import SessionLocal
+
+        while True:
+            time.sleep(MAINTENANCE_SECONDS)
+            lock = _maintenance_lock()
+            if lock is False:
+                continue
+            try:
+                with SessionLocal() as db:
+                    maintenance_tick(db)
+            except Exception:  # noqa: BLE001 - the loop outlives any one failure
+                logger.warning("Mail maintenance failed", exc_info=True)
+            finally:
+                if lock:
+                    lock.close()
+
+    threading.Thread(target=loop, name="spanel-mail-maintenance", daemon=True).start()
+
+
+def dkim_view(row: MailDomain) -> dict:
+    settings = current_settings()
+    retire_days = int(settings.get("dkim_retire_days") or DKIM_RETIRE_DAYS)
+    retire_at = None
+    if row.dkim_state == "retiring" and row.dkim_state_at:
+        retire_at = (row.dkim_state_at + timedelta(days=retire_days)).isoformat()
+    return {
+        "selector": row.dkim_selector or DKIM_SELECTOR,
+        "state": row.dkim_state or "",
+        "state_at": row.dkim_state_at.isoformat() if row.dkim_state_at else None,
+        "next_selector": row.dkim_next_selector or "",
+        "old_selector": row.dkim_old_selector or "",
+        "rotated_at": row.dkim_rotated_at.isoformat() if row.dkim_rotated_at else None,
+        "retire_at": retire_at,
+        "rotate_days": int(settings.get("dkim_rotate_days") or 0),
+    }
+
+
 def set_domain_relay(db: Session, actor: User, domain_id: int, choice: str) -> MailDomain:
     if not _is_admin(actor):
         raise MailError("Only an administrator chooses the relay a domain sends through.", status=403)
@@ -1295,7 +1574,8 @@ def build_state(db: Session) -> dict:
     for row in domains:
         by_owner.setdefault(row.owner_id, []).append(row.domain)
     state: dict = {
-        "domains": [{"domain": row.domain, "catch_all": row.catch_all or ""} for row in domains],
+        "domains": [{"domain": row.domain, "catch_all": row.catch_all or "",
+                     "dkim_selector": row.dkim_selector or DKIM_SELECTOR} for row in domains],
         "mailboxes": [],
         "forwarders": [],
         # A mailbox may send as any domain of the account that owns it.
@@ -1489,6 +1769,12 @@ def save_settings(payload: dict) -> dict:
         merged["max_message_mb"] = whole("max_message_mb", 1, 200, "The largest message is 1 to 200 MB.")
     if "default_quota_mb" in payload:
         merged["default_quota_mb"] = whole("default_quota_mb", 1, MAX_USER_QUOTA_MB, "The size of a new mailbox is 1 to 51200 MB.")
+    if "dkim_rotate_days" in payload:
+        merged["dkim_rotate_days"] = whole("dkim_rotate_days", 0, 3650, "DKIM keys rotate every 0 (never on their own) to 3650 days.")
+        if 0 < merged["dkim_rotate_days"] < 30:
+            raise MailError("Rotate DKIM keys every 30 days or more, or 0 for only by hand.")
+    if "dkim_retire_days" in payload:
+        merged["dkim_retire_days"] = whole("dkim_retire_days", 1, 60, "A replaced DKIM key stays published 1 to 60 days.")
     if "spam_header_score" in payload:
         merged["spam_header_score"] = score("spam_header_score")
     if "spam_rewrite_score" in payload:
@@ -1893,13 +2179,40 @@ def sso_url(db: Session, actor: User, account_id: int) -> str:
 
 # --- backups ---------------------------------------------------------------------------------------
 
+PEM_KEY_RE = re.compile(r"^-----BEGIN (?:RSA )?PRIVATE KEY-----\n[A-Za-z0-9+/=\n]{100,12000}\n-----END (?:RSA )?PRIVATE KEY-----\n?$")
+
+
+def _dkim_keys_for_backup(row: MailDomain) -> dict[str, str]:
+    """The domain's DKIM private keys in use ({selector: PEM}), so a restore
+    signs with the keys its DNS already publishes instead of new ones."""
+    if not active():
+        return {}
+    result = shell.privileged("mail-dkim-export", helper_args=[row.domain], check=False, sensitive=True,
+                              fallback=["bash", "-lc", "echo '{}'"])
+    try:
+        keys = json.loads((result.stdout or "").strip().splitlines()[-1]) if result.returncode == 0 else {}
+    except (IndexError, ValueError):
+        keys = {}
+    wanted = {row.dkim_selector or DKIM_SELECTOR, row.dkim_next_selector, row.dkim_old_selector} - {""}
+    return {str(selector): str(pem) for selector, pem in (keys or {}).items()
+            if selector in wanted and PEM_KEY_RE.fullmatch(str(pem).replace("\r\n", "\n"))}
+
+
 def backup_manifest(db: Session, user: User) -> dict:
-    """An account's mail domains, mailboxes (password hashes) and forwarders."""
+    """An account's mail domains (with their DKIM keys), mailboxes (password
+    hashes), forwarders and autoresponders."""
     domains = db.query(MailDomain).filter(MailDomain.owner_id == user.id).order_by(MailDomain.domain).all()
     names = [row.domain for row in domains]
     return {
-        "domains": [{"domain": row.domain, "catch_all": row.catch_all or "", "relay": row.relay or ""}
+        "domains": [{"domain": row.domain, "catch_all": row.catch_all or "", "relay": row.relay or "",
+                     "dkim_selector": row.dkim_selector or DKIM_SELECTOR,
+                     "dkim_keys": _dkim_keys_for_backup(row)}
                     for row in domains],
+        "autoresponders": [{"local_part": row.local_part, "domain": row.domain, "subject": row.subject,
+                            "body": row.body, "enabled": bool(row.enabled), "start_date": row.start_date or "",
+                            "end_date": row.end_date or "", "interval_days": int(row.interval_days or 1)}
+                           for row in db.query(MailAutoresponder).filter(MailAutoresponder.domain.in_(names or [""]))
+                           .order_by(MailAutoresponder.domain, MailAutoresponder.local_part).all()],
         "mailboxes": [{"local_part": account.local_part, "domain": account.domain, "password_hash": account.password_hash,
                        "quota_mb": account.quota_mb, "enabled": bool(account.enabled)}
                       for account in db.query(MailAccount).filter(MailAccount.owner_id == user.id)
@@ -1942,6 +2255,17 @@ def restore_manifest(db: Session, user: User, section, stage_mail) -> list[str]:
         row.catch_all = normalize_destination(catch_all) if catch_all else ""
         relay = str(entry.get("relay") or "")
         row.relay = relay if relay == "direct" or relay in {item["id"] for item in _relays()} else ""
+        # The key its DNS publishes comes back with it; without one (an older
+        # archive) mail-sync makes a new key and the DNS page shows the record.
+        keys = entry.get("dkim_keys") if isinstance(entry.get("dkim_keys"), dict) else {}
+        selector = str(entry.get("dkim_selector") or DKIM_SELECTOR)
+        pem = str(keys.get(selector) or "").replace("\r\n", "\n")
+        if DKIM_SELECTOR_RE.fullmatch(selector) and PEM_KEY_RE.fullmatch(pem):
+            public = _import_dkim_key(name, selector, pem)
+            if public:
+                row.dkim_selector, row.dkim_public = selector, public
+                row.dkim_next_selector = row.dkim_next_public = row.dkim_old_selector = row.dkim_old_public = ""
+                row.dkim_state, row.dkim_state_at = "", None
         db.flush()
     for entry in section.get("mailboxes") or []:
         try:
@@ -1984,7 +2308,40 @@ def restore_manifest(db: Session, user: User, section, stage_mail) -> list[str]:
         else:
             row.destinations = "\n".join(targets)
         db.flush()
+    owned = {row.domain for row in db.query(MailDomain).filter(MailDomain.owner_id == user.id).all()}
+    for entry in section.get("autoresponders") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            local = normalize_local(str(entry.get("local_part") or ""))
+            domain = normalize_domain(str(entry.get("domain") or ""))
+            values = normalize_autoresponder(entry.get("subject"), entry.get("body"), entry.get("start_date"),
+                                             entry.get("end_date"), entry.get("interval_days") or 1)
+        except MailError as exc:
+            raise ValueError(f"Invalid autoresponder in backup: {exc.message}") from exc
+        if domain not in owned:
+            raise ValueError(f"Autoresponder outside the account's mail domains: {local}@{domain}")
+        row = db.query(MailAutoresponder).filter(MailAutoresponder.domain == domain,
+                                                 MailAutoresponder.local_part == local).first()
+        if row is None:
+            row = MailAutoresponder(domain=domain, local_part=local)
+            db.add(row)
+        for key, value in values.items():
+            setattr(row, key, value)
+        row.enabled = bool(entry.get("enabled", True))
+        db.flush()
     return restored
+
+
+def _import_dkim_key(domain: str, selector: str, pem: str) -> str:
+    """Put a DKIM private key from a backup in place; its public key, or ""."""
+    result = shell.privileged("mail-dkim-import", helper_args=[domain, selector], input=pem, check=False,
+                              sensitive=True, fallback=["true"])
+    lines = (result.stdout or "").strip().splitlines()
+    if result.returncode != 0 or not lines or not re.fullmatch(r"[A-Za-z0-9+/=]{200,1000}", lines[-1]):
+        logger.warning("DKIM key of %s not restored: %s", domain, _helper_message(result.stderr))
+        return ""
+    return lines[-1]
 
 
 # --- disk space ------------------------------------------------------------------------------------

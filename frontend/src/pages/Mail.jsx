@@ -134,9 +134,25 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   async function rotateMailDkim(domain) {
-    if (!confirm(t('Make a new DKIM key for {domain}?\n\nMail is signed with the new key at once, so update the DKIM record in DNS right away: until you do, receivers cannot verify the signature.', { domain: domain.domain }))) return;
+    if (!confirm(t('Start a DKIM key rotation for {domain}?\n\nA new key is published under a selector of its own while mail is still signed with the current one. Mail switches to the new key only once public DNS shows its record, and the old key stays published for a few days after.', { domain: domain.domain }))) return;
     const data = await request(`/mail/domains/${domain.id}/dkim/rotate`, { method: 'POST' }, t('Creating a new key...'));
-    if (data) { setNotice(t('New DKIM key created. Update the DKIM record.')); openMailDns(domain); }
+    if (data) { setNotice(t('New DKIM key published. Mail switches to it once DNS shows its record.')); applyMailDnsView(domain, data); }
+  }
+
+  async function advanceMailDkim(domain) {
+    const retiring = mailDns?.dkim?.state === 'retiring';
+    if (retiring && !confirm(t('Remove the previous DKIM key of {domain} now?\n\nMail signed with it in the last few days and still on its way can no longer be verified.', { domain: domain.domain }))) return;
+    const data = await request(`/mail/domains/${domain.id}/dkim/advance`, { method: 'POST' }, t('Checking DNS...'));
+    if (data) {
+      setNotice(data.step === 'switch' ? t('Mail is now signed with the new DKIM key.') : data.step === 'retire' ? t('The previous DKIM key is removed.') : t('Nothing to do yet.'));
+      applyMailDnsView(domain, data);
+    }
+  }
+
+  async function cancelMailDkim(domain) {
+    if (!confirm(t('Drop the new DKIM key of {domain}? Mail stays signed with the current one.', { domain: domain.domain }))) return;
+    const data = await request(`/mail/domains/${domain.id}/dkim/cancel`, { method: 'POST' }, t('Saving...'));
+    if (data) { setNotice(t('DKIM key rotation cancelled.')); applyMailDnsView(domain, data); }
   }
 
   async function toggleWebmailHost(domain, enabled) {
@@ -198,7 +214,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function applyMailDnsView(domain, data) {
-    setMailDns({ domain, records: data?.records || [], relay: data?.relay || null, hostedZone: data?.hosted_zone || '' });
+    setMailDns({ domain, records: data?.records || [], relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null });
   }
 
   async function openMailDns(domain) {
@@ -276,6 +292,8 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
       spam_subject_tag: String(f.spam_subject_tag || '[SPAM]').trim() || '[SPAM]',
       greylisting: !!f.greylisting,
       default_quota_mb: Number(f.default_quota_mb) || 1024,
+      dkim_rotate_days: Number(f.dkim_rotate_days) || 0,
+      dkim_retire_days: Number(f.dkim_retire_days) || 7,
       allow: splitAddresses(f.allow),
       block: splitAddresses(f.block),
     };
@@ -530,7 +548,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function renderMailDns() {
-    const { domain, records, relay, hostedZone } = mailDns;
+    const { domain, records, relay, hostedZone, dkim } = mailDns;
     const statusLabel = { ok: t('Found'), missing: t('Missing'), different: t('Different'), unknown: t('Not checked') };
     const statusClass = { ok: 'ok', missing: 'bad', different: 'warn', unknown: '' };
     const titles = {
@@ -538,6 +556,8 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
       mail: t('Mail server address (A)'),
       spf: t('Allowed senders (SPF)'),
       dkim: t('Signature key (DKIM)'),
+      'dkim-next': t('Next DKIM key (being published)'),
+      'dkim-old': t('Previous DKIM key (retiring)'),
       dmarc: t('Policy (DMARC)'),
       webmail: t('Webmail address (optional)'),
     };
@@ -551,7 +571,6 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
         </div>
         <div className="actions">
           <button className="secondary-light" disabled={!!loading || records === null} onClick={() => openMailDns(domain)}><RefreshCw size={14}/> {t('Check again')}</button>
-          <button className="secondary-light" disabled={!!loading} onClick={() => rotateMailDkim(domain)}><KeyRound size={14}/> {t('New DKIM key')}</button>
         </div>
       </div>
       {relay && <div className="mail-relay-card">
@@ -564,6 +583,21 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
         <p className="hint">{relay.effective_name
           ? t('Mail from {domain} leaves through the relay {relay}; the records it asks for are listed below.', { domain: domain.domain, relay: relay.effective_name })
           : t('Mail from {domain} is delivered directly from this server.', { domain: domain.domain })}</p>
+      </div>}
+      {dkim && <div className="mail-relay-card">
+        <div className="mail-relay-card-head"><KeyRound size={15}/><strong>{t('DKIM key')}</strong></div>
+        <p className="hint">{t('Mail from {domain} is signed with the selector {selector}.', { domain: domain.domain, selector: dkim.selector })}
+          {' '}{dkim.rotate_days ? t('Keys rotate on their own every {n} days.', { n: dkim.rotate_days }) : ''}</p>
+        {dkim.state === 'publishing' && <p className="hint">{t("A new key ({selector}) is published and waits for DNS: mail switches to it on its own once public DNS shows its record. Publish the record marked \"Next DKIM key\" where the domain's DNS is kept.", { selector: dkim.next_selector })}</p>}
+        {dkim.state === 'retiring' && <p className="hint">{t('The previous key ({selector}) stays published until {date}, so mail already sent with it can still be verified; then it and its record go.', { selector: dkim.old_selector, date: dkim.retire_at ? new Date(dkim.retire_at + 'Z').toLocaleDateString() : '—' })}</p>}
+        <div className="actions">
+          {!dkim.state && <button className="secondary-light" disabled={!!loading} onClick={() => rotateMailDkim(domain)}><KeyRound size={14}/> {t('Rotate the DKIM key')}</button>}
+          {dkim.state === 'publishing' && <>
+            <button className="secondary-light" disabled={!!loading} onClick={() => advanceMailDkim(domain)}><RefreshCw size={14}/> {t('Check DNS and switch')}</button>
+            <button className="secondary-light" disabled={!!loading} onClick={() => cancelMailDkim(domain)}><X size={14}/> {t('Cancel')}</button>
+          </>}
+          {dkim.state === 'retiring' && <button className="secondary-light" disabled={!!loading} onClick={() => advanceMailDkim(domain)}><Trash2 size={14}/> {t('Retire the previous key now')}</button>}
+        </div>
       </div>}
       {hostedZone && <div className="info-box dns-managed-box">
         <Network size={14}/>
@@ -581,7 +615,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
             <span className={`badge mail-dns-status ${statusClass[record.status] || ''}`} title={t('What public DNS answers now')}>{statusLabel[record.status] || record.status}</span>
           </div>
           {renderCopyBlock(t('Name'), record.name)}
-          {renderCopyBlock(t('Value'), record.value, { multiline: record.key === 'dkim' })}
+          {renderCopyBlock(t('Value'), record.value, { multiline: record.key.startsWith('dkim') })}
           {record.status === 'different' && (record.found || []).length > 0 && <p className="hint">{t('Found now:')} <code>{record.found.join(' | ')}</code></p>}
           {record.key === 'webmail' && <p className="hint">{t('Only needed for webmail.{domain}; turn that on in the Domains tab once this record is in place.', { domain: domain.domain })}</p>}
         </div>)}
@@ -747,6 +781,8 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
           <label className="field"><span className="field-label">Giới hạn gửi ra theo Domain / giờ (Outbound Domain Limit) <em>0 = không giới hạn</em></span><input type="number" min="0" value={f.domain_rate_per_hour ?? 500} onChange={e => set({ domain_rate_per_hour: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('Largest message (MB)')}</span><input type="number" min="1" max="200" value={f.max_message_mb ?? 50} onChange={e => set({ max_message_mb: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('New mailbox size (MB)')}</span><input type="number" min="1" value={f.default_quota_mb ?? 1024} onChange={e => set({ default_quota_mb: e.target.value })} /></label>
+          <label className="field"><span className="field-label">{t('Rotate DKIM keys every (days)')} <em>{t('0 = only by hand')}</em></span><input type="number" min="0" max="3650" value={f.dkim_rotate_days ?? 0} onChange={e => set({ dkim_rotate_days: e.target.value })} /></label>
+          <label className="field"><span className="field-label">{t('Keep a replaced DKIM key published (days)')}</span><input type="number" min="1" max="60" value={f.dkim_retire_days ?? 7} onChange={e => set({ dkim_retire_days: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('Spam score: move to Junk')}</span><input type="number" min="1" max="100" step="0.5" value={f.spam_header_score ?? 6} disabled={!f.spam_enabled} onChange={e => set({ spam_header_score: e.target.value })} /></label>
           <label className="field"><span className="field-label">Spam score: gắn nhãn tiêu đề (Rewrite Subject)</span><input type="number" min="1" max="100" step="0.5" value={f.spam_rewrite_score ?? 8} disabled={!f.spam_enabled} onChange={e => set({ spam_rewrite_score: e.target.value })} /></label>
           <label className="field"><span className="field-label">{t('Spam score: refuse')}</span><input type="number" min="1" max="100" step="0.5" value={f.spam_reject_score ?? 15} disabled={!f.spam_enabled} onChange={e => set({ spam_reject_score: e.target.value })} /></label>
