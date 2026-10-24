@@ -702,6 +702,18 @@ def session_status(
     if current_user is None:
         _clear_session_cookies(response)
         return {"authenticated": False, "user": None}
+    jwt_payload = getattr(request.state, "jwt_payload", None) or {}
+    impersonated = bool(jwt_payload.get("imp"))
+    impersonated_by = jwt_payload.get("imp_user") if impersonated else None
+    effective_website_limit = (
+        0
+        if is_admin_role(current_user.role)
+        else (
+            current_user.website_limit
+            if current_user.website_limit is not None
+            else (int(getattr(current_user.package, "website_limit", 0) or 0) if current_user.package else 0)
+        )
+    )
     user_data = {
         "id": current_user.id,
         "username": current_user.username,
@@ -709,7 +721,7 @@ def session_status(
         "role": current_user.role,
         "is_active": current_user.is_active,
         "package_name": current_user.package.name if current_user.package else None,
-        "website_limit": current_user.website_limit,
+        "website_limit": effective_website_limit,
         "subdomain_limit": int(getattr(current_user.package, "subdomain_limit", 0) or 0) if current_user.package else 0,
         "storage_limit_mb": current_user.storage_limit_mb,
         "totp_enabled": current_user.totp_enabled,
@@ -724,7 +736,9 @@ def session_status(
         "sftp_username": current_user.username,
         # The panel shows a "this is a demo" strip, and the server refuses
         # changes whatever the page does (services/demo_mode.py).
-        "demo": demo_mode.is_demo_session(current_user, getattr(request.state, "jwt_payload", None)),
+        "demo": demo_mode.is_demo_session(current_user, jwt_payload),
+        "impersonated": impersonated,
+        "impersonated_by": impersonated_by,
     }
     user_data.update(storage_quota.storage_usage_summary(db, current_user))
     return {"authenticated": True, "user": user_data}
@@ -739,14 +753,15 @@ def impersonate_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Issue a session cookie for ``user_id`` while the caller stays admin.
+    """Issue a session cookie for ``user_id`` while the caller is admin or reseller.
 
     Impersonation is a high-trust operation: it bypasses normal auth for the
-    target account. We therefore (1) require the admin to re-prove possession
-    of their TOTP if 2FA is enabled, and (2) audit-log every successful
-    impersonation with the actor and target identities.
+    target account. We therefore (1) require the caller to re-prove possession
+    of their TOTP if 2FA is enabled, (2) restrict resellers to end-user accounts
+    that belong to them, and (3) audit-log every successful impersonation with
+    the actor and target identities.
     """
-    ensure_role(current_user.role, Role.admin)
+    ensure_role(current_user.role, Role.reseller)
 
     # Rate-limit impersonation attempts to prevent enumeration of user IDs.
     _enforce_rate_limit(_client_key(request))
@@ -756,9 +771,16 @@ def impersonate_user(
     if target_user is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Re-prompt TOTP for admins that have 2FA. Refusing without a code keeps
+    if target_user.id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot impersonate yourself")
+
+    if not is_admin_role(current_user.role):
+        if normalize_role(target_user.role) != Role.end_user or target_user.reseller_id != current_user.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+
+    # Re-prompt TOTP for callers that have 2FA. Refusing without a code keeps
     # the feature usable from the SPA (which can pop a modal on 401) while
-    # blocking session-stealing attackers who don't have the admin's phone.
+    # blocking session-stealing attackers who don't have the caller's phone.
     if current_user.totp_enabled:
         if not otp:
             raise HTTPException(
@@ -782,7 +804,50 @@ def impersonate_user(
         detail=f"target_user_id={target_user.id} target_role={target_user.role}",
         request=request,
     )
-    token = _issue_login_session(response, request, target_user, extra_claims={"imp": True})
+    token = _issue_login_session(
+        response,
+        request,
+        target_user,
+        extra_claims={
+            "imp": True,
+            "imp_by": current_user.id,
+            "imp_user": current_user.username,
+            "imp_tv": int(current_user.token_version or 0),
+        },
+    )
+    return LoginResponse(access_token=token)
+
+
+@router.post("/impersonate-exit", response_model=LoginResponse)
+def exit_impersonation(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return from an impersonated session back to the original admin/reseller account."""
+    jwt_payload = getattr(request.state, "jwt_payload", None) or {}
+    imp_by = jwt_payload.get("imp_by")
+    if not jwt_payload.get("imp") or not imp_by:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not in an impersonated session")
+    actor = db.query(User).filter(User.id == int(imp_by)).first()
+    if (
+        actor is None
+        or not actor.is_active
+        or normalize_role(actor.role) not in {Role.admin, Role.reseller}
+        or int(actor.token_version or 0) != int(jwt_payload.get("imp_tv", 0))
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Original session is no longer valid")
+    _revoke_request_token(db, request, current_user)
+    log_action(
+        db,
+        actor.id,
+        "auth.impersonate_exit",
+        current_user.username,
+        detail=f"from_user_id={current_user.id} to_user_id={actor.id}",
+        request=request,
+    )
+    token = _issue_login_session(response, request, actor)
     return LoginResponse(access_token=token)
 
 

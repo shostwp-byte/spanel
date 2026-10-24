@@ -607,6 +607,8 @@ export function WebsitesPage({
   );
   const subdomainLimit = Number(currentUser?.subdomain_limit ?? userPkg?.subdomain_limit ?? 0);
   const websiteLimit = Number(currentUser?.website_limit ?? userPkg?.website_limit ?? 0);
+  const isWebsiteLimitReached = currentUser?.role !== 'admin' && websiteLimit > 0 && rootDomains.length >= websiteLimit;
+  const isSubdomainLimitReached = currentUser?.role !== 'admin' && subdomainLimit > 0 && subdomainSites.length >= subdomainLimit;
 
   const defaultSite = React.useMemo(() => {
     if (!rootDomains.length) return null;
@@ -902,17 +904,19 @@ export function WebsitesPage({
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               {rootDomains.length === 0 ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCreateFormOpen(true);
-                    navigateToPage('websites');
-                  }}
-                >
-                  <Plus size={15} />
-                  {t('Add Main Domain First')}
-                </button>
-              ) : (
+                !isWebsiteLimitReached && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCreateFormOpen(true);
+                      navigateToPage('websites');
+                    }}
+                  >
+                    <Plus size={15} />
+                    {t('Add Main Domain First')}
+                  </button>
+                )
+              ) : !isSubdomainLimitReached ? (
                 <button
                   type="button"
                   onClick={() => {
@@ -939,7 +943,7 @@ export function WebsitesPage({
                   <Plus size={16} />
                   {t('Add Subdomain')}
                 </button>
-              )}
+              ) : null}
             </div>
           </div>
 
@@ -1823,26 +1827,28 @@ export function WebsitesPage({
             </h2>
           </div>
           <div className="da-header-actions" style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              onClick={() => setCreateFormOpen(true)}
-              style={{
-                background: '#16a34a',
-                borderColor: '#15803d',
-                color: '#ffffff',
-                fontWeight: 700,
-                fontSize: '12.5px',
-                letterSpacing: '0.03em',
-                textTransform: 'uppercase',
-                padding: '0 16px',
-                height: '38px',
-                borderRadius: '8px',
-                boxShadow: '0 2px 6px rgba(22, 163, 74, 0.25)',
-              }}
-            >
-              <Plus size={16} />
-              {t('Add New')}
-            </button>
+            {!isWebsiteLimitReached && (
+              <button
+                type="button"
+                onClick={() => setCreateFormOpen(true)}
+                style={{
+                  background: '#16a34a',
+                  borderColor: '#15803d',
+                  color: '#ffffff',
+                  fontWeight: 700,
+                  fontSize: '12.5px',
+                  letterSpacing: '0.03em',
+                  textTransform: 'uppercase',
+                  padding: '0 16px',
+                  height: '38px',
+                  borderRadius: '8px',
+                  boxShadow: '0 2px 6px rgba(22, 163, 74, 0.25)',
+                }}
+              >
+                <Plus size={16} />
+                {t('Add New')}
+              </button>
+            )}
             <button
               type="button"
               disabled={rootDomains.length === 0}
@@ -2460,7 +2466,7 @@ export function WebsitesPage({
         </div>
 
         {/* DirectAdmin-Style "+ ADD NEW" (Add Domain) Modal Dialog */}
-        {createFormOpen && (
+        {createFormOpen && !isWebsiteLimitReached && (
           <div
             className="modal-backdrop"
             onClick={() => setCreateFormOpen(false)}
