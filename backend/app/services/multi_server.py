@@ -6,14 +6,12 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import socket
-import ssl
 import subprocess
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,10 +19,11 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings as app_settings
 from app.core.secrets import decrypt as _decrypt_secret, encrypt as _encrypt_secret, is_encrypted as _is_encrypted_secret
 from app.core.version import APP_VERSION
 from app.models.entities import DnsZone, User, Website, WebsiteAlias
-from app.services import dns, panel_settings, server_network, system as system_service
+from app.services import cluster_peer, dns, panel_settings, server_network, system as system_service
 
 logger = logging.getLogger("spanel.multi_server")
 
@@ -58,9 +57,17 @@ def _default_state() -> dict[str, Any]:
         "settings": {
             "enabled": True,
             "node_name": _default_hostname(),
+            # This node's identity in the cluster: what a peer records as the
+            # origin of a zone it receives. Unlike node_name it never changes.
+            "node_uid": "",
             "auto_dns_sync": True,
             "check_domain_conflict": True,
             "check_username_conflict": False,
+            # A peer that cannot be asked: refuse the new domain/account
+            # (True) or let it through as before (False).
+            "conflict_fail_closed": False,
+            "health_interval_sec": 60,
+            "reconcile_interval_sec": 900,
         },
         "nodes": [],
         "remote_db_hosts": [],
@@ -68,11 +75,42 @@ def _default_state() -> dict[str, Any]:
     }
 
 
+def _migrate_state(state: dict[str, Any]) -> bool:
+    """Bring a state file written by an older version up to date. True when
+    something changed and the file should be written back.
+
+    - Peer API tokens were stored in plaintext; they are encrypted with the
+      panel's secret box now, on the first read after the update.
+    - A node identity is generated once.
+    """
+    changed = False
+    settings = state.setdefault("settings", {})
+    if not str(settings.get("node_uid") or "").strip():
+        settings["node_uid"] = secrets.token_hex(8)
+        changed = True
+    for node in state.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        token = str(node.get("api_token") or "").strip()
+        if token and not _is_encrypted_secret(token):
+            node["api_token"] = _encrypt_secret(token)
+            changed = True
+        # Nodes added before verification existed keep the behaviour they
+        # were added with (no verification) until an administrator changes it.
+        if "verify_tls" not in node:
+            node["verify_tls"] = False
+            changed = True
+    return changed
+
+
 def _read_state() -> dict[str, Any]:
     path = _resolve_config_path()
     base = _default_state()
     try:
         if not path.is_file():
+            # Written at once so the node id generated here is the one kept.
+            _migrate_state(base)
+            _write_state(base)
             return base
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
@@ -85,6 +123,8 @@ def _read_state() -> dict[str, Any]:
             base["remote_db_hosts"] = raw["remote_db_hosts"]
         if isinstance(raw.get("sync_logs"), list):
             base["sync_logs"] = raw["sync_logs"][:_MAX_SYNC_LOGS]
+        if _migrate_state(base):
+            _write_state(base)
         return base
     except Exception as exc:
         logger.warning("Could not read multi-server state: %s", exc)
@@ -131,11 +171,40 @@ def _mask_secret(value: str) -> str:
     return f"{raw[:6]}••••{raw[-4:]}"
 
 
+def node_token(node: dict[str, Any]) -> str:
+    """The peer's API token in clear, for the moment a request needs it."""
+    stored = str(node.get("api_token") or "").strip()
+    if not stored:
+        return ""
+    if not _is_encrypted_secret(stored):
+        return stored  # not migrated yet (read before the first write)
+    try:
+        return _decrypt_secret(stored)
+    except Exception:
+        logger.warning("Cannot decrypt the API token of cluster node %s (SECRET_KEY changed?)", node.get("id"))
+        return ""
+
+
+def local_node_uid() -> str:
+    with _state_lock:
+        state = _read_state()
+    return str((state.get("settings") or {}).get("node_uid") or "")
+
+
 def _sanitize_node(node: dict[str, Any]) -> dict[str, Any]:
     out = dict(node)
-    token = str(out.pop("api_token", "") or "")
+    out.pop("api_token", None)
+    token = node_token(node)
     out["token_masked"] = _mask_secret(token)
-    out["has_token"] = bool(token)
+    out["has_token"] = bool(str(node.get("api_token") or "").strip())
+    out["token_unreadable"] = bool(out["has_token"] and not token)
+    pin = str(out.get("tls_fingerprint") or "")
+    out["tls_mode"] = (
+        "plain_http" if str(out.get("url") or "").startswith("http://")
+        else "pinned" if pin
+        else "verified" if out.get("verify_tls", True)
+        else "insecure"
+    )
     return out
 
 
@@ -192,6 +261,11 @@ def local_node_summary(db: Session) -> dict[str, Any]:
     cpu_pct = round(float((res.get("cpu") or {}).get("percent") or 0.0), 1)
     mem_pct = round(float((res.get("memory") or {}).get("percent") or 0.0), 1)
     disk_pct = round(float((res.get("disk") or {}).get("percent") or 0.0), 1)
+    load = (res.get("cpu") or {}).get("load") or []
+    try:
+        backup_free = shutil.disk_usage(app_settings.backup_root).free
+    except Exception:
+        backup_free = None
 
     websites_count = db.query(Website).count()
     users_count = db.query(User).count()
@@ -202,20 +276,29 @@ def local_node_summary(db: Session) -> dict[str, Any]:
     with _state_lock:
         state = _read_state()
         node_name = (state.get("settings") or {}).get("node_name") or hostname
+        node_uid = (state.get("settings") or {}).get("node_uid") or ""
 
     return {
         "node_name": node_name,
+        "node_uid": node_uid,
         "hostname": hostname,
         "app_name": p_settings.get("app_name") or "SPanel",
         "version": APP_VERSION,
         "cpu_percent": cpu_pct,
         "ram_percent": mem_pct,
         "disk_percent": disk_pct,
+        # Absolute figures and load, for placement (suggest_node).
+        "cpu_cores": (res.get("cpu") or {}).get("cores"),
+        "load_1": load[0] if load else None,
+        "ram_available_bytes": (res.get("memory") or {}).get("available"),
+        "disk_free_bytes": (res.get("disk") or {}).get("free"),
+        "backup_free_bytes": backup_free,
         "websites_count": websites_count,
         "users_count": users_count,
         "dns_zones_count": dns_zones_count,
         "dns_active": dns.active(),
         "ipv4_addresses": server_network.ipv4_addresses(),
+        "tls_fingerprint": cluster_peer.local_certificate_fingerprint(os.environ.get("PANEL_SSL_CERT", "")),
     }
 
 
@@ -226,44 +309,20 @@ def _peer_request(
     payload: Optional[dict[str, Any]] = None,
     timeout: int = 8,
 ) -> tuple[dict[str, Any], int]:
-    """Perform an authenticated HTTP request to a peer SPanel node."""
-    base_url = str(node.get("url") or "").rstrip("/")
-    token = str(node.get("api_token") or "").strip()
-    verify_tls = bool(node.get("verify_tls", False))
+    """Perform an authenticated, signed HTTP request to a peer SPanel node.
 
-    url = f"{base_url}{path}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-        "User-Agent": f"SPanel-Cluster/{APP_VERSION}",
-    }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
-
-    ctx = None
-    if url.startswith("https://") and not verify_tls:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-    started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
-            data = json.loads(raw) if raw.strip() else {}
-            return (data if isinstance(data, dict) else {"data": data}), latency_ms
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            err_json = json.loads(exc.read().decode("utf-8", errors="replace"))
-            detail = str(err_json.get("detail") or err_json.get("message") or "")
-        except Exception:
-            pass
-        raise RuntimeError(detail or f"Peer trả về mã lỗi HTTP {exc.code}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Không thể kết nối tới {base_url}: {exc}") from exc
+    Raises cluster_peer.PeerError (a RuntimeError) on any failure; its
+    `status` is the HTTP status when the peer answered with an error.
+    """
+    return cluster_peer.request(
+        node,
+        node_token(node),
+        local_node_uid(),
+        method,
+        path,
+        payload,
+        timeout=timeout,
+    )
 
 
 def get_cluster_overview(db: Session) -> dict[str, Any]:
@@ -303,6 +362,12 @@ def update_cluster_settings(payload: dict[str, Any]) -> dict[str, Any]:
             settings["check_domain_conflict"] = bool(payload["check_domain_conflict"])
         if "check_username_conflict" in payload and payload["check_username_conflict"] is not None:
             settings["check_username_conflict"] = bool(payload["check_username_conflict"])
+        if "conflict_fail_closed" in payload and payload["conflict_fail_closed"] is not None:
+            settings["conflict_fail_closed"] = bool(payload["conflict_fail_closed"])
+        if payload.get("health_interval_sec") is not None:
+            settings["health_interval_sec"] = max(30, min(3600, int(payload["health_interval_sec"])))
+        if payload.get("reconcile_interval_sec") is not None:
+            settings["reconcile_interval_sec"] = max(300, min(86400, int(payload["reconcile_interval_sec"])))
         _append_log(
             state,
             "cluster_settings",
@@ -314,6 +379,21 @@ def update_cluster_settings(payload: dict[str, Any]) -> dict[str, Any]:
         return dict(settings)
 
 
+NODE_ROLES = {"full_peer", "dns_only", "db_node"}
+_PEM_CERT_RE = re.compile(r"^-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----$")
+
+
+def _clean_ca_pem(value: Any) -> str:
+    """A CA certificate (PEM) to verify a peer against, or ''."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) > 20000 or not all(_PEM_CERT_RE.match(block.strip() + "-----END CERTIFICATE-----")
+                                    for block in text.split("-----END CERTIFICATE-----") if block.strip()):
+        raise ValueError("The CA must be one or more PEM certificates (-----BEGIN CERTIFICATE-----).")
+    return text
+
+
 def add_peer_node(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "").strip()[:80]
     if not name:
@@ -323,7 +403,7 @@ def add_peer_node(payload: dict[str, Any]) -> dict[str, Any]:
     if not api_token:
         raise ValueError("Vui lòng nhập API Token (bp_...) của máy chủ Peer.")
     role = str(payload.get("role") or "full_peer").strip().lower()
-    if role not in {"full_peer", "dns_only", "db_node"}:
+    if role not in NODE_ROLES:
         role = "full_peer"
 
     node_id = f"node_{secrets.token_hex(4)}"
@@ -331,9 +411,11 @@ def add_peer_node(payload: dict[str, Any]) -> dict[str, Any]:
         "id": node_id,
         "name": name,
         "url": url,
-        "api_token": api_token,
+        "api_token": _encrypt_secret(api_token),
         "role": role,
-        "verify_tls": bool(payload.get("verify_tls", False)),
+        "verify_tls": bool(payload.get("verify_tls", True)),
+        "tls_fingerprint": cluster_peer.normalize_fingerprint(str(payload.get("tls_fingerprint") or "")),
+        "ca_pem": _clean_ca_pem(payload.get("ca_pem")),
         "sync_dns": bool(payload.get("sync_dns", True)),
         "check_domain": bool(payload.get("check_domain", True)),
         "enabled": bool(payload.get("enabled", True)),
@@ -381,11 +463,15 @@ def update_peer_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"Địa chỉ {url} đã được sử dụng bởi một Node khác.")
             node["url"] = url
         if "api_token" in payload and payload["api_token"] and str(payload["api_token"]).strip():
-            node["api_token"] = str(payload["api_token"]).strip()
-        if "role" in payload and payload["role"] in {"full_peer", "dns_only", "db_node"}:
+            node["api_token"] = _encrypt_secret(str(payload["api_token"]).strip())
+        if "role" in payload and payload["role"] in NODE_ROLES:
             node["role"] = payload["role"]
         if "verify_tls" in payload and payload["verify_tls"] is not None:
             node["verify_tls"] = bool(payload["verify_tls"])
+        if "tls_fingerprint" in payload and payload["tls_fingerprint"] is not None:
+            node["tls_fingerprint"] = cluster_peer.normalize_fingerprint(str(payload["tls_fingerprint"]))
+        if "ca_pem" in payload and payload["ca_pem"] is not None:
+            node["ca_pem"] = _clean_ca_pem(payload["ca_pem"])
         if "sync_dns" in payload and payload["sync_dns"] is not None:
             node["sync_dns"] = bool(payload["sync_dns"])
         if "check_domain" in payload and payload["check_domain"] is not None:
@@ -622,7 +708,7 @@ def trigger_background_zone_sync(zone_name: str, action: str = "upsert") -> None
     threading.Thread(target=_worker, name=f"spanel-cluster-dns-{zone_name}", daemon=True).start()
 
 
-def apply_incoming_dns_sync(db: Session, zones_payload: list[dict[str, Any]], source_node: str = "") -> dict[str, Any]:
+def apply_incoming_dns_sync(db: Session, zones_payload: list[dict[str, Any]], source_node: str = "", source_uid: str = "") -> dict[str, Any]:
     """Receive DNS zones & records from a peer SPanel node and apply them to local PowerDNS."""
     if not dns.active():
         raise ValueError("Add-on DNS Manager (PowerDNS) chưa được cài đặt hoặc bật trên máy chủ Peer này.")
@@ -738,7 +824,7 @@ def apply_incoming_dns_sync(db: Session, zones_payload: list[dict[str, Any]], so
 
 # --- Cross-Server Domain & Username Conflict Check ----------------------------
 
-def check_local_conflict(db: Session, domain: str = "", username: str = "") -> dict[str, Any]:
+def check_local_conflict(db: Session, domain: str = "", username: str = "", asking_node: str = "") -> dict[str, Any]:
     domain_clean = (domain or "").strip().lower().rstrip(".")
     username_clean = (username or "").strip().lower()
     domain_exists = False

@@ -1,3 +1,5 @@
+import hashlib
+import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -5,15 +7,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
-from app.api.provisioning import _get_provisioning_token, _require_scope
+from app.api.provisioning import _get_provisioning_token
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role
-from app.models.entities import User
-from app.services import multi_server
+from app.models.entities import ApiToken, User
+from app.services import cluster_peer, multi_server
 from app.services.audit import log_action
 from app.services.provisioning import create_api_token
 
 router = APIRouter(prefix="/multi-server", tags=["multi-server"])
+logger = logging.getLogger("spanel.cluster")
 
 
 class ClusterSettingsIn(BaseModel):
@@ -22,6 +25,9 @@ class ClusterSettingsIn(BaseModel):
     auto_dns_sync: Optional[bool] = None
     check_domain_conflict: Optional[bool] = None
     check_username_conflict: Optional[bool] = None
+    conflict_fail_closed: Optional[bool] = None
+    health_interval_sec: Optional[int] = Field(default=None, ge=30, le=3600)
+    reconcile_interval_sec: Optional[int] = Field(default=None, ge=300, le=86400)
 
 
 class PeerNodeIn(BaseModel):
@@ -29,7 +35,9 @@ class PeerNodeIn(BaseModel):
     url: str = Field(..., max_length=255)
     api_token: str = Field(default="", max_length=255)
     role: str = Field(default="full_peer", max_length=32)
-    verify_tls: bool = False
+    verify_tls: bool = True
+    tls_fingerprint: str = Field(default="", max_length=128)
+    ca_pem: str = Field(default="", max_length=20000)
     sync_dns: bool = True
     check_domain: bool = True
     enabled: bool = True
@@ -41,9 +49,61 @@ class PeerNodeUpdateIn(BaseModel):
     api_token: Optional[str] = Field(default=None, max_length=255)
     role: Optional[str] = Field(default=None, max_length=32)
     verify_tls: Optional[bool] = None
+    tls_fingerprint: Optional[str] = Field(default=None, max_length=128)
+    ca_pem: Optional[str] = Field(default=None, max_length=20000)
     sync_dns: Optional[bool] = None
     check_domain: Optional[bool] = None
     enabled: Optional[bool] = None
+
+
+class TlsProbeIn(BaseModel):
+    url: str = Field(..., max_length=255)
+
+
+# ── Peer authentication ──────────────────────────────────────────────────
+
+def _signed_path(request: Request) -> str:
+    query = request.url.query
+    return request.url.path + (f"?{query}" if query else "")
+
+
+def authenticate_peer(request: Request, db: Session, scope: str, body_sha256: str) -> tuple[ApiToken, str]:
+    """Token, scope and signature of a request from a peer node.
+
+    Returns the token and the sender's node id. A provisioning token is still
+    accepted for the read/write peer scopes it used to cover, with a warning
+    in the log; it is never accepted for moving accounts.
+    """
+    token = _get_provisioning_token(request, db)
+    decision = cluster_peer.scope_decision(token.scopes, scope)
+    if decision == "denied":
+        raise HTTPException(status_code=403, detail=f"Missing scope: {scope}")
+    if decision == "legacy":
+        logger.warning(
+            "Cluster peer used provisioning token '%s' (id %s) for %s; this is deprecated - "
+            "create a node token on the Multi Server page and paste it into the peer.",
+            token.name, token.id, scope,
+        )
+    try:
+        node_uid = cluster_peer.verify_signature(
+            token.token_hash, request.method, _signed_path(request), request.headers, body_sha256,
+        )
+    except cluster_peer.SignatureError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    return token, node_uid
+
+
+async def _body_sha256(request: Request) -> str:
+    return hashlib.sha256(await request.body()).hexdigest()
+
+
+def peer_auth(scope: str):
+    """Dependency for a peer endpoint whose body is small enough to hash whole."""
+    def dependency(request: Request, body_sha256: str = Depends(_body_sha256), db: Session = Depends(get_db)) -> str:
+        _token, node_uid = authenticate_peer(request, db, scope, body_sha256)
+        return node_uid
+
+    return dependency
 
 
 class DnsSyncRequestIn(BaseModel):
@@ -68,6 +128,8 @@ class RemoteDbHostIn(BaseModel):
 class LocalTokenCreateIn(BaseModel):
     name: str = Field(default="SPanel Cluster Peer", max_length=80)
     allowed_ips: str = Field(default="", max_length=255)
+    # cluster:transfer lets the peer push whole accounts onto this server.
+    allow_transfer: bool = True
 
 
 # ── Admin Management Endpoints ───────────────────────────────────────────
@@ -103,10 +165,13 @@ def generate_local_cluster_token(
 ):
     """Generate a ready-to-use Cluster Peer API Token on this server."""
     ensure_role(current_user.role, Role.admin)
+    # Cluster scopes only: the token a peer holds can sync DNS, check for
+    # conflicts and (if allowed) move accounts here, but it is not a billing
+    # token and cannot create or terminate accounts through provisioning.
     raw_token, token_row = create_api_token(
         db,
         name=(payload.name or "SPanel Cluster Peer").strip(),
-        scopes="provisioning:read,provisioning:write",
+        scopes=cluster_peer.node_token_scopes(payload.allow_transfer),
         allowed_ips=(payload.allowed_ips or "").strip(),
     )
     log_action(db, current_user.id, "create_cluster_token", token_row.name, request=request)
@@ -114,8 +179,22 @@ def generate_local_cluster_token(
         "id": token_row.id,
         "name": token_row.name,
         "token": raw_token,
+        "scopes": token_row.scopes,
         "message": "Đã khởi tạo khóa Cluster API Token mới. Hãy sao chép và dán vào máy chủ SPanel đối tác.",
     }
+
+
+@router.post("/tls-probe")
+def probe_peer_tls(payload: TlsProbeIn, current_user: User = Depends(get_current_user)):
+    """The certificate a peer presents, so the administrator can pin it."""
+    ensure_role(current_user.role, Role.admin)
+    try:
+        url = multi_server.normalize_peer_url(payload.url)
+        return cluster_peer.probe_tls(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except cluster_peer.PeerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/nodes")
@@ -286,33 +365,32 @@ def remove_remote_db(
 # ── Peer-to-Peer Cluster Endpoints (Bearer Token Authenticated) ──────────
 
 @router.get("/peer/ping")
-def peer_ping(request: Request, db: Session = Depends(get_db)):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:read")
+def peer_ping(
+    db: Session = Depends(get_db),
+    _node_uid: str = Depends(peer_auth(cluster_peer.SCOPE_READ)),
+):
     return multi_server.local_node_summary(db)
 
 
 @router.get("/peer/check-conflict")
 def peer_check_conflict(
-    request: Request,
     domain: str = Query(default="", max_length=253),
     username: str = Query(default="", max_length=64),
     db: Session = Depends(get_db),
+    node_uid: str = Depends(peer_auth(cluster_peer.SCOPE_READ)),
 ):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:read")
-    return multi_server.check_local_conflict(db, domain=domain, username=username)
+    return multi_server.check_local_conflict(db, domain=domain, username=username, asking_node=node_uid)
 
 
 @router.post("/peer/dns-sync")
 def peer_receive_dns_sync(
     payload: IncomingDnsSyncIn,
-    request: Request,
     db: Session = Depends(get_db),
+    node_uid: str = Depends(peer_auth(cluster_peer.SCOPE_WRITE)),
 ):
-    token = _get_provisioning_token(request, db)
-    _require_scope(token, "provisioning:write")
     try:
-        return multi_server.apply_incoming_dns_sync(db, payload.zones, source_node=payload.source_node)
+        return multi_server.apply_incoming_dns_sync(
+            db, payload.zones, source_node=payload.source_node, source_uid=node_uid,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
