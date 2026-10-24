@@ -1,9 +1,9 @@
 # SPanel — Nền tảng Quản trị Web Hosting Đa tầng Thế hệ mới
 
-**SPanel (`v1.0.6`)** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, gọn nhẹ, bảo mật cao dành cho **Ubuntu 24.04 LTS**. Hệ thống hỗ trợ kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)**, giao diện quản lý tên miền & subdomain trực quan theo phong cách DirectAdmin, tối ưu hiển thị trên cả máy tính lẫn thiết bị di động (Mobile Responsive), hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh** cùng chế độ **Sáng / Tối (Light / Dark Mode)**.
+**SPanel (`v1.0.7`)** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, gọn nhẹ, bảo mật cao dành cho **Ubuntu 24.04 LTS**. Hệ thống hỗ trợ kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)**, giao diện quản lý tên miền & subdomain trực quan theo phong cách DirectAdmin, tối ưu hiển thị trên cả máy tính lẫn thiết bị di động (Mobile Responsive), hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh** cùng chế độ **Sáng / Tối (Light / Dark Mode)**.
 
 - **Kho mã nguồn chính thức:** [https://github.com/shostwp-byte/spanel](https://github.com/shostwp-byte/spanel)
-- **Phiên bản hiện tại:** `v1.0.6`
+- **Phiên bản hiện tại:** `v1.0.7`
 - **Giấy phép:** GNU AGPLv3 ([LICENSE](LICENSE))
 
 ---
@@ -48,6 +48,19 @@ Toàn bộ tài liệu kỹ thuật, hướng dẫn cài đặt, vận hành và
 ### 5. Hệ thống Thông báo Phân loại & Tối ưu Di động
 - **Phân loại Thông báo theo Vai trò:** Tự động phân luồng thông báo riêng biệt cho **Admin**, **Reseller** và **End User** theo từng nhóm danh mục (`Hệ thống`, `Bảo mật`, `Sao lưu`, `Tài nguyên`, `Tài khoản`).
 - **Tối ưu Hiển thị Di động (Mobile-First Responsive):** Tự động thu gọn cột bảng trên màn hình điện thoại (`<= 640px`), điều chỉnh lưới thẻ chức năng, thanh công cụ và hộp thoại Modal tương thích hoàn hảo trên cả iOS và Android.
+
+---
+
+## Giới hạn đã biết
+
+Những điểm dưới đây chưa hoàn thiện ở `v1.0.7`. Nên cân nhắc trước khi dùng cho hosting thương mại nhiều khách:
+
+- **Giới hạn CPU/RAM theo user (cgroups v2):** worker PHP-FPM được chuyển vào slice của user theo đợt quét định kỳ, nên worker vừa sinh ra có thể chạy ngoài giới hạn cho tới lần quét kế tiếp.
+- **Dung lượng đĩa:** chưa có quota cứng ở cấp filesystem (`xfs_quota`/`setquota`); dung lượng được đo và cảnh báo, không bị chặn ở mức kernel.
+- **Remote MySQL:** database tạo trên máy chủ MySQL từ xa chưa được ghi nhận vị trí trong panel, nên chưa nằm trong backup và các thao tác xoá/đổi mật khẩu/phpMyAdmin.
+- **Mã hoá backup:** áp dụng cho backup tạo thủ công có nhập passphrase; backup theo lịch và bản đẩy lên đích từ xa chưa được mã hoá.
+- **HTTP/3:** chỉ bật khi Nginx được build với `--with-http_v3_module`.
+- **Kiểm thử:** bộ test trong `tests/` mới bao phủ một phần tính năng; chưa có CI tự động.
 
 ---
 
