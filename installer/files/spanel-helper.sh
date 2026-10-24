@@ -1555,6 +1555,58 @@ dns_api_answers() {
   curl -fsS -m 3 -H "X-API-Key: $1" "http://127.0.0.1:${PDNS_API_PORT}/api/v1/servers/localhost" >/dev/null 2>&1
 }
 
+# Zone transfers to secondary nameservers: off unless the panel turned them
+# on (dns-transfers). On, PowerDNS sends NOTIFY for primary zones and answers
+# AXFR only to the addresses a zone's ALLOW-AXFR-FROM lists, loopback else.
+PDNS_TRANSFERS_STATE="/etc/powerdns/spanel-transfers"
+
+dns_transfer_lines() {
+  if [[ "$1" == "on" ]]; then
+    printf '%s\n' "# Zone transfers: only to each zone's ALLOW-AXFR-FROM (set in the panel)." \
+      "disable-axfr=no" "allow-axfr-ips=127.0.0.1/32,::1/128" "primary=yes"
+  else
+    printf '%s\n' "# Authoritative only: no zone transfers." "disable-axfr=yes"
+  fi
+}
+
+dns_transfers() {
+  # dns-transfers <on|off>: rewrite the transfer lines of pdns.conf and
+  # restart PowerDNS; the previous file comes back if it does not start.
+  local state="$1" backup key
+  [[ "$state" == "on" || "$state" == "off" ]] || deny "usage: dns-transfers <on|off>"
+  [[ -f "$PDNS_CONF" ]] || deny "DNS Manager is not installed"
+  backup="$(mktemp)"
+  cp -a "$PDNS_CONF" "$backup"
+  python3 - "$PDNS_CONF" <<'PY' || { rm -f "$backup"; deny "could not rewrite ${PDNS_CONF}"; }
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    lines = handle.read().splitlines()
+drop = ("disable-axfr=", "allow-axfr-ips=", "primary=", "master=", "# Zone transfers:", "# Authoritative only:")
+kept = [line for line in lines if not line.startswith(drop)]
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(kept) + "\n")
+PY
+  dns_transfer_lines "$state" >>"$PDNS_CONF"
+  if ! systemctl restart pdns 2>/dev/null; then
+    cp -a "$backup" "$PDNS_CONF"
+    rm -f "$backup"
+    systemctl restart pdns 2>/dev/null || true
+    deny "PowerDNS did not start with zone transfers ${state}; the previous configuration is back"
+  fi
+  rm -f "$backup"
+  printf '%s\n' "$state" >"$PDNS_TRANSFERS_STATE"
+  key="$(tr -d '[:space:]' <"$PDNS_API_KEY_FILE" 2>/dev/null || true)"
+  local waited=0
+  while (( waited < 20 )); do
+    dns_api_answers "$key" && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "Zone transfers ${state}."
+}
+
 install_dns() {
   export DEBIAN_FRONTEND=noninteractive
   local others
@@ -1648,9 +1700,8 @@ webserver=yes
 webserver-address=127.0.0.1
 webserver-port=${PDNS_API_PORT}
 webserver-allow-from=127.0.0.1/32
-# Authoritative only: no zone transfers and no version string.
-disable-axfr=yes
 version-string=anonymous
+$(dns_transfer_lines "$(cat "$PDNS_TRANSFERS_STATE" 2>/dev/null || echo off)")
 EOF
   chown root:pdns "$PDNS_CONF"
   chmod 0640 "$PDNS_CONF"
@@ -8455,6 +8506,11 @@ case "$cmd" in
   dns-status)
     [[ $# -eq 0 ]] || deny "usage: dns-status"
     dns_status
+    ;;
+
+  dns-transfers)
+    [[ $# -eq 1 ]] || deny "usage: dns-transfers <on|off>"
+    dns_transfers "$1"
     ;;
 
   # ---- Email (Exim + Dovecot + webmail, optional) -------------------------
