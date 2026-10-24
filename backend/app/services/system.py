@@ -306,6 +306,35 @@ def clear_self_healing_logs() -> dict:
     return get_self_healing_status()
 
 
+def _alert_webhooks(healed: list[str], failed: list[str], events: list[dict]) -> None:
+    """The same news as the email/Telegram notice, to the chat webhook and to
+    administrators' outbound webhooks - which work without the Notifications
+    addon. A service that stays down is reported once per cooldown, not at
+    every 2-minute check."""
+    try:
+        from app.services import alert_webhooks
+
+        details = {}
+        for event in events[: len(healed) + len(failed)]:
+            details.setdefault(event.get("service"), event.get("detail") or "")
+        if healed:
+            alert_webhooks.alert(
+                "service_recovered", f"Watchdog restarted: {', '.join(healed)}",
+                "\n".join(f"{name}: {details.get(name, 'restarted')}" for name in healed),
+                {"services": healed, "recovered": True},
+                dedupe_key=f"watchdog:recovered:{','.join(sorted(healed))}",
+            )
+        if failed:
+            alert_webhooks.alert(
+                "service_down", f"Service down: {', '.join(failed)}",
+                "\n".join(f"{name}: {details.get(name, 'not running')}" for name in failed),
+                {"services": failed, "recovered": False},
+                dedupe_key=f"watchdog:down:{','.join(sorted(failed))}",
+            )
+    except Exception:  # noqa: BLE001 - an alert must not break the watchdog
+        pass
+
+
 def run_self_healing_check(reason: str = "manual") -> dict:
     data = _load_self_healing_data()
     now_utc = dt.datetime.now(dt.timezone.utc)
@@ -445,6 +474,7 @@ def run_self_healing_check(reason: str = "manual") -> dict:
     _save_self_healing_data(data)
 
     if healed_now or failed_now:
+        _alert_webhooks(healed_now, failed_now, data.get("events") or [])
         try:
             from app.services import notifications
 

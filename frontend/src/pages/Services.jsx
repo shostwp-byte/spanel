@@ -3,6 +3,7 @@ import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
+import { AlertWebhookCard } from '../components/AlertWebhookCard.jsx';
 
 const DEFAULT_SERVICE_NAMES = ['spanel-api', 'nginx', 'php8.3-fpm', 'php8.4-fpm', 'mariadb', 'redis-server'];
 
@@ -99,6 +100,33 @@ export function ServicesPage({ request, isAdmin }) {
       if (res && res.ok) {
         setNotice(`Đã tạo bản sao lưu nóng thành công: ${res.filename} (${formatBytes(res.size_bytes)}, integrity=${res.integrity})`);
         await loadWatchdogAndDb();
+      }
+    } finally {
+      setBusyBackup(false);
+    }
+  }
+
+  async function restoreHotBackup(bk) {
+    if (
+      !window.confirm(
+        t(
+          'Restore the panel database from {name}? Everything changed in the panel since {when} is lost. The panel stops for a few seconds; the current database is kept on the server as spanel.db.pre-restore-*.',
+          { name: bk.filename, when: bk.created_at ? new Date(bk.created_at).toLocaleString() : bk.filename }
+        )
+      )
+    ) {
+      return;
+    }
+    setBusyBackup(true);
+    try {
+      const res = await request(
+        `/services/db-backups/${encodeURIComponent(bk.filename)}/restore`,
+        { method: 'POST' },
+        t('Checking the backup and scheduling the restore...')
+      );
+      if (res) {
+        setNotice(res.detail || t('Restore scheduled.'));
+        setTimeout(() => window.location.reload(), 8000);
       }
     } finally {
       setBusyBackup(false);
@@ -341,8 +369,17 @@ export function ServicesPage({ request, isAdmin }) {
                   {dbHealth.backups.slice(0, 6).map((bk) => (
                     <div key={bk.filename} style={{ padding: '6px 10px', borderRadius: '8px', background: 'var(--surface-1)', fontSize: '0.78rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <code>{bk.filename}</code>
-                      <span style={{ color: 'var(--text-muted)' }}>
+                      <span style={{ color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         {formatBytes(bk.size_bytes)} • {bk.created_at ? new Date(bk.created_at).toLocaleString() : ''}
+                        <button
+                          type="button"
+                          className="cb-btn secondary"
+                          style={{ height: '24px', padding: '0 8px', fontSize: '0.72rem' }}
+                          disabled={busyBackup || !!loading}
+                          onClick={() => restoreHotBackup(bk)}
+                        >
+                          <ArchiveRestore size={12} /> {t('Restore')}
+                        </button>
                       </span>
                     </div>
                   ))}
@@ -352,6 +389,7 @@ export function ServicesPage({ request, isAdmin }) {
           </div>
         </div>
       )}
+      {isAdmin && <AlertWebhookCard request={request} setNotice={setNotice} loading={loading} />}
     </div>;
   }
   return renderServices();
