@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_current_user_optional
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role, is_admin_role
+from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.security import create_access_token, hash_password, needs_rehash, verify_password
 from app.core.secrets import decrypt, encrypt
 from app.core.step_up import require_sensitive_action_step_up, verify_totp
@@ -794,26 +794,31 @@ def impersonate_user(
                 detail="Invalid authentication code",
             )
 
-    # Audit log must be written before the session is issued so a DB failure
-    # doesn't leave an impersonation succeeded with no audit trail.
-    log_action(
-        db,
-        current_user.id,
-        "auth.impersonate",
-        target_user.username,
-        detail=f"target_user_id={target_user.id} target_role={target_user.role}",
-        request=request,
-    )
+    actor_id = current_user.id
+    actor_username = current_user.username
+    actor_tv = int(current_user.token_version or 0)
+    target_id = target_user.id
+    target_username = target_user.username
+    target_role = target_user.role
+
     token = _issue_login_session(
         response,
         request,
         target_user,
         extra_claims={
             "imp": True,
-            "imp_by": current_user.id,
-            "imp_user": current_user.username,
-            "imp_tv": int(current_user.token_version or 0),
+            "imp_by": actor_id,
+            "imp_user": actor_username,
+            "imp_tv": actor_tv,
         },
+    )
+    log_action(
+        db,
+        actor_id,
+        "auth.impersonate",
+        target_username,
+        detail=f"target_user_id={target_id} target_role={target_role}",
+        request=request,
     )
     return LoginResponse(access_token=token)
 
@@ -838,16 +843,19 @@ def exit_impersonation(
         or int(actor.token_version or 0) != int(jwt_payload.get("imp_tv", 0))
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Original session is no longer valid")
+    from_user_id = current_user.id
+    from_username = current_user.username
+    actor_id = actor.id
     _revoke_request_token(db, request, current_user)
+    token = _issue_login_session(response, request, actor)
     log_action(
         db,
-        actor.id,
+        actor_id,
         "auth.impersonate_exit",
-        current_user.username,
-        detail=f"from_user_id={current_user.id} to_user_id={actor.id}",
+        from_username,
+        detail=f"from_user_id={from_user_id} to_user_id={actor_id}",
         request=request,
     )
-    token = _issue_login_session(response, request, actor)
     return LoginResponse(access_token=token)
 
 
