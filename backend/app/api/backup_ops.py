@@ -12,12 +12,13 @@ from app.api.deps import get_current_user
 from app.core.database import SessionLocal, get_db
 from app.core.permissions import Role, ensure_role
 from app.models.entities import SftpBackupTarget, User
-from app.services import panel_backup
+from app.services import backup_verify, panel_backup
 from app.services.audit import log_action
 
 router = APIRouter(prefix="/maintenance", tags=["backup-ops"])
 
 _run_lock = threading.Lock()
+_verify_lock = threading.Lock()
 
 
 def _server_target_ids(db: Session) -> set[int]:
@@ -109,3 +110,51 @@ def panel_dr_run(request: Request, db: Session = Depends(get_db), current_user: 
     threading.Thread(target=_run_panel_dr_job, name="spanel-panel-dr", daemon=True).start()
     log_action(db, current_user.id, "run_panel_dr", "panel-dr", request=request)
     return {"status": "started", "detail": "Running. Refresh to see the result."}
+
+
+class VerifySettings(BaseModel):
+    enabled: Optional[bool] = None
+    window: Optional[str] = Field(default=None, max_length=5)
+    weekdays: Optional[list[int]] = None
+    remote_samples: Optional[int] = None
+    test_restore_db: Optional[bool] = None
+    max_download_mb: Optional[int] = None
+
+
+@router.get("/backup-verify")
+def backup_verify_status(current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return backup_verify.public_status()
+
+
+@router.put("/backup-verify")
+def backup_verify_save(payload: VerifySettings, request: Request, db: Session = Depends(get_db),
+                       current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    try:
+        status = backup_verify.save_settings(payload.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log_action(db, current_user.id, "update_backup_verify", "backup-verify",
+               f"enabled={status['enabled']} window={status['window']} test_restore_db={status['test_restore_db']}",
+               request=request)
+    return status
+
+
+def _run_verify_job() -> None:
+    db = SessionLocal()
+    try:
+        backup_verify.run_verification(db, trigger="manual")
+    finally:
+        db.close()
+        _verify_lock.release()
+
+
+@router.post("/backup-verify/run")
+def backup_verify_run(request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    if not _verify_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="A verification is already running")
+    threading.Thread(target=_run_verify_job, name="spanel-backup-verify", daemon=True).start()
+    log_action(db, current_user.id, "run_backup_verify", "backup-verify", request=request)
+    return {"status": "started", "detail": "Verifying. Refresh to see the result."}

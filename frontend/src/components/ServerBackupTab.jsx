@@ -211,10 +211,118 @@ function PanelDrCard({ request, setNotice, loading, targets }) {
   );
 }
 
+/* Scheduled verification of the newest backups, here and on the destinations. */
+function BackupVerifyCard({ request, setNotice, loading }) {
+  const [data, setData] = useState(null);
+  const [form, setForm] = useState(null);
+
+  async function load() {
+    const res = await request('/maintenance/backup-verify', { silent: true }, null);
+    if (res) {
+      setData(res);
+      setForm({
+        enabled: res.enabled,
+        window: res.window,
+        weekdays: res.weekdays,
+        remote_samples: res.remote_samples,
+        test_restore_db: res.test_restore_db,
+        max_download_mb: res.max_download_mb,
+      });
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  if (!data || !form) return null;
+
+  async function save(e) {
+    e.preventDefault();
+    const res = await request('/maintenance/backup-verify', { method: 'PUT', body: JSON.stringify(form) }, t('Saving...'));
+    if (res) {
+      setData(res);
+      setNotice(t('Verification settings saved.'));
+    }
+  }
+
+  async function runNow() {
+    const res = await request('/maintenance/backup-verify/run', { method: 'POST' }, t('Starting verification...'));
+    if (res) setNotice(res.detail || t('Started.'));
+  }
+
+  const toggleDay = idx =>
+    setForm(p => ({ ...p, weekdays: p.weekdays.includes(idx) ? p.weekdays.filter(d => d !== idx) : [...p.weekdays, idx] }));
+  const last = data.last_run || {};
+
+  return (
+    <div className="card" style={{ padding: '18px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+        <ShieldCheck size={17} />
+        <h3 style={{ margin: 0 }}>{t('Backup verification')}</h3>
+        {last.status && (
+          <span className={`badge ${last.status === 'ok' ? 'ok' : 'warn'}`}>
+            {t('Last run')}: {last.checked} {t('checked')}, {last.failed} {t('failed')}
+          </span>
+        )}
+      </div>
+      <p className="hint">
+        {t('Checks the newest backup of every account on this server and a random sample on each destination: SHA-256, decryption, the full tar listing and the manifest. Optionally loads every SQL dump into a throwaway database and drops it again. Problems are sent to administrators and the alert webhooks.')}
+      </p>
+      <form onSubmit={save} style={{ display: 'grid', gap: '10px' }}>
+        <label style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <input type="checkbox" checked={form.enabled} onChange={e => setForm(p => ({ ...p, enabled: e.target.checked }))} />
+          {t('Run in the maintenance window at')}
+          <input type="time" value={form.window} onChange={e => setForm(p => ({ ...p, window: e.target.value }))} />
+        </label>
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+          <span>{t('Days (none = every day)')}:</span>
+          {WEEKDAYS.map((day, idx) => (
+            <label key={day} style={{ display: 'flex', gap: '4px' }}>
+              <input type="checkbox" checked={form.weekdays.includes(idx)} onChange={() => toggleDay(idx)} />
+              {t(day)}
+            </label>
+          ))}
+        </div>
+        <label style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {t('Accounts to sample on each destination')}
+          <input type="number" min={0} max={20} style={{ width: '70px' }} value={form.remote_samples}
+            onChange={e => setForm(p => ({ ...p, remote_samples: Number(e.target.value) }))} />
+          {t('largest download (MB)')}
+          <input type="number" min={10} style={{ width: '90px' }} value={form.max_download_mb}
+            onChange={e => setForm(p => ({ ...p, max_download_mb: Number(e.target.value) }))} />
+        </label>
+        <label style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <input type="checkbox" checked={form.test_restore_db}
+            onChange={e => setForm(p => ({ ...p, test_restore_db: e.target.checked }))} />
+          {t('Test-restore SQL dumps into a throwaway database')}
+        </label>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button type="submit" disabled={!!loading}><Save size={14} /> {t('Save')}</button>
+          <button type="button" className="secondary-light" disabled={!!loading} onClick={runNow}>
+            <Play size={14} /> {t('Run now')}
+          </button>
+        </div>
+      </form>
+      {(last.checks || []).length > 0 && (
+        <div style={{ marginTop: '12px', fontSize: '0.8rem', maxHeight: '220px', overflowY: 'auto' }}>
+          {last.checks.map((c, i) => (
+            <div key={`${c.target}-${c.name}-${i}`}>
+              <span className={`badge ${c.ok ? 'ok' : 'warn'}`}>{c.ok ? 'OK' : t('failed')}</span>{' '}
+              [{c.scope}] {c.target}: <code>{c.name}</code> — {c.detail}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ServerBackupTab({ request, setNotice, loading, targets }) {
   return (
     <div>
       <PanelDrCard request={request} setNotice={setNotice} loading={loading} targets={targets} />
+      <BackupVerifyCard request={request} setNotice={setNotice} loading={loading} />
     </div>
   );
 }
