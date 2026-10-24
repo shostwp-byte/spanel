@@ -132,6 +132,12 @@ def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), curr
     db.add(item)
     db.commit()
     db.refresh(item)
+    try:
+        mariadb.enforce_db_user_hourly_limits(db_user, *mariadb.owner_hourly_limits(current_user))
+    except Exception:
+        # The periodic database pass applies them too; a new database is not
+        # refused over it.
+        logger.warning("Could not apply hourly MariaDB limits to %s", db_user, exc_info=True)
     return DatabaseCreatedOut(
         id=item.id,
         owner_id=item.owner_id,

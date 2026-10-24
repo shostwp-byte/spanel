@@ -191,6 +191,9 @@ def _apply_package_limits(user: User, package: UserPackage | None) -> None:
         user.tasks_max = getattr(package, "tasks_max", 512)
         user.mysql_storage_limit_mb = getattr(package, "mysql_storage_limit_mb", 0)
         user.mysql_max_db_size_mb = getattr(package, "mysql_max_db_size_mb", 0)
+        user.mysql_max_queries_per_hour = getattr(package, "mysql_max_queries_per_hour", 0)
+        user.mysql_max_updates_per_hour = getattr(package, "mysql_max_updates_per_hour", 0)
+        user.mysql_max_connections_per_hour = getattr(package, "mysql_max_connections_per_hour", 0)
 
 
 def _decode_schedule_user_ids(raw: str | None) -> list[int]:

@@ -30,6 +30,9 @@ class UserResourceLimitsUpdate(BaseModel):
     tasks_max: Optional[int] = Field(default=None, ge=0, le=1000000)
     mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
     mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
+    mysql_max_queries_per_hour: Optional[int] = Field(default=None, ge=0, le=1000000000)
+    mysql_max_updates_per_hour: Optional[int] = Field(default=None, ge=0, le=1000000000)
+    mysql_max_connections_per_hour: Optional[int] = Field(default=None, ge=0, le=1000000000)
 
 
 class DatabaseWriteLockToggle(BaseModel):
@@ -144,6 +147,9 @@ def _build_user_resource_row(
         "effective_mysql_limit_bytes": effective_mysql_limit_bytes,
         "mysql_percent": min(999.0, mysql_pct),
         "mysql_max_db_size_mb": int(getattr(user, "mysql_max_db_size_mb", 0) or 0),
+        "mysql_max_queries_per_hour": int(getattr(user, "mysql_max_queries_per_hour", 0) or 0),
+        "mysql_max_updates_per_hour": int(getattr(user, "mysql_max_updates_per_hour", 0) or 0),
+        "mysql_max_connections_per_hour": int(getattr(user, "mysql_max_connections_per_hour", 0) or 0),
         "largest_db_bytes": max_single_db_bytes,
         "web_used_bytes": web_and_mail_bytes,
         "storage_used_bytes": total_storage_bytes,
@@ -396,6 +402,9 @@ def update_user_resource_limits(
         user.tasks_max = getattr(pkg, "tasks_max", 512)
         user.mysql_storage_limit_mb = getattr(pkg, "mysql_storage_limit_mb", 0)
         user.mysql_max_db_size_mb = getattr(pkg, "mysql_max_db_size_mb", 0)
+        user.mysql_max_queries_per_hour = getattr(pkg, "mysql_max_queries_per_hour", 0)
+        user.mysql_max_updates_per_hour = getattr(pkg, "mysql_max_updates_per_hour", 0)
+        user.mysql_max_connections_per_hour = getattr(pkg, "mysql_max_connections_per_hour", 0)
     else:
         for field in [
             "storage_limit_mb",
@@ -412,6 +421,9 @@ def update_user_resource_limits(
             "tasks_max",
             "mysql_storage_limit_mb",
             "mysql_max_db_size_mb",
+            "mysql_max_queries_per_hour",
+            "mysql_max_updates_per_hour",
+            "mysql_max_connections_per_hour",
         ]:
             val = getattr(payload, field, None)
             if val is not None:

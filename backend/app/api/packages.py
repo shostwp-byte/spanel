@@ -1424,6 +1424,9 @@ def batch_import_packages(
             tasks_max=item.tasks_max,
             mysql_storage_limit_mb=item.mysql_storage_limit_mb,
             mysql_max_db_size_mb=item.mysql_max_db_size_mb,
+            mysql_max_queries_per_hour=getattr(item, "mysql_max_queries_per_hour", 0),
+            mysql_max_updates_per_hour=getattr(item, "mysql_max_updates_per_hour", 0),
+            mysql_max_connections_per_hour=getattr(item, "mysql_max_connections_per_hour", 0),
         )
 
         if existing:
@@ -1535,6 +1538,9 @@ def create_package(
         tasks_max=payload.tasks_max,
         mysql_storage_limit_mb=payload.mysql_storage_limit_mb,
         mysql_max_db_size_mb=payload.mysql_max_db_size_mb,
+        mysql_max_queries_per_hour=payload.mysql_max_queries_per_hour,
+        mysql_max_updates_per_hour=payload.mysql_max_updates_per_hour,
+        mysql_max_connections_per_hour=payload.mysql_max_connections_per_hour,
     )
     db.add(package)
     db.commit()
@@ -1626,6 +1632,7 @@ def update_package(
         "io_read_mbps", "io_write_mbps", "iops_read_max", "iops_write_max",
         "memory_high_mb", "memory_max_mb", "tasks_max",
         "mysql_storage_limit_mb", "mysql_max_db_size_mb",
+        "mysql_max_queries_per_hour", "mysql_max_updates_per_hour", "mysql_max_connections_per_hour",
     ]:
         val = getattr(payload, field, None)
         if val is not None:
@@ -1651,6 +1658,9 @@ def update_package(
         user.tasks_max = package.tasks_max
         user.mysql_storage_limit_mb = package.mysql_storage_limit_mb
         user.mysql_max_db_size_mb = package.mysql_max_db_size_mb
+        user.mysql_max_queries_per_hour = package.mysql_max_queries_per_hour
+        user.mysql_max_updates_per_hour = package.mysql_max_updates_per_hour
+        user.mysql_max_connections_per_hour = package.mysql_max_connections_per_hour
     db.commit()
     from app.services import resource_monitor
     for user in affected_users:

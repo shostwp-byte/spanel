@@ -98,6 +98,11 @@ class UserPackage(Base):
     tasks_max: Mapped[int] = mapped_column(Integer, default=512)
     mysql_storage_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
     mysql_max_db_size_mb: Mapped[int] = mapped_column(Integer, default=0)
+    # MariaDB per-account hourly limits for every database user the account
+    # owns (MAX_QUERIES/UPDATES/CONNECTIONS_PER_HOUR). 0 = no limit.
+    mysql_max_queries_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_updates_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_connections_per_hour: Mapped[int] = mapped_column(Integer, default=0)
 
     owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
 
@@ -148,6 +153,27 @@ class User(Base):
     sftp_accounts_limit: Mapped[int] = mapped_column(Integer, default=3)
     # Copied from the package like the limits above.
     mail_accounts_limit: Mapped[int] = mapped_column(Integer, default=10)
+    # Resource limits, copied from the package like the limits above and
+    # applied by resource_monitor.apply_user_cgroup_limits (cgroups, kernel
+    # quota) and mariadb (database accounts). The columns long existed in the
+    # table (core.database._ensure_resource_limit_columns) but were not mapped
+    # here, so a value set on a user never survived the request.
+    bandwidth_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
+    inode_limit: Mapped[int] = mapped_column(Integer, default=0)
+    database_limit: Mapped[int] = mapped_column(Integer, default=5)
+    cpu_quota_percent: Mapped[int] = mapped_column(Integer, default=100)
+    io_read_mbps: Mapped[int] = mapped_column(Integer, default=0)
+    io_write_mbps: Mapped[int] = mapped_column(Integer, default=0)
+    iops_read_max: Mapped[int] = mapped_column(Integer, default=0)
+    iops_write_max: Mapped[int] = mapped_column(Integer, default=0)
+    memory_high_mb: Mapped[int] = mapped_column(Integer, default=1024)
+    memory_max_mb: Mapped[int] = mapped_column(Integer, default=2048)
+    tasks_max: Mapped[int] = mapped_column(Integer, default=512)
+    mysql_storage_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_db_size_mb: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_queries_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_updates_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_connections_per_hour: Mapped[int] = mapped_column(Integer, default=0)
     # When this account's Linux/SFTP password was last set on its own.
     #
     # NULL is load-bearing: it means the Linux password has never been set

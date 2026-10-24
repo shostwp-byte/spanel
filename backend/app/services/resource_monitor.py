@@ -212,6 +212,20 @@ def apply_user_cgroup_limits(user: User) -> bool:
         return False
 
 
+def apply_user_mysql_limits(db: Session, user: User) -> int:
+    """Put the package's per-hour MariaDB limits on every database account the
+    user owns. Returns how many accounts took them."""
+    limits = mariadb.owner_hourly_limits(user)
+    applied = 0
+    for account in db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).all():
+        try:
+            if mariadb.enforce_db_user_hourly_limits(account.db_user, *limits):
+                applied += 1
+        except Exception:
+            logger.debug("Could not apply hourly MariaDB limits to %s", account.db_user, exc_info=True)
+    return applied
+
+
 def apply_user_cgroup_limits_async(user_id: int) -> None:
     def _runner():
         try:
@@ -219,6 +233,7 @@ def apply_user_cgroup_limits_async(user_id: int) -> None:
                 u = db.query(User).filter(User.id == user_id).first()
                 if u:
                     apply_user_cgroup_limits(u)
+                    apply_user_mysql_limits(db, u)
         except Exception:
             pass
 
@@ -405,6 +420,13 @@ def collect_and_enforce_mysql_quotas(db: Session) -> dict[int, int]:
         if need_conn_limit:
             try:
                 mariadb.enforce_db_user_resource_limits(db_acc.db_user, max_user_connections=25, max_statement_time=15)
+            except Exception:
+                pass
+            # Accounts created by any path (site provisioning, imports,
+            # restores) pick up their owner's package limits here.
+            try:
+                if db_acc.owner is not None:
+                    mariadb.enforce_db_user_hourly_limits(db_acc.db_user, *mariadb.owner_hourly_limits(db_acc.owner))
             except Exception:
                 pass
         user_totals[db_acc.owner_id] = user_totals.get(db_acc.owner_id, 0) + sz
