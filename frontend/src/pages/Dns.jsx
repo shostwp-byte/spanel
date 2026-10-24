@@ -65,7 +65,7 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
       request(`${dnsPath(zone)}/dnssec`, { silent: true }),
     ]);
     setDnsDelegation(check || { status: 'unknown', expected: [], found: [] });
-    setDnsDnssec(sec || { enabled: false, ds_records: [], dnskey_records: [] });
+    setDnsDnssec(sec ? { ...sec, status: sec.status || 'ok' } : { enabled: false, status: 'unknown', ds_records: [], dnskey_records: [] });
   }
 
   async function toggleZoneDnssec(enable) {
@@ -375,8 +375,14 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
             <ShieldCheck size={16} style={{ color: dnsDnssec?.enabled ? '#10b981' : 'var(--text-muted)' }} />
             <strong>1-Click DNSSEC (Bảo mật chống giả mạo DNS — DS / DNSKEY)</strong>
-            <span className={`badge ${dnsDnssec?.enabled ? 'ok' : ''}`}>
-              {dnsDnssec?.enabled ? 'Đã kích hoạt (ECDSAP256SHA256)' : 'Chưa bật'}
+            <span className={`badge ${dnsDnssec?.enabled ? 'ok' : dnsDnssec?.status === 'unknown' ? 'warn' : ''}`}>
+              {!dnsDnssec
+                ? '…'
+                : dnsDnssec.status === 'unknown'
+                  ? 'Không xác định'
+                  : dnsDnssec.enabled
+                    ? 'Đã kích hoạt (ECDSAP256SHA256)'
+                    : 'Chưa bật'}
             </span>
           </div>
           <div>
@@ -385,16 +391,18 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
                 Tắt DNSSEC
               </button>
             ) : (
-              <button type="button" className="mini" disabled={!!loading} onClick={() => toggleZoneDnssec(true)}>
+              <button type="button" className="mini" disabled={!!loading || dnsDnssec?.status === 'unknown'} onClick={() => toggleZoneDnssec(true)}>
                 <KeyRound size={13} /> Bật 1-Click DNSSEC
               </button>
             )}
           </div>
         </div>
         <p className="hint" style={{ marginTop: '4px' }}>
-          {dnsDnssec?.enabled
-            ? 'Zone đã được ký số tự động bằng thuật toán chuẩn công nghiệp ECDSAP256SHA256 (Algorithm 13). Sao chép các thông số DS Record bên dưới và dán vào mục DNSSEC tại Nhà đăng ký tên miền (Registrar) của bạn.'
-            : 'Tự động sinh khóa Combined Signing Key (CSK) chuẩn ECDSA P-256 SHA-256 và xuất bản ghi DS / DNSKEY chỉ với 1 cú nhấp chuột.'}
+          {dnsDnssec?.status === 'unknown'
+            ? 'Không thể kiểm tra trạng thái DNSSEC do dịch vụ PowerDNS API không phản hồi.'
+            : dnsDnssec?.enabled
+              ? 'Zone đã được ký số tự động bằng thuật toán chuẩn công nghiệp ECDSAP256SHA256 (Algorithm 13). Sao chép các thông số DS Record bên dưới và dán vào mục DNSSEC tại Nhà đăng ký tên miền (Registrar) của bạn.'
+              : 'Tự động sinh khóa Combined Signing Key (CSK) chuẩn ECDSA P-256 SHA-256 và xuất bản ghi DS / DNSKEY chỉ với 1 cú nhấp chuột.'}
         </p>
         {dnsDnssec?.enabled && dnsDnssec.primary_ds && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '8px' }}>
