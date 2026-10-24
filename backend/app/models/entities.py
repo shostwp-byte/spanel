@@ -148,6 +148,10 @@ class User(Base):
     sftp_accounts_limit: Mapped[int] = mapped_column(Integer, default=3)
     # Copied from the package like the limits above.
     mail_accounts_limit: Mapped[int] = mapped_column(Integer, default=10)
+    # Monthly traffic in MB, 0 = unlimited. The column has existed since
+    # _ensure_resource_limit_columns, but without this mapping the value
+    # copied from a package was never saved.
+    bandwidth_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
     # When this account's Linux/SFTP password was last set on its own.
     #
     # NULL is load-bearing: it means the Linux password has never been set

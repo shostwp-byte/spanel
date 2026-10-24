@@ -2,6 +2,8 @@ import hashlib
 import ipaddress
 import logging
 import secrets
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -323,7 +325,119 @@ def account_to_dict(account: ProvisioningAccount, db: Session) -> dict:
         "status": account.status,
         "panel_url": panel_base_url() or None,
         "created_at": account.created_at.isoformat() if account.created_at else None,
+        "is_reseller": bool(user and user.role == "reseller"),
+        "reseller_package_id": user.reseller_package_id if user else None,
+        "last_action": account.last_action or "",
     }
+
+
+def apply_account_limits(user: User, package, limits=None) -> None:
+    """Give ``user`` the package's limits, then the per-account overrides.
+
+    The package side is the panel's own rule (api/users.py) so an account
+    made by a billing system is limited exactly like one made in the panel:
+    terminal, SFTP sub-accounts, mailboxes, cgroup and MySQL limits included,
+    not only websites and disk as before.
+    """
+    from app.api.users import _apply_package_limits
+
+    _apply_package_limits(user, package)
+    if limits is None:
+        return
+    for field in ("storage_limit_mb", "bandwidth_limit_mb", "website_limit"):
+        value = getattr(limits, field, None)
+        if value is not None:
+            setattr(user, field, int(value))
+
+
+def account_owner_ids(db: Session, user: User) -> list[int]:
+    """The user and, for a reseller, every account the reseller owns."""
+    owner_ids = [user.id]
+    if user.role == "reseller":
+        owner_ids += [row.id for row in db.query(User.id).filter(User.reseller_id == user.id).all()]
+    return owner_ids
+
+
+def account_usage(db: Session, account: ProvisioningAccount, *, use_cache: bool = False) -> dict:
+    """Disk, bandwidth, website and database usage of one billing account.
+
+    Bandwidth is the current calendar month of nginx traffic counted by the
+    resource monitor. A reseller's figures include the accounts they own,
+    which is what the billing system charges them for.
+    """
+    from app.services import resource_monitor
+
+    user = account.user
+    owner_ids = account_owner_ids(db, user)
+    summary = storage_quota.storage_usage_summary(db, user, use_cache=use_cache)
+    storage_used = int(summary["storage_used_bytes"] or 0)
+    bandwidth_used = 0
+    for oid in owner_ids:
+        bandwidth_used += resource_monitor.cached_user_bandwidth_bytes(oid)
+    if len(owner_ids) > 1:
+        for child in db.query(User).filter(User.id.in_(owner_ids[1:])).all():
+            storage_used += int(storage_quota.storage_usage_summary(db, child, use_cache=True)["storage_used_bytes"] or 0)
+    storage_limit = summary["storage_limit_bytes"]
+    percent = summary["storage_percent"]
+    if storage_limit:
+        percent = min(999.0, round(storage_used / storage_limit * 100, 2))
+    bandwidth_limit_mb = int(getattr(user, "bandwidth_limit_mb", 0) or 0)
+    return {
+        "external_id": account.external_id,
+        "storage_used_bytes": storage_used,
+        "storage_limit_bytes": storage_limit,
+        "storage_percent": percent,
+        "website_count": db.query(Website).filter(Website.owner_id.in_(owner_ids)).count(),
+        "database_count": db.query(DatabaseAccount).filter(DatabaseAccount.owner_id.in_(owner_ids)).count(),
+        "bandwidth_used_bytes": bandwidth_used,
+        # 0 is unlimited, the same convention the package uses.
+        "bandwidth_limit_bytes": bandwidth_limit_mb * storage_quota.BYTES_PER_MB if bandwidth_limit_mb > 0 else 0,
+        "user_count": len(owner_ids) - 1,
+    }
+
+
+# Backups a billing system asked for, by account id. One at a time per
+# account: a second request while one runs is refused rather than queued.
+_backup_lock = threading.Lock()
+_backups_running: set[int] = set()
+_backup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spanel-provisioning-backup")
+
+
+def queue_account_backup(account_id: int) -> bool:
+    """Start a full user backup in the background. False if one is running."""
+    with _backup_lock:
+        if account_id in _backups_running:
+            return False
+        _backups_running.add(account_id)
+    _backup_executor.submit(_run_account_backup, account_id)
+    return True
+
+
+def _run_account_backup(account_id: int) -> None:
+    from app.core.database import SessionLocal
+    from app.services.audit import log_action
+
+    try:
+        with SessionLocal() as db:
+            account = db.query(ProvisioningAccount).filter(ProvisioningAccount.id == account_id).first()
+            if account is None or account.user is None:
+                return
+            try:
+                archive = backup_service.create_user_backup(account.user, db)
+                account.last_message = f"backup={archive}"
+                outcome = "ok"
+            except Exception as exc:  # noqa: BLE001 - recorded on the account
+                db.rollback()
+                account.last_message = f"backup failed: {exc}"[:2000]
+                outcome = "failed"
+            account.last_action = "backup"
+            db.commit()
+            log_action(db, None, "provisioning_backup", account.external_id, detail=outcome)
+    except Exception:  # noqa: BLE001
+        logger.exception("Provisioning backup of account %s failed", account_id)
+    finally:
+        with _backup_lock:
+            _backups_running.discard(account_id)
 
 
 def suspend_account(db: Session, account: ProvisioningAccount, reason: str = "") -> None:

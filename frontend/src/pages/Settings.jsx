@@ -63,7 +63,13 @@ const PROVISIONING_ENDPOINTS = [
   { method: 'PATCH', path: '/accounts/{external_id}/package', desc: 'Nâng cấp / Hạ cấp gói tài nguyên (Upgrade / Downgrade Package)' },
   { method: 'PATCH', path: '/accounts/{external_id}/password', desc: 'Đặt lại mật khẩu đăng nhập Panel & xoay vòng mật khẩu SFTP' },
   { method: 'POST', path: '/accounts/{external_id}/login', desc: 'Tạo đường dẫn đăng nhập 1-click SSO (hiệu lực 300 giây)' },
-  { method: 'GET', path: '/accounts/usage', desc: 'Đồng bộ dung lượng ổ cứng, số lượng Website & Database của toàn bộ tài khoản' },
+  { method: 'GET', path: '/accounts/usage', desc: 'Đồng bộ dung lượng ổ cứng, băng thông tháng, số lượng Website & Database của toàn bộ tài khoản' },
+  { method: 'GET', path: '/accounts?page=1&per_page=100', desc: 'Liệt kê tài khoản (phân trang) cho WHMCS ListAccounts / GetUserCount' },
+  { method: 'POST', path: '/accounts/{external_id}/sftp-password', desc: 'Đặt lại mật khẩu SFTP/SSH ngẫu nhiên (trả về 1 lần)' },
+  { method: 'POST', path: '/accounts/{external_id}/backup', desc: 'Xếp hàng sao lưu toàn bộ tài khoản (chạy nền)' },
+  { method: 'GET', path: '/reseller-plans', desc: 'Lấy danh sách gói Reseller' },
+  { method: 'POST', path: '/admin/login', desc: 'Link SSO đăng nhập Admin (chỉ với scope sso:admin)' },
+  { method: 'POST', path: '/token/rotate', desc: 'Token tự xoay vòng (scope tokens:rotate)' },
 ];
 
 export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanelHost }) {

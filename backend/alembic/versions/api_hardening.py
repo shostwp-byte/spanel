@@ -35,6 +35,14 @@ def upgrade() -> None:
             if "created_by_id" not in token_cols:
                 batch_op.add_column(sa.Column("created_by_id", sa.Integer(), nullable=True))
 
+    if "users" in existing_tables:
+        # Normally added at start-up by _ensure_resource_limit_columns; made
+        # part of the schema here now that the model maps it.
+        user_cols = {c["name"] for c in inspector.get_columns("users")}
+        if "bandwidth_limit_mb" not in user_cols:
+            with op.batch_alter_table("users", schema=None) as batch_op:
+                batch_op.add_column(sa.Column("bandwidth_limit_mb", sa.Integer(), nullable=False, server_default="0"))
+
     if "provisioning_idempotency_keys" not in existing_tables:
         op.create_table(
             "provisioning_idempotency_keys",

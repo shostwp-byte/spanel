@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -9,23 +10,26 @@ from app.core.database import get_db
 from app.core.permissions import Role, ensure_role
 from app.core.rate_limit import enforce_rate_limit
 from app.core.security import hash_password
-from app.models.entities import ApiToken, DatabaseAccount, ProvisioningAccount, User, UserPackage, Website
+from app.models.entities import ApiToken, DatabaseAccount, ProvisioningAccount, ResellerPackage, User, UserPackage, Website
 from app.schemas.schemas import (
     ApiTokenCreate,
     ApiTokenCreatedResponse,
     ApiTokenOut,
     ApiTokenRotate,
     ProvisioningAccountCreate,
+    ProvisioningAccountList,
     ProvisioningAccountOut,
     ProvisioningPackageChange,
     ProvisioningPasswordChange,
     ProvisioningSuspendRequest,
     ProvisioningUsageOut,
 )
-from app.services import mariadb, nginx, provisioning_idempotency as idempotency, site_users, storage_quota, wordpress
+from app.services import mariadb, nginx, provisioning_idempotency as idempotency, site_users, wordpress
 from app.services.audit import log_action
 from app.services.provisioning import (
     account_to_dict,
+    account_usage,
+    apply_account_limits,
     authenticate_token,
     check_ip_allowed,
     create_api_token,
@@ -35,6 +39,7 @@ from app.services.provisioning import (
     normalize_allowed_ips,
     normalize_scopes,
     panel_base_url,
+    queue_account_backup,
     rate_limit_for,
     rotate_api_token,
     suspend_account,
@@ -95,6 +100,26 @@ def _account_by_external_id(db: Session, external_id: str) -> ProvisioningAccoun
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     return account
+
+
+def _check_reseller_package(db: Session, is_reseller: bool, reseller_package_id) -> None:
+    if reseller_package_id is None:
+        return
+    if not is_reseller:
+        raise HTTPException(status_code=400, detail="reseller_package_id is only valid for reseller accounts")
+    if not db.query(ResellerPackage).filter(ResellerPackage.id == reseller_package_id).first():
+        raise HTTPException(status_code=404, detail="Reseller package not found")
+
+
+def _apply_cgroup_limits(user_id: int) -> None:
+    # The same follow-up the panel's own user form does: CPU, memory and IO
+    # limits reach systemd only through this.
+    try:
+        from app.services import resource_monitor
+
+        resource_monitor.apply_user_cgroup_limits_async(user_id)
+    except Exception:  # noqa: BLE001 - limits are re-applied by the monitor
+        pass
 
 
 def _provisioning_email(username: str) -> str:
@@ -170,6 +195,7 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
     package = db.query(UserPackage).filter(UserPackage.id == payload.package_id).first()
     if not package:
         raise HTTPException(status_code=404, detail="Package not found")
+    _check_reseller_package(db, payload.is_reseller, payload.reseller_package_id)
 
     account = ProvisioningAccount(
         external_id=payload.external_id,
@@ -216,7 +242,9 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
             website_limit=package.website_limit,
             storage_limit_mb=package.storage_limit_mb,
             sftp_password_set_at=datetime.utcnow(),
+            reseller_package_id=payload.reseller_package_id if payload.is_reseller else None,
         )
+        apply_account_limits(user, package, payload.limits)
         db.add(user)
         db.flush()
         account.user_id = user.id
@@ -307,6 +335,7 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
             db.rollback()
 
     log_action(db, None, "provisioning_create", payload.external_id, detail=payload.domain or payload.username, request=request)
+    _apply_cgroup_limits(user.id)
     if payload.domain:
         # DNS Manager: every domain on the server gets its DNS.
         from app.services import dns
@@ -334,29 +363,51 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
 @router.get("/accounts/usage", response_model=List[ProvisioningUsageOut])
 def get_all_usage(request: Request, db: Session = Depends(get_db)):
     _authorize(request, db, "usage:read")
+    accounts = db.query(ProvisioningAccount).filter(ProvisioningAccount.user_id.isnot(None)).all()
+    return [account_usage(db, account, use_cache=True) for account in accounts if account.user]
 
-    results = []
-    accounts = db.query(ProvisioningAccount).all()
-    for account in accounts:
-        if not account.user:
-            continue
-        user = account.user
-        summary = storage_quota.storage_usage_summary(db, user, use_cache=True)
-        website_count = db.query(Website).filter(Website.owner_id == user.id).count()
-        database_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).count()
 
-        # NOTE: bandwidth tracking not yet implemented in backend models, returning 0
-        results.append({
-            "external_id": account.external_id,
-            "storage_used_bytes": summary["storage_used_bytes"],
-            "storage_limit_bytes": summary["storage_limit_bytes"],
-            "storage_percent": summary["storage_percent"],
-            "website_count": website_count,
-            "database_count": database_count,
-            "bandwidth_used_bytes": 0,
-            "bandwidth_limit_bytes": 0,
-        })
-    return results
+@router.get("/accounts", response_model=ProvisioningAccountList)
+def list_accounts(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=100, ge=1, le=500),
+    status: str = Query(default="", max_length=32, description="active, suspended, pending, failed, terminated, or all"),
+    q: str = Query(default="", max_length=255, description="Substring of external_id or username"),
+    db: Session = Depends(get_db),
+):
+    """Accounts this panel provisioned, for WHMCS ListAccounts / GetUserCount.
+
+    Without ``status`` the list holds the accounts that exist on the server
+    (active, suspended, pending); ``status=all`` adds failed and terminated
+    records.
+    """
+    _authorize(request, db, "accounts:read")
+    query = db.query(ProvisioningAccount)
+    wanted = status.strip().lower()
+    if wanted and wanted != "all":
+        query = query.filter(ProvisioningAccount.status == wanted)
+    elif not wanted:
+        query = query.filter(ProvisioningAccount.status.in_(("active", "suspended", "pending")))
+    term = q.strip()
+    if term:
+        like = f"%{term}%"
+        query = query.outerjoin(User, ProvisioningAccount.user_id == User.id).filter(
+            or_(ProvisioningAccount.external_id.ilike(like), User.username.ilike(like))
+        )
+    total = query.count()
+    rows = (
+        query.order_by(ProvisioningAccount.id.asc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return {
+        "items": [account_to_dict(account, db) for account in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    }
 
 
 @router.get("/accounts/{external_id}", response_model=ProvisioningAccountOut)
@@ -482,13 +533,15 @@ def _change_package(external_id: str, payload: ProvisioningPackageChange, reques
     package = db.query(UserPackage).filter(UserPackage.id == payload.package_id).first()
     if not package:
         raise HTTPException(status_code=404, detail="Package not found")
+    _check_reseller_package(db, account.user.role == Role.reseller, payload.reseller_package_id)
     account.package_id = package.id
-    account.user.package_id = package.id
-    account.user.website_limit = package.website_limit
-    account.user.storage_limit_mb = package.storage_limit_mb
+    apply_account_limits(account.user, package, payload.limits)
+    if payload.reseller_package_id is not None:
+        account.user.reseller_package_id = payload.reseller_package_id
     account.last_action = "change_package"
     db.commit()
     log_action(db, None, "provisioning_change_package", external_id, detail=str(package.id), request=request)
+    _apply_cgroup_limits(account.user.id)
     return {"ok": True, "package_id": package.id}
 
 
@@ -504,20 +557,96 @@ def get_usage(external_id: str, request: Request, db: Session = Depends(get_db))
     account = _account_by_external_id(db, external_id)
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
-    user = account.user
-    summary = storage_quota.storage_usage_summary(db, user)
-    website_count = db.query(Website).filter(Website.owner_id == user.id).count()
-    database_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).count()
-    return {
-        "external_id": account.external_id,
-        "storage_used_bytes": summary["storage_used_bytes"],
-        "storage_limit_bytes": summary["storage_limit_bytes"],
-        "storage_percent": summary["storage_percent"],
-        "website_count": website_count,
-        "database_count": database_count,
-        "bandwidth_used_bytes": 0,
-        "bandwidth_limit_bytes": 0,
-    }
+    return account_usage(db, account)
+
+
+def _reset_sftp_password(external_id: str, request: Request, db: Session) -> dict:
+    account = _account_by_external_id(db, external_id)
+    if not account.user:
+        raise HTTPException(status_code=400, detail="Account has no user")
+    password = site_users.rotate_panel_user_password(account.user.username)
+    account.user.sftp_password_set_at = datetime.utcnow()
+    account.last_action = "reset_sftp_password"
+    db.commit()
+    log_action(db, None, "provisioning_reset_sftp_password", external_id, request=request)
+    # Shown once; the panel keeps no readable copy.
+    return {"ok": True, "sftp_password": password, "sftp_username": account.user.username}
+
+
+@router.post("/accounts/{external_id}/sftp-password")
+def reset_sftp_password(external_id: str, request: Request, db: Session = Depends(get_db)):
+    """Give the account's SFTP/SSH login a new random password and return it."""
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, None, lambda: _reset_sftp_password(external_id, request, db))
+
+
+def _backup(external_id: str, request: Request, db: Session) -> dict:
+    account = _account_by_external_id(db, external_id)
+    if not account.user or account.status not in ("active", "suspended"):
+        raise HTTPException(status_code=400, detail=f"Cannot back up account in status: {account.status}")
+    if not queue_account_backup(account.id):
+        raise HTTPException(status_code=409, detail="A backup of this account is already running")
+    log_action(db, None, "provisioning_backup_queued", external_id, request=request)
+    return {"ok": True, "queued": True}
+
+
+@router.post("/accounts/{external_id}/backup")
+def create_backup(external_id: str, request: Request, db: Session = Depends(get_db)):
+    """Queue a full backup of the account. It runs in the background; the
+    outcome lands on the account (``last_action=backup``) and in the audit log."""
+    token = _authorize(request, db, "accounts:write")
+    return idempotency.run(db, token, request, None, lambda: _backup(external_id, request, db))
+
+
+# Changing a username is deliberately not offered. The username is the Linux
+# account: it names the home directory every website root lives under
+# (/home/<user>/<domain>), the PHP-FPM pools and their sockets referenced from
+# each vhost, the crontab, the cgroup slice, the backup directory and archive
+# names, and SFTP sub-accounts pinned to those paths. Renaming means moving
+# all of that live, with no atomic step to fall back on if one part fails.
+# Billing systems address accounts by external_id, so they never need it.
+
+
+# ── Reseller packages ────────────────────────────────────────────────────
+
+@router.get("/reseller-plans")
+def list_reseller_plans(request: Request, db: Session = Depends(get_db)):
+    _authorize(request, db, "plans:read")
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "slug": p.slug,
+            "user_limit": p.user_limit,
+            "total_storage_mb": p.total_storage_mb,
+            "total_website_limit": p.total_website_limit,
+            "total_database_limit": p.total_database_limit,
+            "overselling_enabled": p.overselling_enabled,
+        }
+        for p in db.query(ResellerPackage).order_by(ResellerPackage.id.asc()).all()
+    ]
+
+
+# ── Administrator single sign-on ─────────────────────────────────────────
+
+@router.post("/admin/login")
+def create_admin_login_url(request: Request, db: Session = Depends(get_db)):
+    """A one-time login link for the administrator who issued this token.
+
+    Only with the ``sso:admin`` scope, which no legacy token has and which must
+    be granted explicitly: whoever holds such a token can open the panel as
+    that administrator, so it belongs only on a billing server trusted as much.
+    """
+    token = _authorize(request, db, "sso:admin")
+    admin = db.query(User).filter(User.id == token.created_by_id).first() if token.created_by_id else None
+    if admin is None or admin.role != Role.admin or not admin.is_active:
+        raise HTTPException(status_code=403, detail="Token has no active administrator to sign in as")
+    login_token = create_panel_login_token(admin.username)
+    log_action(db, None, "provisioning_admin_login", admin.username, detail=f"token={token.id}", request=request)
+    path = f"/api/auth/sso/{login_token}"
+    base = panel_base_url(request)
+    absolute = f"{base}{path}" if base else path
+    return {"login_url": absolute, "url": absolute, "path": path, "expires_in": 300}
 
 
 # ── Token self-service (Bearer auth) ─────────────────────────────────────
