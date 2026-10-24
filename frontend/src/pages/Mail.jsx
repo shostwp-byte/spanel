@@ -946,6 +946,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
           <button className="mini secondary-light" disabled={rspamdFilter.page >= pages} onClick={() => loadRspamdHistory(rspamdFilter.page + 1)}>{t('Next')}</button>
         </div>}
         <p className="hint">{t('Rspamd keeps the last 2000 scans. A message sent by a signed-in mailbox is not scanned. A message stopped by a test pattern (GTUBE) is not kept.')}</p>
+        <p className="hint">{t('The filter learns from every mailbox: a message moved into Junk (in webmail or any mail app) is learnt as spam, one moved out of Junk as not spam, within a minute. Mailboxes are warned by mail at 80% and 95% of their size.')}</p>
       </>}
       {rspamdView === 'log' && renderLogViewer(rspamdLog, rspamdLogQuery, setRspamdLogQuery, loadRspamdLog)}
       {rspamdView === 'allow' && (f ? <div className="create-inline mail-settings">

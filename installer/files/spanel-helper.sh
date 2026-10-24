@@ -1748,6 +1748,9 @@ MAIL_TOOL_DIR="/usr/local/lib/spanel"
 MAIL_TOOL="${MAIL_TOOL_DIR}/spanel_mailtool.py"
 # A mailbox's autoresponder, written by mail-sync into the mailbox's home.
 MAIL_VACATION_SCRIPT="spanel-vacation.sieve"
+# Messages moved in and out of Junk wait here for Rspamd to learn them.
+MAIL_LEARN_SPOOL="/var/spool/spanel-learn"
+MAIL_QUOTA_WARNING="${MAIL_TOOL_DIR}/mail-quota-warning"
 
 mail_port_taken() {
   # "<port> (<program>)" for each mail port some other program already holds.
@@ -2456,11 +2459,38 @@ plugin {
   # Then the mailbox's autoresponder, which mail-sync writes into its home
   # from the panel's list; a mailbox without one has no such file.
   sieve_before2 = ~/${MAIL_VACATION_SCRIPT}
+
+  # Spam training: moved into Junk is spam, moved out of it (not to Trash) ham.
+  sieve_plugins = sieve_imapsieve sieve_extprograms
+  sieve_global_extensions = +vnd.dovecot.pipe +vnd.dovecot.environment
+  sieve_pipe_bin_dir = ${MAIL_SIEVE_DIR}/bin
+  imapsieve_mailbox1_name = Junk
+  imapsieve_mailbox1_causes = COPY APPEND
+  imapsieve_mailbox1_before = file:${MAIL_SIEVE_DIR}/learn-spam.sieve
+  imapsieve_mailbox2_name = *
+  imapsieve_mailbox2_from = Junk
+  imapsieve_mailbox2_causes = COPY
+  imapsieve_mailbox2_before = file:${MAIL_SIEVE_DIR}/learn-ham.sieve
+
+  # The mailbox is told when it is filling up.
+  quota_warning = storage=95%% quota-warning 95 %u
+  quota_warning2 = storage=80%% quota-warning 80 %u
 }
 
 protocol imap {
-  mail_plugins = \$mail_plugins imap_quota
+  mail_plugins = \$mail_plugins imap_quota imap_sieve
   mail_max_userip_connections = 20
+}
+
+# Run as user dovecot. Every mailbox's processes run as its owner, so the
+# socket is open to all; the script checks what it is asked and warns a
+# mailbox at most once a day per level.
+service quota-warning {
+  executable = script ${MAIL_QUOTA_WARNING}
+  user = dovecot
+  unix_listener quota-warning {
+    mode = 0666
+  }
 }
 protocol lmtp {
   postmaster_address = postmaster@%d
@@ -2698,7 +2728,9 @@ install_mail() {
 
   mail_write_exim_conf
   mail_write_sieve
+  mail_write_quota_warning
   mail_write_dovecot_conf
+  mail_write_learn_service
   mail_write_unbound_conf
   mail_write_rspamd_conf
   mail_install_webmail
@@ -2748,6 +2780,7 @@ remove_mail() {
   systemctl disable --now exim4 >/dev/null 2>&1 || true
   systemctl disable --now dovecot >/dev/null 2>&1 || true
   systemctl disable --now spanel-mail-tls.path >/dev/null 2>&1 || true
+  systemctl disable --now spanel-mail-learn.timer >/dev/null 2>&1 || true
   for conf in /etc/nginx/conf.d/00-spanel-webmail*.conf; do
     [[ -f "$conf" ]] || continue
     mv -f "$conf" "${conf}.off"
@@ -3160,10 +3193,84 @@ if header :contains "X-Spam-Status" "Yes" {
 }
 SIEVE
   chmod 0644 "$MAIL_SIEVE_DIR/spam-to-junk.sieve"
+  # Spam training (IMAPSieve): a message moved into Junk is learnt as spam,
+  # one moved out of it (anywhere but Trash) as ham. The pipe programs run as
+  # the mailbox's owner and only queue the message for spanel-mail-learn.
+  cat >"$MAIL_SIEVE_DIR/learn-spam.sieve" <<'SIEVE'
+# Managed by SPanel (Email addon). Moved into Junk: Rspamd learns it as spam.
+require ["vnd.dovecot.pipe", "copy", "imapsieve"];
+pipe :copy "spanel-learn-spam";
+SIEVE
+  cat >"$MAIL_SIEVE_DIR/learn-ham.sieve" <<'SIEVE'
+# Managed by SPanel (Email addon). Moved out of Junk: Rspamd learns it as ham,
+# unless it went to Trash.
+require ["vnd.dovecot.pipe", "copy", "imapsieve", "environment", "variables"];
+if environment :matches "imap.mailbox" "*" {
+  set "mailbox" "${1}";
+}
+if string "${mailbox}" "Trash" {
+  stop;
+}
+pipe :copy "spanel-learn-ham";
+SIEVE
+  install -d -o root -g root -m 0755 "$MAIL_SIEVE_DIR/bin"
+  local kind
+  for kind in spam ham; do
+    printf '#!/bin/sh\n# Managed by SPanel (Email addon). Runs as the mailbox owner: queues the message.\nexec /usr/bin/python3 -I %s learn-enqueue %s\n' \
+      "$MAIL_TOOL" "$kind" >"$MAIL_SIEVE_DIR/bin/spanel-learn-${kind}"
+    chmod 0755 "$MAIL_SIEVE_DIR/bin/spanel-learn-${kind}"
+  done
+  chmod 0644 "$MAIL_SIEVE_DIR"/learn-spam.sieve "$MAIL_SIEVE_DIR"/learn-ham.sieve
   # Compiled here, as root: the mailbox owners could not write the result.
   sievec "$MAIL_SIEVE_DIR/spam-to-junk.sieve" >>"$MAIL_INSTALL_LOG" 2>&1 \
     || deny "could not compile the spam Sieve script (see ${MAIL_INSTALL_LOG})"
   chmod 0644 "$MAIL_SIEVE_DIR"/spam-to-junk.svbin
+  # The learn scripts need the pipe extension, which only the IMAPSieve
+  # configuration enables: Dovecot compiles them itself when first used.
+  rm -f "$MAIL_SIEVE_DIR"/learn-spam.svbin "$MAIL_SIEVE_DIR"/learn-ham.svbin
+}
+
+mail_write_learn_service() {
+  # The spool mailbox owners queue messages into (they can add files but not
+  # list or read anyone else's), and the root service that hands them to
+  # Rspamd's controller with its key.
+  install -d -o root -g root -m 1733 "$MAIL_LEARN_SPOOL"
+  cat >/etc/systemd/system/spanel-mail-learn.service <<UNIT
+[Unit]
+Description=SPanel: hand messages moved in and out of Junk to Rspamd
+After=rspamd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I ${MAIL_TOOL} learn-process ${MAIL_LEARN_SPOOL} ${MAIL_RSPAMD_KEY_FILE}
+UNIT
+  # Every minute rather than on a change of the directory: a file a mailbox
+  # owner leaves there must not make the service run back to back.
+  cat >/etc/systemd/system/spanel-mail-learn.timer <<UNIT
+[Unit]
+Description=SPanel: hand the spam-training queue to Rspamd every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  rm -f /etc/systemd/system/spanel-mail-learn.path
+  systemctl daemon-reload
+  systemctl enable --now spanel-mail-learn.timer >/dev/null 2>&1 || true
+}
+
+mail_write_quota_warning() {
+  # Dovecot runs this as user dovecot when a mailbox crosses 80% or 95% of its
+  # quota; the mail tool checks the mailbox exists and mails it once a day.
+  install -d -o root -g root -m 0755 "$MAIL_TOOL_DIR"
+  printf '#!/bin/sh\n# Managed by SPanel (Email addon): warns a mailbox that is filling up.\nexec /usr/bin/python3 -I %s quota-warning "$@"\n' \
+    "$MAIL_TOOL" >"$MAIL_QUOTA_WARNING"
+  chmod 0755 "$MAIL_QUOTA_WARNING"
+  install -d -o dovecot -g dovecot -m 0750 /var/lib/spanel-mail /var/lib/spanel-mail/quota-warnings
 }
 
 mail_rspamd_group() {
@@ -3672,7 +3779,9 @@ mail_reconfigure() {
   "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
   mail_write_exim_conf
   mail_write_sieve
+  mail_write_quota_warning
   mail_write_dovecot_conf
+  mail_write_learn_service
   if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
   if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
   echo "Mail configuration rewritten."

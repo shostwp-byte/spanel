@@ -561,6 +561,222 @@ def sni_apply(registry: str, le_live: str, tls_dir: str, exim_dir: str, dovecot_
     return changed
 
 
+# --- spam training: learning from what people move in and out of Junk ----------------------
+# Dovecot's IMAPSieve runs learn-spam.sieve when a message is moved into Junk
+# and learn-ham.sieve when one is moved out (not to Trash); each pipes the
+# message to a program in the Sieve bin directory, which runs as the
+# mailbox's owner and only queues it here (learn_enqueue). The root service
+# spanel-mail-learn hands the queue to Rspamd's controller with the key no
+# mailbox owner may read (learn_process).
+
+LEARN_SPOOL = "/var/spool/spanel-learn"
+LEARN_MAX_BYTES = 20 * 1024 * 1024
+LEARN_BATCH = 500
+LEARN_KINDS = ("spam", "ham")
+RSPAMD_CONTROLLER = "http://127.0.0.1:11334"
+
+
+def learn_enqueue(kind: str, source, spool: str = LEARN_SPOOL) -> str:
+    """Write one message (from source, a binary stream) to the spool as
+    <kind>.<random>, through a temporary name so the processor never reads
+    half a message. Returns the file name."""
+    import os
+    import secrets
+
+    if kind not in LEARN_KINDS:
+        raise ToolError(f"invalid learn kind: {kind!r}")
+    token = secrets.token_hex(12)
+    tmp = os.path.join(spool, f"tmp.{token}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o600)
+    written = 0
+    try:
+        while written <= LEARN_MAX_BYTES:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            os.write(fd, chunk)
+            written += len(chunk)
+    finally:
+        os.close(fd)
+    if written == 0 or written > LEARN_MAX_BYTES:
+        os.unlink(tmp)
+        return ""
+    final = os.path.join(spool, f"{kind}.{token}")
+    os.rename(tmp, final)
+    return os.path.basename(final)
+
+
+def learn_process(spool: str, send, *, now: float | None = None, batch: int = LEARN_BATCH) -> dict:
+    """Hand queued messages to Rspamd: send(kind, data) -> bool (True when
+    Rspamd learnt it or had already). Only plain files named spam.* or ham.*
+    are read, never through a link; anything else, and temporary files left
+    for an hour, is removed. Returns counts."""
+    import os
+    import stat
+    import time
+
+    now = time.time() if now is None else now
+    counts = {"spam": 0, "ham": 0, "failed": 0, "removed": 0}
+    try:
+        names = sorted(os.listdir(spool))
+    except OSError:
+        return counts
+    for name in names[:batch * 2]:
+        path = os.path.join(spool, name)
+        kind = name.split(".", 1)[0]
+        if kind == "tmp":
+            try:
+                if now - os.lstat(path).st_mtime > 3600:
+                    _remove_entry(path)
+                    counts["removed"] += 1
+            except OSError:
+                pass
+            continue
+        if kind not in LEARN_KINDS:
+            _remove_entry(path)
+            counts["removed"] += 1
+            continue
+        if counts["spam"] + counts["ham"] + counts["failed"] >= batch:
+            continue
+        data = None
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                         | getattr(os, "O_BINARY", 0))
+            try:
+                info = os.fstat(fd)
+                if stat.S_ISREG(info.st_mode) and 0 < info.st_size <= LEARN_MAX_BYTES:
+                    chunks, size = [], 0
+                    while size < info.st_size:
+                        chunk = os.read(fd, min(1 << 20, info.st_size - size))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        size += len(chunk)
+                    data = b"".join(chunks)
+            finally:
+                os.close(fd)
+        except OSError:
+            data = None
+        if data and send(kind, data):
+            counts[kind] += 1
+        else:
+            counts["failed"] += 1
+        _remove_entry(path)
+    return counts
+
+
+def _remove_entry(path: str) -> None:
+    """Remove a spool entry, whatever a mailbox owner made it: a link is
+    removed, not followed, and a directory with whatever is in it (rmtree
+    works through directory descriptors and never follows a link)."""
+    import os
+    import shutil
+    import stat
+
+    try:
+        if stat.S_ISDIR(os.lstat(path).st_mode):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def rspamd_learn_sender(key: str, controller: str = RSPAMD_CONTROLLER):
+    """send() for learn_process: POST to /learnspam or /learnham. "Already
+    learnt" counts as learnt."""
+    import urllib.error
+    import urllib.request
+
+    def send(kind: str, data: bytes) -> bool:
+        request = urllib.request.Request(f"{controller}/learn{kind}", data=data, method="POST",
+                                         headers={"Password": key})
+        try:
+            with urllib.request.urlopen(request, timeout=30):  # noqa: S310 - fixed loopback URL
+                return True
+        except urllib.error.HTTPError as exc:
+            return exc.code == 208
+        except (urllib.error.URLError, OSError):
+            return False
+
+    return send
+
+
+# --- quota warnings ------------------------------------------------------------------------------
+# Dovecot's quota plugin runs the quota-warning service as a mailbox crosses
+# 80% and 95% of its quota; the service (as user dovecot) mails the mailbox.
+
+QUOTA_LEVELS = (80, 95)
+QUOTA_STAMP_DIR = "/var/lib/spanel-mail/quota-warnings"
+
+
+def check_quota_warning(percent, address, known: set[str] | None = None) -> tuple[int, str]:
+    try:
+        level = int(percent)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(f"invalid quota level: {percent!r}") from exc
+    if level not in QUOTA_LEVELS:
+        raise ToolError(f"invalid quota level: {percent!r}")
+    local, domain = _address(str(address or "").lower())
+    full = f"{local}@{domain}"
+    if known is not None and full not in known:
+        raise ToolError(f"{full} is not a mailbox here")
+    return level, full
+
+
+def render_quota_warning(level: int, address: str, date: str = "") -> bytes:
+    """The message a mailbox gets at 80% or 95% of its quota."""
+    level, address = check_quota_warning(level, address)
+    domain = address.split("@", 1)[1]
+    urgent = level >= 95
+    subject = f"Your mailbox is {level}% full" + (" - mail will soon be refused" if urgent else "")
+    body = (
+        f"The mailbox {address} is using {level}% of its space.\n\n"
+        + ("When it is full, new mail to it is refused and the senders are told so.\n\n" if urgent else "")
+        + "Delete mail you no longer need (and empty Trash and Junk), or ask your provider for more space.\n\n"
+        "-- \nThe mail server\n"
+    )
+    headers = [
+        f"From: Mail server <postmaster@{domain}>",
+        f"To: <{address}>",
+        f"Subject: {subject}",
+        "Auto-Submitted: auto-generated",
+        "Precedence: bulk",
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=utf-8",
+        "Content-Transfer-Encoding: 8bit",
+    ]
+    if date:
+        headers.insert(0, f"Date: {date}")
+    return ("\n".join(headers) + "\n\n" + body).encode()
+
+
+def quota_warning_due(stamp_dir: str, level: int, address: str, now: float, every: int = 86400) -> bool:
+    """Once a day per mailbox and level, however often Dovecot asks (or
+    anyone else on the machine does: the service's socket is open to every
+    mailbox owner). Records the warning when it is due."""
+    import os
+
+    path = os.path.join(stamp_dir, f"{address}.{level}")
+    try:
+        if now - os.stat(path).st_mtime < every:
+            return False
+    except FileNotFoundError:
+        pass
+    with open(path, "w", encoding="ascii") as handle:
+        handle.write(str(int(now)))
+    os.utime(path, (now, now))
+    return True
+
+
+def dovecot_mailboxes(users_file: str = "/etc/dovecot/spanel/users") -> set[str]:
+    try:
+        with open(users_file, encoding="utf-8") as handle:
+            return {line.split(":", 1)[0] for line in handle if ":" in line}
+    except OSError:
+        return set()
+
+
 # --- command line -------------------------------------------------------------------------
 
 def _read_json_stdin(limit: int = 8_000_000):
@@ -600,6 +816,30 @@ def main(argv: list[str]) -> int:
             if args[0] != f"/var/www/spanel-mailhosts/{item['domain']}":
                 raise ToolError("the documents go in /var/www/spanel-mailhosts/<domain>")
             print(" ".join(write_mailhost_documents(args[0], item)))
+            return 0
+        if command == "learn-enqueue" and len(args) == 1:
+            # From Dovecot's sieve pipe, as the mailbox's owner: never fails the move.
+            try:
+                learn_enqueue(args[0], sys.stdin.buffer)
+            except OSError as exc:
+                print(f"spanel-helper: could not queue the message for learning: {exc}", file=sys.stderr)
+            return 0
+        if command == "learn-process" and len(args) == 2:
+            with open(args[1], encoding="utf-8") as handle:
+                key = handle.read().strip()
+            counts = learn_process(args[0], rspamd_learn_sender(key))
+            print(json.dumps(counts))
+            return 0
+        if command == "quota-warning" and len(args) == 2:
+            import subprocess
+            import time
+            from email.utils import formatdate
+
+            level, address = check_quota_warning(args[0], args[1], dovecot_mailboxes())
+            if quota_warning_due(QUOTA_STAMP_DIR, level, address, time.time()):
+                message = render_quota_warning(level, address, formatdate(localtime=True))
+                subprocess.run(["/usr/sbin/sendmail", "-oi", "-f", f"postmaster@{address.split('@', 1)[1]}", "--", address],
+                               input=message, check=False, timeout=60)
             return 0
         if command == "sni-apply" and len(args) == 5:
             print("changed" if sni_apply(*args) else "unchanged")

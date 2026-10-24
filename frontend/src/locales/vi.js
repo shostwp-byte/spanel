@@ -1539,6 +1539,7 @@ export const vi = {
   "The demo passwords are shown on the sign-in page, so pick accounts that exist only for the demo. They are never the SFTP or SSH password.": "Mật khẩu demo hiện công khai trên trang đăng nhập, nên hãy chọn các tài khoản chỉ dùng cho demo. Đây không bao giờ là mật khẩu SFTP hay SSH.",
   "The disk is nearly full": "Ổ đĩa sắp đầy",
   "The domain must point to the correct VPS IP before issuing SSL.": "Tên miền phải trỏ đúng về IP của VPS trước khi cấp SSL.",
+  "The filter learns from every mailbox: a message moved into Junk (in webmail or any mail app) is learnt as spam, one moved out of Junk as not spam, within a minute. Mailboxes are warned by mail at 80% and 95% of their size.": "Bộ lọc học từ mọi hộp thư: thư được chuyển vào Junk (trong webmail hoặc ứng dụng mail) được học là spam, thư chuyển ra khỏi Junk được học là không phải spam, trong vòng một phút. Hộp thư được cảnh báo qua email khi dùng 80% và 95% dung lượng.",
   "The firewall is off": "Tường lửa đang tắt",
   "The firewall is off.": "Tường lửa đang tắt.",
   "The firewall is turned on, but its rules are not in force: this server still filters with UFW, or iptables and ipset are missing. An update from an older release can leave it so.": "Firewall đã bật nhưng các rule chưa có hiệu lực: server này vẫn lọc bằng UFW, hoặc thiếu iptables và ipset. Việc update từ một bản cũ có thể để lại tình trạng này.",
