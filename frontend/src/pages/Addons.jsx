@@ -121,12 +121,15 @@ export function AddonsPage({ request, isAdmin, addons, setAddons, loadAddons: lo
             <div className={`addon-card ${addon.installed ? 'installed' : ''}`} key={addon.slug}>
               <div className="addon-head">
                 <strong>{t(addon.name)}</strong>
-                <code>v{addon.installed ? addon.installed_version || addon.version : addon.version}</code>
+                <code>v{String(addon.installed ? addon.installed_version || addon.version : addon.version).replace(/^v/i, '')}</code>
+                {addon.stack && (
+                  <span className="hint" style={{ fontSize: '12px' }}>{addon.stack}</span>
+                )}
                 <span className={`badge ${addon.installed ? 'ok' : ''}`}>
                   {addon.installed ? t('Installed') : t('Not installed')}
                 </span>
                 {addon.installed && addon.installed_version && addon.installed_version !== addon.version && (
-                  <span className="badge">v{addon.version} available</span>
+                  <span className="badge">v{String(addon.version).replace(/^v/i, '')} available</span>
                 )}
               </div>
               <p className="addon-summary">{t(addon.summary)}</p>

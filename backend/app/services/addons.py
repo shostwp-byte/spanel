@@ -12,13 +12,157 @@ has no session to hand.
 
 import json
 import os
+import re
+import subprocess
+import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from fastapi import HTTPException, status
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+VERSION_FILE = PROJECT_ROOT / "VERSION"
 ADDONS_DIR = Path(os.environ.get("SPANEL_DATA_DIR") or os.environ.get("spanel_DATA_DIR") or "/var/lib/spanel")
 ADDONS_FILE = ADDONS_DIR / "addons.json"
+
+
+def _panel_version() -> str:
+    try:
+        raw = VERSION_FILE.read_text(encoding="utf-8").strip().lstrip("vV")
+        if raw:
+            return raw
+    except OSError:
+        pass
+    return "1.0.7"
+
+
+_VERSION_CACHE: dict[str, object] = {"ts": 0.0, "data": {}}
+
+
+def _clean_deb_version(raw: str) -> str:
+    if not raw:
+        return ""
+    val = raw.strip()
+    if ":" in val:
+        val = val.split(":", 1)[1]
+    match = re.match(r"^(\d+(?:\.\d+)+(?:\.[a-z0-9]+)?)", val, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return re.split(r"[-+~]", val, maxsplit=1)[0].strip()
+
+
+def _detect_system_versions() -> dict[str, str]:
+    now = time.monotonic()
+    cached_ts = float(_VERSION_CACHE.get("ts") or 0.0)
+    cached_data = _VERSION_CACHE.get("data")
+    if isinstance(cached_data, dict) and cached_data and (now - cached_ts) < 120.0:
+        return dict(cached_data)
+
+    detected: dict[str, str] = {}
+    if os.name == "nt":
+        return detected
+
+    packages = [
+        "fail2ban",
+        "pdns-server",
+        "exim4-daemon-heavy",
+        "exim4-base",
+        "dovecot-core",
+        "rspamd",
+        "clamav-daemon",
+        "clamav",
+        "docker-ce",
+        "docker.io",
+        "nodejs",
+    ]
+    try:
+        res = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Package}|${db:Status-Abbrev}|${Version}\\n", *packages],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        for line in (res.stdout or "").splitlines():
+            parts = line.strip().split("|", 2)
+            if len(parts) == 3:
+                pkg, status_abbrev, raw_ver = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                if status_abbrev.startswith("ii") and raw_ver:
+                    cleaned = _clean_deb_version(raw_ver)
+                    if cleaned:
+                        detected[pkg] = cleaned
+    except Exception:
+        pass
+
+    missing_pkgs = [p for p in packages if p not in detected]
+    if missing_pkgs:
+        try:
+            res = subprocess.run(
+                ["apt-cache", "policy", *missing_pkgs],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            current_pkg = ""
+            for line in (res.stdout or "").splitlines():
+                if not line.startswith(" ") and line.endswith(":"):
+                    current_pkg = line[:-1].strip()
+                elif current_pkg and line.strip().startswith("Candidate:"):
+                    cand = line.strip().split("Candidate:", 1)[1].strip()
+                    if cand and cand != "(none)":
+                        cleaned = _clean_deb_version(cand)
+                        if cleaned and current_pkg not in detected:
+                            detected[current_pkg] = cleaned
+        except Exception:
+            pass
+
+    for lmd_ver_path in (Path("/usr/local/maldetect/VERSION"), Path("/usr/local/maldetect/files/VERSION")):
+        try:
+            if lmd_ver_path.is_file():
+                raw_lmd = lmd_ver_path.read_text(encoding="utf-8", errors="ignore").strip()
+                m = re.search(r"(\d+(?:\.\d+)+)", raw_lmd)
+                if m:
+                    detected["lmd"] = m.group(1)
+                    break
+        except OSError:
+            pass
+
+    _VERSION_CACHE["ts"] = now
+    _VERSION_CACHE["data"] = dict(detected)
+    return detected
+
+
+def _resolve_addon_version(slug: str, default_version: str) -> tuple[str, str]:
+    panel_ver = _panel_version()
+    sys_vers = _detect_system_versions()
+    if slug == "fail2ban":
+        ver = sys_vers.get("fail2ban") or default_version
+        return ver, f"Fail2ban v{ver} · iptables-multiport"
+    if slug == "dns":
+        ver = sys_vers.get("pdns-server") or default_version
+        return ver, f"PowerDNS Authoritative v{ver}"
+    if slug == "mail":
+        exim_ver = sys_vers.get("exim4-daemon-heavy") or sys_vers.get("exim4-base") or default_version
+        dovecot_ver = sys_vers.get("dovecot-core") or "2.3.21"
+        rspamd_ver = sys_vers.get("rspamd") or "3.8.4"
+        return exim_ver, f"Exim v{exim_ver} · Dovecot v{dovecot_ver} · Rspamd v{rspamd_ver}"
+    if slug == "malware":
+        clam_ver = sys_vers.get("clamav-daemon") or sys_vers.get("clamav") or default_version
+        lmd_ver = sys_vers.get("lmd") or "1.6.5"
+        return clam_ver, f"ClamAV v{clam_ver} · LMD v{lmd_ver}"
+    if slug == "application":
+        docker_ver = sys_vers.get("docker-ce") or sys_vers.get("docker.io") or default_version
+        node_ver = sys_vers.get("nodejs")
+        node_label = f"v{node_ver}" if node_ver else "LTS (18/20/22)"
+        return docker_ver, f"Docker Engine v{docker_ver} · Node.js {node_label}"
+    if slug == "mcp":
+        return panel_ver, f"MCP 2025-06-18 · SPanel v{panel_ver}"
+    if slug == "notifications":
+        return panel_ver, f"SPanel Alert Engine v{panel_ver} · SMTP & Telegram"
+    if slug == "demo":
+        return panel_ver, f"SPanel Sandbox Guard v{panel_ver}"
+    return default_version, f"SPanel v{panel_ver}"
 
 APPLICATION = "application"
 DEMO = "demo"
@@ -34,7 +178,7 @@ NOTIFICATIONS = "notifications"
 CATALOGUE: dict[str, dict] = {
     FAIL2BAN: {
         "name": "Fail2ban",
-        "version": "1.0.0",
+        "version": "1.0.2",
         "summary": "Stops SSH password guessing by banning an address that keeps getting it wrong.",
         "details": [
             "sshd on a public address collects hundreds of password attempts a day with nobody watching; one live customer server logged 679 failures in 24 hours.",
@@ -50,7 +194,7 @@ CATALOGUE: dict[str, dict] = {
     },
     MCP: {
         "name": "AI assistants (MCP)",
-        "version": "1.0.0",
+        "version": _panel_version(),
         "summary": "Lets Claude Code, Cursor or VS Code read and operate the panel with a personal token.",
         "details": [
             "Each person creates their own token, and it acts with exactly their own permissions: an administrator's reaches the whole server, a customer's reaches only their own websites, databases, backups and files.",
@@ -68,7 +212,7 @@ CATALOGUE: dict[str, dict] = {
     },
     NOTIFICATIONS: {
         "name": "Notifications",
-        "version": "1.0.0",
+        "version": _panel_version(),
         "summary": "Tells administrators what needs their attention on the server, by email and Telegram.",
         "details": [
             "The server: a service that stopped, a disk filling up, the firewall off, a failed backup, malware, certificates about to expire, a panel update.",
@@ -84,7 +228,7 @@ CATALOGUE: dict[str, dict] = {
     },
     MALWARE: {
         "name": "Malware Scanner",
-        "version": "1.0.0",
+        "version": "1.4.2",
         "summary": "Scans the websites and the server for malware with Linux Malware Detect and ClamAV.",
         "details": [
             "Scans a website, every website or the whole server on demand, and on a weekly schedule.",
@@ -100,7 +244,7 @@ CATALOGUE: dict[str, dict] = {
     },
     DNS: {
         "name": "DNS Manager",
-        "version": "1.0.0",
+        "version": "4.8.3",
         "summary": "Runs the DNS for your domains on this server, and lets you edit their records in the panel.",
         "details": [
             "Installs PowerDNS and opens port 53. Point a domain's nameservers at this server and its records are served from here.",
@@ -118,7 +262,7 @@ CATALOGUE: dict[str, dict] = {
     },
     MAIL: {
         "name": "Email",
-        "version": "1.0.0",
+        "version": "4.97",
         "summary": "Mailboxes on your domains, with a webmail your customers open from the panel without a password.",
         "details": [
             "Installs Exim to send and receive, Dovecot for IMAP and POP3, and SPanel Webmail on port 2096.",
@@ -140,7 +284,7 @@ CATALOGUE: dict[str, dict] = {
     },
     DEMO: {
         "name": "Demo mode",
-        "version": "1.0.0",
+        "version": _panel_version(),
         "summary": "Public demo accounts that can look at every page and change nothing.",
         "details": [
             "Up to three demo accounts (Admin, Reseller, and End User), with one-click sign-in buttons on the login page.",
@@ -156,7 +300,7 @@ CATALOGUE: dict[str, dict] = {
     },
     APPLICATION: {
         "name": "Application",
-        "version": "1.0.0",
+        "version": "27.3.1",
         "summary": "Runs Node.js apps, containers and Docker Compose, and puts them behind a domain with Nginx.",
         "details": [
             "Installs Docker and the Node.js versions you need; none of it is in a default install.",
@@ -212,15 +356,34 @@ def state() -> list[dict]:
     """The catalogue with each addon's installed state folded in."""
     stored = _read()
     entries = []
+    dirty = False
     for slug, entry in sorted(CATALOGUE.items()):
         record = stored.get(slug) or {}
+        is_inst = bool(record.get("installed"))
+        live_ver, stack_label = _resolve_addon_version(slug, entry["version"])
+        stored_ver = str(record.get("version") or "").strip()
+        if is_inst:
+            if not stored_ver or stored_ver == "1.0.0" or stored_ver != live_ver:
+                stored_ver = live_ver
+                if isinstance(stored.get(slug), dict) and stored[slug].get("version") != live_ver:
+                    stored[slug]["version"] = live_ver
+                    dirty = True
+        elif stored_ver == "1.0.0":
+            stored_ver = ""
         entries.append({
             "slug": slug,
             **entry,
-            "installed": bool(record.get("installed")),
-            "installed_version": record.get("version") or "",
+            "version": live_ver,
+            "stack": stack_label,
+            "installed": is_inst,
+            "installed_version": stored_ver if is_inst else "",
             "installed_at": record.get("installed_at") or "",
         })
+    if dirty:
+        try:
+            _write(stored)
+        except OSError:
+            pass
     return entries
 
 
@@ -228,10 +391,12 @@ def install(slug: str) -> dict:
     entry = known(slug)
     from datetime import datetime, timezone
 
+    _VERSION_CACHE["ts"] = 0.0
+    live_ver, _ = _resolve_addon_version(slug, entry["version"])
     data = _read()
     data[slug] = {
         "installed": True,
-        "version": entry["version"],
+        "version": live_ver,
         "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     _write(data)
@@ -247,6 +412,7 @@ def uninstall(slug: str) -> dict:
     picks up where it left off.
     """
     known(slug)
+    _VERSION_CACHE["ts"] = 0.0
     data = _read()
     record = data.get(slug) or {}
     record["installed"] = False
