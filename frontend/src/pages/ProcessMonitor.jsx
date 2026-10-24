@@ -9,13 +9,14 @@ export function ProcessMonitorPage({ request, isAdmin }) {
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [autoReload, setAutoReload] = useState(15);
+  const [showThreads, setShowThreads] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
 
-  async function loadData() {
+  async function loadData(threadsMode = showThreads) {
     setLoading(true);
     try {
-      const res = await request('/processes');
+      const res = await request(`/processes${threadsMode ? '?threads=true' : ''}`);
       if (res && res.items) setData(res);
     } catch (e) {
       setError(t('Failed to load processes.'));
@@ -24,16 +25,16 @@ export function ProcessMonitorPage({ request, isAdmin }) {
   }
 
   useEffect(() => {
-    if (isAdmin) loadData();
-  }, [isAdmin]);
+    if (isAdmin) loadData(showThreads);
+  }, [isAdmin, showThreads]);
 
   useEffect(() => {
     if (autoReload === 0 || !isAdmin || searchTerm) return;
     const interval = setInterval(() => {
-      loadData();
+      loadData(showThreads);
     }, autoReload * 1000);
     return () => clearInterval(interval);
-  }, [isAdmin, searchTerm, autoReload]);
+  }, [isAdmin, searchTerm, autoReload, showThreads]);
 
   async function handleKill(pid) {
     if (!window.confirm(t(`Send SIGKILL to process ${pid}?`))) return;
@@ -86,11 +87,11 @@ export function ProcessMonitorPage({ request, isAdmin }) {
         const colonIdx = line.indexOf(':');
         content = colonIdx > -1 ? line.substring(colonIdx + 1).trim() : line;
       } else if (lowerLine.startsWith('mib mem') || lowerLine.startsWith('kib mem')) {
-        title = 'KiB Mem:';
+        title = lowerLine.startsWith('mib mem') ? 'MiB Mem:' : 'KiB Mem:';
         const colonIdx = line.indexOf(':');
         content = colonIdx > -1 ? line.substring(colonIdx + 1).trim() : line;
       } else if (lowerLine.startsWith('mib swap') || lowerLine.startsWith('kib swap')) {
-        title = 'KiB Swap:';
+        title = lowerLine.startsWith('mib swap') ? 'MiB Swap:' : 'KiB Swap:';
         const colonIdx = line.indexOf(':');
         content = colonIdx > -1 ? line.substring(colonIdx + 1).trim() : line;
       } else {
@@ -134,7 +135,26 @@ export function ProcessMonitorPage({ request, isAdmin }) {
       </div>
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '15px', gap: '10px', flexWrap: 'wrap' }}>
-        <button className="secondary" onClick={loadData} disabled={loading} style={{ background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', padding: '6px 12px', borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
+        <button
+          className="secondary"
+          onClick={() => { setShowThreads(prev => !prev); setCurrentPage(1); }}
+          style={{
+            background: showThreads ? 'var(--primary-light)' : 'var(--surface)',
+            color: showThreads ? 'var(--primary)' : 'var(--text)',
+            border: `1px solid ${showThreads ? 'var(--primary)' : 'var(--border)'}`,
+            padding: '6px 12px',
+            borderRadius: '4px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            fontSize: '13px',
+            fontWeight: showThreads ? '600' : '400',
+            cursor: 'pointer'
+          }}
+        >
+          {t('Threads')} ({showThreads ? t('On') : t('Off')})
+        </button>
+        <button className="secondary" onClick={() => loadData(showThreads)} disabled={loading} style={{ background: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', padding: '6px 12px', borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
           <RefreshCw size={14} className={loading ? 'spin' : ''} /> {t('Reload')}
         </button>
         <select 
@@ -172,7 +192,7 @@ export function ProcessMonitorPage({ request, isAdmin }) {
             </thead>
             <tbody>
               {currentProcesses.map((p, idx) => (
-                <tr key={p.pid} style={{ borderBottom: '1px solid var(--border)', background: idx % 2 === 0 ? 'var(--surface-alt)' : 'var(--surface)' }}>
+                <tr key={`${p.pid}-${idx}`} style={{ borderBottom: '1px solid var(--border)', background: idx % 2 === 0 ? 'var(--surface-alt)' : 'var(--surface)' }}>
                   <td style={{ padding: '12px 15px', color: 'var(--text-secondary)' }}>{p.pid}</td>
                   <td style={{ padding: '12px 15px', color: 'var(--text-secondary)' }}>{p.user}</td>
                   <td style={{ padding: '12px 15px', color: 'var(--text-secondary)' }}>{p.pr || '-'}</td>

@@ -10240,6 +10240,39 @@ EOF
     list_installed_node_majors
     ;;
 
+  process-top)
+    [[ $# -le 1 ]] || deny "usage: process-top [threads]"
+    top_flags=(-b -n 1 -c)
+    if [[ "${1:-}" == "threads" ]]; then
+      top_flags=(-H -b -n 1 -c)
+    elif [[ -n "${1:-}" ]]; then
+      deny "invalid mode: $1"
+    fi
+    unshare --mount -- bash -c 'mount -t proc proc /proc 2>/dev/null || true; exec env LC_ALL=C COLUMNS=512 top "$@"' _ "${top_flags[@]}" 2>/dev/null \
+      || exec env LC_ALL=C COLUMNS=512 top "${top_flags[@]}"
+    ;;
+
+  process-ps)
+    [[ $# -eq 0 ]] || deny "usage: process-ps"
+    unshare --mount -- bash -c 'mount -t proc proc /proc 2>/dev/null || true; exec env LC_ALL=C ps -eo pid,user:32,pcpu,rss,nlwp,comm,args --no-headers' 2>/dev/null \
+      || exec env LC_ALL=C ps -eo pid,user:32,pcpu,rss,nlwp,comm,args --no-headers
+    ;;
+
+  process-kill)
+    [[ $# -eq 1 ]] || deny "usage: process-kill <pid>"
+    target_pid="$1"
+    [[ "$target_pid" =~ ^[0-9]{1,10}$ ]] || deny "invalid pid: $target_pid"
+    (( target_pid > 2 )) || deny "refusing to kill protected system PID: $target_pid"
+    api_main_pid="$(systemctl show -p MainPID --value spanel-api 2>/dev/null || echo 0)"
+    if [[ "$target_pid" == "$api_main_pid" || "$target_pid" == "$$" || "$target_pid" == "$PPID" ]]; then
+      deny "refusing to kill SPanel API process: $target_pid"
+    fi
+    if [[ -d "/proc/${target_pid}" ]] && [[ ! -s "/proc/${target_pid}/cmdline" ]] && [[ ! -e "/proc/${target_pid}/exe" ]]; then
+      deny "refusing to kill kernel thread: $target_pid"
+    fi
+    kill -9 "$target_pid"
+    ;;
+
   *)
     deny "unknown command: $cmd"
     ;;

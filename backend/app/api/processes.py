@@ -9,7 +9,7 @@ from app.services.shell import shell
 router = APIRouter(prefix="/processes", tags=["processes"])
 
 @router.get("")
-def get_processes(current_user: User = Depends(get_current_user)):
+def get_processes(threads: bool = False, current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
     if os.name == 'nt':
         return {
@@ -22,7 +22,17 @@ def get_processes(current_user: User = Depends(get_current_user)):
     
     try:
         # Note: setting COLUMNS=512 prevents command line truncation in top's output
-        res = shell.run(["env", "COLUMNS=512", "top", "-b", "-n", "1", "-c"])
+        helper_args = ["threads"] if threads else []
+        top_fallback = ["env", "LC_ALL=C", "COLUMNS=512", "top", *(["-H"] if threads else []), "-b", "-n", "1", "-c"]
+        res = shell.privileged(
+            "process-top",
+            helper_args=helper_args,
+            check=False,
+            timeout=10,
+            fallback=top_fallback,
+        )
+        if res.returncode != 0 or not (res.stdout or "").strip():
+            res = shell.run(["env", "COLUMNS=512", "top", *(["-H"] if threads else []), "-b", "-n", "1", "-c"])
         lines = res.stdout.split("\n")
         
         summary_lines = []
@@ -55,6 +65,24 @@ def get_processes(current_user: User = Depends(get_current_user)):
                         "time": parts[10],
                         "cmd": parts[11]
                     })
+        if any((item.get("user") or "").endswith("+") for item in items):
+            ps_res = shell.privileged(
+                "process-ps",
+                helper_args=[],
+                check=False,
+                timeout=5,
+                fallback=["ps", "-eo", "pid,user:32,pcpu,rss,nlwp,comm,args", "--no-headers"],
+            )
+            if ps_res.returncode == 0 and (ps_res.stdout or "").strip():
+                pid_to_user = {}
+                for ps_line in ps_res.stdout.splitlines():
+                    ps_parts = ps_line.strip().split(None, 2)
+                    if len(ps_parts) >= 2:
+                        pid_to_user[ps_parts[0]] = ps_parts[1]
+                for item in items:
+                    full_user = pid_to_user.get(str(item.get("pid")))
+                    if full_user:
+                        item["user"] = full_user
         return {
             "summary": "\n".join(summary_lines),
             "items": items
@@ -65,7 +93,7 @@ def get_processes(current_user: User = Depends(get_current_user)):
 @router.post("/{pid}/kill")
 def kill_process(pid: int, current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
-    if pid <= 1 or pid == os.getpid():
+    if pid <= 2 or pid == os.getpid():
         raise HTTPException(status_code=400, detail="Invalid or protected PID")
     if os.name == 'nt':
         return {"success": True}
@@ -74,6 +102,20 @@ def kill_process(pid: int, current_user: User = Depends(get_current_user)):
     import subprocess
 
     try:
+        priv_res = shell.privileged(
+            "process-kill",
+            helper_args=[str(pid)],
+            check=False,
+            timeout=5,
+            fallback=["kill", "-9", str(pid)],
+        )
+        if priv_res.returncode == 0:
+            return {"success": True}
+        err_msg = (priv_res.stderr or priv_res.stdout or "").strip()
+        if "No such process" in err_msg:
+            raise HTTPException(status_code=404, detail=f"Process {pid} not found")
+        if "refusing to kill" in err_msg or "protected" in err_msg:
+            raise HTTPException(status_code=400, detail=err_msg)
         os.kill(pid, signal.SIGKILL)
         return {"success": True}
     except ProcessLookupError as exc:

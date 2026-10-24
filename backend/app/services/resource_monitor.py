@@ -552,13 +552,21 @@ def collect_live_process_metrics(db: Session) -> None:
             pass
 
         try:
-            res = subprocess.run(
-                ["ps", "-eo", "pid,user:32,pcpu,rss,nlwp,comm,args", "--no-headers"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            res = shell.privileged(
+                "process-ps",
+                helper_args=[],
                 check=False,
+                timeout=5,
+                fallback=["ps", "-eo", "pid,user:32,pcpu,rss,nlwp,comm,args", "--no-headers"],
             )
+            if res.returncode != 0 or not (res.stdout or "").strip():
+                res = subprocess.run(
+                    ["ps", "-eo", "pid,user:32,pcpu,rss,nlwp,comm,args", "--no-headers"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
             for line in (res.stdout or "").splitlines():
                 parts = line.strip().split(None, 6)
                 if len(parts) < 6:

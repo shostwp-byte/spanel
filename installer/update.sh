@@ -949,6 +949,8 @@ ExecStart=
 ExecStart=/usr/local/sbin/spanel-api-start
 SupplementaryGroups=www-data spanel-sites
 ProtectHome=false
+ProtectProc=default
+ProcSubset=all
 ReadWritePaths=
 ReadWritePaths=${APP_DIR} /home /var/backups/spanel /etc/nginx/conf.d /etc/nginx/spanel/custom /tmp /var/lib/spanel /home/admin/spanel_backups/da /var/lib/spanel/da-import /var/lib/spanel/import-stage
 SERVICE
@@ -1910,6 +1912,8 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # This file is the list of what the helper needs from the sandbox. The jail was
 # added without adding its requirement here, which is how it shipped broken.
 RestrictNamespaces=mnt
+ProtectProc=default
+ProcSubset=all
 SERVICE
 systemctl daemon-reload
 systemctl restart spanel-api
