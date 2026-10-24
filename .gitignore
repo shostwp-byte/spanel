@@ -92,10 +92,9 @@ setup.sh
 change_IP.sh
 
 # Test files & internal audit/plan reports
-tests/
+# tests/ is tracked on purpose: it is the regression suite that catches code
+# from one change silently disappearing in the next.
 backend/tests/
-test_*.py
-*_test.py
 plan-report/
 BAO_CAO_DANH_GIA_ENTERPRISE_SPANEL.doc
 
