@@ -58,6 +58,23 @@ esac
 HOME_ROOT="/home"
 USER_HOME="${HOME_ROOT}/${JAIL_USER}"
 
+if [[ ! -d "$USER_HOME" || -L "$USER_HOME" ]]; then
+  echo "spanel-cron-jail: user home directory does not exist or is a symlink: $USER_HOME" >&2
+  exit 64
+fi
+
+RESOLVED_USER_HOME="$(realpath -e -- "$USER_HOME" 2>/dev/null || true)"
+RESOLVED_CWD="$(realpath -m -- "$JAIL_CWD" 2>/dev/null || true)"
+if [[ -z "$RESOLVED_USER_HOME" || -z "$RESOLVED_CWD" ]]; then
+  echo "spanel-cron-jail: could not resolve working directory: $JAIL_CWD" >&2
+  exit 64
+fi
+if [[ "$RESOLVED_CWD" != "$RESOLVED_USER_HOME" && "$RESOLVED_CWD" != "${RESOLVED_USER_HOME}/"* ]]; then
+  echo "spanel-cron-jail: working directory must be inside ${RESOLVED_USER_HOME}: $JAIL_CWD" >&2
+  exit 64
+fi
+JAIL_CWD="$RESOLVED_CWD"
+
 # Inner script executed as root inside the private mount namespace, then
 # immediately drops privileges to $jail_user before cd and exec.
 INNER_JAIL_SCRIPT='

@@ -692,74 +692,52 @@ migrate_protect_php_from_autoremove() {
 migrate_site_cron_php_binary() {
   local db_path="$APP_DIR/backend/spanel.db"
   [[ -f "$db_path" ]] || return 0
-  [[ -d /var/spool/cron/crontabs ]] || return 0
-  SPANEL_DB_PATH="$db_path" python3 - <<'PY'
+  local py_bin="$APP_DIR/backend/.venv/bin/python"
+  [[ -x "$py_bin" ]] || py_bin="python3"
+  PYTHONPATH="$APP_DIR/backend" SPANEL_DB_PATH="$db_path" "$py_bin" - <<'PY'
 import os
-import re
-import shlex
-import sqlite3
 import subprocess
 from pathlib import Path
 
-PHP_VERSION_RE = re.compile(r"^\d\.\d$")
-INTERPRETER_RE = re.compile(r"(&&\s+)((?:/usr/bin/)?php(?:\d\.\d)?)(\s)")
-MARKER_RE = re.compile(r"#\s*spanel:([a-z0-9.\-]{3,253})\s*$")
-QUOTED_REDIRECT_RE = re.compile(r"""\s'((?:\d?>>?|\d?>&\d)[^']*)'""")
+try:
+    from app.core.database import SessionLocal
+    from app.models.entities import Website
+    from app.services import cron as cron_service
 
-php_versions = {}
-with sqlite3.connect(f"file:{os.environ['SPANEL_DB_PATH']}?mode=ro", uri=True) as db:
-    for domain, php_version in db.execute("select domain, php_version from websites"):
-        php_versions[(domain or "").lower()] = (php_version or "").strip()
-
-
-def php_binary(domain):
-    version = php_versions.get(domain, "")
-    if not PHP_VERSION_RE.fullmatch(version):
-        return None
-    candidate = f"/usr/bin/php{version}"
-    return candidate if Path(candidate).exists() else None
-
-
-for spool in sorted(Path("/var/spool/cron/crontabs").iterdir()):
-    if not spool.is_file():
-        continue
-    try:
-        original = spool.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        continue
-    lines = original.splitlines()
-    changed = False
-    for index, line in enumerate(lines):
-        marker = MARKER_RE.search(line)
-        if not marker:
-            continue
-        new_line = line
-        # Unquote redirections so /bin/sh treats them as syntax again.
-        new_line = QUOTED_REDIRECT_RE.sub(lambda match: " " + match.group(1), new_line)
-        binary = php_binary(marker.group(1).lower())
-        if binary:
-            new_line = INTERPRETER_RE.sub(
-                lambda match: f"{match.group(1)}{shlex.quote(binary)}{match.group(3)}",
-                new_line,
-                count=1,
-            )
-        if new_line != line:
-            lines[index] = new_line
-            changed = True
-    if not changed:
-        continue
-    content = "\n".join(lines) + "\n"
-    result = subprocess.run(
-        ["runuser", "-u", spool.name, "--", "crontab", "-"],
-        input=content,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        print(f"Repaired spanel cron entries for {spool.name}")
-    else:
-        print(f"WARNING: could not rewrite crontab for {spool.name}: {result.stderr.strip()}")
+    # First, if any legacy user spool crontabs exist in /var/spool/cron/crontabs,
+    # migrate their spanel entries into /etc/cron.d/spanel-user-<user> via add_cron
+    spool_dir = Path("/var/spool/cron/crontabs")
+    with SessionLocal() as db:
+        websites_by_domain = {
+            (w.domain or "").lower(): w for w in db.query(Website).all()
+        }
+        if spool_dir.is_dir():
+            for spool in sorted(spool_dir.iterdir()):
+                if not spool.is_file() or spool.name in ("root", "www-data"):
+                    continue
+                try:
+                    raw_lines = spool.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
+                    continue
+                migrated_any = False
+                for raw_line in raw_lines:
+                    if "# spanel:" not in raw_line:
+                        continue
+                    parsed = cron_service._parse_cron_line(0, raw_line)
+                    dom = raw_line.rsplit("# spanel:", 1)[-1].strip().lower()
+                    site = websites_by_domain.get(dom)
+                    if site and parsed.get("schedule") and parsed.get("command"):
+                        try:
+                            cron_service.add_cron(site, parsed["schedule"], parsed["command"])
+                            migrated_any = True
+                        except Exception:
+                            pass
+                if migrated_any:
+                    subprocess.run(["crontab", "-r", "-u", spool.name], check=False, capture_output=True)
+        # Enforce full spanel-cron-jail (/bin/sh -c '...') confinement across all websites
+        cron_service.enforce_all_cron_confinement(db)
+except Exception as exc:
+    print(f"WARNING: cron confinement migration notice: {exc}")
 PY
 }
 
