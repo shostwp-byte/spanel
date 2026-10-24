@@ -4,7 +4,7 @@ import json
 from app.core.database import SessionLocal
 from app.core.secrets import decrypt
 from app.models.entities import BackupSchedule, SftpBackupTarget, User
-from app.services import backup, backup_s3
+from app.services import backup, backup_remote, backup_retention, backup_s3
 
 
 def _field_matches(field: str, value: int) -> bool:
@@ -67,6 +67,8 @@ def _upload_if_configured(db, schedule: BackupSchedule, archive: str, username: 
     if (target.kind or "sftp") == "s3":
         result = backup_s3.upload(target, archive, remote_name=remote_name, subpath=subpath)
         return f"{target.name}:{result['remote_file']}"
+    if (target.kind or "sftp") in backup_remote.FTP_KINDS:
+        return backup_remote.upload(target, archive, remote_name, subpath, db=db)
 
     try:
         password = decrypt(target.password) if target.password else None
@@ -98,6 +100,25 @@ def _upload_if_configured(db, schedule: BackupSchedule, archive: str, username: 
         target.host_key_fingerprint = result["host_key_fingerprint"]
         db.commit()
     return f"{target.name}:{result['remote_file']}"
+
+
+def _prune_remote(db, schedule: BackupSchedule, username: str) -> str:
+    """Retention on the destination as well as here. Never fails the backup
+    it follows: the new archive is already safe, and a destination that
+    refuses a delete is reported in the schedule's message instead."""
+    if not schedule.target_id:
+        return ""
+    target = db.query(SftpBackupTarget).filter(SftpBackupTarget.id == schedule.target_id).first()
+    if not target:
+        return ""
+    try:
+        result = backup_retention.prune_remote(target, username, schedule.retention)
+    except Exception as exc:  # noqa: BLE001
+        return f" (remote retention skipped: {exc})"
+    note = f" (pruned {len(result['deleted'])} old)" if result["deleted"] else ""
+    if result["errors"]:
+        note += f" (could not prune: {'; '.join(result['errors'][:3])})"
+    return note
 
 
 def _decode_user_ids(raw: str | None) -> list[int]:
@@ -172,7 +193,7 @@ def run_one(db, schedule: BackupSchedule, now: datetime | None = None) -> bool:
                 # failed upload raised above and leaves the archive in place.
                 backup.discard_local_copy(archive)
             backup.prune_user_backups(user.username, schedule.retention)
-            messages.append(f"{user.username}: {target}")
+            messages.append(f"{user.username}: {target}{_prune_remote(db, schedule, user.username)}")
         except Exception as exc:  # pragma: no cover - operational path
             errors.append(f"{user.username}: {exc}")
 

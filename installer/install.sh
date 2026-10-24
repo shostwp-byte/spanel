@@ -1084,6 +1084,11 @@ SERVICE
     sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-watchdog.service
     install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-watchdog.timer" /etc/systemd/system/spanel-watchdog.timer
   fi
+  if [[ -f "${SCRIPT_DIR}/files/spanel-maintenance.service" && -f "${SCRIPT_DIR}/files/spanel-maintenance.timer" ]]; then
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-maintenance.service" /etc/systemd/system/spanel-maintenance.service
+    sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-maintenance.service
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel-maintenance.timer" /etc/systemd/system/spanel-maintenance.timer
+  fi
 
   systemctl daemon-reload
   systemctl disable --now spanel-auto-update.timer 2>/dev/null || true
@@ -1095,6 +1100,7 @@ SERVICE
   systemctl enable --now spanel-malware-scheduler.timer
   systemctl enable --now spanel-notify.timer
   systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
+  systemctl enable --now spanel-maintenance.timer >/dev/null 2>&1 || true
   systemctl enable spanel-autotune.service >/dev/null 2>&1 || true
   systemctl start spanel-autotune.service >/dev/null 2>&1 || true
   systemctl enable spanel-timesync.timer >/dev/null 2>&1 || true

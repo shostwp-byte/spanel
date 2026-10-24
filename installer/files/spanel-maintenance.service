@@ -1,0 +1,23 @@
+[Unit]
+Description=SPanel maintenance window (auto-update, core stack and PHP patching, panel self-backup, backup verification)
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# A core stack patch or a panel self-backup can take a while; the runner holds
+# a lock, so a slow run never overlaps the next tick.
+TimeoutStartSec=3h
+User=spanel
+Group=spanel
+SupplementaryGroups=www-data spanel-sites
+WorkingDirectory=/opt/spanel/backend
+Environment=PYTHONPATH=/opt/spanel/backend
+Environment=HOME=/opt/spanel
+Environment=SPANEL_USE_HELPER=true
+EnvironmentFile=-/opt/spanel/backend/.env
+# The jobs reach root only through sudo spanel-helper.
+NoNewPrivileges=false
+ExecStart=/opt/spanel/backend/.venv/bin/python -m app.services.maintenance_window
+StandardOutput=journal
+StandardError=journal

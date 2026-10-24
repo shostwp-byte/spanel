@@ -521,19 +521,96 @@ run_os_update() {
   echo "OS update started in background. Log: /var/log/spanel-os-update.log"
 }
 
+CORE_STACK_BLACKLIST_FILE="/etc/apt/apt.conf.d/52spanel-core-stack-blacklist"
+
+# The unit to reload after a core stack package changed version. Empty where
+# the package's own postinst already restarts the daemon (MariaDB, Redis,
+# PowerDNS) or there is no daemon (openssl).
+core_stack_reload_unit() {
+  case "$1" in
+    nginx) echo nginx ;;
+    exim4-daemon-heavy) echo exim4 ;;
+    dovecot-core) echo dovecot ;;
+    rspamd) echo rspamd ;;
+    fail2ban) echo fail2ban ;;
+    *) echo "" ;;
+  esac
+}
+
+# Package-Blacklist entries for one core stack package: the binary packages
+# that come from the same source and move together. unattended-upgrades
+# matches each entry as a Python regex anchored at the start of the name.
+core_stack_blacklist_patterns() {
+  case "$1" in
+    nginx) printf '%s\n' '^nginx$' '^nginx-(common|core|full|light|extras)$' '^libnginx-mod-' ;;
+    mariadb-server) printf '%s\n' '^mariadb-' '^libmariadb' '^mysql-common$' ;;
+    redis-server) printf '%s\n' '^redis-(server|tools)$' ;;
+    pdns-server) printf '%s\n' '^pdns-' ;;
+    exim4-daemon-heavy) printf '%s\n' '^exim4' ;;
+    dovecot-core) printf '%s\n' '^dovecot-' ;;
+    rspamd) printf '%s\n' '^rspamd$' ;;
+    openssl) printf '%s\n' '^openssl$' '^libssl3' ;;
+    fail2ban) printf '%s\n' '^fail2ban$' ;;
+    *) return 1 ;;
+  esac
+}
+
+# The apt.conf.d snippet that keeps unattended-upgrades off the packages the
+# panel patches itself, so exactly one mechanism upgrades them: the panel's,
+# inside its maintenance window and with nginx -t before and after.
+render_core_blacklist() {
+  local pkg pattern
+  echo "// Managed by SPanel. These packages are patched by the panel's scheduled"
+  echo "// core stack patching (maintenance window, nginx -t before and after);"
+  echo "// turning that off in Updates removes this file."
+  echo "Unattended-Upgrade::Package-Blacklist {"
+  for pkg in "$@"; do
+    while IFS= read -r pattern; do
+      [[ -n "$pattern" ]] && printf '    "%s";\n' "$pattern"
+    done < <(core_stack_blacklist_patterns "$pkg")
+  done
+  echo "};"
+}
+
+set_core_stack_blacklist() {
+  local mode="${1:-}" pkg tmp
+  shift || true
+  case "$mode" in
+    off)
+      [[ $# -eq 0 ]] || deny "usage: updates-core-blacklist off"
+      rm -f "$CORE_STACK_BLACKLIST_FILE"
+      echo "core stack blacklist removed"
+      ;;
+    on)
+      [[ $# -ge 1 ]] || deny "usage: updates-core-blacklist on <pkg> [pkg...]"
+      for pkg in "$@"; do
+        core_stack_blacklist_patterns "$pkg" >/dev/null || deny "core stack package not allowed: $pkg"
+      done
+      install -d -m 0755 /etc/apt/apt.conf.d
+      tmp="$(mktemp "${CORE_STACK_BLACKLIST_FILE}.XXXXXX")"
+      render_core_blacklist "$@" >"$tmp"
+      chmod 0644 "$tmp"
+      mv -f "$tmp" "$CORE_STACK_BLACKLIST_FILE"
+      echo "core stack blacklist written: $*"
+      ;;
+    *)
+      deny "usage: updates-core-blacklist <on|off> [pkg...]"
+      ;;
+  esac
+}
+
 upgrade_core_stack_packages() {
   export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
-  local valid_pkgs=() pkg need_nginx_check=0 hold_after=0
+  local valid_pkgs=() pkg need_nginx_check=0 unit after
+  local changed=() reloaded=()
+  declare -A before=()
   for pkg in "$@"; do
     case "$pkg" in
-      --hold)
-        hold_after=1
-        ;;
       nginx)
         valid_pkgs+=("nginx")
         need_nginx_check=1
         ;;
-      mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|postfix|dovecot-core|rspamd|openssl|fail2ban)
+      mariadb-server|redis-server|pdns-server|exim4-daemon-heavy|dovecot-core|rspamd|openssl|fail2ban)
         valid_pkgs+=("$pkg")
         ;;
       *)
@@ -547,22 +624,46 @@ upgrade_core_stack_packages() {
     nginx -t >/dev/null 2>&1 || deny "nginx -t pre-upgrade configuration test failed"
   fi
 
+  for pkg in "${valid_pkgs[@]}"; do
+    before[$pkg]="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+  done
+
+  # Holds are not used any more (they block security updates too); undo any
+  # an older panel left behind so --only-upgrade can move these packages.
   apt-mark unhold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
   apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true
   local upgrade_rc=0
-  apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
-  if [[ "$hold_after" -eq 1 ]]; then
-    apt-mark hold "${valid_pkgs[@]}" >/dev/null 2>&1 || true
-  fi
-
+  apt-get install --only-upgrade -y "${valid_pkgs[@]}" || upgrade_rc=$?
   [[ "$upgrade_rc" -eq 0 ]] || deny "apt-get --only-upgrade failed for core stack packages"
 
+  for pkg in "${valid_pkgs[@]}"; do
+    after="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+    if [[ -n "${before[$pkg]}" && "$after" != "${before[$pkg]}" ]]; then
+      changed+=("$pkg")
+    fi
+  done
+  echo "upgraded=$(IFS=,; echo "${changed[*]:-}")"
+
   if [[ "$need_nginx_check" -eq 1 ]] && command -v nginx >/dev/null 2>&1; then
-    nginx -t >/dev/null 2>&1 || deny "nginx -t post-upgrade configuration test failed"
-    systemctl reload nginx >/dev/null 2>&1 || true
+    if ! nginx -t >/dev/null 2>&1; then
+      # Leave the running nginx alone: a reload with a config the new
+      # binary rejects would take every site down.
+      echo "post_check=failed:nginx"
+      deny "nginx -t post-upgrade configuration test failed; nginx was not reloaded"
+    fi
   fi
 
-  echo "Core stack packages selectively upgraded: ${valid_pkgs[*]}"
+  for pkg in "${changed[@]:-}"; do
+    [[ -n "$pkg" ]] || continue
+    unit="$(core_stack_reload_unit "$pkg")"
+    [[ -n "$unit" ]] || continue
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      systemctl reload "$unit" >/dev/null 2>&1 || systemctl restart "$unit" >/dev/null 2>&1 || true
+      reloaded+=("$unit")
+    fi
+  done
+  echo "reloaded=$(IFS=,; echo "${reloaded[*]:-}")"
+  echo "post_check=ok"
 }
 
 ensure_cron_jail_binary() {
@@ -575,6 +676,28 @@ ensure_cron_jail_binary() {
 
 
 PANEL_SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+PANEL_DB_BACKUP_DIR="${SPANEL_DATA_DIR}/db-backups"
+DEFAULT_SNAPSHOT_KEEP=5
+# The units that open spanel.db. All of them are stopped while the file is
+# swapped: a oneshot still holding the old file would write into a WAL that
+# no longer belongs to the database on disk.
+SPANEL_DB_TIMERS=(spanel-backup-scheduler.timer spanel-malware-scheduler.timer spanel-notify.timer spanel-watchdog.timer spanel-maintenance.timer)
+SPANEL_DB_ONESHOTS=(spanel-backup-scheduler.service spanel-malware-scheduler.service spanel-notify.service spanel-watchdog.service spanel-maintenance.service)
+# What spanel-update rewrites outside the code tree, relative to /. A rollback
+# that restores the code but keeps the new units or the new tools vhost is
+# half a rollback.
+PANEL_SNAPSHOT_SYSTEM_GLOBS=(
+  "etc/systemd/system/spanel-*.service"
+  "etc/systemd/system/spanel-*.timer"
+  "etc/systemd/system/spanel-api.service.d"
+  "etc/nginx/conf.d/00-spanel-*.conf"
+  "etc/sudoers.d/spanel"
+  "usr/local/sbin/spanel"
+  "usr/local/sbin/spanel-api-start"
+  "usr/local/sbin/spanel-memory-guard"
+  "usr/local/sbin/spanel-change-ip"
+  "usr/local/bin/spanel-cron-jail"
+)
 
 panel_current_version() {
   local ver="1.0.0"
@@ -584,11 +707,135 @@ panel_current_version() {
   [[ -n "$ver" ]] && echo "$ver" || echo "1.0.0"
 }
 
+# The panel's SQLite file, from DATABASE_URL in .env. Only an absolute
+# sqlite:/// path with plain characters is accepted.
+panel_db_path() {
+  local url path
+  url="$(env_get DATABASE_URL)"
+  if [[ "$url" =~ ^sqlite:///(/[A-Za-z0-9._/-]+\.db)$ ]]; then
+    path="${BASH_REMATCH[1]}"
+  else
+    path="${APP_DIR}/backend/spanel.db"
+  fi
+  [[ "$path" != *..* ]] || deny "invalid database path"
+  echo "$path"
+}
+
+# The system python and its stdlib only (-I: no user site, no cwd on the path).
+# Never the panel's venv: that would be panel-writable code running as root.
+sqlite_online_copy() {
+  /usr/bin/python3 -I - "$1" "$2" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+PY
+}
+
+sqlite_integrity_ok() {
+  /usr/bin/python3 -I - "$1" <<'PY'
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+    row = conn.execute("PRAGMA integrity_check").fetchone()
+    tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+    conn.close()
+except sqlite3.Error as exc:
+    print(f"integrity_check: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not row or row[0] != "ok" or tables == 0:
+    print(f"integrity_check: {row[0] if row else 'no answer'} ({tables} tables)", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+sqlite_alembic_revision() {
+  /usr/bin/python3 -I - "$1" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+try:
+    print(",".join(r[0] for r in conn.execute("SELECT version_num FROM alembic_version")))
+except sqlite3.Error:
+    pass
+PY
+}
+
+# Replace the panel database with <src>, safely:
+#   1. integrity_check the replacement before anything is stopped;
+#   2. stop the API and every timer/oneshot that opens the database;
+#   3. keep the current database (read through its WAL) as
+#      <db>.pre-restore-<ts>, so nothing is ever lost by a restore;
+#   4. drop -wal/-shm (they belong to the old file) and move the copy in;
+#   5. start what was running again.
+swap_panel_db() {
+  local src="$1" db ts timer tmp
+  local -a active_timers=()
+  db="$(panel_db_path)"
+  [[ -f "$src" ]] || deny "database copy not found"
+  sqlite_integrity_ok "$src" || deny "the database copy failed PRAGMA integrity_check; nothing was changed"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  tmp="${db}.restore-${ts}"
+  install -m 0640 -o spanel -g spanel "$src" "$tmp"
+
+  for timer in "${SPANEL_DB_TIMERS[@]}"; do
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then
+      active_timers+=("$timer")
+    fi
+  done
+  systemctl stop "${SPANEL_DB_TIMERS[@]}" >/dev/null 2>&1 || true
+  systemctl stop spanel-api >/dev/null 2>&1 || true
+  # A oneshot already running is given a minute to finish, never killed: the
+  # maintenance runner may be half-way through apt, the backup runner through
+  # an archive. One still running after that keeps the old file open and
+  # writes there - a lost status line, not a damaged database (SQLite locks
+  # by inode, and the copy moved in below is a new one).
+  local deadline=$((SECONDS + 60)) unit
+  for unit in "${SPANEL_DB_ONESHOTS[@]}"; do
+    while systemctl is-active --quiet "$unit" 2>/dev/null && (( SECONDS < deadline )); do
+      sleep 2
+    done
+  done
+
+  if [[ -f "$db" ]]; then
+    sqlite_online_copy "$db" "${db}.pre-restore-${ts}" || cp -a "$db" "${db}.pre-restore-${ts}"
+    chown spanel:spanel "${db}.pre-restore-${ts}" 2>/dev/null || true
+    chmod 0640 "${db}.pre-restore-${ts}" 2>/dev/null || true
+  fi
+  rm -f "${db}-wal" "${db}-shm"
+  mv -f "$tmp" "$db"
+  # Keep the three newest pre-restore copies.
+  ls -1t "${db}".pre-restore-* 2>/dev/null | tail -n +4 | xargs -r rm -f || true
+
+  systemctl start spanel-api >/dev/null 2>&1 || true
+  for timer in "${active_timers[@]:-}"; do
+    [[ -n "$timer" ]] && systemctl start "$timer" >/dev/null 2>&1 || true
+  done
+  echo "database_restored=${db} previous=${db}.pre-restore-${ts}"
+}
+
+panel_snapshot_prune() {
+  local keep="$1" s
+  local old_snaps=()
+  while IFS= read -r s; do
+    [[ -n "$s" ]] && old_snaps+=("$s")
+  done < <(ls -1t "${PANEL_SNAPSHOT_DIR}"/snapshot-*.tar.gz 2>/dev/null | tail -n +"$((keep + 1))" || true)
+  for s in "${old_snaps[@]:-}"; do
+    [[ -n "$s" ]] || continue
+    rm -f "$s" "${s%.tar.gz}.json" 2>/dev/null || true
+  done
+}
+
 panel_snapshot_create() {
-  local reason="${1:-manual}"
+  local reason="${1:-manual}" keep="${2:-$DEFAULT_SNAPSHOT_KEEP}"
   [[ "$reason" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || reason="manual"
+  [[ "$keep" =~ ^[0-9]{1,2}$ ]] || deny "snapshot keep must be a number"
+  (( keep >= 1 && keep <= 20 )) || deny "snapshot keep must be between 1 and 20"
   install -d -o root -g spanel -m 0750 "$PANEL_SNAPSHOT_DIR"
-  local ver ts snap_id work tar_path meta_path size_bytes
+  local ver ts snap_id work tar_path meta_path size_bytes db revision="" glob path
+  local -a system_paths=()
   ver="$(panel_current_version)"
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   snap_id="snapshot-v${ver}-${ts}"
@@ -604,12 +851,31 @@ panel_snapshot_create() {
   [[ -f "/usr/local/sbin/spanel-helper" ]] && cp -a "/usr/local/sbin/spanel-helper" "$work/sbin/spanel-helper"
   [[ -f "/usr/local/sbin/spanel-update" ]] && cp -a "/usr/local/sbin/spanel-update" "$work/sbin/spanel-update"
 
-  if [[ -f "${APP_DIR}/backend/spanel.db" ]]; then
-    if command -v sqlite3 >/dev/null 2>&1; then
-      sqlite3 "${APP_DIR}/backend/spanel.db" ".backup '${work}/backend/spanel.db.bak'" 2>/dev/null || cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    else
-      cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    fi
+  # The database through SQLite's online backup API, which reads committed
+  # pages from the WAL too: a plain cp of a WAL-mode file can miss them.
+  # Taken before spanel-update runs any migration, so restoring it is what
+  # reverses one (Alembic downgrades are not written for this schema).
+  db="$(panel_db_path)"
+  if [[ -f "$db" ]]; then
+    sqlite_online_copy "$db" "$work/backend/spanel.db.bak" || cp -a "$db" "$work/backend/spanel.db.bak"
+    revision="$(sqlite_alembic_revision "$work/backend/spanel.db.bak")"
+  fi
+
+  # The virtualenv is ~160 MB, too much to keep five copies of. Its exact
+  # package set is recorded instead; a rollback reinstalls it when it differs.
+  if [[ -x "${APP_DIR}/backend/.venv/bin/python" ]]; then
+    "${APP_DIR}/backend/.venv/bin/python" -m pip freeze --all >"$work/backend/pip-freeze.txt" 2>/dev/null || rm -f "$work/backend/pip-freeze.txt"
+  fi
+
+  shopt -s nullglob
+  for glob in "${PANEL_SNAPSHOT_SYSTEM_GLOBS[@]}"; do
+    for path in /$glob; do
+      [[ -e "$path" && ! -L "$path" ]] && system_paths+=("${path#/}")
+    done
+  done
+  shopt -u nullglob
+  if [[ ${#system_paths[@]} -gt 0 ]]; then
+    tar -C / -cpf "$work/system.tar" "${system_paths[@]}" 2>/dev/null || rm -f "$work/system.tar"
   fi
 
   tar -czf "$tar_path" -C "$work" .
@@ -624,30 +890,131 @@ panel_snapshot_create() {
   "version": "${ver}",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "size_bytes": ${size_bytes},
-  "reason": "${reason}"
+  "reason": "${reason}",
+  "db_revision": "${revision}",
+  "has_db": $([[ -n "$revision" || -f "$db" ]] && echo true || echo false),
+  "has_system_files": $([[ ${#system_paths[@]} -gt 0 ]] && echo true || echo false)
 }
 EOF
   chmod 0640 "$meta_path"
   chown root:spanel "$meta_path" 2>/dev/null || true
 
-  # Prune old snapshots beyond the newest 5
-  local old_snaps=() s
-  while IFS= read -r s; do
-    [[ -n "$s" ]] && old_snaps+=("$s")
-  done < <(ls -1t "${PANEL_SNAPSHOT_DIR}"/snapshot-*.tar.gz 2>/dev/null | tail -n +6 || true)
-  for s in "${old_snaps[@]:-}"; do
-    [[ -n "$s" ]] || continue
-    rm -f "$s" "${s%.tar.gz}.json" 2>/dev/null || true
-  done
-
+  panel_snapshot_prune "$keep"
   echo "${snap_id}"
 }
 
+# Put the system files of a snapshot back. The current versions are kept
+# aside first; if nginx refuses the restored set, they go back.
+panel_snapshot_restore_system() {
+  local work="$1" saved path
+  local -a paths=()
+  [[ -f "$work/system.tar" ]] || return 0
+  while IFS= read -r path; do
+    [[ -n "$path" && "$path" != /* && "$path" != *..* ]] && paths+=("$path")
+  done < <(tar -tf "$work/system.tar" 2>/dev/null)
+  [[ ${#paths[@]} -gt 0 ]] || return 0
+  saved="$work/system-current.tar"
+  tar -C / -cpf "$saved" --ignore-failed-read "${paths[@]}" 2>/dev/null || true
+  tar -C / -xpf "$work/system.tar"
+  # Units the newer release added and the snapshot's release does not know:
+  # left in place they would start code that is no longer there.
+  local unit_file unit
+  local -A in_snapshot=()
+  for path in "${paths[@]}"; do
+    in_snapshot["$path"]=1
+  done
+  # Only when the snapshot did record units, and never the API itself.
+  if [[ -n "${in_snapshot[etc/systemd/system/spanel-api.service]:-}" ]]; then
+    shopt -s nullglob
+    for unit_file in /etc/systemd/system/spanel-*.service /etc/systemd/system/spanel-*.timer; do
+      [[ "$unit_file" == /etc/systemd/system/spanel-api.service ]] && continue
+      if [[ -z "${in_snapshot[${unit_file#/}]:-}" ]]; then
+        unit="$(basename "$unit_file")"
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        rm -f "$unit_file"
+      fi
+    done
+    shopt -u nullglob
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    echo "restored nginx files fail nginx -t; keeping the current ones" >&2
+    [[ -f "$saved" ]] && tar -C / -xpf "$saved" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  visudo -c -f /etc/sudoers.d/spanel >/dev/null 2>&1 || {
+    [[ -f "$saved" ]] && tar -C / -xpf "$saved" etc/sudoers.d/spanel 2>/dev/null || true
+  }
+}
+
+panel_snapshot_restore_venv() {
+  local work="$1" current
+  [[ -f "$work/backend/pip-freeze.txt" && -x "${APP_DIR}/backend/.venv/bin/python" ]] || return 0
+  current="$(mktemp)"
+  "${APP_DIR}/backend/.venv/bin/python" -m pip freeze --all >"$current" 2>/dev/null || true
+  if ! cmp -s "$current" "$work/backend/pip-freeze.txt"; then
+    echo "Python packages differ from the snapshot; reinstalling the recorded set" >&2
+    "${APP_DIR}/backend/.venv/bin/python" -m pip install --no-input -q -r "$work/backend/pip-freeze.txt" >&2 \
+      || echo "pip could not reinstall the recorded packages; the panel may need: spanel-update" >&2
+  fi
+  rm -f "$current"
+}
+
+# Record the outcome of a restore that ran detached from the API, so the
+# Updates page does not show "rolling back" forever. The directory belongs to
+# the panel account: never follow a link it planted, write a fresh file and
+# rename it over the old name.
+panel_update_state_set() {
+  local status="$1" message="$2" snap="$3"
+  /usr/bin/python3 -I - "${SPANEL_DATA_DIR}/update-status.json" "$status" "$message" "$snap" <<'PY' || true
+import json, os, sys, tempfile, time
+path, status, message, snap = sys.argv[1:5]
+state = {}
+if os.path.isfile(path) and not os.path.islink(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = {}
+state.update({"last_update_status": status, "progress_phase": status, "progress_percent": 100,
+              "progress_message": message, "last_update_message": message, "rollback_snapshot_id": snap,
+              "last_update_finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".update-status.")
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(state, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+PY
+  chown spanel:spanel "${SPANEL_DATA_DIR}/update-status.json" 2>/dev/null || true
+}
+
 panel_snapshot_restore() {
-  local snap_id="${1:-}"
+  local snap_id="${1:-}" restore_db="" now="" arg
   [[ "$snap_id" =~ ^snapshot-[A-Za-z0-9._-]+$ ]] || deny "invalid snapshot id: $snap_id"
+  shift || true
+  for arg in "$@"; do
+    case "$arg" in
+      --restore-db) restore_db=1 ;;
+      --now) now=1 ;;
+      *) deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db] [--now]" ;;
+    esac
+  done
   local tar_path="${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz"
   [[ -f "$tar_path" ]] || deny "snapshot not found: $snap_id"
+
+  # From the API this runs inside spanel-api's own cgroup, and stopping
+  # spanel-api (to swap the database, or to restart it) would kill this
+  # very process half-way. Run the restore in a unit of its own instead.
+  if [[ -z "$now" ]] && command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --unit="spanel-snapshot-restore-$(date +%s)" --collect \
+      --description="SPanel snapshot restore ${snap_id}" \
+      --on-active=2s \
+      --setenv=SUDO_USER=spanel \
+      /usr/local/sbin/spanel-helper panel-snapshot-restore "$snap_id" ${restore_db:+--restore-db} --now >/dev/null
+    echo "scheduled=${snap_id}"
+    return 0
+  fi
 
   local work
   work="$(mktemp -d /tmp/spanel-restore.XXXXXX)"
@@ -684,15 +1051,20 @@ panel_snapshot_restore() {
     chown root:root "/usr/local/sbin/spanel-update.new" 2>/dev/null || true
     mv -f "/usr/local/sbin/spanel-update.new" "/usr/local/sbin/spanel-update"
   fi
-  if [[ -f "$work/backend/spanel.db.bak" && "${2:-}" == "--restore-db" ]]; then
-    cp -a "$work/backend/spanel.db.bak" "${APP_DIR}/backend/spanel.db"
-    chown spanel:spanel "${APP_DIR}/backend/spanel.db" 2>/dev/null || true
+  panel_snapshot_restore_system "$work"
+  panel_snapshot_restore_venv "$work"
+
+  if [[ -n "$restore_db" && -f "$work/backend/spanel.db.bak" ]]; then
+    # swap_panel_db stops and starts spanel-api itself.
+    swap_panel_db "$work/backend/spanel.db.bak"
+  else
+    systemctl restart spanel-api >/dev/null 2>&1 || true
   fi
 
   rm -rf "$work"
   rm -rf /var/lib/spanel/update-state 2>/dev/null || true
-  systemctl restart spanel-api >/dev/null 2>&1 || true
   systemctl reload nginx >/dev/null 2>&1 || true
+  panel_update_state_set "rolled_back" "Restored snapshot ${snap_id}${restore_db:+ (database included)}." "$snap_id"
   echo "restored=${snap_id}"
 }
 
@@ -701,6 +1073,283 @@ panel_snapshot_delete() {
   [[ "$snap_id" =~ ^snapshot-[A-Za-z0-9._-]+$ ]] || deny "invalid snapshot id: $snap_id"
   rm -f "${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz" "${PANEL_SNAPSHOT_DIR}/${snap_id}.json" 2>/dev/null || true
   echo "deleted=${snap_id}"
+}
+
+# ---- panel self-backup (disaster recovery) ----------------------------------
+# One encrypted archive of everything that makes this server this panel and is
+# not in the per-account backups: the panel database and .env (SECRET_KEY
+# decrypts every stored secret), /etc/spanel, certificates, the nginx/PHP/mail
+# configuration the panel wrote, DKIM keys and the PowerDNS zones.
+#
+# It is encrypted here, as root, with a passphrase only root can read
+# (PANEL_DR_KEY_FILE). The panel account uploads the result but cannot open
+# it: the archive holds secrets - the audit key, DKIM private keys - that the
+# panel account itself is not meant to be able to read back from a bucket.
+PANEL_DR_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-dr"
+PANEL_DR_KEY_FILE="/etc/spanel/dr-passphrase"
+PANEL_DR_KEEP_LOCAL=3
+# Relative to /. Globs are expanded; what does not exist is skipped.
+PANEL_DR_PATHS=(
+  "opt/spanel/backend/.env"
+  "etc/spanel"
+  "var/lib/spanel"
+  "etc/nginx/nginx.conf"
+  "etc/nginx/conf.d"
+  "etc/nginx/spanel"
+  "etc/php/*/fpm/pool.d"
+  "etc/php/*/fpm/conf.d/*spanel*"
+  "etc/php/*/cli/conf.d/*spanel*"
+  "etc/exim4"
+  "etc/dovecot"
+  "etc/rspamd/local.d"
+  "etc/rspamd/override.d"
+  "etc/spanel-mail-tls"
+  "etc/powerdns"
+  "etc/letsencrypt"
+  "etc/mysql/mariadb.conf.d/90-spanel-tuning.cnf"
+  "etc/ssh/sshd_config.d"
+  "etc/sudoers.d/spanel"
+  "etc/systemd/system/spanel-*.service"
+  "etc/systemd/system/spanel-*.timer"
+  "var/spool/cron/crontabs"
+)
+# Never in the archive: the passphrase that encrypts it, bulky caches and
+# copies that are themselves backups.
+PANEL_DR_EXCLUDES=(
+  "etc/spanel/dr-passphrase"
+  "var/lib/spanel/db-backups"
+  "var/lib/spanel/geoip"
+  "var/lib/spanel/malware-scan-jobs"
+  "var/lib/spanel/da-import"
+  "var/lib/spanel/import-stage"
+  "*.sock"
+)
+
+# The include list, relative to <root> (/ on a server; a test points it at a
+# fixture tree). The app directory is taken from APP_DIR when it differs.
+panel_dr_include_paths() {
+  local root="${1:-/}" glob path app_rel
+  app_rel="${APP_DIR#/}"
+  shopt -s nullglob
+  for glob in "${PANEL_DR_PATHS[@]}"; do
+    glob="${glob/opt\/spanel/$app_rel}"
+    for path in "${root%/}"/$glob; do
+      [[ -e "$path" && ! -L "$path" ]] || continue
+      printf '%s\n' "${path#"${root%/}"/}"
+    done
+  done
+  shopt -u nullglob
+}
+
+panel_dr_fingerprint() {
+  /usr/bin/python3 -I - "$PANEL_DR_KEY_FILE" <<'PY'
+import hashlib, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = handle.readline().strip()
+print(hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16])
+PY
+}
+
+panel_dr_key_status() {
+  if [[ -s "$PANEL_DR_KEY_FILE" ]]; then
+    echo "initialised=yes"
+    echo "fingerprint=$(panel_dr_fingerprint)"
+  else
+    echo "initialised=no"
+  fi
+}
+
+# Generate the passphrase and print it, once. It is not printed again by
+# anything: the panel shows it to the administrator, who must keep a copy
+# off this server - without it the archive cannot be opened on a new one.
+panel_dr_key_init() {
+  local mode="${1:-}" tmp
+  if [[ -s "$PANEL_DR_KEY_FILE" && "$mode" != "--rotate" ]]; then
+    deny "the panel self-backup passphrase is already set; rotate it explicitly"
+  fi
+  [[ -z "$mode" || "$mode" == "--rotate" ]] || deny "usage: panel-dr-key-init [--rotate]"
+  install -d -o root -g spanel -m 0750 /etc/spanel
+  tmp="$(mktemp /etc/spanel/.dr-passphrase.XXXXXX)"
+  chmod 0600 "$tmp"
+  /usr/bin/python3 -I -c 'import secrets; print(secrets.token_urlsafe(30))' >"$tmp"
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; deny "could not generate a passphrase"; }
+  chown root:root "$tmp"
+  mv -f "$tmp" "$PANEL_DR_KEY_FILE"
+  echo "passphrase=$(head -n 1 "$PANEL_DR_KEY_FILE")"
+  echo "fingerprint=$(panel_dr_fingerprint)"
+}
+
+# Encrypt <plain> to <out> in the panel's backup format: OpenSSL
+# AES-256-CBC with PBKDF2-HMAC-SHA256 (100000 rounds, "Salted__" header),
+# then an SPNLMAC1 + HMAC-SHA256 trailer over header and ciphertext, keyed
+# with bytes 48-80 of the same PBKDF2 output. backup.decrypt_backup_archive
+# and `spanelctl dr-restore` both open it. The passphrase never appears on a
+# command line: openssl reads it from the root-only file.
+panel_dr_encrypt() {
+  local plain="$1" out="$2"
+  openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -md sha256 \
+    -pass file:"$PANEL_DR_KEY_FILE" -in "$plain" -out "$out"
+  /usr/bin/python3 -I - "$out" "$PANEL_DR_KEY_FILE" <<'PY'
+import hashlib, hmac, sys
+path, keyfile = sys.argv[1], sys.argv[2]
+with open(keyfile, encoding="utf-8") as handle:
+    secret = handle.readline().strip()
+with open(path, "rb") as handle:
+    header = handle.read(16)
+    if header[:8] != b"Salted__":
+        sys.exit("openssl did not write a salted header")
+    key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), header[8:16], 100000, dklen=80)
+    mac = hmac.new(key[48:80], digestmod=hashlib.sha256)
+    mac.update(header)
+    while chunk := handle.read(1024 * 1024):
+        mac.update(chunk)
+with open(path, "ab") as handle:
+    handle.write(b"SPNLMAC1" + mac.digest())
+PY
+}
+
+# PowerDNS data the way its backend holds it, plus a plain zone-file export
+# that any backend can load (pdnsutil load-zone).
+panel_dr_dump_pdns() {
+  local out="$1" dbname zone
+  mkdir -p "$out/zones"
+  if [[ -f "$PDNS_DB" ]]; then
+    sqlite_online_copy "$PDNS_DB" "$out/pdns.sqlite3" && echo "gsqlite3" >"$out/backend"
+  elif grep -qs '^launch=.*gmysql' /etc/powerdns/pdns.conf /etc/powerdns/pdns.d/*.conf 2>/dev/null; then
+    dbname="$(awk -F= '/^gmysql-dbname=/{print $2; exit}' /etc/powerdns/pdns.conf /etc/powerdns/pdns.d/*.conf 2>/dev/null || true)"
+    dbname="${dbname:-pdns}"
+    [[ "$dbname" =~ ^[A-Za-z0-9_]{1,64}$ ]] || dbname="pdns"
+    if mysqldump --single-transaction --routines "$dbname" >"$out/pdns.sql" 2>/dev/null; then
+      echo "gmysql:${dbname}" >"$out/backend"
+    else
+      rm -f "$out/pdns.sql"
+    fi
+  fi
+  if command -v pdnsutil >/dev/null 2>&1; then
+    while IFS= read -r zone; do
+      zone="${zone%.}"
+      is_domain "$zone" || continue
+      pdnsutil list-zone "$zone" >"$out/zones/${zone}.zone" 2>/dev/null || rm -f "$out/zones/${zone}.zone"
+    done < <(pdnsutil list-all-zones 2>/dev/null)
+  fi
+}
+
+panel_dr_archive() {
+  [[ -s "$PANEL_DR_KEY_FILE" ]] || deny "set the panel self-backup passphrase first (panel-dr-key-init)"
+  local host ts work name plain out manifest db exclude
+  local -a includes=() tar_excludes=()
+  host="$(hostname -f 2>/dev/null || hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9.-' '-' | cut -c1-63)"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  name="panel-dr-${host}-${ts}"
+  install -d -o root -g spanel -m 0750 "$PANEL_DR_DIR"
+  work="$(mktemp -d /var/tmp/spanel-dr.XXXXXX)"
+  chmod 0700 "$work"
+  PANEL_DR_WORK="$work"   # removed by the EXIT trap set in the command case
+
+  mkdir -p "$work/db" "$work/pdns"
+  db="$(panel_db_path)"
+  [[ -f "$db" ]] && sqlite_online_copy "$db" "$work/db/spanel.db"
+  panel_dr_dump_pdns "$work/pdns"
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && includes+=("$path")
+  done < <(panel_dr_include_paths /)
+  for exclude in "${PANEL_DR_EXCLUDES[@]}"; do
+    tar_excludes+=("--exclude=${exclude}")
+  done
+  # The live database is in db/ as an online copy; the file itself may be
+  # mid-write.
+  tar_excludes+=("--exclude=${db#/}" "--exclude=${db#/}-wal" "--exclude=${db#/}-shm")
+  if [[ ${#includes[@]} -gt 0 ]]; then
+    tar -C / -cpf "$work/files.tar" "${tar_excludes[@]}" --ignore-failed-read "${includes[@]}" 2>/dev/null || true
+  fi
+
+  /usr/bin/python3 -I - "$work" "$host" "$(panel_current_version)" "${includes[@]}" <<'PY'
+import json, os, sqlite3, sys, time
+work, host, version, includes = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+revision = ""
+db = os.path.join(work, "db", "spanel.db")
+if os.path.isfile(db):
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        revision = ",".join(r[0] for r in conn.execute("SELECT version_num FROM alembic_version"))
+        conn.close()
+    except sqlite3.Error:
+        pass
+backend = ""
+backend_file = os.path.join(work, "pdns", "backend")
+if os.path.isfile(backend_file):
+    backend = open(backend_file, encoding="utf-8").read().strip()
+zones = sorted(f[:-5] for f in os.listdir(os.path.join(work, "pdns", "zones")) if f.endswith(".zone")) \
+    if os.path.isdir(os.path.join(work, "pdns", "zones")) else []
+manifest = {
+    "kind": "spanel_panel_dr",
+    "format": 1,
+    "hostname": host,
+    "panel_version": version,
+    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "db_revision": revision,
+    "has_database": os.path.isfile(db),
+    "pdns_backend": backend,
+    "dns_zones": len(zones),
+    "paths": includes,
+}
+with open(os.path.join(work, "manifest.json"), "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+PY
+
+  plain="$work/${name}.tar.gz"
+  tar -C "$work" -czf "$plain" manifest.json db pdns $([[ -f "$work/files.tar" ]] && echo files.tar)
+  out="${PANEL_DR_DIR}/${name}.spdr"
+  manifest="${PANEL_DR_DIR}/${name}.json"
+  panel_dr_encrypt "$plain" "$out.tmp"
+  mv -f "$out.tmp" "$out"
+  # The manifest beside the archive is plain and holds no secret: what is in
+  # it, for the page and for a person choosing which archive to restore.
+  /usr/bin/python3 -I - "$work/manifest.json" "$out" "$manifest" <<'PY'
+import hashlib, json, os, sys
+src, archive, dst = sys.argv[1:4]
+data = json.load(open(src, encoding="utf-8"))
+digest = hashlib.sha256()
+with open(archive, "rb") as handle:
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+data.update({"archive": os.path.basename(archive), "size": os.path.getsize(archive), "sha256": digest.hexdigest()})
+with open(dst, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+PY
+  chown root:spanel "$out" "$manifest"
+  chmod 0640 "$out" "$manifest"
+
+  ls -1t "${PANEL_DR_DIR}"/panel-dr-*.spdr 2>/dev/null | tail -n +"$((PANEL_DR_KEEP_LOCAL + 1))" | while IFS= read -r old; do
+    rm -f "$old" "${old%.spdr}.json"
+  done || true
+  echo "archive=${out}"
+  echo "manifest=${manifest}"
+}
+
+# Hot database backups (taken by the watchdog every 6 h and on demand) live
+# in PANEL_DB_BACKUP_DIR as spanel-<UTC stamp>-<reason>.db.
+panel_db_restore() {
+  local name="${1:-}" mode="${2:-}" src
+  [[ "$name" =~ ^spanel-[0-9]{8}T[0-9]{6}Z-[a-z0-9_-]{1,24}\.db$ ]] || deny "invalid database backup name"
+  src="${PANEL_DB_BACKUP_DIR}/${name}"
+  [[ -f "$src" && ! -L "$src" ]] || deny "database backup not found: $name"
+  sqlite_integrity_ok "$src" || deny "the backup failed PRAGMA integrity_check; nothing was changed"
+  if [[ "$mode" == "--now" ]] || ! command -v systemd-run >/dev/null 2>&1; then
+    swap_panel_db "$src"
+    return 0
+  fi
+  [[ -z "$mode" ]] || deny "usage: panel-db-restore <backup-name> [--now]"
+  # Same reason as panel-snapshot-restore: stopping spanel-api from inside
+  # spanel-api's cgroup would kill this process before the swap.
+  systemd-run --unit="spanel-db-restore-$(date +%s)" --collect \
+    --description="SPanel database restore ${name}" \
+    --on-active=2s \
+    --setenv=SUDO_USER=spanel \
+    /usr/local/sbin/spanel-helper panel-db-restore "$name" --now >/dev/null
+  echo "scheduled=${name}"
 }
 
 run_panel_update() {
@@ -8674,6 +9323,11 @@ case "$cmd" in
     upgrade_core_stack_packages "$@"
     ;;
 
+  updates-core-blacklist)
+    [[ $# -ge 1 ]] || deny "usage: updates-core-blacklist <on|off> [pkg...]"
+    set_core_stack_blacklist "$@"
+    ;;
+
   updates-os-auto)
     [[ $# -eq 3 ]] || deny "usage: updates-os-auto <on|off> <security|all> <on|off>"
     configure_unattended_upgrades "$1" "$2" "$3"
@@ -8684,17 +9338,40 @@ case "$cmd" in
     ;;
 
   panel-snapshot-create)
-    panel_snapshot_create "${1:-manual}"
+    [[ $# -le 2 ]] || deny "usage: panel-snapshot-create [reason] [keep]"
+    panel_snapshot_create "${1:-manual}" "${2:-$DEFAULT_SNAPSHOT_KEEP}"
     ;;
 
   panel-snapshot-restore)
-    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db]"
-    panel_snapshot_restore "$1" "${2:-}"
+    [[ $# -ge 1 && $# -le 3 ]] || deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db] [--now]"
+    panel_snapshot_restore "$@"
     ;;
 
   panel-snapshot-delete)
     [[ $# -eq 1 ]] || deny "usage: panel-snapshot-delete <snapshot-id>"
     panel_snapshot_delete "$1"
+    ;;
+
+  panel-db-restore)
+    [[ $# -ge 1 && $# -le 2 ]] || deny "usage: panel-db-restore <backup-name> [--now]"
+    panel_db_restore "$1" "${2:-}"
+    ;;
+
+  panel-dr-key-status)
+    [[ $# -eq 0 ]] || deny "usage: panel-dr-key-status"
+    panel_dr_key_status
+    ;;
+
+  panel-dr-key-init)
+    [[ $# -le 1 ]] || deny "usage: panel-dr-key-init [--rotate]"
+    panel_dr_key_init "${1:-}"
+    ;;
+
+  panel-dr-archive)
+    [[ $# -eq 0 ]] || deny "usage: panel-dr-archive"
+    PANEL_DR_WORK=""
+    trap '[[ -n "${PANEL_DR_WORK:-}" ]] && rm -rf "$PANEL_DR_WORK"' EXIT
+    panel_dr_archive
     ;;
 
   # ---- WAF --------------------------------------------------------------

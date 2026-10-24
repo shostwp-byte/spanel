@@ -1486,7 +1486,7 @@ class SftpBackupTargetCreate(BaseModel):
     """An SSH server or an object store. `kind` decides which fields matter."""
 
     name: str = Field(min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._ -]+$")
-    kind: str = Field(default="sftp", pattern=r"^(sftp|s3)$")
+    kind: str = Field(default="sftp", pattern=r"^(sftp|s3|ftp|ftps)$")
 
     # S3 and anything that speaks its API
     endpoint: Optional[str] = Field(default=None, max_length=255)
@@ -1553,6 +1553,13 @@ class SftpBackupTargetCreate(BaseModel):
                        if not getattr(self, name)]
             if missing:
                 raise ValueError("An S3 target needs " + ", ".join(missing))
+        elif self.kind in ("ftp", "ftps"):
+            if not self.host or not self.username or not self.password:
+                raise ValueError("An FTP target needs a host, a username and a password")
+            if self.private_key:
+                raise ValueError("An FTP target takes a password, not a private key")
+            if self.port == 22:
+                self.port = 21  # the form's SFTP default
         else:
             if not self.host or not self.username:
                 raise ValueError("An SFTP target needs a host and a username")

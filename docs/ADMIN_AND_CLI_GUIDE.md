@@ -50,6 +50,7 @@ Menu tương tác sẽ hiển thị các chức năng cứu hộ toàn diện. N
 | `sudo spanel ssl` | Cấp mới hoặc gia hạn chứng chỉ SSL Let's Encrypt cho tên miền quản trị Panel. |
 | `sudo spanel-update` | Kiểm tra và cập nhật SPanel lên phiên bản mới nhất từ GitHub. |
 | `sudo spanel-rescue-firewall` | Cứu hộ khẩn cấp khi cấu hình nhầm tường lửa: sao lưu luật cũ và mở lại các cổng thiết yếu. |
+| `sudo spanel dr-restore <file.spdr>` | Dựng lại trạng thái Panel trên máy chủ mới từ bản tự sao lưu của Panel (xem mục 6). Thêm `--inspect` để chỉ xem nội dung. |
 
 ---
 
@@ -103,3 +104,32 @@ SPanel hỗ trợ công cụ **Migration & Restore** mạnh mẽ giúp chuyển 
    - Quá trình giải nén được bảo vệ chống tấn công Path Traversal / Symlink, tự động chuyển đổi cấu trúc thư mục và cơ sở dữ liệu sang chuẩn của SPanel.
 3. **Khôi phục từ Kho lưu trữ Từ xa (S3 / SFTP / FTP):**
    - Hỗ trợ kết nối trực tiếp tới AWS S3, Cloudflare R2, Wasabi, Backblaze B2, MinIO hoặc máy chủ SFTP/FTP từ xa để chọn danh sách tài khoản và khôi phục hàng loạt trong nền.
+
+---
+
+## 6. Khôi phục sau thảm hoạ (Disaster Recovery)
+
+Bản sao lưu tài khoản khôi phục website, cơ sở dữ liệu và hộp thư. Bản **tự sao lưu của Panel** (Backups > Panel self-backup & verification) giữ phần còn lại: database của Panel (tài khoản, gói, đích sao lưu, lịch), `.env` (`SECRET_KEY` để giải mã mọi mật khẩu đã lưu), `/etc/spanel` (khoá audit, chứng chỉ Panel), `/etc/letsencrypt`, khoá DKIM, vùng DNS PowerDNS (theo backend SQLite/MySQL và dạng zone file), cấu hình nginx/PHP/mail mà Panel đã ghi.
+
+**Passphrase:** do helper tạo (chỉ root đọc được, `/etc/spanel/dr-passphrase`) và chỉ hiển thị **một lần**. Hãy lưu nó ngoài máy chủ (trình quản lý mật khẩu, bản in). Lịch tự sao lưu chỉ chạy sau khi bạn gõ lại passphrase để xác nhận. Khi xoay vòng (rotate) passphrase, các bản cũ vẫn cần passphrase cũ.
+
+Bản lưu trữ (`panel-dr-<host>-<thời gian>.spdr`, mã hoá AES-256-CBC + HMAC-SHA256) được đẩy lên các đích đã chọn trong thư mục `<hostname>/_panel-dr/` và chỉ giữ N bản mới nhất.
+
+### Dựng lại một máy chủ đã mất
+
+1. Cài SPanel mới (cùng phiên bản hoặc mới hơn) bằng `install.sh`.
+2. Tải bản `.spdr` mới nhất từ đích sao lưu về máy chủ mới (`scp`, `aws s3 cp`, `rclone`...).
+3. Chạy với quyền root:
+
+   ```bash
+   sudo spanel dr-restore /root/panel-dr-srv1-20261024T013000Z.spdr --inspect   # xem trước
+   sudo spanel dr-restore /root/panel-dr-srv1-20261024T013000Z.spdr             # gõ RESTORE để xác nhận
+   ```
+
+   Lệnh kiểm tra HMAC trước khi giải mã, dừng `spanel-api` và các timer, giữ cấu hình hiện tại ở `/root/spanel-pre-dr-*.tar.gz`, rồi khôi phục database Panel, `.env`, `/etc/spanel`, chứng chỉ, PowerDNS và cấu hình mail/nginx của Panel. Vhost từng website, pool PHP-FPM và crontab của khách **không** được ghi đè (các tài khoản Linux chưa tồn tại); thêm `--with-site-configs` nếu cần.
+4. Đăng nhập Panel > Backups > Restore & Destinations: chọn đích sao lưu (thông tin đăng nhập giải mã lại được vì `.env` đã về), chọn tất cả tài khoản và Restore. Bước này tạo lại tài khoản Linux, website, vhost, pool PHP, database và hộp thư.
+5. Nếu IP thay đổi: `sudo spanel change-ip <IP_CŨ> <IP_MỚI>`, rồi trỏ DNS về máy chủ mới.
+
+### Kiểm tra định kỳ
+
+Backups > Panel self-backup & verification có lịch **kiểm tra backup**: kiểm tra toàn vẹn bản mới nhất của mỗi tài khoản trên máy chủ, tải mẫu từ đích xa (SHA-256, giải mã, liệt kê tar, có manifest) và tuỳ chọn khôi phục thử dump SQL vào một database tạm rồi xoá. Lỗi được gửi qua email/Telegram và webhook cảnh báo.

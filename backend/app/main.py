@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api import addons as addons_api, auth, dashboard, databases, demo_mode as demo_mode_api, dns as dns_api, fail2ban as fail2ban_api, firewall, mail as mail_api, maintenance, malware, mcp as mcp_api, notifications as notifications_api, packages, panel_settings as panel_settings_api, provisioning, services, sftp_accounts as sftp_accounts_api, site_apps as site_apps_api, terminal, updates, users, waf, websites
 from app.api import migration, resellers, ips, app_installer, ai, message_templates, server_tls, processes, name_servers, message_all, custombuild, resources, multi_server, licensing
 from app.api import remote_mysql as remote_mysql_api
+from app.api import backup_ops
 from app.core.config import settings
 from app.core.database import run_migrations
 from app.core.version import APP_VERSION
@@ -190,6 +191,7 @@ app.include_router(services.router, prefix="/api")
 app.include_router(updates.router, prefix="/api")
 app.include_router(waf.router, prefix="/api")
 app.include_router(maintenance.router, prefix="/api")
+app.include_router(backup_ops.router, prefix="/api")
 app.include_router(panel_settings_api.router, prefix="/api")
 app.include_router(malware.router, prefix="/api")
 app.include_router(terminal.router, prefix="/api")

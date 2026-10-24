@@ -461,10 +461,12 @@ def test_p1_cron_jail_audit_hmac_backup_etm_yara_exim4():
     fm_text = (repo_root / "backend" / "app" / "services" / "file_manager.py").read_text(encoding="utf-8")
     assert fm_text.count("scan_upload_realtime") >= 2
 
-    # P1.6: Core stack patch & upgrade_php_version do not hold packages permanently by default
+    # P1.6: Core stack patch & upgrade_php_version do not hold packages (the
+    # core stack no longer offers holds at all; unattended-upgrades is kept off
+    # those packages with a Package-Blacklist instead)
     import inspect
     sig = inspect.signature(updates.upgrade_core_stack_packages)
-    assert sig.parameters["hold_packages"].default is False
+    assert "hold_packages" not in sig.parameters
     php_upgrade_body = helper_text.split("upgrade_php_version() {", 1)[1].split("\n}\n", 1)[0]
     assert "apt-mark unhold" in php_upgrade_body
     assert "apt-mark hold " not in php_upgrade_body

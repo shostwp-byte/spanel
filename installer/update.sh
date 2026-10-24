@@ -1593,6 +1593,16 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
     fi
+    # The maintenance window runner (panel auto-update, core stack and PHP
+    # patching, panel self-backup, backup verification). Replaces the
+    # in-process thread that only fired if a check landed inside the hour.
+    if [[ -f "$SOURCE_DIR/installer/files/spanel-maintenance.service" && -f "$SOURCE_DIR/installer/files/spanel-maintenance.timer" ]]; then
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-maintenance.service" /etc/systemd/system/spanel-maintenance.service
+      sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-maintenance.service
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-maintenance.timer" /etc/systemd/system/spanel-maintenance.timer
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable --now spanel-maintenance.timer >/dev/null 2>&1 || true
+    fi
     install -m 0440 -o root -g root  "$SOURCE_DIR/installer/files/spanel-sudoers"   /etc/sudoers.d/spanel
     visudo -c -f /etc/sudoers.d/spanel >/dev/null
     sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper wp --info >/dev/null
