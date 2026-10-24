@@ -1,3 +1,4 @@
+import logging
 import os
 import secrets
 import shutil
@@ -15,6 +16,8 @@ from app.services import malware_scan
 from app.services import site_users
 from app.services import storage_quota
 from app.services.shell import shell
+
+logger = logging.getLogger("spanel.file_manager")
 
 
 def _env_int(name: str, default: int) -> Optional[int]:
@@ -1192,20 +1195,24 @@ def extract_archive(
         with tarfile.open(archive_file, "r:gz") as archive:
             _extract_tar_archive(archive, destination, archive_file)
     site_users.fix_site_path(str(destination), website.linux_user, check=True)
-    # Real-Time YARA + Heuristic scan on extracted executable/script/disguised files
-    # with bounded file count (<= 500 priority files, <= 10 MB each, <= 8s budget)
-    # so large WordPress/static archives extract without HTTP timeout.
+    # Real-Time YARA + Heuristic scan on extracted executable/script/disguised files.
+    # The request scans scripts first, within a bounded budget (<= 500 files,
+    # <= 10 MB each, <= 8 s), so large WordPress/static archives extract without
+    # an HTTP timeout. Whatever the budget leaves goes to the background scan
+    # queue instead of being skipped.
     _STATIC_EXTS = {
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp",
         ".woff", ".woff2", ".ttf", ".eot", ".otf",
         ".css", ".map", ".mo", ".po", ".pot",
         ".mp4", ".webm", ".mp3", ".wav", ".ogg", ".pdf",
     }
+    _SCRIPT_EXTS = {".php", ".phtml", ".phar", ".php3", ".php4", ".php5", ".php7", ".php8", ".inc", ".sh", ".py", ".pl", ".cgi"}
     _MAX_SYNC_SCAN_FILES = 500
     _MAX_SYNC_SCAN_BYTES = 10 * 1024 * 1024
     _MAX_SYNC_SCAN_SECONDS = 8.0
 
     priority_candidates: list[tuple[int, Path]] = []
+    oversized: list[tuple[int, Path]] = []
     for root_dir, _, filenames in os.walk(destination):
         for fname in filenames:
             candidate_file = Path(root_dir) / fname
@@ -1217,10 +1224,9 @@ def extract_archive(
                 fsize = candidate_file.stat().st_size
             except OSError:
                 continue
-            if fsize <= 0 or fsize > _MAX_SYNC_SCAN_BYTES:
+            if fsize <= 0:
                 continue
-            lower_name = fname.lower()
-            ext = Path(lower_name).suffix
+            ext = Path(fname.lower()).suffix
             if ext in _STATIC_EXTS:
                 # Quick 64-byte magic check for disguised ELF/PE/shebang/PHP inside static extensions
                 try:
@@ -1234,18 +1240,24 @@ def extract_archive(
                     or b"<?=" in head
                 ):
                     continue
-                priority_candidates.append((0, candidate_file))
-            elif ext in {".php", ".phtml", ".phar", ".php3", ".php4", ".php5", ".php7", ".php8", ".inc", ".sh", ".py", ".pl", ".cgi"}:
-                priority_candidates.append((0, candidate_file))
+                priority = 0
+            elif ext in _SCRIPT_EXTS:
+                priority = 0
             else:
-                priority_candidates.append((1, candidate_file))
+                priority = 1
+            if fsize > _MAX_SYNC_SCAN_BYTES:
+                oversized.append((priority, candidate_file))
+            else:
+                priority_candidates.append((priority, candidate_file))
 
     priority_candidates.sort(key=lambda item: item[0])
     infected_findings: list[str] = []
     scan_deadline = time.monotonic() + _MAX_SYNC_SCAN_SECONDS
+    scanned = 0
     for _, candidate_file in priority_candidates[:_MAX_SYNC_SCAN_FILES]:
         if time.monotonic() > scan_deadline:
             break
+        scanned += 1
         scan_res = malware_scan.scan_upload_realtime(
             str(candidate_file),
             domain=getattr(website, "domain", "") or "",
@@ -1254,6 +1266,14 @@ def extract_archive(
         if scan_res.get("status") == "infected":
             candidate_file.unlink(missing_ok=True)
             infected_findings.append(f"{candidate_file.name} ({scan_res.get('signature')})")
+    deferred = sorted(priority_candidates[scanned:] + oversized, key=lambda item: item[0])
+    if deferred and not infected_findings:
+        logger.warning(
+            "extract %s: %d file(s) over the inline scan budget handed to the background scan queue",
+            archive_file.name, len(deferred),
+        )
+        for _, candidate_file in deferred:
+            malware_queue.enqueue(website.id, str(candidate_file), candidate_file.name)
     _clear_fastcgi_cache()
     if infected_findings:
         raise ValueError(
