@@ -164,6 +164,183 @@ def dkim_maps(selectors: dict) -> tuple[list[str], list[str]]:
     return domains, chosen
 
 
+# --- mail hosts: mail.<domain> and friends, with their own certificate --------------------
+# One Let's Encrypt certificate per mail domain, named after mail.<domain>,
+# covers the hosts the panel turned on. nginx serves them on 80/443 (the ACME
+# challenge, then whatever the host is for); Exim and Dovecot present the
+# certificate to a client that asks for mail.<domain> by SNI.
+
+MAIL_HOST_LABELS = ("mail", "mta-sts", "autoconfig", "autodiscover")
+ACME_ROOT = "/var/www/spanel-acme"
+LE_LIVE = "/etc/letsencrypt/live"
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$")
+
+
+def check_mail_hosts(data) -> dict:
+    """What mail-hosts-apply receives, checked: the domain, the hosts to
+    serve (labels of MAIL_HOST_LABELS, "mail" always among them) and the
+    address Let's Encrypt writes to, if any."""
+    if not isinstance(data, dict):
+        raise ToolError("mail-hosts-apply expects a JSON object")
+    domain = str(data.get("domain") or "")
+    if not DOMAIN_RE.fullmatch(domain) or len(domain) > 200:
+        raise ToolError(f"invalid domain: {domain!r}")
+    labels = data.get("hosts")
+    if not isinstance(labels, list) or not labels:
+        raise ToolError("name the mail hosts to serve")
+    clean = []
+    for label in labels:
+        if label not in MAIL_HOST_LABELS:
+            raise ToolError(f"not a mail host: {label!r}")
+        if label not in clean:
+            clean.append(label)
+    if "mail" not in clean:
+        raise ToolError("mail.<domain> is always one of the mail hosts")
+    email = str(data.get("email") or "")
+    if email and not EMAIL_RE.fullmatch(email):
+        raise ToolError(f"invalid email: {email!r}")
+    ordered = [label for label in MAIL_HOST_LABELS if label in clean]
+    return {"domain": domain, "hosts": ordered, "names": [f"{label}.{domain}" for label in ordered],
+            "cert_name": f"mail.{domain}", "email": email}
+
+
+def render_mailhosts_nginx(domain: str, names: list[str], cert_name: str, docs_dir: str, with_tls: bool) -> str:
+    """The server blocks of a domain's mail hosts. Without a certificate yet
+    only port 80 and the ACME challenge; with one, HTTPS on 443 as well."""
+    for name in names + [cert_name]:
+        if not DOMAIN_RE.fullmatch(name) or not (name == domain or name.endswith("." + domain)):
+            raise ToolError(f"invalid mail host: {name!r}")
+    if not re.fullmatch(r"/[A-Za-z0-9/_.-]+", docs_dir) or ".." in docs_dir:
+        raise ToolError(f"invalid documents directory: {docs_dir!r}")
+    hosts = " ".join(names)
+    lines = [
+        f"# Managed by SPanel (Email addon): the mail hosts of {domain}.",
+        "server {",
+        "    listen 80;",
+        f"    server_name {hosts};",
+        "    location ^~ /.well-known/acme-challenge/ {",
+        f"        root {ACME_ROOT};",
+        "        default_type text/plain;",
+        "        try_files $uri =404;",
+        "    }",
+        "    location / { return 301 https://$host$request_uri; }" if with_tls else "    location / { return 404; }",
+        "}",
+    ]
+    if with_tls:
+        lines += [
+            "server {",
+            "    listen 443 ssl;",
+            f"    server_name {hosts};",
+            f"    ssl_certificate {LE_LIVE}/{cert_name}/fullchain.pem;",
+            f"    ssl_certificate_key {LE_LIVE}/{cert_name}/privkey.pem;",
+            "    ssl_protocols TLSv1.2 TLSv1.3;",
+            f"    root {docs_dir};",
+            "    default_type text/plain;",
+            "    add_header X-Content-Type-Options nosniff always;",
+            *_mailhost_locations(),
+            "    location / { return 404; }",
+            "}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _mailhost_locations() -> list[str]:
+    """What the mail hosts serve besides the challenge (MTA-STS, autoconfig)."""
+    return []
+
+
+def render_sni(entries: dict, tls_dir: str) -> tuple[list[str], list[str], str]:
+    """Exim's tls_certs and tls_keys maps and Dovecot's local_name blocks for
+    the hosts that have a certificate of their own: {host: certificate name}.
+    The files are the copies spanel-mail-tls keeps in <tls_dir>/<name>/."""
+    certs, keys, dovecot = [], [], [
+        "# Managed by SPanel (Email addon): the certificate each mail host's name is",
+        "# answered with (SNI). Written by spanel-mail-tls from /etc/exim4/spanel/tls_hosts.",
+    ]
+    for host in sorted(entries):
+        name = entries[host]
+        for value in (host, name):
+            if not DOMAIN_RE.fullmatch(str(value or "")):
+                raise ToolError(f"invalid TLS host: {value!r}")
+        cert, key = f"{tls_dir}/{name}/fullchain.pem", f"{tls_dir}/{name}/privkey.pem"
+        certs.append(f"{host}: {cert}")
+        keys.append(f"{host}: {key}")
+        dovecot += [f"local_name {host} {{", f"  ssl_cert = <{cert}", f"  ssl_key = <{key}", "}"]
+    return certs, keys, "\n".join(dovecot) + "\n"
+
+
+def parse_tls_hosts(text: str) -> dict:
+    """/etc/exim4/spanel/tls_hosts: "<host>: <certificate name>" a line."""
+    entries = {}
+    for line in (text or "").splitlines():
+        host, _, name = line.partition(":")
+        host, name = host.strip(), name.strip()
+        if host and DOMAIN_RE.fullmatch(host) and DOMAIN_RE.fullmatch(name):
+            entries[host] = name
+    return entries
+
+
+def sni_apply(registry: str, le_live: str, tls_dir: str, exim_dir: str, dovecot_sni: str, *, owned: bool = True) -> bool:
+    """Copy each registered certificate where Exim (as Debian-exim) can read
+    it, and write the SNI maps and Dovecot's local_name blocks. A certificate
+    whose files are missing or whose key does not match is left out rather
+    than break TLS. Returns whether anything changed (Dovecot then needs a
+    reload; Exim reads the files per connection)."""
+    import filecmp
+    import os
+    import shutil
+
+    gid = None
+    if owned:
+        import grp
+
+        gid = grp.getgrnam("Debian-exim").gr_gid
+    try:
+        with open(registry, encoding="utf-8") as handle:
+            entries = parse_tls_hosts(handle.read())
+    except OSError:
+        entries = {}
+    changed = False
+    usable = {}
+    for host, name in entries.items():
+        source = os.path.join(le_live, name)
+        cert, key = os.path.join(source, "fullchain.pem"), os.path.join(source, "privkey.pem")
+        if not (os.path.isfile(cert) and os.path.isfile(key)):
+            continue
+        target = os.path.join(tls_dir, name)
+        os.makedirs(target, mode=0o750, exist_ok=True)
+        if owned:
+            os.chown(target, 0, gid)
+        for src, dst in ((cert, os.path.join(target, "fullchain.pem")), (key, os.path.join(target, "privkey.pem"))):
+            if os.path.isfile(dst) and filecmp.cmp(src, dst, shallow=False):
+                continue
+            shutil.copyfile(src, dst + ".new")
+            if owned:
+                os.chown(dst + ".new", 0, gid)
+            os.chmod(dst + ".new", 0o640)
+            os.replace(dst + ".new", dst)
+            changed = True
+        usable[host] = name
+    certs, keys, dovecot = render_sni(usable, tls_dir)
+    for path, text, mode in ((os.path.join(exim_dir, "tls_certs"), "".join(line + "\n" for line in certs), 0o640),
+                             (os.path.join(exim_dir, "tls_keys"), "".join(line + "\n" for line in keys), 0o640),
+                             (dovecot_sni, dovecot, 0o644)):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                if handle.read() == text:
+                    continue
+        except OSError:
+            pass
+        with open(path + ".new", "w", encoding="utf-8") as handle:
+            handle.write(text)
+        if owned and path != dovecot_sni:
+            os.chown(path + ".new", 0, gid)
+        os.chmod(path + ".new", mode)
+        os.replace(path + ".new", path)
+        changed = True
+    return changed
+
+
 # --- command line -------------------------------------------------------------------------
 
 def _read_json_stdin(limit: int = 8_000_000):
@@ -184,6 +361,22 @@ def main(argv: list[str]) -> int:
     try:
         if command == "render-vacation" and not args:
             sys.stdout.write(render_vacation(_read_json_stdin()))
+            return 0
+        if command == "check-mail-hosts" and not args:
+            print(json.dumps(check_mail_hosts(_read_json_stdin(200_000))))
+            return 0
+        if command == "mail-hosts-fields" and not args:
+            # For the shell: every value is a checked name, so one line splits safely.
+            item = check_mail_hosts(_read_json_stdin(200_000))
+            print(item["domain"], item["cert_name"], item["email"] or "-", ",".join(item["names"]))
+            return 0
+        if command == "mailhosts-nginx" and len(args) == 2 and args[1] in ("http", "https"):
+            item = check_mail_hosts(_read_json_stdin(200_000))
+            sys.stdout.write(render_mailhosts_nginx(item["domain"], item["names"], item["cert_name"], args[0],
+                                                    args[1] == "https"))
+            return 0
+        if command == "sni-apply" and len(args) == 5:
+            print("changed" if sni_apply(*args) else "unchanged")
             return 0
         raise ToolError(f"unknown spanel_mailtool command: {command}")
     except ToolError as exc:

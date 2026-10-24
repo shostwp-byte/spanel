@@ -40,6 +40,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   const [forwarderForm, setForwarderForm] = useState({ domain_id: '', local_part: '', destinations: '' });
   const [forwarderEdit, setForwarderEdit] = useState(null);
   const [dmarcForm, setDmarcForm] = useState(null);
+  const [hostsDraft, setHostsDraft] = useState([]);
 
   useEffect(() => { loadMailInfo(); loadMailboxes(); }, []);
   useEffect(() => { if (mailTab === 'server' || mailTab === 'settings') { loadMailSettings(); loadEximLog(); } }, [mailTab]);
@@ -156,6 +157,15 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     if (data) { setNotice(t('DKIM key rotation cancelled.')); applyMailDnsView(domain, data); }
   }
 
+  async function saveMailHosts(domain, off = false) {
+    const names = hostsDraft.map(label => `${label}.${domain.domain}`).join(', ');
+    if (!off && !confirm(t("Serve {names} with a Let's Encrypt certificate of their own?\n\nEach name must already point at this server. Mail apps and other mail servers then see mail.{domain} with a certificate that matches it.", { names, domain: domain.domain }))) return;
+    if (off && !confirm(t('Stop serving the mail hosts of {domain}? Mail apps go back to the server name and its certificate.', { domain: domain.domain }))) return;
+    const data = await request(`/mail/domains/${domain.id}/mail-hosts`, off ? { method: 'DELETE' } : { method: 'POST', body: JSON.stringify({ hosts: hostsDraft }) },
+      off ? t('Removing...') : t('Issuing a certificate for {names}...', { names }));
+    if (data) { setNotice(off ? t('The mail hosts of {domain} are no longer served.', { domain: domain.domain }) : t('{names} served with their own certificate.', { names })); applyMailDnsView(domain, data); loadMailInfo(); }
+  }
+
   async function saveMailDmarc(domain, reset = false) {
     const f = dmarcForm;
     const body = reset ? null : {
@@ -225,7 +235,8 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function applyMailDnsView(domain, data) {
-    setMailDns({ domain, records: data?.records || [], relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null, dmarc: data?.dmarc || null });
+    setMailDns(prev => ({ domain, records: data?.records || (prev?.domain?.id === domain.id ? prev.records : []), relay: data?.relay || null, hostedZone: data?.hosted_zone || '', dkim: data?.dkim || null, dmarc: data?.dmarc || null, hosts: data?.hosts || null }));
+    setHostsDraft(data?.hosts?.served?.length ? data.hosts.served : ['mail', 'mta-sts', 'autoconfig', 'autodiscover']);
     const policy = data?.dmarc?.policy;
     setDmarcForm(policy ? { ...policy, rua: (policy.rua || []).join(', '), ruf: (policy.ruf || []).join(', ') } : null);
   }
@@ -561,7 +572,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   function renderMailDns() {
-    const { domain, records, relay, hostedZone, dkim, dmarc } = mailDns;
+    const { domain, records, relay, hostedZone, dkim, dmarc, hosts } = mailDns;
     const statusLabel = { ok: t('Found'), missing: t('Missing'), different: t('Different'), unknown: t('Not checked') };
     const statusClass = { ok: 'ok', missing: 'bad', different: 'warn', unknown: '' };
     const titles = {
@@ -573,6 +584,9 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
       'dkim-old': t('Previous DKIM key (retiring)'),
       dmarc: t('Policy (DMARC)'),
       webmail: t('Webmail address (optional)'),
+      'mta-sts': t('MTA-STS policy host (optional)'),
+      autoconfig: t('Thunderbird set-up host (optional)'),
+      autodiscover: t('Outlook set-up host (optional)'),
     };
     const titleFor = record => titles[record.key] || t('Asked for by the relay {relay}', { relay: record.relay });
     return <div className="section mail-dns-page">
@@ -596,6 +610,22 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
         <p className="hint">{relay.effective_name
           ? t('Mail from {domain} leaves through the relay {relay}; the records it asks for are listed below.', { domain: domain.domain, relay: relay.effective_name })
           : t('Mail from {domain} is delivered directly from this server.', { domain: domain.domain })}</p>
+      </div>}
+      {hosts && <div className="mail-relay-card">
+        <div className="mail-relay-card-head"><Lock size={15}/><strong>{t('Mail hosts and certificate')}</strong></div>
+        <p className="hint">{t('Mail apps connect to {host}.', { host: hosts.client?.host || '—' })}{' '}
+          {hosts.served?.length ? t('These names are served here with their own certificate, renewed on its own.') : t("Serve mail.{domain} with its own certificate so mail apps and other mail servers see a name that matches; mta-sts., autoconfig. and autodiscover. can share it.", { domain: domain.domain })}</p>
+        <div className="mail-hosts-picks" style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+          {(hosts.available || []).map(label => <label className="check-line" key={label}>
+            <input type="checkbox" checked={label === 'mail' || hostsDraft.includes(label)} disabled={label === 'mail' || !!loading}
+              onChange={e => setHostsDraft(prev => e.target.checked ? [...new Set([...prev, label])] : prev.filter(item => item !== label))} />
+            <span>{label}.{domain.domain}{(hosts.served || []).includes(label) && <span className="badge ok">{t('Served')}</span>}</span>
+          </label>)}
+        </div>
+        <div className="actions">
+          <button className="secondary-light" disabled={!!loading} onClick={() => saveMailHosts(domain)}><Lock size={14}/> {hosts.served?.length ? t('Update the mail hosts') : t('Issue the certificate and serve')}</button>
+          {hosts.served?.length > 0 && <button className="secondary-light" disabled={!!loading} onClick={() => saveMailHosts(domain, true)}><X size={14}/> {t('Stop serving')}</button>}
+        </div>
       </div>}
       {dkim && <div className="mail-relay-card">
         <div className="mail-relay-card-head"><KeyRound size={15}/><strong>{t('DKIM key')}</strong></div>

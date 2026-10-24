@@ -86,6 +86,11 @@ class AutoresponderUpdate(BaseModel):
     interval_days: int | None = Field(default=None, ge=1, le=30)
 
 
+class MailHostsIn(BaseModel):
+    # Of mail, mta-sts, autoconfig, autodiscover; mail is always served.
+    hosts: list[str] = Field(default_factory=lambda: ["mail"], max_length=4)
+
+
 class DmarcIn(BaseModel):
     p: str = Field(max_length=12)
     sp: str = Field(default="", max_length=12)
@@ -280,6 +285,27 @@ def delete_dmarc(domain_id: int, request: Request, db: Session = Depends(get_db)
     row = _answer(lambda: mail.set_dmarc(db, current_user, domain_id, None))
     log_action(db, current_user.id, "mail_dmarc", row.domain, "default", request=request)
     return mail.dns_view(db, row, current_user)
+
+
+@router.post("/domains/{domain_id}/mail-hosts")
+def post_mail_hosts(domain_id: int, payload: MailHostsIn, request: Request, db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_user)):
+    """Serve mail.<domain> (and mta-sts., autoconfig., autodiscover.) with a
+    Let's Encrypt certificate of their own; Exim and Dovecot answer mail.<domain>
+    with it."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_mail_hosts(db, current_user, domain_id, payload.hosts))
+    log_action(db, current_user.id, "mail_hosts", row.domain, row.mail_hosts, request=request)
+    return mail.dns_view(db, row, current_user, check=False)
+
+
+@router.delete("/domains/{domain_id}/mail-hosts")
+def delete_mail_hosts(domain_id: int, request: Request, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.remove_mail_hosts(db, current_user, domain_id))
+    log_action(db, current_user.id, "mail_hosts", row.domain, "off", request=request)
+    return mail.dns_view(db, row, current_user, check=False)
 
 
 @router.post("/domains/{domain_id}/webmail-host")

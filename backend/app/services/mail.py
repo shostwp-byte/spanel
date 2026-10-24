@@ -457,7 +457,7 @@ def add_domain(db: Session, actor: User, domain: str, owner_id: int | None = Non
 def delete_domain(db: Session, actor: User, domain_id: int) -> str:
     """Email off for a domain: its mailboxes with their mail, its forwarders."""
     row = get_domain(db, actor, domain_id)
-    name, webmail = row.domain, bool(row.webmail_host)
+    name, webmail, hosts = row.domain, bool(row.webmail_host), bool(row.mail_hosts)
     owner = db.query(User).filter(User.id == row.owner_id).first()
     db.query(MailAccount).filter(MailAccount.domain == name).delete(synchronize_session=False)
     db.query(MailForwarder).filter(MailForwarder.domain == name).delete(synchronize_session=False)
@@ -467,6 +467,8 @@ def delete_domain(db: Session, actor: User, domain_id: int) -> str:
     sync(db)
     if webmail:
         shell.privileged("mail-webmail-host-remove", helper_args=[name], check=False, fallback=["true"])
+    if hosts:
+        shell.privileged("mail-hosts-remove", helper_args=[name], check=False, fallback=["true"])
     # Last, once nothing routes there any more.
     if owner is not None:
         shell.privileged("mail-purge-domain", helper_args=[linux_user_of(owner), name], check=False,
@@ -481,6 +483,8 @@ def delete_for_owner(db: Session, owner: User) -> list[str]:
     for row in rows:
         if row.webmail_host:
             shell.privileged("mail-webmail-host-remove", helper_args=[row.domain], check=False, fallback=["true"])
+        if row.mail_hosts:
+            shell.privileged("mail-hosts-remove", helper_args=[row.domain], check=False, fallback=["true"])
         db.query(MailForwarder).filter(MailForwarder.domain == row.domain).delete(synchronize_session=False)
         db.query(MailAutoresponder).filter(MailAutoresponder.domain == row.domain).delete(synchronize_session=False)
         db.delete(row)
@@ -538,6 +542,83 @@ def set_webmail_host(db: Session, actor: User, domain_id: int, enabled: bool) ->
     return row
 
 
+# --- mail hosts: mail.<domain> and the others, with a certificate of their own ------------------
+# mail.<domain> is the domain's MX; with its own certificate Exim and Dovecot
+# answer it by SNI, so mail apps and MTA-STS senders see a name that matches.
+# mta-sts., autoconfig. and autodiscover. serve what their names say. One
+# Let's Encrypt certificate (the webroot flow webmail.<domain> uses) covers
+# the hosts turned on; the helper's mail-hosts-apply does the rest.
+
+MAIL_HOST_LABELS = ("mail", "mta-sts", "autoconfig", "autodiscover")
+
+
+def served_hosts(row: MailDomain) -> list[str]:
+    labels = [label.strip() for label in (row.mail_hosts or "").split(",")]
+    return [label for label in MAIL_HOST_LABELS if label in labels]
+
+
+def client_host(row: MailDomain | None) -> str:
+    """The name mail apps use for a domain: mail.<domain> once it has its own
+    certificate, else the server's own name (the panel's certificate)."""
+    if row is not None and "mail" in served_hosts(row):
+        return f"mail.{row.domain}"
+    return _hostname_or_blank()
+
+
+def normalize_hosts(labels) -> list[str]:
+    chosen = {str(label or "").strip().lower() for label in labels or []}
+    unknown = chosen - set(MAIL_HOST_LABELS)
+    if unknown:
+        raise MailError("The mail hosts are mail, mta-sts, autoconfig and autodiscover.")
+    chosen.add("mail")
+    return [label for label in MAIL_HOST_LABELS if label in chosen]
+
+
+def _points_here(name: str) -> bool | None:
+    """Whether public DNS sends name to this server; None if DNS could not be asked."""
+    answer = _resolve(name, "A")
+    if answer is None:
+        return None
+    own = set(server_addresses()[0]) | ({server_ip()} if server_ip() else set())
+    return bool(set(answer) & own)
+
+
+def set_mail_hosts(db: Session, actor: User, domain_id: int, labels) -> MailDomain:
+    """Serve the domain's mail hosts with a certificate of their own."""
+    _require_active()
+    row = get_domain(db, actor, domain_id)
+    chosen = normalize_hosts(labels)
+    names = [f"{label}.{row.domain}" for label in chosen]
+    taken = [name for name in names
+             if db.query(Website).filter(func.lower(Website.domain) == name).first() is not None
+             or db.query(WebsiteAlias).filter(func.lower(WebsiteAlias.domain) == name).first() is not None
+             or name == panel_host()]
+    if taken:
+        raise MailError(f"{', '.join(taken)} is already a website or the panel's own address on this server.", status=409)
+    # Where this server runs the domain's DNS, the names go in first.
+    publish_dns_quietly(db, row, hosts=set(chosen))
+    elsewhere = [name for name in names if _points_here(name) is False]
+    if elsewhere:
+        raise MailError(f"Point {', '.join(elsewhere)} at this server first (an A record to {server_ip() or 'its address'}); "
+                        "a certificate is issued only for names that reach it.")
+    payload = {"domain": row.domain, "hosts": chosen, "email": app_settings.ssl_email or ""}
+    _helper("mail-hosts-apply", input=json.dumps(payload), timeout=600)
+    row.mail_hosts = ",".join(chosen)
+    db.commit()
+    publish_dns_quietly(db, row)
+    return row
+
+
+def remove_mail_hosts(db: Session, actor: User, domain_id: int) -> MailDomain:
+    _require_active()
+    row = get_domain(db, actor, domain_id)
+    _helper("mail-hosts-remove", row.domain, timeout=300)
+    row.mail_hosts = ""
+    db.commit()
+    publish_dns_quietly(db, row)
+    return row
+
+
 def webmail_host_taken(db: Session, domain: str) -> bool:
     """Whether a website name is the webmail.<domain> of a mail domain here."""
     name = (domain or "").strip().lower()
@@ -560,6 +641,8 @@ def domain_out(db: Session, row: MailDomain, owners: dict[int, User] | None = No
         "relay": row.relay or "",
         "dkim_selector": row.dkim_selector or DKIM_SELECTOR,
         "dkim_state": row.dkim_state or "",
+        "mail_hosts": served_hosts(row),
+        "client_host": client_host(row),
         "mailboxes": db.query(MailAccount).filter(MailAccount.domain == row.domain).count(),
         "forwarders": db.query(MailForwarder).filter(MailForwarder.domain == row.domain).count(),
         "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -1179,6 +1262,11 @@ def dns_records(row: MailDomain) -> list[dict]:
             })
     if ip:
         records.append({"key": "webmail", "type": "A", "name": f"webmail.{domain}", "value": ip, "optional": True})
+        # The other mail hosts: published once they are served (Mail hosts on
+        # the DNS page), and needed in DNS before their certificate is issued.
+        for label in MAIL_HOST_LABELS[1:]:
+            records.append({"key": label, "type": "A", "name": f"{label}.{domain}", "value": ip, "optional": True,
+                            "host": label})
     return records
 
 
@@ -1328,6 +1416,7 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
         "records": records,
         "dkim": dkim_view(row),
         "dmarc": dmarc_view(row),
+        "hosts": {"served": served_hosts(row), "available": list(MAIL_HOST_LABELS), "client": client_settings(row)},
         "hosted_zone": zone.name if zone else "",
         "relay": {
             "choice": row.relay or "",
@@ -1340,7 +1429,8 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
     }
 
 
-def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[str] | frozenset = frozenset()) -> list[str]:
+def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[str] | frozenset = frozenset(),
+                hosts: set[str] | None = None) -> list[str]:
     """Keep the domain's mail records in its zone, when DNS Manager serves it.
 
     DKIM and the relay's records always follow the panel, and so does an SPF
@@ -1370,9 +1460,12 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[
             return [dns._untxt(item) for item in existing] == [dns._untxt(content)]
         return [item.rstrip(".").lower() for item in existing] == [content.rstrip(".").lower()]
 
+    wanted_hosts = set(served_hosts(row)) | set(hosts or ())
     for record in dns_records(row):
         key, rtype = record["key"], record["type"]
         if not record["value"]:
+            continue
+        if record.get("host") and record["host"] not in wanted_hosts:
             continue
         name = dns._absolute(record["name"])
         if rtype == "MX":
@@ -1417,11 +1510,11 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[
     return sorted({name.rstrip(".") for name, _ in changes})
 
 
-def publish_dns_quietly(db: Session, row: MailDomain) -> list[str]:
+def publish_dns_quietly(db: Session, row: MailDomain, hosts: set[str] | None = None) -> list[str]:
     from app.services import dns
 
     try:
-        return publish_dns(db, row, replace=False)
+        return publish_dns(db, row, replace=False, hosts=hosts)
     except (MailError, dns.DnsError, dns.DnsInputError) as exc:
         logger.warning("Mail records not published for %s: %s", row.domain, exc)
         return []
@@ -2496,8 +2589,8 @@ def _import_dkim_key(domain: str, selector: str, pem: str) -> str:
 
 # --- disk space ------------------------------------------------------------------------------------
 
-def client_settings() -> dict:
-    host = _hostname_or_blank()
+def client_settings(row: MailDomain | None = None) -> dict:
+    host = client_host(row)
     return {"host": host, "imap_port": PORTS["imap"], "pop3_port": PORTS["pop3"], "smtp_port": PORTS["smtps"],
             "submission_port": PORTS["submission"], "webmail": webmail_url()}
 
