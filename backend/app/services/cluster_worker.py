@@ -76,6 +76,14 @@ def run_once(now: float | None = None) -> dict:
 def _loop() -> None:
     # Let the panel finish starting before the first round.
     _wake.wait(timeout=30)
+    try:
+        from app.core.database import SessionLocal
+        from app.services import cluster_transfer
+
+        with SessionLocal() as db:
+            cluster_transfer.recover_interrupted(db)
+    except Exception:  # noqa: BLE001 - nothing to recover is the usual case
+        logger.warning("Could not check for interrupted cluster transfers", exc_info=True)
     while True:
         _wake.clear()
         try:

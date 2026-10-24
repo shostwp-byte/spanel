@@ -333,3 +333,16 @@ def test_reconcile_queues_missing_changed_withdrawn_and_deleted(sender):
     assert queued == {("changed-cltest.com", "upsert"), ("missing-cltest.com", "upsert"),
                       ("signed-cltest.com", "upsert"), ("removed-cltest.com", "delete")}
     assert result["queued"] == 4
+
+
+def test_handover_only_from_the_origin(receiver):
+    db, fake = receiver
+    _apply(db, _item("ho-cltest.com"))
+    refused = _apply(db, {"zone": "ho-cltest.com", "action": "handover", "new_origin": OTHER}, source=OTHER)
+    assert refused["ho-cltest.com"]["status"] == "conflict"
+    done = _apply(db, {"zone": "ho-cltest.com", "action": "handover", "new_origin": OTHER, "new_origin_name": "C"})
+    assert done["ho-cltest.com"]["status"] == "handed_over"
+    assert cluster_dns.origin_row(db, "ho-cltest.com").origin_uid == OTHER
+    # From now on the new master's pushes are taken, the old one's are not.
+    assert _apply(db, _item("ho-cltest.com", serial=50), source=OTHER)["ho-cltest.com"]["status"] == "applied"
+    assert _apply(db, _item("ho-cltest.com", serial=60))["ho-cltest.com"]["status"] == "conflict"

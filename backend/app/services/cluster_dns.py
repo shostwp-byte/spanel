@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
@@ -551,6 +552,22 @@ def _apply_one(db: Session, item: dict[str, Any], source_uid: str, source_name: 
         if row is None and not exists_local:
             return {"zone": zone, "status": "absent"}
         return {"zone": zone, "status": "conflict", "detail": "the zone here does not belong to the sending node"}
+
+    if action == "handover":
+        # The origin moved the zone to another node (account transfer): that
+        # node is the one to take it from now on. Only the origin can say so.
+        new_origin = str(item.get("new_origin") or "")
+        if row is None:
+            return {"zone": zone, "status": "absent"}
+        if row.origin_uid != source_uid or not re.fullmatch(r"[a-z0-9]{8,40}", new_origin):
+            return {"zone": zone, "status": "conflict", "detail": "only the zone's origin can hand it over"}
+        row.origin_uid = new_origin
+        row.origin_name = str(item.get("new_origin_name") or "")[:120]
+        row.source_serial = 0
+        row.content_hash = ""
+        row.updated_at = datetime.utcnow()
+        db.commit()
+        return {"zone": zone, "status": "handed_over"}
 
     if action != "upsert":
         return {"zone": zone, "status": "error", "detail": f"unknown action {action}"}

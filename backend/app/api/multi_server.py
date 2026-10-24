@@ -1,17 +1,21 @@
 import hashlib
 import logging
+import re
+import shutil
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_user
 from app.api.provisioning import _get_provisioning_token
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role
 from app.models.entities import ApiToken, User
-from app.services import cluster_dns, cluster_peer, cluster_worker, multi_server
+from app.services import backup, cluster_dns, cluster_peer, cluster_transfer, cluster_worker, multi_server
 from app.services.audit import log_action
 from app.services.provisioning import create_api_token
 
@@ -60,6 +64,32 @@ class TlsProbeIn(BaseModel):
     url: str = Field(..., max_length=255)
 
 
+class TransferIn(BaseModel):
+    user_id: int = Field(..., ge=1)
+    node_id: str = Field(..., max_length=40)
+    switch_dns: bool = False
+    suspend_source: bool = False
+
+
+class PeerTransferPrecheckIn(BaseModel):
+    username: str = Field(..., max_length=64)
+    domains: list[str] = Field(default_factory=list, max_length=2000)
+
+
+class PeerTransferRestoreIn(BaseModel):
+    upload_id: str = Field(..., max_length=120)
+    username: str = Field(..., max_length=64)
+    source_job: str = Field(default="", max_length=32)
+    source_name: str = Field(default="", max_length=120)
+    passphrase_sealed: str = Field(..., max_length=4096)
+    password_hash_sealed: str = Field(default="", max_length=4096)
+
+
+class PeerClaimZonesIn(BaseModel):
+    zones: list[str] = Field(default_factory=list, max_length=2000)
+    old_ips: list[str] = Field(default_factory=list, max_length=64)
+
+
 # ── Peer authentication ──────────────────────────────────────────────────
 
 def _signed_path(request: Request) -> str:
@@ -104,6 +134,25 @@ def peer_auth(scope: str):
         return node_uid
 
     return dependency
+
+
+def peer_auth_token(scope: str):
+    """As peer_auth, also handing over the token (its hash unseals transfer secrets)."""
+    def dependency(request: Request, body_sha256: str = Depends(_body_sha256),
+                   db: Session = Depends(get_db)) -> tuple[ApiToken, str]:
+        return authenticate_peer(request, db, scope, body_sha256)
+
+    return dependency
+
+
+def _streamed_upload_auth(request: Request, db: Session = Depends(get_db)) -> str:
+    """A streamed upload is signed over its declared SHA-256; the endpoint
+    compares the stream with it once read."""
+    declared = (request.headers.get(cluster_peer.HDR_BODY_SHA256) or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", declared):
+        raise HTTPException(status_code=400, detail="Missing content SHA-256")
+    _token, node_uid = authenticate_peer(request, db, cluster_peer.SCOPE_TRANSFER, declared)
+    return node_uid
 
 
 class DnsSyncRequestIn(BaseModel):
@@ -330,6 +379,34 @@ def dns_sync_retry(row_id: int, db: Session = Depends(get_db), current_user: Use
     return {"ok": True}
 
 
+@router.get("/transfers")
+def list_transfers(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return {"jobs": cluster_transfer.list_jobs(db)}
+
+
+@router.post("/transfers")
+def start_transfer(
+    payload: TransferIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Move an account to another node: backup, upload, restore there, and
+    optionally hand its DNS over and suspend it here."""
+    ensure_role(current_user.role, Role.admin)
+    try:
+        job = cluster_transfer.start_transfer(
+            db, user_id=payload.user_id, node_id=payload.node_id, switch_dns=payload.switch_dns,
+            suspend_source=payload.suspend_source, created_by=current_user.id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log_action(db, current_user.id, "multi_server_transfer", f"{job['username']} -> {job['node_name']}",
+               f"dns={payload.switch_dns} suspend={payload.suspend_source}", request=request)
+    return {"job": job, "message": f"Đã bắt đầu chuyển tài khoản {job['username']} sang {job['node_name']}."}
+
+
 @router.delete("/dns-sync/outbox/{row_id}")
 def dns_sync_discard(row_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
@@ -443,3 +520,100 @@ def peer_dns_inventory(
 ):
     """The asking node's zones held here, with the serial last applied (for its reconcile)."""
     return {"zones": cluster_dns.inventory_for(db, node_uid)}
+
+
+# ── Peer-to-peer account transfer (cluster:transfer) ─────────────────────
+
+@router.post("/peer/transfer/precheck")
+def peer_transfer_precheck(
+    payload: PeerTransferPrecheckIn,
+    db: Session = Depends(get_db),
+    node_uid: str = Depends(peer_auth(cluster_peer.SCOPE_TRANSFER)),
+):
+    return cluster_transfer.precheck(db, payload.username, payload.domains, node_uid)
+
+
+@router.put("/peer/transfer/upload")
+async def peer_transfer_upload(request: Request, node_uid: str = Depends(_streamed_upload_auth)):
+    """Receive an account archive as a stream, within the size limit, and
+    keep it only if its SHA-256 is the one the signature covered."""
+    declared = (request.headers.get(cluster_peer.HDR_BODY_SHA256) or "").strip().lower()
+    username = (request.headers.get("X-SPanel-Transfer-User") or "").strip()
+    try:
+        length = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        length = 0
+    try:
+        name = cluster_transfer.new_upload_name(username)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    directory = await run_in_threadpool(backup._ensure_user_dir, Path(backup.user_restore_dir()))
+    free = (await run_in_threadpool(shutil.disk_usage, directory)).free
+    limit = min(backup.MAX_UPLOAD_BYTES, int(free / cluster_transfer.DISK_MARGIN))
+    if length <= 0:
+        raise HTTPException(status_code=411, detail="Content-Length is required")
+    if length > limit:
+        raise HTTPException(status_code=413, detail=f"The archive is larger than this node accepts ({limit} bytes).")
+    path = directory / name
+    digest = hashlib.sha256()
+    written = 0
+    handle = await run_in_threadpool(path.open, "wb")
+    try:
+        async for chunk in request.stream():
+            written += len(chunk)
+            if written > length:
+                raise HTTPException(status_code=400, detail="More data than Content-Length")
+            digest.update(chunk)
+            await run_in_threadpool(handle.write, chunk)
+    except BaseException:
+        handle.close()
+        path.unlink(missing_ok=True)
+        raise
+    handle.close()
+    if written != length or digest.hexdigest() != declared:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="The upload is incomplete or its SHA-256 does not match.")
+    multi_server.append_sync_log("transfer_upload", username, "info", f"Nhận bản sao lưu {written} bytes từ node {node_uid}.")
+    return {"upload_id": name, "size": written}
+
+
+@router.post("/peer/transfer/restore")
+def peer_transfer_restore(
+    payload: PeerTransferRestoreIn,
+    db: Session = Depends(get_db),
+    auth: tuple = Depends(peer_auth_token(cluster_peer.SCOPE_TRANSFER)),
+):
+    token, node_uid = auth
+    try:
+        passphrase = cluster_transfer.unseal(token.token_hash, payload.passphrase_sealed)
+        password_hash = (cluster_transfer.unseal(token.token_hash, payload.password_hash_sealed)
+                         if payload.password_hash_sealed else "")
+        job = cluster_transfer.start_incoming_restore(
+            db, upload_id=payload.upload_id, username=payload.username, passphrase=passphrase,
+            password_hash=password_hash, source_uid=node_uid, source_name=payload.source_name,
+            source_job=payload.source_job,
+        )
+    except (ValueError, cluster_transfer.TransferError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"job_uid": job["job_uid"], "status": job["status"]}
+
+
+@router.get("/peer/transfer/jobs/{job_uid}")
+def peer_transfer_job(
+    job_uid: str,
+    db: Session = Depends(get_db),
+    node_uid: str = Depends(peer_auth(cluster_peer.SCOPE_TRANSFER)),
+):
+    try:
+        return cluster_transfer.incoming_job(db, job_uid, node_uid)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/peer/transfer/claim-zones")
+def peer_transfer_claim_zones(
+    payload: PeerClaimZonesIn,
+    db: Session = Depends(get_db),
+    node_uid: str = Depends(peer_auth(cluster_peer.SCOPE_TRANSFER)),
+):
+    return cluster_transfer.claim_zones(db, payload.zones, payload.old_ips, node_uid)
