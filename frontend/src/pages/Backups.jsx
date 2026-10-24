@@ -9,6 +9,7 @@ import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 import { WebsiteSelect } from '../components/WebsiteSelect.jsx';
+import { ServerBackupTab } from '../components/ServerBackupTab.jsx';
 import { formatBytes, BACKUP_SCHEDULE_PRESETS, isPresetSchedule } from '../utils/helpers.js';
 
 const S3_PRESETS = [
@@ -870,6 +871,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
               { id: 'website', label: 'Website Backups', icon: Globe, badge: backups.length },
               ...(isAdmin ? [
                 { id: 'schedule', label: 'Scheduled Backups', icon: Clock, badge: backupSchedules.length },
+                { id: 'server', label: t('Panel self-backup & verification'), icon: ShieldCheck, badge: '' },
               ] : []),
               {
                 id: 'restore',
@@ -1428,6 +1430,10 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
       {/* =====================================================================
           TAB 3: SCHEDULED BACKUPS (Cron Automation + Retention + SFTP/S3)
          ===================================================================== */}
+      {isAdmin && activeBackupTab === 'server' && (
+        <ServerBackupTab request={request} setNotice={setNotice} loading={loading} targets={sftpTargets} />
+      )}
+
       {isAdmin && activeBackupTab === 'schedule' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
           <div className="pkg-card" style={{ padding: '20px 22px' }}>

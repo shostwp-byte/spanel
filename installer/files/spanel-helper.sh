@@ -927,6 +927,260 @@ panel_snapshot_delete() {
   echo "deleted=${snap_id}"
 }
 
+# ---- panel self-backup (disaster recovery) ----------------------------------
+# One encrypted archive of everything that makes this server this panel and is
+# not in the per-account backups: the panel database and .env (SECRET_KEY
+# decrypts every stored secret), /etc/spanel, certificates, the nginx/PHP/mail
+# configuration the panel wrote, DKIM keys and the PowerDNS zones.
+#
+# It is encrypted here, as root, with a passphrase only root can read
+# (PANEL_DR_KEY_FILE). The panel account uploads the result but cannot open
+# it: the archive holds secrets - the audit key, DKIM private keys - that the
+# panel account itself is not meant to be able to read back from a bucket.
+PANEL_DR_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-dr"
+PANEL_DR_KEY_FILE="/etc/spanel/dr-passphrase"
+PANEL_DR_KEEP_LOCAL=3
+# Relative to /. Globs are expanded; what does not exist is skipped.
+PANEL_DR_PATHS=(
+  "opt/spanel/backend/.env"
+  "etc/spanel"
+  "var/lib/spanel"
+  "etc/nginx/nginx.conf"
+  "etc/nginx/conf.d"
+  "etc/nginx/spanel"
+  "etc/php/*/fpm/pool.d"
+  "etc/php/*/fpm/conf.d/*spanel*"
+  "etc/php/*/cli/conf.d/*spanel*"
+  "etc/exim4"
+  "etc/dovecot"
+  "etc/rspamd/local.d"
+  "etc/rspamd/override.d"
+  "etc/spanel-mail-tls"
+  "etc/powerdns"
+  "etc/letsencrypt"
+  "etc/mysql/mariadb.conf.d/90-spanel-tuning.cnf"
+  "etc/ssh/sshd_config.d"
+  "etc/sudoers.d/spanel"
+  "etc/systemd/system/spanel-*.service"
+  "etc/systemd/system/spanel-*.timer"
+  "var/spool/cron/crontabs"
+)
+# Never in the archive: the passphrase that encrypts it, bulky caches and
+# copies that are themselves backups.
+PANEL_DR_EXCLUDES=(
+  "etc/spanel/dr-passphrase"
+  "var/lib/spanel/db-backups"
+  "var/lib/spanel/geoip"
+  "var/lib/spanel/malware-scan-jobs"
+  "var/lib/spanel/da-import"
+  "var/lib/spanel/import-stage"
+  "*.sock"
+)
+
+# The include list, relative to <root> (/ on a server; a test points it at a
+# fixture tree). The app directory is taken from APP_DIR when it differs.
+panel_dr_include_paths() {
+  local root="${1:-/}" glob path app_rel
+  app_rel="${APP_DIR#/}"
+  shopt -s nullglob
+  for glob in "${PANEL_DR_PATHS[@]}"; do
+    glob="${glob/opt\/spanel/$app_rel}"
+    for path in "${root%/}"/$glob; do
+      [[ -e "$path" && ! -L "$path" ]] || continue
+      printf '%s\n' "${path#"${root%/}"/}"
+    done
+  done
+  shopt -u nullglob
+}
+
+panel_dr_fingerprint() {
+  /usr/bin/python3 -I - "$PANEL_DR_KEY_FILE" <<'PY'
+import hashlib, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = handle.readline().strip()
+print(hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16])
+PY
+}
+
+panel_dr_key_status() {
+  if [[ -s "$PANEL_DR_KEY_FILE" ]]; then
+    echo "initialised=yes"
+    echo "fingerprint=$(panel_dr_fingerprint)"
+  else
+    echo "initialised=no"
+  fi
+}
+
+# Generate the passphrase and print it, once. It is not printed again by
+# anything: the panel shows it to the administrator, who must keep a copy
+# off this server - without it the archive cannot be opened on a new one.
+panel_dr_key_init() {
+  local mode="${1:-}" tmp
+  if [[ -s "$PANEL_DR_KEY_FILE" && "$mode" != "--rotate" ]]; then
+    deny "the panel self-backup passphrase is already set; rotate it explicitly"
+  fi
+  [[ -z "$mode" || "$mode" == "--rotate" ]] || deny "usage: panel-dr-key-init [--rotate]"
+  install -d -o root -g spanel -m 0750 /etc/spanel
+  tmp="$(mktemp /etc/spanel/.dr-passphrase.XXXXXX)"
+  chmod 0600 "$tmp"
+  /usr/bin/python3 -I -c 'import secrets; print(secrets.token_urlsafe(30))' >"$tmp"
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; deny "could not generate a passphrase"; }
+  chown root:root "$tmp"
+  mv -f "$tmp" "$PANEL_DR_KEY_FILE"
+  echo "passphrase=$(head -n 1 "$PANEL_DR_KEY_FILE")"
+  echo "fingerprint=$(panel_dr_fingerprint)"
+}
+
+# Encrypt <plain> to <out> in the panel's backup format: OpenSSL
+# AES-256-CBC with PBKDF2-HMAC-SHA256 (100000 rounds, "Salted__" header),
+# then an SPNLMAC1 + HMAC-SHA256 trailer over header and ciphertext, keyed
+# with bytes 48-80 of the same PBKDF2 output. backup.decrypt_backup_archive
+# and `spanelctl dr-restore` both open it. The passphrase never appears on a
+# command line: openssl reads it from the root-only file.
+panel_dr_encrypt() {
+  local plain="$1" out="$2"
+  openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -md sha256 \
+    -pass file:"$PANEL_DR_KEY_FILE" -in "$plain" -out "$out"
+  /usr/bin/python3 -I - "$out" "$PANEL_DR_KEY_FILE" <<'PY'
+import hashlib, hmac, sys
+path, keyfile = sys.argv[1], sys.argv[2]
+with open(keyfile, encoding="utf-8") as handle:
+    secret = handle.readline().strip()
+with open(path, "rb") as handle:
+    header = handle.read(16)
+    if header[:8] != b"Salted__":
+        sys.exit("openssl did not write a salted header")
+    key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), header[8:16], 100000, dklen=80)
+    mac = hmac.new(key[48:80], digestmod=hashlib.sha256)
+    mac.update(header)
+    while chunk := handle.read(1024 * 1024):
+        mac.update(chunk)
+with open(path, "ab") as handle:
+    handle.write(b"SPNLMAC1" + mac.digest())
+PY
+}
+
+# PowerDNS data the way its backend holds it, plus a plain zone-file export
+# that any backend can load (pdnsutil load-zone).
+panel_dr_dump_pdns() {
+  local out="$1" dbname zone
+  mkdir -p "$out/zones"
+  if [[ -f "$PDNS_DB" ]]; then
+    sqlite_online_copy "$PDNS_DB" "$out/pdns.sqlite3" && echo "gsqlite3" >"$out/backend"
+  elif grep -qs '^launch=.*gmysql' /etc/powerdns/pdns.conf /etc/powerdns/pdns.d/*.conf 2>/dev/null; then
+    dbname="$(awk -F= '/^gmysql-dbname=/{print $2; exit}' /etc/powerdns/pdns.conf /etc/powerdns/pdns.d/*.conf 2>/dev/null || true)"
+    dbname="${dbname:-pdns}"
+    [[ "$dbname" =~ ^[A-Za-z0-9_]{1,64}$ ]] || dbname="pdns"
+    if mysqldump --single-transaction --routines "$dbname" >"$out/pdns.sql" 2>/dev/null; then
+      echo "gmysql:${dbname}" >"$out/backend"
+    else
+      rm -f "$out/pdns.sql"
+    fi
+  fi
+  if command -v pdnsutil >/dev/null 2>&1; then
+    while IFS= read -r zone; do
+      zone="${zone%.}"
+      is_domain "$zone" || continue
+      pdnsutil list-zone "$zone" >"$out/zones/${zone}.zone" 2>/dev/null || rm -f "$out/zones/${zone}.zone"
+    done < <(pdnsutil list-all-zones 2>/dev/null)
+  fi
+}
+
+panel_dr_archive() {
+  [[ -s "$PANEL_DR_KEY_FILE" ]] || deny "set the panel self-backup passphrase first (panel-dr-key-init)"
+  local host ts work name plain out manifest db exclude
+  local -a includes=() tar_excludes=()
+  host="$(hostname -f 2>/dev/null || hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9.-' '-' | cut -c1-63)"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  name="panel-dr-${host}-${ts}"
+  install -d -o root -g spanel -m 0750 "$PANEL_DR_DIR"
+  work="$(mktemp -d /var/tmp/spanel-dr.XXXXXX)"
+  chmod 0700 "$work"
+  PANEL_DR_WORK="$work"   # removed by the EXIT trap set in the command case
+
+  mkdir -p "$work/db" "$work/pdns"
+  db="$(panel_db_path)"
+  [[ -f "$db" ]] && sqlite_online_copy "$db" "$work/db/spanel.db"
+  panel_dr_dump_pdns "$work/pdns"
+
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && includes+=("$path")
+  done < <(panel_dr_include_paths /)
+  for exclude in "${PANEL_DR_EXCLUDES[@]}"; do
+    tar_excludes+=("--exclude=${exclude}")
+  done
+  # The live database is in db/ as an online copy; the file itself may be
+  # mid-write.
+  tar_excludes+=("--exclude=${db#/}" "--exclude=${db#/}-wal" "--exclude=${db#/}-shm")
+  if [[ ${#includes[@]} -gt 0 ]]; then
+    tar -C / -cpf "$work/files.tar" "${tar_excludes[@]}" --ignore-failed-read "${includes[@]}" 2>/dev/null || true
+  fi
+
+  /usr/bin/python3 -I - "$work" "$host" "$(panel_current_version)" "${includes[@]}" <<'PY'
+import json, os, sqlite3, sys, time
+work, host, version, includes = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+revision = ""
+db = os.path.join(work, "db", "spanel.db")
+if os.path.isfile(db):
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        revision = ",".join(r[0] for r in conn.execute("SELECT version_num FROM alembic_version"))
+        conn.close()
+    except sqlite3.Error:
+        pass
+backend = ""
+backend_file = os.path.join(work, "pdns", "backend")
+if os.path.isfile(backend_file):
+    backend = open(backend_file, encoding="utf-8").read().strip()
+zones = sorted(f[:-5] for f in os.listdir(os.path.join(work, "pdns", "zones")) if f.endswith(".zone")) \
+    if os.path.isdir(os.path.join(work, "pdns", "zones")) else []
+manifest = {
+    "kind": "spanel_panel_dr",
+    "format": 1,
+    "hostname": host,
+    "panel_version": version,
+    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "db_revision": revision,
+    "has_database": os.path.isfile(db),
+    "pdns_backend": backend,
+    "dns_zones": len(zones),
+    "paths": includes,
+}
+with open(os.path.join(work, "manifest.json"), "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+PY
+
+  plain="$work/${name}.tar.gz"
+  tar -C "$work" -czf "$plain" manifest.json db pdns $([[ -f "$work/files.tar" ]] && echo files.tar)
+  out="${PANEL_DR_DIR}/${name}.spdr"
+  manifest="${PANEL_DR_DIR}/${name}.json"
+  panel_dr_encrypt "$plain" "$out.tmp"
+  mv -f "$out.tmp" "$out"
+  # The manifest beside the archive is plain and holds no secret: what is in
+  # it, for the page and for a person choosing which archive to restore.
+  /usr/bin/python3 -I - "$work/manifest.json" "$out" "$manifest" <<'PY'
+import hashlib, json, os, sys
+src, archive, dst = sys.argv[1:4]
+data = json.load(open(src, encoding="utf-8"))
+digest = hashlib.sha256()
+with open(archive, "rb") as handle:
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+data.update({"archive": os.path.basename(archive), "size": os.path.getsize(archive), "sha256": digest.hexdigest()})
+with open(dst, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+PY
+  chown root:spanel "$out" "$manifest"
+  chmod 0640 "$out" "$manifest"
+
+  ls -1t "${PANEL_DR_DIR}"/panel-dr-*.spdr 2>/dev/null | tail -n +"$((PANEL_DR_KEEP_LOCAL + 1))" | while IFS= read -r old; do
+    rm -f "$old" "${old%.spdr}.json"
+  done
+  echo "archive=${out}"
+  echo "manifest=${manifest}"
+}
+
 # Hot database backups (taken by the watchdog every 6 h and on demand) live
 # in PANEL_DB_BACKUP_DIR as spanel-<UTC stamp>-<reason>.db.
 panel_db_restore() {
@@ -8296,6 +8550,23 @@ case "$cmd" in
   panel-db-restore)
     [[ $# -ge 1 && $# -le 2 ]] || deny "usage: panel-db-restore <backup-name> [--now]"
     panel_db_restore "$1" "${2:-}"
+    ;;
+
+  panel-dr-key-status)
+    [[ $# -eq 0 ]] || deny "usage: panel-dr-key-status"
+    panel_dr_key_status
+    ;;
+
+  panel-dr-key-init)
+    [[ $# -le 1 ]] || deny "usage: panel-dr-key-init [--rotate]"
+    panel_dr_key_init "${1:-}"
+    ;;
+
+  panel-dr-archive)
+    [[ $# -eq 0 ]] || deny "usage: panel-dr-archive"
+    PANEL_DR_WORK=""
+    trap '[[ -n "${PANEL_DR_WORK:-}" ]] && rm -rf "$PANEL_DR_WORK"' EXIT
+    panel_dr_archive
     ;;
 
   # ---- WAF --------------------------------------------------------------
