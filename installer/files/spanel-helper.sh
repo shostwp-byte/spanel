@@ -9543,6 +9543,43 @@ EOF
     exec systemctl status "$1" --no-pager
     ;;
 
+  audit-anchor-write)
+    [[ $# -eq 3 ]] || deny "usage: audit-anchor-write <last_id> <head_hash> <total_entries>"
+    last_id="$1"; head_hash="$2"; total_entries="$3"
+    [[ "$last_id" =~ ^[0-9]{1,18}$ ]] || deny "invalid audit last_id"
+    [[ "$head_hash" =~ ^[0-9a-f]{64}$ ]] || deny "invalid audit head_hash"
+    [[ "$total_entries" =~ ^[0-9]{1,18}$ ]] || deny "invalid audit total_entries"
+    install -d -m 0750 -o root -g spanel /etc/spanel
+    anchor_file="/etc/spanel/audit-chain-anchor.json"
+    anchor_log="/etc/spanel/audit-chain-anchor.log"
+    if [[ -f "$anchor_file" ]]; then
+      prev_id="$(awk -F'[^0-9]+' '/"last_id"/ {print $2; exit}' "$anchor_file" 2>/dev/null || echo 0)"
+      prev_total="$(awk -F'[^0-9]+' '/"total_entries"/ {print $2; exit}' "$anchor_file" 2>/dev/null || echo 0)"
+      if [[ "$prev_id" =~ ^[0-9]+$ ]] && (( last_id < prev_id )); then
+        deny "audit-anchor-write: refusing non-monotonic last_id (${last_id} < ${prev_id})"
+      fi
+      if [[ "$prev_total" =~ ^[0-9]+$ ]] && (( total_entries < prev_total )); then
+        deny "audit-anchor-write: refusing non-monotonic total_entries (${total_entries} < ${prev_total})"
+      fi
+    fi
+    ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    tmp_anchor="$(mktemp /etc/spanel/.audit-anchor.XXXXXX)"
+    cat >"$tmp_anchor" <<EOF
+{
+  "last_id": ${last_id},
+  "head_hash": "${head_hash}",
+  "total_entries": ${total_entries},
+  "updated_at": "${ts_utc}"
+}
+EOF
+    chown root:spanel "$tmp_anchor"
+    chmod 0640 "$tmp_anchor"
+    mv -f "$tmp_anchor" "$anchor_file"
+    printf '%s\tlast_id=%s\ttotal_entries=%s\thead_hash=%s\n' "$ts_utc" "$last_id" "$total_entries" "$head_hash" >>"$anchor_log"
+    chown root:spanel "$anchor_log"
+    chmod 0640 "$anchor_log"
+    ;;
+
   # ---- terminal command execution as panel Linux user ------------------
   terminal-exec)
     # Execute a whitelisted command as the panel Linux user

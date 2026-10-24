@@ -1480,6 +1480,12 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
       install -d -m 0755 -o root -g spanel /etc/spanel/yara
       install -m 0644 -o root -g spanel "$SOURCE_DIR/installer/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
     fi
+    install -d -m 0750 -o root -g spanel /etc/spanel
+    if [[ ! -s /etc/spanel/audit-hmac.key ]]; then
+      openssl rand -hex 32 >/etc/spanel/audit-hmac.key
+    fi
+    chown root:spanel /etc/spanel/audit-hmac.key
+    chmod 0640 /etc/spanel/audit-hmac.key
     if [[ -f "$SOURCE_DIR/installer/files/spanel-watchdog.service" && -f "$SOURCE_DIR/installer/files/spanel-watchdog.timer" ]]; then
       install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-watchdog.service" /etc/systemd/system/spanel-watchdog.service
       sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-watchdog.service

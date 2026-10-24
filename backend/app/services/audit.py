@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.entities import AuditLog, User
+from app.services.shell import shell
 from app.services.webhooks import dispatch_webhook
 
 
@@ -25,7 +26,7 @@ def _audit_anchor_path() -> Path:
     custom = os.environ.get("SPANEL_AUDIT_ANCHOR_PATH", "").strip()
     if custom:
         return Path(custom)
-    return Path("/var/lib/spanel/audit-chain-anchor.json")
+    return Path("/etc/spanel/audit-chain-anchor.json")
 
 
 def _audit_hmac_key() -> bytes:
@@ -39,7 +40,9 @@ def _audit_hmac_key() -> bytes:
                 return raw.encode("utf-8")
     except OSError:
         pass
-    secret = settings.secret_key or "spanel-default-secret"
+    secret = (settings.secret_key or "").strip()
+    if not secret:
+        raise RuntimeError("SECRET_KEY or /etc/spanel/audit-hmac.key is required for audit HMAC")
     return hmac.new(secret.encode("utf-8"), b"spanel-audit-hmac-v1", hashlib.sha256).digest()
 
 
@@ -107,6 +110,18 @@ def _write_audit_anchor(
         action,
         target,
     )
+    custom_path = os.environ.get("SPANEL_AUDIT_ANCHOR_PATH", "").strip()
+    if not custom_path:
+        try:
+            res = shell.privileged(
+                "audit-anchor-write",
+                helper_args=[str(anchor["last_id"]), head_hash, str(anchor["total_entries"])],
+                check=False,
+            )
+            if res.returncode == 0:
+                return
+        except Exception:
+            pass
     path = _audit_anchor_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
