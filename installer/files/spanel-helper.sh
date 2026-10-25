@@ -859,15 +859,6 @@ panel_snapshot_create() {
   [[ -f "/usr/local/sbin/spanel-helper" ]] && cp -a "/usr/local/sbin/spanel-helper" "$work/sbin/spanel-helper"
   [[ -f "/usr/local/sbin/spanel-update" ]] && cp -a "/usr/local/sbin/spanel-update" "$work/sbin/spanel-update"
 
-  if [[ -f "${APP_DIR}/backend/spanel.db" ]]; then
-    if command -v python3 >/dev/null 2>&1; then
-      python3 -c 'import sqlite3, sys; src=sqlite3.connect(sys.argv[1], timeout=15); dst=sqlite3.connect(sys.argv[2], timeout=15); src.backup(dst); dst.close(); src.close()' "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak" 2>/dev/null \
-        || cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    elif command -v sqlite3 >/dev/null 2>&1; then
-      sqlite3 "${APP_DIR}/backend/spanel.db" ".backup '${work}/backend/spanel.db.bak'" 2>/dev/null || cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    else
-      cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
-    fi
   # The database through SQLite's online backup API, which reads committed
   # pages from the WAL too: a plain cp of a WAL-mode file can miss them.
   # Taken before spanel-update runs any migration, so restoring it is what
@@ -1068,10 +1059,6 @@ panel_snapshot_restore() {
     chown root:root "/usr/local/sbin/spanel-update.new" 2>/dev/null || true
     mv -f "/usr/local/sbin/spanel-update.new" "/usr/local/sbin/spanel-update"
   fi
-  if [[ -f "$work/backend/spanel.db.bak" && "${2:-}" == "--restore-db" ]]; then
-    rm -f "${APP_DIR}/backend/spanel.db-wal" "${APP_DIR}/backend/spanel.db-shm" "${APP_DIR}/backend/spanel.db-journal" 2>/dev/null || true
-    cp -a "$work/backend/spanel.db.bak" "${APP_DIR}/backend/spanel.db"
-    chown spanel:spanel "${APP_DIR}/backend/spanel.db" 2>/dev/null || true
   panel_snapshot_restore_system "$work"
   panel_snapshot_restore_venv "$work"
 
