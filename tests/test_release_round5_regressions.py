@@ -6,11 +6,13 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "backend"))
 UPDATE_SH = REPO_ROOT / "installer" / "update.sh"
 BASH = shutil.which("bash")
 RSYNC = shutil.which("rsync")
@@ -111,3 +113,25 @@ def test_pre_update_snapshot_never_falls_back_to_cp():
     body = _update_function("backup_db")
     assert "cp -a" not in body
     assert "xargs -r rm" not in body.replace("xargs -0 -r rm", "")
+
+
+# --- the cron migration must open the panel's real database -----------------
+
+def test_cron_migration_runs_the_panel_code_from_backend():
+    """Stage 2 ran after `cd frontend`. The app reads .env (and DATABASE_URL)
+    relative to the working directory, so it opened an empty
+    frontend/spanel.db and migrated nothing, on every update."""
+    from app.core.config import Settings
+
+    assert Settings.Config.env_file == ".env"  # relative: the cwd decides
+    body = _update_function("migrate_site_cron_php_binary")
+    stage2 = body.split("mig_out=", 1)[1].split("<<'PY_MIGRATE'", 1)[0]
+    assert stage2.lstrip().startswith('"$(cd "$APP_DIR/backend" && sudo -u spanel')
+    # Nothing in the app reads it; it only looked like the path was passed.
+    assert "SPANEL_DB_PATH" not in UPDATE_SH.read_text(encoding="utf-8")
+
+
+def test_update_removes_the_empty_database_left_in_frontend():
+    text = UPDATE_SH.read_text(encoding="utf-8")
+    after = text.split("\nmigrate_site_cron_php_binary\n", 1)[1].split("nginx -t", 1)[0]
+    assert 'rm -f -- "$APP_DIR/frontend/spanel.db"' in after

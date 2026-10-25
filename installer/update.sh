@@ -750,11 +750,16 @@ PY_DUMP
 
   # Stage 2 (unprivileged spanel account via sudo -u spanel + SPANEL_USE_HELPER=true):
   # Migrate legacy spool lines and enforce spanel-cron-jail across all sites.
+  #
+  # From backend/, like the panel's own units (WorkingDirectory=): the app
+  # reads .env, and with it DATABASE_URL, relative to the working directory.
+  # This runs after the frontend build has cd'd into frontend/, where it used
+  # to open a fresh empty frontend/spanel.db, find no websites table, and
+  # migrate nothing on every update.
   local mig_out
-  mig_out="$(sudo -u spanel env \
+  mig_out="$(cd "$APP_DIR/backend" && sudo -u spanel env \
     HOME="$APP_DIR" \
     PYTHONPATH="$APP_DIR/backend" \
-    SPANEL_DB_PATH="$db_path" \
     SPANEL_USE_HELPER=true \
     "$py_bin" - "$spool_json" <<'PY_MIGRATE'
 import json
@@ -2169,6 +2174,12 @@ migrate_nginx_wordpress_csp_worker_src
 migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
+# The empty database earlier updates left behind when the cron migration ran
+# from frontend/ (see migrate_site_cron_php_binary). As spanel: frontend/ is
+# spanel's directory.
+if [[ -f "$APP_DIR/frontend/spanel.db" && ! -L "$APP_DIR/frontend/spanel.db" ]]; then
+  sudo -u spanel rm -f -- "$APP_DIR/frontend/spanel.db" || true
+fi
 nginx -t
 systemctl reload nginx
 
