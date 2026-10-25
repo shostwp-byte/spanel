@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_current_user_optional
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role, is_admin_role
+from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.security import create_access_token, hash_password, needs_rehash, verify_password
 from app.core.secrets import decrypt, encrypt
 from app.core.step_up import require_sensitive_action_step_up, verify_totp
@@ -794,14 +794,66 @@ def impersonate_user(
                 detail="Invalid authentication code",
             )
 
-    # Audit log must be written before the session is issued so a DB failure
-    # doesn't leave an impersonation succeeded with no audit trail.
+    actor_id = current_user.id
+    actor_username = current_user.username
+    actor_tv = int(current_user.token_version or 0)
+    target_id = target_user.id
+    target_username = target_user.username
+    target_role = target_user.role
+
+    token = _issue_login_session(
+        response,
+        request,
+        target_user,
+        extra_claims={
+            "imp": True,
+            "imp_by": actor_id,
+            "imp_user": actor_username,
+            "imp_tv": actor_tv,
+        },
+    )
     log_action(
         db,
-        current_user.id,
+        actor_id,
         "auth.impersonate",
-        target_user.username,
-        detail=f"target_user_id={target_user.id} target_role={target_user.role}",
+        target_username,
+        detail=f"target_user_id={target_id} target_role={target_role}",
+        request=request,
+    )
+    return LoginResponse(access_token=token)
+
+
+@router.post("/impersonate-exit", response_model=LoginResponse)
+def exit_impersonation(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return from an impersonated session back to the original admin/reseller account."""
+    jwt_payload = getattr(request.state, "jwt_payload", None) or {}
+    imp_by = jwt_payload.get("imp_by")
+    if not jwt_payload.get("imp") or not imp_by:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not in an impersonated session")
+    actor = db.query(User).filter(User.id == int(imp_by)).first()
+    if (
+        actor is None
+        or not actor.is_active
+        or normalize_role(actor.role) not in {Role.admin, Role.reseller}
+        or int(actor.token_version or 0) != int(jwt_payload.get("imp_tv", 0))
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Original session is no longer valid")
+    from_user_id = current_user.id
+    from_username = current_user.username
+    actor_id = actor.id
+    _revoke_request_token(db, request, current_user)
+    token = _issue_login_session(response, request, actor)
+    log_action(
+        db,
+        actor_id,
+        "auth.impersonate_exit",
+        from_username,
+        detail=f"from_user_id={from_user_id} to_user_id={actor_id}",
         request=request,
     )
     token = _issue_login_session(
