@@ -9581,6 +9581,12 @@ EOF
       tmp_cron="$(mktemp /etc/cron.d/.spanel-cron.XXXXXX)"
       chmod 0644 "$tmp_cron"
       chown root:root "$tmp_cron"
+      # Same grammar as JAILED_COMMAND_ARG_RE in backend/app/services/cron.py:
+      #   ^'[^']*('(\\'|"'")'[^']*)*'$
+      # and a % after an even run of backslashes, which cron would cut at.
+      q="'"
+      jailed_arg_re="^${q}[^${q}]*(${q}(\\\\${q}|\"${q}\")${q}[^${q}]*)*${q}\$"
+      unescaped_pct_re='(^|[^\])(\\\\)*%'
       {
         echo "# Managed by SPanel — root-enforced Mount Namespace Jail for ${user}"
         echo "SHELL=/bin/sh"
@@ -9590,9 +9596,11 @@ EOF
           [[ "$line" =~ ^[[:space:]]*# ]] && continue
           [[ "$line" =~ ^[[:space:]]*(SHELL|PATH)= ]] && continue
           if [[ "$line" =~ ^([0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+[[:space:]]+[0-9*,/-]+)[[:space:]]+root[[:space:]]+/usr/local/bin/spanel-cron-jail[[:space:]]+(\'?[a-z_][a-z0-9_-]{0,31}\'?)[[:space:]]+(\'[^\']+\'|/[A-Za-z0-9._/-]+)[[:space:]]+--[[:space:]]+/bin/sh[[:space:]]+-c[[:space:]]+(\'.*\')[[:space:]]+(#[[:space:]]*spanel:[a-z0-9.-]{3,253})[[:space:]]*$ ]]; then
+            # Copy every capture now: the next regex test resets them.
             sched="${BASH_REMATCH[1]}"
             line_user="${BASH_REMATCH[2]//\'/}"
-            line_cwd="${BASH_REMATCH[3]//\'/}"
+            cwd_word="${BASH_REMATCH[3]}"
+            line_cwd="${cwd_word//\'/}"
             quoted_cmd="${BASH_REMATCH[4]}"
             marker="${BASH_REMATCH[5]}"
             if [[ "$line_user" != "$user" ]]; then
@@ -9604,14 +9612,18 @@ EOF
               rm -f "$tmp_cron"
               deny "cron-write: working directory outside ${resolved_home}: ${line_cwd}"
             fi
-            # Ensure quoted_cmd has no unquoted shell operators outside single quotes (supports both '\'' and '"'"')
-            stripped_escapes="$(sed -E "s/'\"'\"'//g; s/'\\\\''//g" <<<"$quoted_cmd")"
-            if [[ ! "$stripped_escapes" =~ ^\'[^\']*\'$ ]]; then
+            # quoted_cmd must be one shell word: single-quoted segments joined
+            # only by '\'' or '"'"', so root's shell sees nothing unquoted.
+            if [[ ! "$quoted_cmd" =~ $jailed_arg_re ]]; then
               rm -f "$tmp_cron"
               deny "cron-write: unquoted shell tokens outside /bin/sh -c string refused"
             fi
+            if [[ "$quoted_cmd" =~ $unescaped_pct_re ]]; then
+              rm -f "$tmp_cron"
+              deny "cron-write: unescaped % in /bin/sh -c string refused"
+            fi
             printf '%s root /usr/local/bin/spanel-cron-jail %s %s -- /bin/sh -c %s %s\n' \
-              "$sched" "$line_user" "${BASH_REMATCH[3]}" "$quoted_cmd" "$marker"
+              "$sched" "$line_user" "$cwd_word" "$quoted_cmd" "$marker"
           else
             rm -f "$tmp_cron"
             deny "cron-write: rejected unconfined or malformed cron line for ${user}"
@@ -10277,6 +10289,16 @@ EOF
     fi
     if [[ -d "/proc/${target_pid}" ]] && [[ ! -s "/proc/${target_pid}/cmdline" ]] && [[ ! -e "/proc/${target_pid}/exe" ]]; then
       deny "refusing to kill kernel thread: $target_pid"
+    fi
+    # Only hosting accounts' processes: anything owned by root or a system
+    # account is a service, and those are restarted from System Services.
+    target_uid="$(awk '$1=="Uid:"{print $2; exit}' "/proc/${target_pid}/status" 2>/dev/null || true)"
+    [[ "$target_uid" =~ ^[0-9]+$ ]] || deny "No such process: $target_pid"
+    if (( target_uid < 1000 || target_uid >= 65000 )); then
+      deny "refusing to kill process of system account (uid ${target_uid}): $target_pid"
+    fi
+    if [[ "$(getent passwd "$target_uid" | cut -d: -f1)" == "spanel" ]]; then
+      deny "refusing to kill SPanel process: $target_pid"
     fi
     target_comm="$(tr -d '\0\n' <"/proc/${target_pid}/comm" 2>/dev/null || true)"
     case "$target_comm" in
