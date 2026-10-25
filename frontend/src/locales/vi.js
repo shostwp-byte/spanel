@@ -2861,6 +2861,11 @@ export const vi = {
   "Optional": "Tùy chọn",
   "Testing webhook...": "Đang gửi thử nghiệm Webhook...",
   "Saved {path}": "Đã lưu {path}",
+  "SPanel & OS Updates": "SPanel & Hệ điều hành",
+  "Core Infrastructure": "Hạ tầng Core Stack",
+  "Snapshots & Rollback": "Snapshots & Rollback",
+  "Updates navigation tabs": "Các tab quản lý cập nhật",
+  "new": "mới",
 };
 
 /* Said in English by the people who run these servers. Translating them
