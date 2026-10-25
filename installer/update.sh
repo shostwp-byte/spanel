@@ -1335,20 +1335,37 @@ backup_db() {
   fi
   local snap_dir="${BACKUP_ROOT:-/var/backups/spanel}/db-snapshots"
   install -d -m 0750 "$snap_dir"
+  local -a as_owner=()
   if id -u spanel >/dev/null 2>&1; then
     chown spanel:spanel "$snap_dir" 2>/dev/null || true
+    # The directory is spanel's, so spanel writes into it: root following a
+    # name spanel planted there would write wherever that name points.
+    as_owner=(sudo -u spanel)
   fi
   local stamp
   stamp=$(date -u +%Y%m%d-%H%M%S)
   local snap="$snap_dir/spanel-$stamp.db"
-  if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$db_path" ".backup '$snap'"
-  else
-    cp -a "$db_path" "$snap"
+  # SQLite's backup API, never cp: the API runs in WAL mode, so rows written
+  # since the last checkpoint live only in spanel.db-wal and a copy of the
+  # main file alone is missing them (the sqlite3 CLI is not installed on a
+  # stock Ubuntu either, which is how every snapshot became a cp).
+  if ! "${as_owner[@]}" python3 -I - "$db_path" "$snap" <<'PY'; then
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+PY
+    echo "ERROR: could not snapshot $db_path; nothing was changed." >&2
+    exit 1
   fi
   echo "DB snapshot saved: $snap"
   # Keep the 10 most recent snapshots.
-  ls -1t "$snap_dir"/spanel-*.db 2>/dev/null | tail -n +11 | xargs -r rm -f
+  "${as_owner[@]}" find "$snap_dir" -maxdepth 1 -type f -name 'spanel-*.db' -printf '%T@ %p\0' \
+    | sort -z -rn | tail -z -n +11 | cut -z -d' ' -f2- \
+    | "${as_owner[@]}" xargs -0 -r rm -f -- || true
 }
 
 if [[ -n "${SPANEL_UPDATE_STAGE2:-}" ]]; then
@@ -1508,16 +1525,40 @@ fi
 log "Syncing source to $APP_DIR"
 mkdir -p "$APP_DIR"
 
+# Fold the WAL into spanel.db while the API is still running. The protect
+# filters below are what keeps the WAL alive; this only shrinks what a crash
+# during the update could leave behind. As spanel: a root connection would
+# create spanel.db-wal/-shm owned by root if they were missing, and the API
+# could no longer open its own database.
+if [[ -f "$APP_DIR/backend/spanel.db" ]] && id -u spanel >/dev/null 2>&1; then
+  sudo -u spanel python3 -I - "$APP_DIR/backend/spanel.db" <<'PY' || true
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=15)
+try:
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+finally:
+    conn.close()
+PY
+fi
+
 if command -v rsync >/dev/null 2>&1; then
   # --filter='protect ...' keeps the destination file even when --delete
   # would otherwise remove it because the source side doesn't have it. We use
   # this for runtime artefacts that the installer creates: .env, .venv,
   # spanel.db, .my.cnf.
+  #
+  # spanel.db-wal, -shm and -journal belong to the database as much as
+  # spanel.db does. Deleting the WAL under a running API dropped every row
+  # written since the last checkpoint: on a test server a website created ten
+  # minutes before the update was gone from the panel afterwards.
   rsync -a --delete \
     --filter='protect /.env' \
     --filter='protect /.venv' \
     --filter='protect /.venv/**' \
     --filter='protect /spanel.db' \
+    --filter='protect /spanel.db-wal' \
+    --filter='protect /spanel.db-shm' \
+    --filter='protect /spanel.db-journal' \
     --filter='protect /.my.cnf' \
     --exclude '__pycache__/' \
     --exclude '*.pyc' \
