@@ -15,6 +15,7 @@ from app.models.entities import User, Website
 from app.services import addons as addons_service
 from app.services import php as php_service
 from app.services import site_apps as site_apps_service
+from app.services import site_users
 from app.services import system as system_service
 from app.services import updates as updates_service
 
@@ -183,6 +184,7 @@ def get_custombuild_status(
         php_smart = {}
     smart_by_branch = {r.get("branch"): r for r in (php_smart.get("versions") or []) if r.get("branch")}
 
+    account_masters = site_users.installed_user_php_fpm_units()
     php_matrix = []
     for ver in supported_php:
         is_inst = ver in installed_php
@@ -193,6 +195,9 @@ def get_custombuild_status(
             "installed": is_inst,
             "running": _service_running(unit) if is_inst else False,
             "service_unit": unit,
+            # Sites run on their account's own master (spanel-php<ver>-fpm@<user>);
+            # the distro unit above serves phpMyAdmin and the panel tools.
+            "account_masters": sum(1 for u in account_masters if u.startswith(f"spanel-php{ver}-fpm@")),
             "sites_count": php_usage.get(ver, 0),
             "is_default": ver == "8.4",
             "current_full_version": s_row.get("current_version") or (ver if is_inst else ""),

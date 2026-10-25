@@ -1,4 +1,5 @@
 import datetime as dt
+import re
 import shutil
 import sqlite3
 from pathlib import Path
@@ -108,6 +109,9 @@ def _ensure_resource_limit_columns() -> None:
             ("tasks_max", "INTEGER NOT NULL DEFAULT 512"),
             ("mysql_storage_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_db_size_mb", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_queries_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_updates_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_connections_per_hour", "INTEGER NOT NULL DEFAULT 0"),
         ],
         "users": [
             ("bandwidth_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
@@ -123,6 +127,9 @@ def _ensure_resource_limit_columns() -> None:
             ("tasks_max", "INTEGER NOT NULL DEFAULT 512"),
             ("mysql_storage_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_db_size_mb", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_queries_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_updates_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+            ("mysql_max_connections_per_hour", "INTEGER NOT NULL DEFAULT 0"),
         ],
         "database_accounts": [
             ("size_bytes", "INTEGER NOT NULL DEFAULT 0"),
@@ -156,6 +163,34 @@ def _ensure_resource_limit_columns() -> None:
 
 
 DB_BACKUP_DIR = Path("/var/lib/spanel/db-backups")
+# What run_sqlite_hot_backup names its files; the helper's panel-db-restore
+# accepts exactly this.
+DB_BACKUP_NAME_RE = re.compile(r"^spanel-[0-9]{8}T[0-9]{6}Z-[a-z0-9_-]{1,24}\.db$")
+
+
+def check_sqlite_backup(name: str) -> dict:
+    """Read-only integrity_check of one hot backup, before a restore is asked
+    of the helper (which checks again as root before it stops anything)."""
+    if not DB_BACKUP_NAME_RE.fullmatch(name or ""):
+        raise ValueError("Not a database backup name")
+    path = DB_BACKUP_DIR / name
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError("Database backup not found")
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=15)
+        try:
+            result = str(conn.execute("PRAGMA integrity_check;").fetchone()[0])
+            tables = int(conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0])
+            revision = ""
+            try:
+                revision = ",".join(r[0] for r in conn.execute("SELECT version_num FROM alembic_version"))
+            except sqlite3.Error:
+                pass
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return {"ok": False, "integrity": str(exc)[:200], "tables": 0, "revision": ""}
+    return {"ok": result.lower() == "ok" and tables > 0, "integrity": result, "tables": tables, "revision": revision}
 
 
 def _resolve_sqlite_path() -> Path | None:

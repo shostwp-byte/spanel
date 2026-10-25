@@ -37,19 +37,20 @@ from __future__ import annotations
 import logging
 
 from app.models.entities import DatabaseAccount, SftpAccount, SiteApp, WebauthnCredential
-from app.services import mariadb, sftp_accounts, site_apps
+from app.services import db_backends, sftp_accounts, site_apps
 
 logger = logging.getLogger("spanel.teardown")
 
 
 def drop_database_record(db, db_item: DatabaseAccount) -> None:
-    """Drop the MariaDB database and account, then forget the panel row.
+    """Drop the database and account wherever they live (local MariaDB or a
+    remote host), then forget the panel row.
 
     The row goes even if the drop fails, so a MariaDB that is already missing
     the database cannot wedge an account deletion forever.
     """
     try:
-        mariadb.drop_database(db_item.db_name, db_item.db_user)
+        db_backends.backend_for(db_item).drop_database(db_item.db_name, db_item.db_user)
     finally:
         db.delete(db_item)
         db.flush()
@@ -154,6 +155,19 @@ def set_owner_sftp_accounts_locked(db, owner_id: int, locked: bool) -> list[str]
         touched.append(account.linux_user)
     db.flush()
     return touched
+
+
+def set_owner_databases_locked(db, owner_id: int, locked: bool) -> list[str]:
+    """Suspending a panel account has to reach its databases too.
+
+    The sites are taken offline, but a database account keeps working with
+    the credentials in their config files - from a script, a cron job or a
+    client on a host it may connect from. ACCOUNT LOCK on every one of the
+    owner's accounts, on whichever server it lives. Returns the accounts that
+    could not be changed; the suspension itself goes ahead.
+    """
+    rows = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == owner_id).all()
+    return db_backends.set_accounts_locked(rows, locked)
 
 
 def purge_owner_passkeys(db, owner_id: int) -> list[str]:

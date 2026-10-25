@@ -53,14 +53,60 @@ def validate_php_version(php_version: str) -> str:
     return php_version
 
 
+# PHP-FPM layout. spanel-helper.sh names the same paths (SPANEL_PHP_FPM_ROOT,
+# SPANEL_PHP_RUN_ROOT, php_pool_name, user_php_fpm_socket); a test runs both and
+# holds them together. A site's pool lives either with its account's own master
+# (spanel-php<ver>-fpm@<user>.service, inside user-<uid>.slice) or, until it is
+# moved or when that master would not start, with the distro php<ver>-fpm.
+PHP_FPM_USER_ROOT = Path("/etc/spanel/php-fpm")
+PHP_FPM_USER_RUN_ROOT = "/run/spanel-php"
+PHP_FPM_LEGACY_RUN_ROOT = "/run/php"
+# Every socket a vhost may name: a pool of the distro master, or of an
+# account's master (whose directory is the account's Linux user).
+PHP_FPM_SOCKET_RE = re.compile(
+    r"/run/php/[A-Za-z0-9_.-]+\.sock"
+    r"|/run/spanel-php/[a-z_][a-z0-9_-]{2,31}/[A-Za-z0-9_.-]+\.sock"
+)
+
+
+def _resolved_site_root(root_path: str | Path) -> str:
+    return str(Path(root_path).resolve())
+
+
 def php_fpm_pool_name(username: str, php_version: str, root_path: str | Path | None = None) -> str:
     safe_user = validate_linux_user(username)
     safe_version = validate_php_version(php_version).replace(".", "_")
     if root_path is not None:
-        resolved_root = str(Path(root_path).resolve())
+        resolved_root = _resolved_site_root(root_path)
         site_hash = hashlib.sha256(resolved_root.encode("utf-8")).hexdigest()[:12]
         return f"spanel-{safe_user}-{site_hash}-{safe_version}"
     return f"spanel-{safe_user}-{safe_version}"
+
+
+_POOL_OWNER_RE = re.compile(r"^spanel-([a-z_][a-z0-9_-]{2,31})-[0-9a-f]{12}-(?:5_6|7_4|8_[0-5])$")
+
+
+def linux_user_from_pool_name(pool_name: str) -> str:
+    """The Linux user a per-site pool belongs to, or "" for any other pool.
+
+    Pool names are the same whichever master serves them, so slowlog headers
+    ("[pool spanel-<user>-<hash>-<ver>]") and slowlog file names read the same.
+    """
+    match = _POOL_OWNER_RE.match(pool_name or "")
+    return match.group(1) if match else ""
+
+
+def php_fpm_user_unit(username: str, php_version: str) -> str:
+    """systemd unit of an account's own PHP-FPM master for one PHP version."""
+    return f"spanel-php{validate_php_version(php_version)}-fpm@{validate_linux_user(username)}.service"
+
+
+def php_fpm_user_pool_file(username: str, php_version: str, root_path: str | Path) -> Path:
+    """Where the helper keeps a site's pool when the account's master serves it."""
+    safe_user = validate_linux_user(username)
+    safe_version = validate_php_version(php_version)
+    pool = php_fpm_pool_name(safe_user, safe_version, root_path)
+    return PHP_FPM_USER_ROOT / safe_version / safe_user / "pool.d" / f"{pool}.conf"
 
 
 def php_fpm_socket(
@@ -68,12 +114,42 @@ def php_fpm_socket(
     php_version: Optional[str] = None,
     root_path: str | Path | None = None,
 ) -> Optional[str]:
+    """The socket nginx must use for a site's PHP.
+
+    The account's master socket while the helper has the site's pool there,
+    otherwise the distro master's. The pool file is the record of which one
+    serves the site: the helper only leaves it in place once that master has
+    started, and falls back to the distro pool.d when it did not.
+    """
     if not username:
         return None
     if php_version:
-        return f"/run/php/{php_fpm_pool_name(username, php_version, root_path)}.sock"
+        pool = php_fpm_pool_name(username, php_version, root_path)
+        if root_path is not None and php_fpm_user_pool_file(username, php_version, root_path).is_file():
+            return f"{PHP_FPM_USER_RUN_ROOT}/{validate_linux_user(username)}/{pool}.sock"
+        return f"{PHP_FPM_LEGACY_RUN_ROOT}/{pool}.sock"
     safe_user = validate_linux_user(username)
-    return f"/run/php/spanel-{safe_user}.sock"
+    return f"{PHP_FPM_LEGACY_RUN_ROOT}/spanel-{safe_user}.sock"
+
+
+def is_valid_php_fpm_socket(socket_path: str | None) -> bool:
+    return bool(PHP_FPM_SOCKET_RE.fullmatch(socket_path or ""))
+
+
+def installed_user_php_fpm_units() -> list[str]:
+    """Per-account PHP-FPM masters that have at least one pool to serve."""
+    units: list[str] = []
+    try:
+        for conf in sorted(PHP_FPM_USER_ROOT.glob("*/*/php-fpm.conf")):
+            version, username = conf.parent.parent.name, conf.parent.name
+            if not PHP_VERSION_RE.fullmatch(version) or not LINUX_USER_RE.fullmatch(username):
+                continue
+            if not any((conf.parent / "pool.d").glob("*.conf")):
+                continue
+            units.append(f"spanel-php{version}-fpm@{username}")
+    except OSError:
+        return units
+    return units
 
 
 def site_php_fpm_socket(username: Optional[str], root_path: str | Path, php_version: Optional[str]) -> Optional[str]:

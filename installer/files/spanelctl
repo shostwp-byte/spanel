@@ -671,6 +671,210 @@ change_panel_ip() {
   "$script" "$old_ip" "$new_ip"
 }
 
+# ---- disaster recovery: rebuild a server from a panel self-backup -------------
+# Usage (as root, on a freshly installed SPanel of the same or newer version):
+#   spanel dr-restore <panel-dr-....spdr> [--passphrase-file F] [--inspect]
+#                     [--with-site-configs] [--yes]
+#
+# The archive is made by the panel's self-backup (Backups > Panel self-backup)
+# and copied here from the backup destination by hand (scp, aws s3 cp, rclone).
+# It restores the panel's own state: database, .env, /etc/spanel, panel state
+# in /var/lib/spanel, certificates, PowerDNS zones, mail and nginx/PHP panel
+# configuration. Websites, databases and mailboxes come back afterwards from
+# the per-account backups: Backups > Restore in the panel, pick the
+# destination (its credentials decrypt again because .env is back), select
+# every account, Restore. That recreates the Linux accounts, vhosts and PHP
+# pools, which is why per-site vhosts, pools and crontabs are left out here
+# unless --with-site-configs is given.
+DR_TIMERS=(spanel-backup-scheduler.timer spanel-malware-scheduler.timer spanel-notify.timer spanel-watchdog.timer spanel-maintenance.timer)
+
+dr_decrypt() {
+  local archive="$1" passfile="$2" out="$3" cipher
+  cipher="$(dirname "$out")/cipher.bin"
+  # Check the SPNLMAC1 HMAC before decrypting anything: a wrong passphrase
+  # or a damaged download stops here, not half-way through tar.
+  /usr/bin/python3 -I - "$archive" "$passfile" "$cipher" <<'PY' || fail "wrong passphrase, or the archive is damaged (HMAC check failed)"
+import hashlib, hmac, os, sys
+archive, passfile, cipher = sys.argv[1:4]
+secret = open(passfile, encoding="utf-8").readline().strip()
+size = os.path.getsize(archive)
+trailer_len = 8 + 32
+with open(archive, "rb") as src:
+    header = src.read(16)
+    if size < 16 + trailer_len or header[:8] != b"Salted__":
+        sys.exit(1)
+    key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), header[8:16], 100000, dklen=80)
+    src.seek(size - trailer_len)
+    trailer = src.read(trailer_len)
+    if trailer[:8] != b"SPNLMAC1":
+        sys.exit(1)
+    mac = hmac.new(key[48:80], digestmod=hashlib.sha256)
+    src.seek(0)
+    remaining = size - trailer_len
+    with open(cipher, "wb") as dst:
+        while remaining > 0:
+            chunk = src.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            mac.update(chunk)
+            dst.write(chunk)
+            remaining -= len(chunk)
+    if not hmac.compare_digest(mac.digest(), trailer[8:]):
+        os.unlink(cipher)
+        sys.exit(1)
+PY
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -pass file:"$passfile" -in "$cipher" -out "$out" \
+    || fail "openssl could not decrypt the archive"
+  rm -f "$cipher"
+}
+
+dr_db_path() {
+  local url
+  url="$(env_get DATABASE_URL)"
+  if [[ "$url" =~ ^sqlite:///(/[A-Za-z0-9._/-]+\.db)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "${APP_DIR}/backend/spanel.db"
+  fi
+}
+
+dr_restore() {
+  local archive="" passfile="" inspect=0 with_sites=0 assume_yes=0 work pass confirm db timer zone
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --passphrase-file) [[ $# -ge 2 ]] || fail "--passphrase-file needs a path"; passfile="$2"; shift 2 ;;
+      --inspect) inspect=1; shift ;;
+      --with-site-configs) with_sites=1; shift ;;
+      --yes) assume_yes=1; shift ;;
+      -*) fail "unknown option: $1" ;;
+      *) archive="$1"; shift ;;
+    esac
+  done
+  [[ -n "$archive" && -f "$archive" ]] || fail "usage: spanel dr-restore <panel-dr-....spdr> [--passphrase-file F] [--inspect] [--with-site-configs] [--yes]"
+  command -v openssl >/dev/null 2>&1 || fail "openssl is required"
+
+  work="$(mktemp -d /var/tmp/spanel-dr-restore.XXXXXX)"
+  chmod 0700 "$work"
+  trap 'rm -rf "$work"' EXIT
+  if [[ -n "$passfile" ]]; then
+    [[ -f "$passfile" ]] || fail "passphrase file not found: $passfile"
+    install -m 0600 /dev/null "$work/pass"
+    # One line, no surrounding whitespace, LF: a copy saved on Windows ends
+    # in CRLF, and openssl would take the CR as part of the passphrase.
+    /usr/bin/python3 -I -c 'import sys; open(sys.argv[2], "w", newline="\n").write(open(sys.argv[1], encoding="utf-8").readline().strip() + "\n")' \
+      "$passfile" "$work/pass"
+  else
+    read -rsp "Panel self-backup passphrase: " pass
+    echo ""
+    install -m 0600 /dev/null "$work/pass"
+    printf '%s\n' "$(printf '%s' "$pass" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" >"$work/pass"
+    pass=""
+  fi
+
+  dr_decrypt "$archive" "$work/pass" "$work/plain.tar.gz"
+  mkdir -p "$work/x"
+  tar -xzf "$work/plain.tar.gz" -C "$work/x"
+  rm -f "$work/plain.tar.gz"
+  [[ -f "$work/x/manifest.json" ]] || fail "this is not a panel self-backup (no manifest.json)"
+  /usr/bin/python3 -I - "$work/x/manifest.json" <<'PY' || fail "this is not a panel self-backup"
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+if m.get("kind") != "spanel_panel_dr":
+    sys.exit(1)
+print(f"Archive from {m.get('hostname')} (panel {m.get('panel_version')}), made {m.get('created_at')}")
+print(f"  database: {'yes' if m.get('has_database') else 'no'} (revision {m.get('db_revision') or '-'})")
+print(f"  PowerDNS: {m.get('pdns_backend') or 'none'}, {m.get('dns_zones', 0)} zone file(s)")
+print(f"  {len(m.get('paths') or [])} configuration path(s):")
+for path in m.get("paths") or []:
+    print(f"    /{path}")
+PY
+  [[ "$inspect" -eq 1 ]] && return 0
+
+  if [[ "$assume_yes" -ne 1 ]]; then
+    echo ""
+    echo "This replaces this server's panel database, .env, /etc/spanel, certificates,"
+    echo "DNS zones and the panel's nginx/PHP/mail configuration with the archive's."
+    read -rp "Type RESTORE to continue: " confirm
+    [[ "$confirm" == "RESTORE" ]] || { echo "Canceled."; return 0; }
+  fi
+
+  systemctl stop "${DR_TIMERS[@]}" >/dev/null 2>&1 || true
+  systemctl stop spanel-api >/dev/null 2>&1 || true
+
+  if [[ -f "$work/x/files.tar" ]]; then
+    mkdir -p "$work/files"
+    tar -xpf "$work/x/files.tar" -C "$work/files"
+    if [[ "$with_sites" -ne 1 ]]; then
+      # Per-site vhosts, PHP pools and crontabs name Linux accounts that do
+      # not exist on this server yet; the account restore writes them anew.
+      if [[ -d "$work/files/etc/nginx/conf.d" ]]; then
+        find "$work/files/etc/nginx/conf.d" -maxdepth 1 -type f ! -name '00-spanel-*' ! -name 'spanel-*' -delete
+      fi
+      rm -rf "$work"/files/etc/php/*/fpm/pool.d "$work/files/var/spool/cron/crontabs"
+    fi
+    # Keep what is about to be replaced, in case this was the wrong archive.
+    local -a current=()
+    mapfile -t current < <(/usr/bin/python3 -I -c 'import json, sys; [print(p) for p in json.load(open(sys.argv[1]))["paths"] if p and not p.startswith("/") and ".." not in p]' "$work/x/manifest.json")
+    if [[ ${#current[@]} -gt 0 ]]; then
+      tar -C / -czf "/root/spanel-pre-dr-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" --ignore-failed-read "${current[@]}" 2>/dev/null || true
+    fi
+    cp -a "$work/files/." /
+    echo "Configuration restored."
+  fi
+
+  db="$(dr_db_path)"
+  if [[ -f "$work/x/db/spanel.db" ]]; then
+    [[ -f "$db" ]] && cp -a "$db" "${db}.pre-dr-$(date -u +%Y%m%dT%H%M%SZ)"
+    rm -f "${db}-wal" "${db}-shm"
+    install -m 0640 -o spanel -g spanel "$work/x/db/spanel.db" "$db"
+    echo "Panel database restored to ${db}."
+  fi
+
+  if [[ -f "$work/x/pdns/pdns.sqlite3" ]]; then
+    systemctl stop pdns >/dev/null 2>&1 || true
+    install -d -m 0755 /var/lib/powerdns
+    install -m 0640 -o pdns -g pdns "$work/x/pdns/pdns.sqlite3" /var/lib/powerdns/pdns.sqlite3 2>/dev/null \
+      || install -m 0640 "$work/x/pdns/pdns.sqlite3" /var/lib/powerdns/pdns.sqlite3
+    systemctl start pdns >/dev/null 2>&1 || true
+    echo "PowerDNS database restored."
+  elif [[ -f "$work/x/pdns/pdns.sql" ]]; then
+    local pdns_db
+    pdns_db="$(cut -d: -f2 "$work/x/pdns/backend" 2>/dev/null)"
+    [[ "$pdns_db" =~ ^[A-Za-z0-9_]{1,64}$ ]] || pdns_db="pdns"
+    mysql "$pdns_db" <"$work/x/pdns/pdns.sql" && echo "PowerDNS (MySQL) database restored."
+  elif compgen -G "$work/x/pdns/zones/*.zone" >/dev/null && command -v pdnsutil >/dev/null 2>&1; then
+    for zone in "$work"/x/pdns/zones/*.zone; do
+      pdnsutil load-zone "$(basename "$zone" .zone)" "$zone" >/dev/null 2>&1 || echo "  could not load $(basename "$zone")"
+    done
+    echo "PowerDNS zones loaded from zone files."
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx >/dev/null 2>&1 || true
+    else
+      echo "WARNING: nginx -t fails with the restored configuration; nginx was not reloaded. Run: nginx -t"
+    fi
+  fi
+  for unit in exim4 dovecot rspamd; do
+    systemctl is-active --quiet "$unit" 2>/dev/null && systemctl restart "$unit" >/dev/null 2>&1 || true
+  done
+  systemctl start spanel-api >/dev/null 2>&1 || true
+  for timer in "${DR_TIMERS[@]}"; do
+    systemctl start "$timer" >/dev/null 2>&1 || true
+  done
+
+  echo ""
+  echo "Panel state restored. Next:"
+  echo "  1. Sign in to the panel (same admin accounts and URL settings as the old server)."
+  echo "  2. Backups > Restore: choose the backup destination, select all accounts, Restore."
+  echo "     This recreates the Linux accounts, websites, databases and mailboxes."
+  echo "  3. Point DNS / the server IP at this machine (spanel change-ip <old> <new> if the IP changed)."
+  echo "  4. Backups > Panel self-backup: create and confirm a passphrase for this server"
+  echo "     (the old server's passphrase file is never inside the archive)."
+}
+
 menu() {
   while true; do
     echo ""
@@ -687,6 +891,7 @@ menu() {
     echo "10) Update panel from release"
     echo "11) Change server IP"
     echo "12) Sync admin password from root"
+    echo "13) Restore panel from a self-backup (disaster recovery)"
     echo "0) Exit"
     read -rp "Choose: " choice
     case "$choice" in
@@ -702,6 +907,7 @@ menu() {
       10) run_panel_update ;;
       11) change_panel_ip ;;
       12) sync_admin_root_password ;;
+      13) read -rp "Path to the panel-dr-....spdr archive: " dr_file; dr_restore "$dr_file" ;;
       0) exit 0 ;;
       *) echo "Invalid choice" ;;
     esac
@@ -722,8 +928,9 @@ case "${1:-menu}" in
   change-admin-password|--change-admin-password) change_admin_password ;;
   sync-admin-root-password|--sync-admin-root-password|admin-use-root-password|--admin-use-root-password) sync_admin_root_password ;;
   status|--status) show_status ;;
+  dr-restore|--dr-restore) shift; dr_restore "$@" ;;
   *)
-    echo "Usage: spanel [menu|login|status|logs|restart|repair-firewall|change-ip [old-ip new-ip]|set-panel-url|install-panel-ssl|fix-permissions|change-admin-password|sync-admin-root-password|update]"
+    echo "Usage: spanel [menu|login|status|logs|restart|repair-firewall|change-ip [old-ip new-ip]|set-panel-url|install-panel-ssl|fix-permissions|change-admin-password|sync-admin-root-password|update|dr-restore <archive.spdr>]"
     exit 2
     ;;
 esac

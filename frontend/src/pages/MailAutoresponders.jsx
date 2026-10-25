@@ -13,7 +13,8 @@ export function MailAutorespondersPage({ request, isAdmin }) {
   
   const [showCreate, setShowCreate] = useState(false);
   const [editItem, setEditItem] = useState(null);
-  const [form, setForm] = useState({ domain_id: '', local_part: '', subject: '', body: '' });
+  const emptyForm = { domain_id: '', local_part: '', subject: '', body: '', enabled: true, start_date: '', end_date: '', interval_days: 1 };
+  const [form, setForm] = useState(emptyForm);
 
   useEffect(() => {
     loadMailInfo();
@@ -62,7 +63,11 @@ export function MailAutorespondersPage({ request, isAdmin }) {
           method: 'PUT',
           body: JSON.stringify({
             subject: form.subject,
-            body: form.body
+            body: form.body,
+            enabled: !!form.enabled,
+            start_date: form.start_date || '',
+            end_date: form.end_date || '',
+            interval_days: Number(form.interval_days) || 1
           })
         }, t('Saving...'));
         if (res) setNotice(t('Autoresponder updated.'));
@@ -73,7 +78,11 @@ export function MailAutorespondersPage({ request, isAdmin }) {
             domain_id: parseInt(form.domain_id),
             local_part: form.local_part,
             subject: form.subject,
-            body: form.body
+            body: form.body,
+            enabled: !!form.enabled,
+            start_date: form.start_date || '',
+            end_date: form.end_date || '',
+            interval_days: Number(form.interval_days) || 1
           })
         }, t('Creating...'));
         if (res) setNotice(t('Autoresponder created.'));
@@ -81,7 +90,7 @@ export function MailAutorespondersPage({ request, isAdmin }) {
       if (res) {
         setShowCreate(false);
         setEditItem(null);
-        setForm({ domain_id: '', local_part: '', subject: '', body: '' });
+        setForm(emptyForm);
         loadAutoresponders();
       }
     } catch (e) {
@@ -95,7 +104,11 @@ export function MailAutorespondersPage({ request, isAdmin }) {
       domain_id: '',
       local_part: item.local_part,
       subject: item.subject,
-      body: item.body
+      body: item.body,
+      enabled: item.enabled !== false,
+      start_date: item.start_date || '',
+      end_date: item.end_date || '',
+      interval_days: item.interval_days || 1
     });
     setShowCreate(true);
   };
@@ -180,6 +193,30 @@ export function MailAutorespondersPage({ request, isAdmin }) {
               />
             </div>
 
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px', marginBottom: '20px' }}>
+              <label style={{ display: 'block', fontSize: '14px', fontWeight: '500', color: 'var(--text-secondary)' }}>
+                {t('From (optional)')}
+                <input type="date" value={form.start_date} onChange={e => setForm({ ...form, start_date: e.target.value })}
+                  style={{ display: 'block', width: '100%', marginTop: '8px', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--surface)', color: 'var(--text)' }} />
+              </label>
+              <label style={{ display: 'block', fontSize: '14px', fontWeight: '500', color: 'var(--text-secondary)' }}>
+                {t('Until (optional)')}
+                <input type="date" value={form.end_date} min={form.start_date || undefined} onChange={e => setForm({ ...form, end_date: e.target.value })}
+                  style={{ display: 'block', width: '100%', marginTop: '8px', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--surface)', color: 'var(--text)' }} />
+              </label>
+              <label style={{ display: 'block', fontSize: '14px', fontWeight: '500', color: 'var(--text-secondary)' }}>
+                {t('Answer the same sender once every (days)')}
+                <input type="number" min="1" max="30" value={form.interval_days} onChange={e => setForm({ ...form, interval_days: e.target.value })}
+                  style={{ display: 'block', width: '100%', marginTop: '8px', padding: '8px 12px', border: '1px solid var(--border)', borderRadius: '4px', background: 'var(--surface)', color: 'var(--text)' }} />
+              </label>
+            </div>
+
+            <label className="check-line" style={{ marginBottom: '8px' }}>
+              <input type="checkbox" checked={!!form.enabled} onChange={e => setForm({ ...form, enabled: e.target.checked })} />
+              <span>{t('Autoresponder on')}</span>
+            </label>
+            <p className="hint">{t('Replies go out only between the two dates (when set), never to mailing lists, automatic mail or mail marked as spam. The address must be a mailbox.')}</p>
+
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px', paddingTop: '15px', borderTop: '1px solid var(--border)', flexWrap: 'wrap' }}>
               <button type="button" onClick={() => { setShowCreate(false); setEditItem(null); }} disabled={loading} style={{ background: 'var(--surface)', border: '1px solid var(--border)', padding: '8px 20px', borderRadius: '4px', cursor: 'pointer', color: 'var(--text)', fontSize: '13px', fontWeight: '500' }}>
                 {t('Cancel')}
@@ -204,7 +241,7 @@ export function MailAutorespondersPage({ request, isAdmin }) {
         <button 
           onClick={() => {
             setEditItem(null);
-            setForm({ domain_id: domains[0]?.id || '', local_part: '', subject: '', body: '' });
+            setForm({ ...emptyForm, domain_id: domains[0]?.id || '' });
             setShowCreate(true);
           }}
           style={{ display: 'flex', alignItems: 'center', gap: '6px', background: '#0066cc', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '4px', fontSize: '13px', fontWeight: '500', cursor: 'pointer', textTransform: 'uppercase' }}
@@ -242,7 +279,8 @@ export function MailAutorespondersPage({ request, isAdmin }) {
             <thead>
               <tr style={{ background: 'var(--surface-alt)', borderBottom: '1px solid var(--border)' }}>
                 <th style={{ padding: '15px 20px', fontWeight: '600', color: 'var(--text)', width: '35%' }}>{t('Responder Address')}</th>
-                <th style={{ padding: '15px 20px', fontWeight: '600', color: 'var(--text)', width: '50%' }}>{t('Subject')}</th>
+                <th style={{ padding: '15px 20px', fontWeight: '600', color: 'var(--text)', width: '35%' }}>{t('Subject')}</th>
+                <th style={{ padding: '15px 20px', fontWeight: '600', color: 'var(--text)', width: '15%' }}>{t('Status')}</th>
                 <th style={{ padding: '15px 20px', fontWeight: '600', color: 'var(--text)', width: '15%', textAlign: 'right' }}>{t('Actions')}</th>
               </tr>
             </thead>
@@ -251,6 +289,12 @@ export function MailAutorespondersPage({ request, isAdmin }) {
                 <tr key={item.id} style={{ borderBottom: '1px solid var(--border)', background: idx % 2 === 0 ? 'var(--surface)' : 'var(--surface-alt)' }}>
                   <td style={{ padding: '15px 20px', color: 'var(--primary)', fontWeight: '500' }}>{item.address}</td>
                   <td style={{ padding: '15px 20px', color: 'var(--text-secondary)' }}>{item.subject}</td>
+                  <td style={{ padding: '15px 20px' }}>
+                    <span className={`badge ${!item.has_mailbox ? 'bad' : item.active_now ? 'ok' : 'warn'}`}>
+                      {!item.has_mailbox ? t('No mailbox') : !item.enabled ? t('Off') : item.active_now ? t('Answering') : t('Scheduled')}
+                    </span>
+                    {(item.start_date || item.end_date) && <small style={{ display: 'block', color: 'var(--text-muted)' }}>{item.start_date || '…'} → {item.end_date || '…'}</small>}
+                  </td>
                   <td style={{ padding: '15px 20px', textAlign: 'right' }}>
                     <button onClick={() => handleEdit(item)} style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', padding: '4px', marginRight: '8px' }} title={t('Edit')}>
                       <Pencil size={16} />
@@ -263,7 +307,7 @@ export function MailAutorespondersPage({ request, isAdmin }) {
               ))}
               {filteredItems.length === 0 && (
                 <tr>
-                  <td colSpan="3" style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                  <td colSpan="4" style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
                     {t('No autoresponders found')}
                   </td>
                 </tr>

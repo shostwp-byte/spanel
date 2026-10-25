@@ -6,14 +6,12 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import socket
-import ssl
 import subprocess
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,10 +19,11 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings as app_settings
 from app.core.secrets import decrypt as _decrypt_secret, encrypt as _encrypt_secret, is_encrypted as _is_encrypted_secret
 from app.core.version import APP_VERSION
 from app.models.entities import DnsZone, User, Website, WebsiteAlias
-from app.services import dns, panel_settings, server_network, system as system_service
+from app.services import cluster_peer, dns, panel_settings, server_network, system as system_service
 
 logger = logging.getLogger("spanel.multi_server")
 
@@ -58,9 +57,17 @@ def _default_state() -> dict[str, Any]:
         "settings": {
             "enabled": True,
             "node_name": _default_hostname(),
+            # This node's identity in the cluster: what a peer records as the
+            # origin of a zone it receives. Unlike node_name it never changes.
+            "node_uid": "",
             "auto_dns_sync": True,
             "check_domain_conflict": True,
             "check_username_conflict": False,
+            # A peer that cannot be asked: refuse the new domain/account
+            # (True) or let it through as before (False).
+            "conflict_fail_closed": False,
+            "health_interval_sec": 60,
+            "reconcile_interval_sec": 900,
         },
         "nodes": [],
         "remote_db_hosts": [],
@@ -68,11 +75,42 @@ def _default_state() -> dict[str, Any]:
     }
 
 
+def _migrate_state(state: dict[str, Any]) -> bool:
+    """Bring a state file written by an older version up to date. True when
+    something changed and the file should be written back.
+
+    - Peer API tokens were stored in plaintext; they are encrypted with the
+      panel's secret box now, on the first read after the update.
+    - A node identity is generated once.
+    """
+    changed = False
+    settings = state.setdefault("settings", {})
+    if not str(settings.get("node_uid") or "").strip():
+        settings["node_uid"] = secrets.token_hex(8)
+        changed = True
+    for node in state.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        token = str(node.get("api_token") or "").strip()
+        if token and not _is_encrypted_secret(token):
+            node["api_token"] = _encrypt_secret(token)
+            changed = True
+        # Nodes added before verification existed keep the behaviour they
+        # were added with (no verification) until an administrator changes it.
+        if "verify_tls" not in node:
+            node["verify_tls"] = False
+            changed = True
+    return changed
+
+
 def _read_state() -> dict[str, Any]:
     path = _resolve_config_path()
     base = _default_state()
     try:
         if not path.is_file():
+            # Written at once so the node id generated here is the one kept.
+            _migrate_state(base)
+            _write_state(base)
             return base
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
@@ -85,6 +123,8 @@ def _read_state() -> dict[str, Any]:
             base["remote_db_hosts"] = raw["remote_db_hosts"]
         if isinstance(raw.get("sync_logs"), list):
             base["sync_logs"] = raw["sync_logs"][:_MAX_SYNC_LOGS]
+        if _migrate_state(base):
+            _write_state(base)
         return base
     except Exception as exc:
         logger.warning("Could not read multi-server state: %s", exc)
@@ -131,11 +171,40 @@ def _mask_secret(value: str) -> str:
     return f"{raw[:6]}••••{raw[-4:]}"
 
 
+def node_token(node: dict[str, Any]) -> str:
+    """The peer's API token in clear, for the moment a request needs it."""
+    stored = str(node.get("api_token") or "").strip()
+    if not stored:
+        return ""
+    if not _is_encrypted_secret(stored):
+        return stored  # not migrated yet (read before the first write)
+    try:
+        return _decrypt_secret(stored)
+    except Exception:
+        logger.warning("Cannot decrypt the API token of cluster node %s (SECRET_KEY changed?)", node.get("id"))
+        return ""
+
+
+def local_node_uid() -> str:
+    with _state_lock:
+        state = _read_state()
+    return str((state.get("settings") or {}).get("node_uid") or "")
+
+
 def _sanitize_node(node: dict[str, Any]) -> dict[str, Any]:
     out = dict(node)
-    token = str(out.pop("api_token", "") or "")
+    out.pop("api_token", None)
+    token = node_token(node)
     out["token_masked"] = _mask_secret(token)
-    out["has_token"] = bool(token)
+    out["has_token"] = bool(str(node.get("api_token") or "").strip())
+    out["token_unreadable"] = bool(out["has_token"] and not token)
+    pin = str(out.get("tls_fingerprint") or "")
+    out["tls_mode"] = (
+        "plain_http" if str(out.get("url") or "").startswith("http://")
+        else "pinned" if pin
+        else "verified" if out.get("verify_tls", True)
+        else "insecure"
+    )
     return out
 
 
@@ -192,6 +261,11 @@ def local_node_summary(db: Session) -> dict[str, Any]:
     cpu_pct = round(float((res.get("cpu") or {}).get("percent") or 0.0), 1)
     mem_pct = round(float((res.get("memory") or {}).get("percent") or 0.0), 1)
     disk_pct = round(float((res.get("disk") or {}).get("percent") or 0.0), 1)
+    load = (res.get("cpu") or {}).get("load") or []
+    try:
+        backup_free = shutil.disk_usage(app_settings.backup_root).free
+    except Exception:
+        backup_free = None
 
     websites_count = db.query(Website).count()
     users_count = db.query(User).count()
@@ -202,20 +276,29 @@ def local_node_summary(db: Session) -> dict[str, Any]:
     with _state_lock:
         state = _read_state()
         node_name = (state.get("settings") or {}).get("node_name") or hostname
+        node_uid = (state.get("settings") or {}).get("node_uid") or ""
 
     return {
         "node_name": node_name,
+        "node_uid": node_uid,
         "hostname": hostname,
         "app_name": p_settings.get("app_name") or "SPanel",
         "version": APP_VERSION,
         "cpu_percent": cpu_pct,
         "ram_percent": mem_pct,
         "disk_percent": disk_pct,
+        # Absolute figures and load, for placement (suggest_node).
+        "cpu_cores": (res.get("cpu") or {}).get("cores"),
+        "load_1": load[0] if load else None,
+        "ram_available_bytes": (res.get("memory") or {}).get("available"),
+        "disk_free_bytes": (res.get("disk") or {}).get("free"),
+        "backup_free_bytes": backup_free,
         "websites_count": websites_count,
         "users_count": users_count,
         "dns_zones_count": dns_zones_count,
         "dns_active": dns.active(),
         "ipv4_addresses": server_network.ipv4_addresses(),
+        "tls_fingerprint": cluster_peer.local_certificate_fingerprint(os.environ.get("PANEL_SSL_CERT", "")),
     }
 
 
@@ -226,51 +309,29 @@ def _peer_request(
     payload: Optional[dict[str, Any]] = None,
     timeout: int = 8,
 ) -> tuple[dict[str, Any], int]:
-    """Perform an authenticated HTTP request to a peer SPanel node."""
-    base_url = str(node.get("url") or "").rstrip("/")
-    token = str(node.get("api_token") or "").strip()
-    verify_tls = bool(node.get("verify_tls", False))
+    """Perform an authenticated, signed HTTP request to a peer SPanel node.
 
-    url = f"{base_url}{path}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-        "User-Agent": f"SPanel-Cluster/{APP_VERSION}",
-    }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
-
-    ctx = None
-    if url.startswith("https://") and not verify_tls:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-    started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
-            data = json.loads(raw) if raw.strip() else {}
-            return (data if isinstance(data, dict) else {"data": data}), latency_ms
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            err_json = json.loads(exc.read().decode("utf-8", errors="replace"))
-            detail = str(err_json.get("detail") or err_json.get("message") or "")
-        except Exception:
-            pass
-        raise RuntimeError(detail or f"Peer trả về mã lỗi HTTP {exc.code}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Không thể kết nối tới {base_url}: {exc}") from exc
+    Raises cluster_peer.PeerError (a RuntimeError) on any failure; its
+    `status` is the HTTP status when the peer answered with an error.
+    """
+    return cluster_peer.request(
+        node,
+        node_token(node),
+        local_node_uid(),
+        method,
+        path,
+        payload,
+        timeout=timeout,
+    )
 
 
 def get_cluster_overview(db: Session) -> dict[str, Any]:
     with _state_lock:
         state = _read_state()
     nodes = [_sanitize_node(n) for n in state.get("nodes", [])]
-    remote_dbs = [_sanitize_remote_db(h) for h in state.get("remote_db_hosts", [])]
+    from app.services import remote_mysql
+
+    remote_dbs = remote_mysql.list_hosts(db)
     online_nodes = sum(1 for n in nodes if n.get("status") == "online" and n.get("enabled", True))
     dns_sync_nodes = sum(1 for n in nodes if n.get("sync_dns", True) and n.get("enabled", True))
     return {
@@ -303,6 +364,12 @@ def update_cluster_settings(payload: dict[str, Any]) -> dict[str, Any]:
             settings["check_domain_conflict"] = bool(payload["check_domain_conflict"])
         if "check_username_conflict" in payload and payload["check_username_conflict"] is not None:
             settings["check_username_conflict"] = bool(payload["check_username_conflict"])
+        if "conflict_fail_closed" in payload and payload["conflict_fail_closed"] is not None:
+            settings["conflict_fail_closed"] = bool(payload["conflict_fail_closed"])
+        if payload.get("health_interval_sec") is not None:
+            settings["health_interval_sec"] = max(30, min(3600, int(payload["health_interval_sec"])))
+        if payload.get("reconcile_interval_sec") is not None:
+            settings["reconcile_interval_sec"] = max(300, min(86400, int(payload["reconcile_interval_sec"])))
         _append_log(
             state,
             "cluster_settings",
@@ -314,6 +381,21 @@ def update_cluster_settings(payload: dict[str, Any]) -> dict[str, Any]:
         return dict(settings)
 
 
+NODE_ROLES = {"full_peer", "dns_only", "db_node"}
+_PEM_CERT_RE = re.compile(r"^-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----$")
+
+
+def _clean_ca_pem(value: Any) -> str:
+    """A CA certificate (PEM) to verify a peer against, or ''."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) > 20000 or not all(_PEM_CERT_RE.match(block.strip() + "-----END CERTIFICATE-----")
+                                    for block in text.split("-----END CERTIFICATE-----") if block.strip()):
+        raise ValueError("The CA must be one or more PEM certificates (-----BEGIN CERTIFICATE-----).")
+    return text
+
+
 def add_peer_node(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "").strip()[:80]
     if not name:
@@ -323,7 +405,7 @@ def add_peer_node(payload: dict[str, Any]) -> dict[str, Any]:
     if not api_token:
         raise ValueError("Vui lòng nhập API Token (bp_...) của máy chủ Peer.")
     role = str(payload.get("role") or "full_peer").strip().lower()
-    if role not in {"full_peer", "dns_only", "db_node"}:
+    if role not in NODE_ROLES:
         role = "full_peer"
 
     node_id = f"node_{secrets.token_hex(4)}"
@@ -331,9 +413,11 @@ def add_peer_node(payload: dict[str, Any]) -> dict[str, Any]:
         "id": node_id,
         "name": name,
         "url": url,
-        "api_token": api_token,
+        "api_token": _encrypt_secret(api_token),
         "role": role,
-        "verify_tls": bool(payload.get("verify_tls", False)),
+        "verify_tls": bool(payload.get("verify_tls", True)),
+        "tls_fingerprint": cluster_peer.normalize_fingerprint(str(payload.get("tls_fingerprint") or "")),
+        "ca_pem": _clean_ca_pem(payload.get("ca_pem")),
         "sync_dns": bool(payload.get("sync_dns", True)),
         "check_domain": bool(payload.get("check_domain", True)),
         "enabled": bool(payload.get("enabled", True)),
@@ -381,11 +465,15 @@ def update_peer_node(node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"Địa chỉ {url} đã được sử dụng bởi một Node khác.")
             node["url"] = url
         if "api_token" in payload and payload["api_token"] and str(payload["api_token"]).strip():
-            node["api_token"] = str(payload["api_token"]).strip()
-        if "role" in payload and payload["role"] in {"full_peer", "dns_only", "db_node"}:
+            node["api_token"] = _encrypt_secret(str(payload["api_token"]).strip())
+        if "role" in payload and payload["role"] in NODE_ROLES:
             node["role"] = payload["role"]
         if "verify_tls" in payload and payload["verify_tls"] is not None:
             node["verify_tls"] = bool(payload["verify_tls"])
+        if "tls_fingerprint" in payload and payload["tls_fingerprint"] is not None:
+            node["tls_fingerprint"] = cluster_peer.normalize_fingerprint(str(payload["tls_fingerprint"]))
+        if "ca_pem" in payload and payload["ca_pem"] is not None:
+            node["ca_pem"] = _clean_ca_pem(payload["ca_pem"])
         if "sync_dns" in payload and payload["sync_dns"] is not None:
             node["sync_dns"] = bool(payload["sync_dns"])
         if "check_domain" in payload and payload["check_domain"] is not None:
@@ -409,6 +497,55 @@ def delete_peer_node(node_id: str) -> None:
         _write_state(state)
 
 
+DOWN_AFTER_FAILURES = 2
+_HEALTH_HISTORY = 30
+_REMOTE_INFO_KEYS = (
+    "node_uid", "hostname", "version", "cpu_percent", "ram_percent", "disk_percent", "cpu_cores", "load_1",
+    "ram_available_bytes", "disk_free_bytes", "backup_free_bytes", "websites_count", "users_count",
+    "dns_zones_count", "dns_active", "tls_fingerprint",
+)
+
+
+def apply_health_result(node: dict[str, Any], *, ok: bool, latency_ms: Optional[int], error: str,
+                        remote_data: Optional[dict[str, Any]], now_iso: str) -> Optional[str]:
+    """Record one health check on a node. Returns "down" or "up" when the node
+    just crossed into or out of the alerted state, else None.
+
+    A node is reported down after DOWN_AFTER_FAILURES failed checks in a row
+    (one failure is often a restart), once, and reported back when it answers
+    again after that.
+    """
+    node["last_checked_at"] = now_iso
+    node["latency_ms"] = latency_ms
+    history = list(node.get("health_history") or [])
+    history.append({"at": now_iso, "ok": ok, "latency_ms": latency_ms})
+    node["health_history"] = history[-_HEALTH_HISTORY:]
+    event = None
+    if ok:
+        node["status"] = "online"
+        node["last_error"] = ""
+        node["last_seen_at"] = now_iso
+        node["consecutive_failures"] = 0
+        data = remote_data or {}
+        info = {key: data.get(key) for key in _REMOTE_INFO_KEYS}
+        info["node_name"] = data.get("node_name") or data.get("hostname") or ""
+        info["hostname"] = info["hostname"] or ""
+        info["version"] = info["version"] or ""
+        info["ipv4_addresses"] = data.get("ipv4_addresses") or []
+        node["remote_info"] = info
+        if node.get("down_alerted"):
+            node["down_alerted"] = False
+            event = "up"
+    else:
+        node["status"] = "offline"
+        node["last_error"] = error
+        node["consecutive_failures"] = int(node.get("consecutive_failures") or 0) + 1
+        if node["consecutive_failures"] >= DOWN_AFTER_FAILURES and not node.get("down_alerted"):
+            node["down_alerted"] = True
+            event = "down"
+    return event
+
+
 def ping_peer_node(node_id: str) -> dict[str, Any]:
     with _state_lock:
         state = _read_state()
@@ -419,45 +556,39 @@ def ping_peer_node(node_id: str) -> dict[str, Any]:
 
     try:
         remote_data, latency_ms = _peer_request(node_copy, "GET", "/api/multi-server/peer/ping", timeout=7)
-        status = "online"
-        last_error = ""
+        ok, last_error = True, ""
     except Exception as exc:
-        remote_data = {}
-        latency_ms = None
-        status = "offline"
-        last_error = str(exc)
+        remote_data, latency_ms = {}, None
+        ok, last_error = False, str(exc)
 
     with _state_lock:
         state = _read_state()
         node = next((n for n in state.get("nodes", []) if n.get("id") == node_id), None)
         if not node:
             raise ValueError("Không tìm thấy máy chủ Peer này.")
-        node["status"] = status
-        node["latency_ms"] = latency_ms
-        node["last_error"] = last_error
-        if status == "online":
-            node["last_seen_at"] = datetime.now(timezone.utc).isoformat()
-            node["remote_info"] = {
-                "node_name": remote_data.get("node_name") or remote_data.get("hostname") or "",
-                "hostname": remote_data.get("hostname") or "",
-                "version": remote_data.get("version") or "",
-                "cpu_percent": remote_data.get("cpu_percent"),
-                "ram_percent": remote_data.get("ram_percent"),
-                "disk_percent": remote_data.get("disk_percent"),
-                "websites_count": remote_data.get("websites_count"),
-                "users_count": remote_data.get("users_count"),
-                "dns_zones_count": remote_data.get("dns_zones_count"),
-                "dns_active": remote_data.get("dns_active"),
-                "ipv4_addresses": remote_data.get("ipv4_addresses") or [],
-            }
+        event = apply_health_result(node, ok=ok, latency_ms=latency_ms, error=last_error, remote_data=remote_data,
+                                    now_iso=datetime.now(timezone.utc).isoformat())
+        if event:
+            _append_log(state, "node_down" if event == "down" else "node_up",
+                        f"{node.get('name')} ({node.get('url')})", "warn" if event == "down" else "success",
+                        f"Máy chủ Peer không phản hồi: {last_error}" if event == "down" else "Máy chủ Peer đã trực tuyến lại.")
         _write_state(state)
-        return _sanitize_node(node)
+        result = _sanitize_node(node)
+    if event:
+        from app.services import notifications
+
+        notifications.notify_in_background("cluster_node_down", {
+            "node": node_copy.get("name"), "url": node_copy.get("url"), "error": last_error,
+            "failures": result.get("consecutive_failures"), "recovered": event == "up",
+        }, admins=True)
+    return result
 
 
-def ping_all_peer_nodes() -> list[dict[str, Any]]:
+def ping_all_peer_nodes(enabled_only: bool = False) -> list[dict[str, Any]]:
     with _state_lock:
         state = _read_state()
-        node_ids = [n.get("id") for n in state.get("nodes", []) if n.get("id")]
+        node_ids = [n.get("id") for n in state.get("nodes", [])
+                    if n.get("id") and (n.get("enabled", True) or not enabled_only)]
     if not node_ids:
         return []
     results = []
@@ -472,273 +603,99 @@ def ping_all_peer_nodes() -> list[dict[str, Any]]:
 
 
 # --- Multi-Server DNS Zone Synchronization ------------------------------------
+# The mechanics (outbox, origins, serials, reconcile) are in cluster_dns; these
+# are the entry points dns.py and the API have always called.
 
-def _collect_zones_payload(db: Session, zone_name: Optional[str] = None, action: str = "upsert") -> list[dict[str, Any]]:
-    cfg = dns.settings()
-    nameservers = cfg.get("nameservers") or []
-    default_ttl = int(cfg.get("ttl") or 3600)
+def append_sync_log(action: str, target: str, status: str, detail: str) -> None:
+    with _state_lock:
+        state = _read_state()
+        _append_log(state, action, target, status, detail)
+        _write_state(state)
 
-    if action == "delete" and zone_name:
-        return [{"zone": dns.normalize_zone(zone_name), "action": "delete", "records": [], "nameservers": nameservers, "ttl": default_ttl}]
 
-    if zone_name:
-        normalized = dns.normalize_zone(zone_name)
-        zone_names = [normalized]
-    else:
-        zone_names = [row.name for row in db.query(DnsZone).order_by(DnsZone.name).all()]
-
-    payload_items: list[dict[str, Any]] = []
-    for zname in zone_names:
-        try:
-            recs = dns.records(zname)
-            payload_items.append(
-                {
-                    "zone": zname,
-                    "action": "upsert",
-                    "nameservers": nameservers,
-                    "ttl": default_ttl,
-                    "records": recs,
-                }
-            )
-        except Exception as exc:
-            logger.warning("Could not read local DNS zone %s for cluster sync: %s", zname, exc)
-    return payload_items
+def record_node_sync(node_id: str, *, ok: bool, error: str = "") -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _state_lock:
+        state = _read_state()
+        node = next((n for n in state.get("nodes", []) if n.get("id") == node_id), None)
+        if not node:
+            return
+        if ok:
+            node["last_sync_at"] = now_iso
+            node["last_seen_at"] = now_iso
+            node["last_sync_error"] = ""
+        else:
+            node["last_sync_error"] = (error or "")[:500]
+        _write_state(state)
 
 
 def sync_dns_to_peers(db: Session, zone_name: Optional[str] = None, action: str = "upsert") -> dict[str, Any]:
-    """Push local DNS zones & records to all active DNS peer nodes in the cluster."""
+    """Queue one zone (or every zone this node is master of) for the DNS peers
+    and deliver it now. What a peer does not take stays queued and is retried."""
+    from app.services import cluster_dns
+
     with _state_lock:
         state = _read_state()
-        cluster_settings = state.get("settings") or {}
-        if not cluster_settings.get("enabled", True):
+        if not (state.get("settings") or {}).get("enabled", True):
             return {"synced_nodes": 0, "failed_nodes": 0, "zones_count": 0, "details": [], "message": "Multi-Server Cluster đang tắt."}
-        active_peers = [
-            dict(n)
-            for n in state.get("nodes", [])
-            if n.get("enabled", True) and n.get("sync_dns", True)
-        ]
-        source_node = cluster_settings.get("node_name") or _default_hostname()
-
-    if not active_peers:
+    peers = cluster_dns._sync_peers()
+    if not peers:
         return {"synced_nodes": 0, "failed_nodes": 0, "zones_count": 0, "details": [], "message": "Chưa có máy chủ Peer nào bật đồng bộ DNS."}
-
-    zones_payload = _collect_zones_payload(db, zone_name=zone_name, action=action)
-    if not zones_payload:
-        return {"synced_nodes": 0, "failed_nodes": 0, "zones_count": 0, "details": [], "message": "Không có DNS Zone nào cần đồng bộ."}
-
-    synced_nodes = 0
-    failed_nodes = 0
-    details = []
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    for peer in active_peers:
-        try:
-            resp, latency_ms = _peer_request(
-                peer,
-                "POST",
-                "/api/multi-server/peer/dns-sync",
-                payload={"source_node": source_node, "zones": zones_payload},
-                timeout=15,
-            )
-            synced_nodes += 1
-            details.append(
-                {
-                    "node_id": peer["id"],
-                    "node_name": peer["name"],
-                    "status": "success",
-                    "latency_ms": latency_ms,
-                    "zones_applied": resp.get("applied", len(zones_payload)),
-                }
-            )
-            with _state_lock:
-                st = _read_state()
-                target_n = next((n for n in st.get("nodes", []) if n.get("id") == peer["id"]), None)
-                if target_n:
-                    target_n["status"] = "online"
-                    target_n["latency_ms"] = latency_ms
-                    target_n["last_seen_at"] = now_iso
-                    target_n["last_sync_at"] = now_iso
-                    target_n["last_error"] = ""
-                _write_state(st)
-        except Exception as exc:
-            failed_nodes += 1
-            err_msg = str(exc)
-            details.append(
-                {
-                    "node_id": peer["id"],
-                    "node_name": peer["name"],
-                    "status": "failed",
-                    "error": err_msg,
-                }
-            )
-            with _state_lock:
-                st = _read_state()
-                target_n = next((n for n in st.get("nodes", []) if n.get("id") == peer["id"]), None)
-                if target_n:
-                    target_n["last_error"] = err_msg
-                _write_state(st)
-
-    with _state_lock:
-        st = _read_state()
-        target_label = zone_name or f"{len(zones_payload)} zones"
-        _append_log(
-            st,
-            f"dns_sync_{action}",
-            target_label,
-            "success" if failed_nodes == 0 else "warn",
-            f"Đồng bộ {len(zones_payload)} DNS zone tới {synced_nodes}/{len(active_peers)} máy chủ Peer.",
-        )
-        _write_state(st)
-
+    if action == "delete" and zone_name:
+        cluster_dns.note_local_change(db, zone_name, "delete")
+        zones_count = 1
+    else:
+        queued = cluster_dns.queue_all(db, zone_name)
+        zones_count = queued // max(1, len(peers))
+    result = cluster_dns.process_outbox(db)
+    failed = sum(1 for d in result.get("details", []) if d.get("errors"))
+    synced = len(peers) - failed
+    message = (
+        f"Đã đồng bộ {zones_count} DNS zone sang {synced}/{len(peers)} máy chủ Peer."
+        + (f" {result['retrying']} zone sẽ được thử lại tự động." if result.get("retrying") else "")
+        + (f" {result['conflicts']} zone bị từ chối do xung đột quyền sở hữu." if result.get("conflicts") else "")
+    )
     return {
-        "synced_nodes": synced_nodes,
-        "failed_nodes": failed_nodes,
-        "zones_count": len(zones_payload),
-        "details": details,
-        "message": f"Đã đồng bộ {len(zones_payload)} DNS zone sang {synced_nodes}/{len(active_peers)} máy chủ Peer.",
+        "synced_nodes": synced,
+        "failed_nodes": failed,
+        "zones_count": zones_count,
+        "details": result.get("details", []),
+        "dnssec_skipped": sorted(set(result.get("dnssec_skipped") or [])),
+        "message": message,
     }
 
 
 def trigger_background_zone_sync(zone_name: str, action: str = "upsert") -> None:
-    """Non-blocking background DNS zone push to cluster peers when a local zone changes."""
-    with _state_lock:
-        state = _read_state()
+    """A local zone changed (called from dns.py). Records that this node is the
+    zone's master and queues it for the peers in the durable outbox; the
+    cluster worker delivers it. Never raises: DNS editing must not fail
+    because of the cluster."""
+    try:
+        with _state_lock:
+            state = _read_state()
         settings = state.get("settings") or {}
-        if not (settings.get("enabled", True) and settings.get("auto_dns_sync", True)):
-            return
-        has_peers = any(n.get("enabled", True) and n.get("sync_dns", True) for n in state.get("nodes", []))
-    if not has_peers:
-        return
-
-    def _worker() -> None:
+        push = bool(settings.get("enabled", True) and settings.get("auto_dns_sync", True))
         from app.core.database import SessionLocal
+        from app.services import cluster_dns, cluster_worker
 
-        try:
-            with SessionLocal() as db:
-                sync_dns_to_peers(db, zone_name=zone_name, action=action)
-        except Exception as exc:
-            logger.warning("Background cluster DNS sync failed for %s: %s", zone_name, exc)
+        with SessionLocal() as db:
+            queued = cluster_dns.note_local_change(db, zone_name, action, push=push)
+        if queued:
+            cluster_worker.kick()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        logger.warning("Could not queue cluster DNS sync for %s: %s", zone_name, exc)
 
-    threading.Thread(target=_worker, name=f"spanel-cluster-dns-{zone_name}", daemon=True).start()
 
+def apply_incoming_dns_sync(db: Session, zones_payload: list[dict[str, Any]], source_node: str = "", source_uid: str = "") -> dict[str, Any]:
+    """Receive DNS zones from a peer node (see cluster_dns.apply_incoming for the rules)."""
+    from app.services import cluster_dns
 
-def apply_incoming_dns_sync(db: Session, zones_payload: list[dict[str, Any]], source_node: str = "") -> dict[str, Any]:
-    """Receive DNS zones & records from a peer SPanel node and apply them to local PowerDNS."""
-    if not dns.active():
-        raise ValueError("Add-on DNS Manager (PowerDNS) chưa được cài đặt hoặc bật trên máy chủ Peer này.")
-
-    applied = 0
-    deleted = 0
-    errors: list[str] = []
-
-    for item in zones_payload or []:
-        if not isinstance(item, dict):
-            continue
-        raw_zone = str(item.get("zone") or "").strip()
-        action = str(item.get("action") or "upsert").strip().lower()
-        if not raw_zone:
-            continue
-        try:
-            zone = dns.normalize_zone(raw_zone)
-            if action == "delete":
-                dns.delete_zone(db, zone, sync_cluster=False)
-                deleted += 1
-                continue
-
-            local_cfg = dns.settings()
-            nameservers = [
-                str(ns).strip().lower().rstrip(".")
-                for ns in (item.get("nameservers") or local_cfg.get("nameservers") or [])
-                if str(ns).strip()
-            ]
-            if len(nameservers) < 2:
-                nameservers = local_cfg.get("nameservers") or [f"ns1.{zone}", f"ns2.{zone}"]
-
-            ttl = int(item.get("ttl") or local_cfg.get("ttl") or dns.DEFAULT_TTL)
-            apex = dns._absolute(zone)
-            rrsets = [
-                {
-                    "name": apex,
-                    "type": "SOA",
-                    "ttl": ttl,
-                    "records": [
-                        {
-                            "content": f"{dns._absolute(nameservers[0])} hostmaster.{apex} 1 10800 3600 604800 3600",
-                            "disabled": False,
-                        }
-                    ],
-                },
-                {
-                    "name": apex,
-                    "type": "NS",
-                    "ttl": ttl,
-                    "records": [{"content": dns._absolute(ns), "disabled": False} for ns in nameservers],
-                },
-            ]
-
-            grouped: dict[tuple[str, str], tuple[int, list[str]]] = {}
-            for rec in item.get("records") or []:
-                if not isinstance(rec, dict):
-                    continue
-                name, rtype, rec_ttl, content = dns.to_pdns(zone, rec)
-                if rtype == "NS" and name == apex:
-                    continue
-                _, existing_contents = grouped.get((name, rtype), (rec_ttl, []))
-                if content not in existing_contents:
-                    existing_contents.append(content)
-                grouped[(name, rtype)] = (rec_ttl, existing_contents)
-
-            for (name, rtype), (rec_ttl, contents) in grouped.items():
-                rrsets.append(
-                    {
-                        "name": name,
-                        "type": rtype,
-                        "ttl": rec_ttl,
-                        "records": [{"content": c, "disabled": False} for c in contents],
-                    }
-                )
-
-            # Recreate or replace zone in PowerDNS
-            try:
-                dns._request("DELETE", f"/zones/{apex}")
-            except dns.DnsError as exc:
-                if exc.status != 404:
-                    raise
-            dns._request(
-                "POST",
-                "/zones",
-                {
-                    "name": apex,
-                    "kind": "Native",
-                    "soa_edit_api": dns.SOA_EDIT_API,
-                    "nameservers": [],
-                    "rrsets": rrsets,
-                },
-            )
-            if not db.query(DnsZone).filter(DnsZone.name == zone).first():
-                db.add(DnsZone(name=zone, owner_id=None))
-                db.commit()
-            applied += 1
-        except Exception as exc:
-            errors.append(f"{raw_zone}: {exc}")
-
-    with _state_lock:
-        state = _read_state()
-        _append_log(
-            state,
-            "receive_dns_sync",
-            source_node or "peer",
-            "success" if not errors else "warn",
-            f"Nhận đồng bộ từ {source_node or 'Peer'}: cập nhật {applied} zone, xóa {deleted} zone.",
-        )
-        _write_state(state)
-
-    return {"applied": applied, "deleted": deleted, "errors": errors}
+    return cluster_dns.apply_incoming(db, zones_payload, source_uid=source_uid, source_name=source_node)
 
 
 # --- Cross-Server Domain & Username Conflict Check ----------------------------
 
-def check_local_conflict(db: Session, domain: str = "", username: str = "") -> dict[str, Any]:
+def check_local_conflict(db: Session, domain: str = "", username: str = "", asking_node: str = "") -> dict[str, Any]:
     domain_clean = (domain or "").strip().lower().rstrip(".")
     username_clean = (username or "").strip().lower()
     domain_exists = False
@@ -751,7 +708,12 @@ def check_local_conflict(db: Session, domain: str = "", username: str = "") -> d
         elif db.query(WebsiteAlias).filter(WebsiteAlias.domain.in_(list(candidates))).first():
             domain_exists = True
         elif db.query(DnsZone).filter(DnsZone.name == domain_clean).first():
-            domain_exists = True
+            # A zone here that is only our copy of the asking node's own zone
+            # is not a conflict with it.
+            from app.services import cluster_dns
+
+            row = cluster_dns.origin_row(db, domain_clean)
+            domain_exists = not (asking_node and row is not None and row.origin_uid == asking_node)
 
     if username_clean:
         if db.query(User).filter(User.username == username_clean).first():
@@ -764,8 +726,14 @@ def check_local_conflict(db: Session, domain: str = "", username: str = "") -> d
     }
 
 
-def check_cluster_conflict(domain: str = "", username: str = "") -> dict[str, Any]:
-    """Query active peer nodes in the cluster to see if domain or username already exists."""
+def check_cluster_conflict(domain: str = "", username: str = "", *, fail_closed: Optional[bool] = None) -> dict[str, Any]:
+    """Ask the peer nodes whether a domain or username already exists there.
+
+    A peer that cannot be asked used to be skipped silently, so the same
+    domain or account could be created on two nodes while one was down. With
+    conflict_fail_closed on, that answer is a conflict of kind "unreachable"
+    instead (HTTP 503 at the API). The peers are asked in parallel.
+    """
     with _state_lock:
         state = _read_state()
         settings = state.get("settings") or {}
@@ -775,6 +743,8 @@ def check_cluster_conflict(domain: str = "", username: str = "") -> dict[str, An
         check_usr = bool(username and settings.get("check_username_conflict", False))
         if not check_dom and not check_usr:
             return {"conflict": False}
+        if fail_closed is None:
+            fail_closed = bool(settings.get("conflict_fail_closed", False))
         peers = [
             dict(n)
             for n in state.get("nodes", [])
@@ -790,333 +760,52 @@ def check_cluster_conflict(domain: str = "", username: str = "") -> dict[str, An
             "username": username if check_usr else "",
         }
     )
-    for peer in peers:
+
+    def ask(peer: dict[str, Any]) -> tuple[dict[str, Any], Optional[dict[str, Any]], str]:
         try:
             resp, _ = _peer_request(peer, "GET", f"/api/multi-server/peer/check-conflict?{qs}", timeout=4)
-            if check_dom and resp.get("domain_exists"):
-                return {
-                    "conflict": True,
-                    "kind": "domain",
-                    "node_name": peer.get("name"),
-                    "node_url": peer.get("url"),
-                    "message": f"Tên miền '{domain}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
-                }
-            if check_usr and resp.get("username_exists"):
-                return {
-                    "conflict": True,
-                    "kind": "username",
-                    "node_name": peer.get("name"),
-                    "node_url": peer.get("url"),
-                    "message": f"Tài khoản '{username}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
-                }
-        except Exception as exc:
-            logger.debug("Cluster conflict check skipped unreachable peer %s: %s", peer.get("name"), exc)
+            return peer, resp, ""
+        except Exception as exc:  # noqa: BLE001 - reported below
+            return peer, None, str(exc)
 
-    return {"conflict": False}
+    unreachable: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(8, len(peers))) as pool:
+        answers = list(pool.map(ask, peers))
+    for peer, resp, error in answers:
+        if resp is None:
+            logger.warning("Cluster conflict check could not ask %s: %s", peer.get("name"), error)
+            unreachable.append(str(peer.get("name") or peer.get("url")))
+            continue
+        if check_dom and resp.get("domain_exists"):
+            return {
+                "conflict": True,
+                "kind": "domain",
+                "node_name": peer.get("name"),
+                "node_url": peer.get("url"),
+                "message": f"Tên miền '{domain}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
+            }
+        if check_usr and resp.get("username_exists"):
+            return {
+                "conflict": True,
+                "kind": "username",
+                "node_name": peer.get("name"),
+                "node_url": peer.get("url"),
+                "message": f"Tài khoản '{username}' đã tồn tại trên máy chủ '{peer.get('name')}' trong cụm Multi-Server.",
+            }
 
-
-# --- Remote Database Hosts (Remote MySQL / MariaDB Nodes) ---------------------
-
-_DB_IDENT_RE = re.compile(r"^[a-z0-9_]{1,64}$")
-_RESERVED_REMOTE_DB_USERS = frozenset({"root", "mysql", "mariadb.sys", "debian-sys-maint", "spanel"})
-
-
-def _validate_remote_db_identifier(value: str, label: str = "identifier") -> str:
-    cleaned = (value or "").strip().lower()
-    if not _DB_IDENT_RE.match(cleaned):
-        raise ValueError(f"Invalid remote database {label}: '{value}'")
-    return cleaned
-
-
-def _probe_mysql_banner(host: str, port: int, timeout: float = 4.0) -> tuple[int, str]:
-    """Connect to a remote MySQL/MariaDB TCP port and parse its initial handshake version."""
-    started = time.perf_counter()
-    with socket.create_connection((host, int(port)), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        raw = sock.recv(256)
-    latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
-    version_str = "MySQL / MariaDB"
-    if len(raw) > 5 and raw[4] == 10:
-        end_idx = raw.find(b"\x00", 5)
-        if end_idx != -1:
-            parsed_ver = raw[5:end_idx].decode("ascii", errors="replace").strip()
-            if parsed_ver:
-                version_str = parsed_ver
-    return latency_ms, version_str
+    if unreachable and fail_closed:
+        return {
+            "conflict": True,
+            "kind": "unreachable",
+            "nodes": unreachable,
+            "message": (
+                f"Không thể kiểm tra trùng lặp trên máy chủ Peer: {', '.join(unreachable)}. "
+                "Cụm đang ở chế độ an toàn (fail-closed) nên thao tác bị chặn cho tới khi máy chủ đó phản hồi."
+            ),
+        }
+    return {"conflict": False, "unreachable": unreachable}
 
 
-def _open_remote_mysql_connection(entry: dict[str, Any], timeout: int = 5):
-    """Open an authenticated PyMySQL connection to a remote MySQL/MariaDB node."""
-    import pymysql
-
-    host = str(entry.get("host") or "").strip()
-    port = int(entry.get("port") or 3306)
-    admin_user = str(entry.get("admin_user") or "root").strip()
-    admin_password = _decrypt_remote_db_password(str(entry.get("admin_password") or ""))
-    use_tls = bool(entry.get("use_tls", False))
-
-    kwargs: dict[str, Any] = {
-        "host": host,
-        "port": port,
-        "user": admin_user,
-        "password": admin_password,
-        "connect_timeout": timeout,
-        "read_timeout": timeout,
-        "write_timeout": timeout,
-        "charset": "utf8mb4",
-        "autocommit": True,
-    }
-    if use_tls:
-        kwargs["ssl"] = {"ssl": {}}
-    return pymysql.connect(**kwargs)
-
-
-def add_remote_db_host(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()[:80]
-    host = str(payload.get("host") or "").strip().lower()
-    port = int(payload.get("port") or 3306)
-    admin_user = str(payload.get("admin_user") or "root").strip()[:64]
-    admin_password = str(payload.get("admin_password") or "").strip()
-
-    if not name or not host:
-        raise ValueError("Vui lòng nhập Tên gợi nhớ và Địa chỉ IP/Hostname của máy chủ Database.")
-    if not (1 <= port <= 65535):
-        raise ValueError("Cổng MySQL/MariaDB phải nằm trong khoảng 1 – 65535.")
-
-    stored_password = (
-        _encrypt_secret(admin_password)
-        if admin_password and not _is_encrypted_secret(admin_password)
-        else admin_password
-    )
-
-    host_id = f"rdb_{secrets.token_hex(4)}"
-    entry = {
-        "id": host_id,
-        "name": name,
-        "host": host,
-        "port": port,
-        "admin_user": admin_user,
-        "admin_password": stored_password,
-        "use_tls": bool(payload.get("use_tls", False)),
-        "enabled": bool(payload.get("enabled", True)),
-        "status": "unknown",
-        "latency_ms": None,
-        "server_version": "",
-        "last_checked_at": None,
-        "last_error": "",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    with _state_lock:
-        state = _read_state()
-        if any(h.get("host") == host and int(h.get("port", 3306)) == port for h in state.get("remote_db_hosts", [])):
-            raise ValueError(f"Máy chủ Database {host}:{port} đã tồn tại trong danh sách.")
-        state.setdefault("remote_db_hosts", []).append(entry)
-        _append_log(state, "add_remote_db", f"{name} ({host}:{port})", "info", "Đã thêm cấu hình Remote MySQL/MariaDB Node (mã hóa mật khẩu Fernet AES).")
-        _write_state(state)
-
-    return test_remote_db_host(host_id)
-
-
-def test_remote_db_host(host_id: str) -> dict[str, Any]:
-    with _state_lock:
-        state = _read_state()
-        entry = next((h for h in state.get("remote_db_hosts", []) if h.get("id") == host_id), None)
-        if not entry:
-            raise ValueError("Không tìm thấy máy chủ Remote Database này.")
-        entry_copy = dict(entry)
-        host = str(entry.get("host") or "")
-        port = int(entry.get("port") or 3306)
-
-    try:
-        has_pw = bool(_decrypt_remote_db_password(str(entry_copy.get("admin_password") or "")))
-        if has_pw:
-            try:
-                started = time.perf_counter()
-                conn = _open_remote_mysql_connection(entry_copy, timeout=4)
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT VERSION()")
-                        row = cur.fetchone()
-                        version_str = str(row[0]) if row and row[0] else "MySQL / MariaDB"
-                finally:
-                    conn.close()
-                latency_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
-            except ImportError:
-                latency_ms, version_str = _probe_mysql_banner(host, port)
-        else:
-            latency_ms, version_str = _probe_mysql_banner(host, port)
-        status = "online"
-        last_error = ""
-    except Exception as exc:
-        latency_ms = None
-        version_str = ""
-        status = "offline"
-        last_error = str(exc)
-
-    with _state_lock:
-        state = _read_state()
-        entry = next((h for h in state.get("remote_db_hosts", []) if h.get("id") == host_id), None)
-        if not entry:
-            raise ValueError("Không tìm thấy máy chủ Remote Database này.")
-        entry["status"] = status
-        entry["latency_ms"] = latency_ms
-        entry["server_version"] = version_str
-        entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
-        entry["last_error"] = last_error
-        _write_state(state)
-        return _sanitize_remote_db(entry)
-
-
-def get_active_remote_db_host(host_id: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """Return an active Remote DB host configuration (with decrypted admin_password) for database provisioning."""
-    with _state_lock:
-        state = _read_state()
-        hosts = state.get("remote_db_hosts", [])
-        target = None
-        if host_id and host_id != "auto":
-            target = next((h for h in hosts if h.get("id") == host_id and h.get("enabled", True)), None)
-        elif host_id == "auto":
-            target = next((h for h in hosts if h.get("enabled", True)), None)
-        if not target:
-            return None
-        out = dict(target)
-        out["admin_password_plain"] = _decrypt_remote_db_password(str(out.get("admin_password") or ""))
-        return out
-
-
-def provision_remote_database(
-    host_entry: dict[str, Any],
-    db_name: str,
-    db_user: str,
-    db_password: str,
-    allowed_client_host: str = "%",
-) -> dict[str, Any]:
-    """Connect to a remote MySQL/MariaDB server via PyMySQL (or mysql CLI fallback) and provision database + user."""
-    safe_db = _validate_remote_db_identifier(db_name, "db_name")
-    safe_user = _validate_remote_db_identifier(db_user, "db_user")
-    if safe_user in _RESERVED_REMOTE_DB_USERS:
-        raise ValueError(f"'{safe_user}' is a reserved database account and cannot be provisioned.")
-    client_host = (allowed_client_host or "%").strip()
-    if any(ch in client_host for ch in ("'", '"', ";", "`", "\\")):
-        raise ValueError("Invalid allowed_client_host")
-
-    host = str(host_entry.get("host") or "").strip()
-    port = int(host_entry.get("port") or 3306)
-    admin_user = str(host_entry.get("admin_user") or "root").strip()
-    admin_pw = str(
-        host_entry.get("admin_password_plain")
-        or _decrypt_remote_db_password(str(host_entry.get("admin_password") or ""))
-    )
-
-    try:
-        conn = _open_remote_mysql_connection(host_entry, timeout=8)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"CREATE DATABASE IF NOT EXISTS `{safe_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-                cur.execute("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s", (safe_user, client_host, db_password))
-                cur.execute("ALTER USER %s@%s IDENTIFIED BY %s", (safe_user, client_host, db_password))
-                cur.execute(f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO %s@%s", (safe_user, client_host))
-                cur.execute("FLUSH PRIVILEGES")
-        finally:
-            conn.close()
-    except ImportError:
-        escaped_pw = db_password.replace("\\", "\\\\").replace("'", "''")
-        sql = (
-            f"CREATE DATABASE IF NOT EXISTS `{safe_db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
-            f"CREATE USER IF NOT EXISTS '{safe_user}'@'{client_host}' IDENTIFIED BY '{escaped_pw}';\n"
-            f"ALTER USER '{safe_user}'@'{client_host}' IDENTIFIED BY '{escaped_pw}';\n"
-            f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO '{safe_user}'@'{client_host}';\n"
-            "FLUSH PRIVILEGES;\n"
-        )
-        env = os.environ.copy()
-        if admin_pw:
-            env["MYSQL_PWD"] = admin_pw
-        cmd = ["mysql", "-h", host, "-P", str(port), "-u", admin_user]
-        if host_entry.get("use_tls"):
-            cmd.append("--ssl")
-        subprocess.run(cmd, input=sql, text=True, capture_output=True, env=env, timeout=10, check=True)
-
-    with _state_lock:
-        state = _read_state()
-        _append_log(
-            state,
-            "provision_remote_db",
-            f"{safe_db}@{host}:{port}",
-            "success",
-            f"Đã khởi tạo CSDL '{safe_db}' và user '{safe_user}' trên Remote MySQL {host}:{port}.",
-        )
-        _write_state(state)
-
-    return {
-        "host_id": host_entry.get("id"),
-        "host": host,
-        "port": port,
-        "db_name": safe_db,
-        "db_user": safe_user,
-    }
-
-
-def drop_remote_database(
-    host_entry: dict[str, Any],
-    db_name: str,
-    db_user: str,
-    allowed_client_host: str = "%",
-) -> dict[str, Any]:
-    """Drop a database and user on a remote MySQL/MariaDB server."""
-    safe_db = _validate_remote_db_identifier(db_name, "db_name")
-    safe_user = _validate_remote_db_identifier(db_user, "db_user")
-    if safe_user in _RESERVED_REMOTE_DB_USERS:
-        raise ValueError(f"'{safe_user}' is a reserved database account and cannot be dropped.")
-    client_host = (allowed_client_host or "%").strip()
-    if any(ch in client_host for ch in ("'", '"', ";", "`", "\\")):
-        raise ValueError("Invalid allowed_client_host")
-
-    host = str(host_entry.get("host") or "").strip()
-    port = int(host_entry.get("port") or 3306)
-    admin_user = str(host_entry.get("admin_user") or "root").strip()
-    admin_pw = str(
-        host_entry.get("admin_password_plain")
-        or _decrypt_remote_db_password(str(host_entry.get("admin_password") or ""))
-    )
-
-    try:
-        conn = _open_remote_mysql_connection(host_entry, timeout=8)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"DROP DATABASE IF EXISTS `{safe_db}`")
-                cur.execute("DROP USER IF EXISTS %s@%s", (safe_user, client_host))
-                cur.execute("FLUSH PRIVILEGES")
-        finally:
-            conn.close()
-    except ImportError:
-        sql = (
-            f"DROP DATABASE IF EXISTS `{safe_db}`;\n"
-            f"DROP USER IF EXISTS '{safe_user}'@'{client_host}';\n"
-            "FLUSH PRIVILEGES;\n"
-        )
-        env = os.environ.copy()
-        if admin_pw:
-            env["MYSQL_PWD"] = admin_pw
-        cmd = ["mysql", "-h", host, "-P", str(port), "-u", admin_user]
-        subprocess.run(cmd, input=sql, text=True, capture_output=True, env=env, timeout=10, check=True)
-
-    return {"host_id": host_entry.get("id"), "host": host, "port": port, "dropped_db": safe_db}
-
-
-def delete_remote_db_host(host_id: str) -> None:
-    with _state_lock:
-        state = _read_state()
-        hosts = state.get("remote_db_hosts", [])
-        target = next((h for h in hosts if h.get("id") == host_id), None)
-        if not target:
-            raise ValueError("Không tìm thấy máy chủ Remote Database này.")
-        state["remote_db_hosts"] = [h for h in hosts if h.get("id") != host_id]
-        _append_log(
-            state,
-            "remove_remote_db",
-            f"{target.get('name')} ({target.get('host')}:{target.get('port')})",
-            "info",
-            "Đã xóa máy chủ Remote Database.",
-        )
-        _write_state(state)
+def conflict_http_status(result: dict[str, Any]) -> int:
+    """409 for a real duplicate, 503 when a peer could not be asked (fail-closed)."""
+    return 503 if result.get("kind") == "unreachable" else 409

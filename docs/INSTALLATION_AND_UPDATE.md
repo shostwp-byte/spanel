@@ -53,6 +53,9 @@ export PANEL_URL="https://panel.yourdomain.com:2222"
 export ENABLE_SSL="yes"
 export SSL_EMAIL="admin@yourdomain.com"
 export SPANEL_ADMIN_PASSWORD="MatKhauManh@2026!"
+# Tùy chọn: bật quota đĩa của kernel cho /home (chỉ sửa /etc/fstab, không tự mount lại/khởi động lại).
+# sudo xoá biến môi trường: truyền qua `sudo env SPANEL_DISK_QUOTA=kernel bash` (cập nhật: `sudo env SPANEL_DISK_QUOTA=kernel spanel-update`)
+export SPANEL_DISK_QUOTA="kernel"
 curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" | sudo env npm_config_legacy_peer_deps=true bash
 ```
 

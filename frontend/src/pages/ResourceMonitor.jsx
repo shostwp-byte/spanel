@@ -4,6 +4,7 @@ import {
   Lock, Unlock, Network, Pencil, RefreshCw, Search, Server, ShieldAlert,
   Sliders, Sparkles, Users, Wrench, X, Zap, Eye
 } from 'lucide-react';
+import { DiskQuotaCard } from '../components/DiskQuotaCard.jsx';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
@@ -132,6 +133,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
       storage_limit_mb: userRow.storage_limit_mb ?? 1024,
       mysql_storage_limit_mb: userRow.mysql_storage_limit_mb ?? 0,
       mysql_max_db_size_mb: userRow.mysql_max_db_size_mb ?? 0,
+      mysql_max_queries_per_hour: userRow.mysql_max_queries_per_hour ?? 0,
+      mysql_max_updates_per_hour: userRow.mysql_max_updates_per_hour ?? 0,
+      mysql_max_connections_per_hour: userRow.mysql_max_connections_per_hour ?? 0,
       bandwidth_limit_mb: userRow.bandwidth_limit_mb ?? 0,
       inode_limit: userRow.inode_limit ?? 0,
       database_limit: userRow.database_limit ?? 5,
@@ -255,6 +259,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
           storage_limit_mb: Number(limitsForm.storage_limit_mb || 0),
           mysql_storage_limit_mb: Number(limitsForm.mysql_storage_limit_mb || 0),
           mysql_max_db_size_mb: Number(limitsForm.mysql_max_db_size_mb || 0),
+          mysql_max_queries_per_hour: Number(limitsForm.mysql_max_queries_per_hour || 0),
+          mysql_max_updates_per_hour: Number(limitsForm.mysql_max_updates_per_hour || 0),
+          mysql_max_connections_per_hour: Number(limitsForm.mysql_max_connections_per_hour || 0),
           bandwidth_limit_mb: Number(limitsForm.bandwidth_limit_mb || 0),
           inode_limit: Number(limitsForm.inode_limit || 0),
           database_limit: Number(limitsForm.database_limit || 0),
@@ -354,6 +361,8 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
           </button>
         </div>
       </div>
+
+      {isAdmin && <DiskQuotaCard request={request} setNotice={setNotice} busy={!!loading} />}
 
       {/* MySQL Slow Query & PHP-FPM Slowlog Bottleneck Inspector */}
       {bottlenecksOpen && (
@@ -863,6 +872,18 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
                 <label>
                   <span>{t('Max Single DB Size (MB) (0 = Unlimited)')}</span>
                   <input type="number" min="0" value={limitsForm.mysql_max_db_size_mb} onChange={e => setLimitsForm(prev => ({ ...prev, mysql_max_db_size_mb: e.target.value }))} />
+                </label>
+                <label>
+                  <span>{t('MySQL Queries per Hour (0 = Unlimited)')}</span>
+                  <input type="number" min="0" value={limitsForm.mysql_max_queries_per_hour} onChange={e => setLimitsForm(prev => ({ ...prev, mysql_max_queries_per_hour: e.target.value }))} />
+                </label>
+                <label>
+                  <span>{t('MySQL Updates per Hour (0 = Unlimited)')}</span>
+                  <input type="number" min="0" value={limitsForm.mysql_max_updates_per_hour} onChange={e => setLimitsForm(prev => ({ ...prev, mysql_max_updates_per_hour: e.target.value }))} />
+                </label>
+                <label>
+                  <span>{t('MySQL Connections per Hour (0 = Unlimited)')}</span>
+                  <input type="number" min="0" value={limitsForm.mysql_max_connections_per_hour} onChange={e => setLimitsForm(prev => ({ ...prev, mysql_max_connections_per_hour: e.target.value }))} />
                 </label>
                 <label>
                   <span>{t('Bandwidth Limit (MB)')}</span>

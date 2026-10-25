@@ -2,9 +2,11 @@ import React, { useState, useEffect } from 'react';
 import {
   Activity, AlertCircle, Check, CheckCircle, Clock, Copy, Cpu, Database,
   Edit2, Globe, HardDrive, KeyRound, Network, Plus, RefreshCw, Save,
-  Server, ShieldCheck, Trash2, Wifi, Zap
+  Server, ShieldAlert, ShieldCheck, Trash2, Wifi, Zap, ArrowRightLeft
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
+import { RemoteDbHostsPanel } from '../components/RemoteDbHosts.jsx';
+import { ClusterDnsSyncPanel, ClusterTransfersPanel } from './ClusterPanels.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
@@ -19,6 +21,7 @@ export function MultiServerPage({ request, isAdmin }) {
     auto_dns_sync: true,
     check_domain_conflict: true,
     check_username_conflict: false,
+    conflict_fail_closed: false,
   });
 
   // Peer Node form state
@@ -29,26 +32,17 @@ export function MultiServerPage({ request, isAdmin }) {
     url: '',
     api_token: '',
     role: 'full_peer',
-    verify_tls: false,
+    verify_tls: true,
+    tls_fingerprint: '',
+    ca_pem: '',
     sync_dns: true,
     check_domain: true,
     enabled: true,
   });
+  const [tlsProbe, setTlsProbe] = useState(null);
 
   // Local token generator state
   const [generatedClusterToken, setGeneratedClusterToken] = useState('');
-
-  // Remote DB form state
-  const [showDbForm, setShowDbForm] = useState(false);
-  const [dbForm, setDbForm] = useState({
-    name: '',
-    host: '',
-    port: 3306,
-    admin_user: 'root',
-    admin_password: '',
-    use_tls: false,
-    enabled: true,
-  });
 
   useEffect(() => {
     if (isAdmin) {
@@ -71,6 +65,7 @@ export function MultiServerPage({ request, isAdmin }) {
           auto_dns_sync: data.settings.auto_dns_sync !== false,
           check_domain_conflict: data.settings.check_domain_conflict !== false,
           check_username_conflict: !!data.settings.check_username_conflict,
+          conflict_fail_closed: !!data.settings.conflict_fail_closed,
         });
       }
     }
@@ -106,6 +101,16 @@ export function MultiServerPage({ request, isAdmin }) {
     if (res?.token) {
       setGeneratedClusterToken(res.token);
     }
+  }
+
+  async function probeTls() {
+    if (!nodeForm.url.trim()) return;
+    const res = await request(
+      '/multi-server/tls-probe',
+      { method: 'POST', body: JSON.stringify({ url: nodeForm.url }) },
+      t('Reading the peer certificate...')
+    );
+    if (res) setTlsProbe(res);
   }
 
   async function copyValue(val, msg = 'Đã sao chép vào bộ nhớ tạm.') {
@@ -199,60 +204,6 @@ export function MultiServerPage({ request, isAdmin }) {
         body: JSON.stringify({ zone: null }),
       },
       'Đang đồng bộ toàn bộ DNS Zones sang các máy chủ Peer...'
-    );
-    if (res) {
-      await loadClusterStatus(true);
-    }
-  }
-
-  async function submitRemoteDbForm(e) {
-    e.preventDefault();
-    if (!dbForm.name.trim() || !dbForm.host.trim()) {
-      setError('Vui lòng nhập tên gợi nhớ và IP/Hostname của máy chủ Database.');
-      return;
-    }
-    const res = await request(
-      '/multi-server/remote-db',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...dbForm,
-          port: Number(dbForm.port || 3306),
-        }),
-      },
-      'Đang kết nối và kiểm tra Remote MySQL/MariaDB...'
-    );
-    if (res) {
-      setShowDbForm(false);
-      setDbForm({
-        name: '',
-        host: '',
-        port: 3306,
-        admin_user: 'root',
-        admin_password: '',
-        use_tls: false,
-        enabled: true,
-      });
-      await loadClusterStatus(true);
-    }
-  }
-
-  async function testRemoteDb(host) {
-    const res = await request(
-      `/multi-server/remote-db/${host.id}/test`,
-      { method: 'POST' },
-      `Đang kiểm tra kết nối MySQL tới ${host.name}...`
-    );
-    await loadClusterStatus(true);
-    if (res?.message) setNotice(res.message);
-  }
-
-  async function removeRemoteDb(host) {
-    if (!confirm(`Xóa máy chủ Remote Database "${host.name}" (${host.host}:${host.port})?`)) return;
-    const res = await request(
-      `/multi-server/remote-db/${host.id}`,
-      { method: 'DELETE' },
-      `Đang xóa ${host.name}...`
     );
     if (res) {
       await loadClusterStatus(true);
@@ -369,6 +320,12 @@ export function MultiServerPage({ request, isAdmin }) {
             <span style={{ fontSize: '0.77rem', color: 'var(--text-muted)' }}>
               Dán mã Token này cùng địa chỉ <code>{window.location.origin}</code> vào mục <strong>Multi Server Setup</strong> trên máy chủ SPanel đối tác để liên kết 2 chiều.
             </span>
+            <span style={{ fontSize: '0.77rem', color: 'var(--text-muted)' }}>
+              {t('This token only works between cluster nodes (DNS sync, conflict checks, account transfer); it cannot create or delete accounts through the billing API.')}
+              {localNode.tls_fingerprint && (
+                <> {t('Certificate fingerprint of this server, to pin on the peer')}: <code style={{ wordBreak: 'break-all' }}>{localNode.tls_fingerprint}</code></>
+              )}
+            </span>
           </div>
         )}
 
@@ -446,6 +403,22 @@ export function MultiServerPage({ request, isAdmin }) {
         <button
           type="button"
           role="tab"
+          className={activeTab === 'dns_sync' ? 'active' : ''}
+          onClick={() => setActiveTab('dns_sync')}
+        >
+          <Zap size={14} /> {t('DNS sync')}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          className={activeTab === 'transfers' ? 'active' : ''}
+          onClick={() => setActiveTab('transfers')}
+        >
+          <ArrowRightLeft size={14} /> {t('Account transfers')}
+        </button>
+        <button
+          type="button"
+          role="tab"
           className={activeTab === 'logs' ? 'active' : ''}
           onClick={() => setActiveTab('logs')}
         >
@@ -519,6 +492,15 @@ export function MultiServerPage({ request, isAdmin }) {
                 />
                 <span>Chặn tạo trùng Username trên toàn cụm</span>
               </label>
+
+              <label className="check-line" style={{ margin: 0 }} title={t('When a peer cannot be asked, refuse the new domain or account instead of allowing it.')}>
+                <input
+                  type="checkbox"
+                  checked={!!settingsForm.conflict_fail_closed}
+                  onChange={(e) => setSettingsForm((prev) => ({ ...prev, conflict_fail_closed: e.target.checked }))}
+                />
+                <span>{t('Block when a peer cannot be checked (fail-closed)')}</span>
+              </label>
             </div>
           </div>
 
@@ -542,11 +524,14 @@ export function MultiServerPage({ request, isAdmin }) {
                     url: '',
                     api_token: '',
                     role: 'full_peer',
-                    verify_tls: false,
+                    verify_tls: true,
+                    tls_fingerprint: '',
+                    ca_pem: '',
                     sync_dns: true,
                     check_domain: true,
                     enabled: true,
                   });
+                  setTlsProbe(null);
                   setShowNodeForm(true);
                 }}
               >
@@ -648,7 +633,7 @@ export function MultiServerPage({ request, isAdmin }) {
                       checked={!!nodeForm.verify_tls}
                       onChange={(e) => setNodeForm({ ...nodeForm, verify_tls: e.target.checked })}
                     />
-                    <span>Bắt buộc chứng chỉ SSL hợp lệ (Tắt nếu dùng SSL tự ký trên IP)</span>
+                    <span>{t('Verify the peer TLS certificate')}</span>
                   </label>
 
                   <label className="check-line" style={{ margin: 0 }}>
@@ -660,6 +645,54 @@ export function MultiServerPage({ request, isAdmin }) {
                     <span>Kích hoạt Node</span>
                   </label>
                 </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '12px' }}>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      {t('Pinned certificate fingerprint (SHA-256, for a self-signed peer)')}
+                    </span>
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      <input
+                        value={nodeForm.tls_fingerprint}
+                        onChange={(e) => setNodeForm({ ...nodeForm, tls_fingerprint: e.target.value })}
+                        placeholder="AB:CD:..."
+                        style={{ fontFamily: 'monospace', fontSize: '0.78rem' }}
+                      />
+                      <button type="button" className="secondary-light" disabled={!!loading || !nodeForm.url.trim()} onClick={probeTls}>
+                        <ShieldCheck size={13} /> {t('Read')}
+                      </button>
+                    </div>
+                    {tlsProbe && (
+                      <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '6px' }}>
+                        <div>{tlsProbe.subject} • {t('Issuer')}: {tlsProbe.issuer}</div>
+                        <code style={{ wordBreak: 'break-all' }}>{tlsProbe.fingerprint}</code>
+                        <div style={{ marginTop: '4px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                          <span>{tlsProbe.trusted_by_system ? t('Trusted by the system CA store.') : t('Not trusted by the system: compare it with the fingerprint shown on the peer, then pin it.')}</span>
+                          <button type="button" className="secondary-light" style={{ padding: '4px 8px', fontSize: '0.74rem' }} onClick={() => setNodeForm({ ...nodeForm, tls_fingerprint: tlsProbe.fingerprint })}>
+                            {t('Pin this certificate')}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </label>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      {t('Or a CA certificate to trust for this peer (PEM, optional)')}
+                    </span>
+                    <textarea
+                      rows={3}
+                      value={nodeForm.ca_pem}
+                      onChange={(e) => setNodeForm({ ...nodeForm, ca_pem: e.target.value })}
+                      placeholder="-----BEGIN CERTIFICATE-----"
+                      style={{ fontFamily: 'monospace', fontSize: '0.74rem', width: '100%' }}
+                    />
+                  </label>
+                </div>
+                {!nodeForm.verify_tls && !nodeForm.tls_fingerprint && (
+                  <div style={{ fontSize: '0.78rem', color: '#f59e0b', display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    <ShieldAlert size={14} /> {t('Without verification or a pinned fingerprint, anyone on the path can impersonate this peer.')}
+                  </div>
+                )}
 
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
                   <button type="button" className="secondary-light" onClick={() => setShowNodeForm(false)}>
@@ -738,6 +771,32 @@ export function MultiServerPage({ request, isAdmin }) {
                                 Sync: {new Date(node.last_sync_at).toLocaleTimeString()}
                               </span>
                             )}
+                            {node.last_sync_error && (
+                              <span style={{ fontSize: '0.71rem', color: '#f59e0b', maxWidth: '210px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={node.last_sync_error}>
+                                {t('DNS sync')}: {node.last_sync_error}
+                              </span>
+                            )}
+                            {node.consecutive_failures > 0 && (
+                              <span style={{ fontSize: '0.71rem', color: '#ef4444' }}>
+                                {t('Failed checks in a row')}: {node.consecutive_failures}
+                              </span>
+                            )}
+                            {node.last_checked_at && (
+                              <span style={{ fontSize: '0.71rem', color: 'var(--text-muted)' }}>
+                                {t('Checked')}: {new Date(node.last_checked_at).toLocaleTimeString()}
+                              </span>
+                            )}
+                            {(node.tls_mode === 'insecure' || node.tls_mode === 'plain_http') && (
+                              <span style={{ fontSize: '0.71rem', color: '#f59e0b', display: 'inline-flex', gap: '4px', alignItems: 'center' }}>
+                                <ShieldAlert size={12} /> {node.tls_mode === 'plain_http' ? t('Plain HTTP') : t('TLS not verified')}
+                              </span>
+                            )}
+                            {node.tls_mode === 'pinned' && (
+                              <span style={{ fontSize: '0.71rem', color: '#10b981' }}>{t('Certificate pinned')}</span>
+                            )}
+                            {node.token_unreadable && (
+                              <span style={{ fontSize: '0.71rem', color: '#ef4444' }}>{t('Stored token cannot be decrypted; enter it again.')}</span>
+                            )}
                           </div>
                         </td>
                         <td>
@@ -785,10 +844,13 @@ export function MultiServerPage({ request, isAdmin }) {
                                   api_token: '',
                                   role: node.role || 'full_peer',
                                   verify_tls: !!node.verify_tls,
+                                  tls_fingerprint: node.tls_fingerprint || '',
+                                  ca_pem: node.ca_pem || '',
                                   sync_dns: node.sync_dns !== false,
                                   check_domain: node.check_domain !== false,
                                   enabled: node.enabled !== false,
                                 });
+                                setTlsProbe(null);
                                 setShowNodeForm(true);
                               }}
                               title="Chỉnh sửa cấu hình Node"
@@ -830,203 +892,12 @@ export function MultiServerPage({ request, isAdmin }) {
 
       {/* TAB 2: REMOTE DATABASE NODES */}
       {activeTab === 'remote_db' && (
-        <div className="pkg-card" style={{ padding: '20px 22px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
-            <div>
-              <h3 style={{ margin: 0, fontSize: '1.02rem', fontWeight: 700, color: 'var(--text-main)' }}>
-                Cấu hình Máy chủ Cơ sở dữ liệu Tách rời (Remote MySQL / MariaDB Hosts)
-              </h3>
-              <p style={{ margin: '3px 0 0', fontSize: '0.81rem', color: 'var(--text-muted)' }}>
-                Kết nối và giám sát các máy chủ MySQL / MariaDB chuyên dụng bên ngoài để giảm tải cho Web Server chính.
-              </p>
-            </div>
-            <button type="button" onClick={() => setShowDbForm((v) => !v)}>
-              <Plus size={15} /> Thêm Remote Database Node
-            </button>
-          </div>
-
-          {showDbForm && (
-            <form
-              onSubmit={submitRemoteDbForm}
-              style={{
-                padding: '16px',
-                borderRadius: '10px',
-                background: 'var(--surface-2)',
-                border: '1px solid var(--border-subtle)',
-                marginBottom: '18px',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '14px',
-              }}
-            >
-              <div style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
-                Thêm máy chủ MySQL / MariaDB từ xa
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' }}>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Tên gợi nhớ Node DB
-                  </span>
-                  <input
-                    value={dbForm.name}
-                    onChange={(e) => setDbForm({ ...dbForm, name: e.target.value })}
-                    placeholder="VD: MariaDB Cluster Node 01"
-                    required
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Địa chỉ IP hoặc Hostname
-                  </span>
-                  <input
-                    value={dbForm.host}
-                    onChange={(e) => setDbForm({ ...dbForm, host: e.target.value })}
-                    placeholder="10.0.0.25 hoặc db1.yourdomain.com"
-                    required
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Cổng (Port)
-                  </span>
-                  <input
-                    type="number"
-                    min="1"
-                    max="65535"
-                    value={dbForm.port}
-                    onChange={(e) => setDbForm({ ...dbForm, port: e.target.value })}
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Tài khoản Quản trị DB
-                  </span>
-                  <input
-                    value={dbForm.admin_user}
-                    onChange={(e) => setDbForm({ ...dbForm, admin_user: e.target.value })}
-                    placeholder="root / spanel_admin"
-                  />
-                </label>
-                <label style={{ margin: 0 }}>
-                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                    Mật khẩu Quản trị DB
-                  </span>
-                  <input
-                    type="password"
-                    value={dbForm.admin_password}
-                    onChange={(e) => setDbForm({ ...dbForm, admin_password: e.target.value })}
-                    placeholder="••••••••••••"
-                  />
-                </label>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
-                <label className="check-line" style={{ margin: 0 }}>
-                  <input
-                    type="checkbox"
-                    checked={!!dbForm.use_tls}
-                    onChange={(e) => setDbForm({ ...dbForm, use_tls: e.target.checked })}
-                  />
-                  <span>Sử dụng kết nối mã hóa SSL/TLS</span>
-                </label>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button type="button" className="secondary-light" onClick={() => setShowDbForm(false)}>
-                    Hủy
-                  </button>
-                  <button type="submit" disabled={!!loading}>
-                    <Check size={15} /> Lưu & Kiểm tra kết nối
-                  </button>
-                </div>
-              </div>
-            </form>
-          )}
-
-          <div className="pkg-table-wrap">
-            <table className="pkg-clean-table">
-              <thead>
-                <tr>
-                  <th>Tên Node Database</th>
-                  <th>Địa chỉ & Cổng</th>
-                  <th>Phiên bản MySQL / MariaDB</th>
-                  <th>Trạng thái & Độ trễ</th>
-                  <th>Kiểm tra gần nhất</th>
-                  <th style={{ textAlign: 'right' }}>Thao tác</th>
-                </tr>
-              </thead>
-              <tbody>
-                {remoteDbs.map((host) => {
-                  const isOnline = host.status === 'online';
-                  return (
-                    <tr key={host.id}>
-                      <td>
-                        <strong style={{ color: 'var(--text-main)' }}>{host.name}</strong>
-                        <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
-                          User: <code>{host.admin_user}</code> {host.use_tls ? '• TLS' : ''}
-                        </div>
-                      </td>
-                      <td>
-                        <code>{host.host}:{host.port}</code>
-                      </td>
-                      <td>
-                        <code style={{ fontSize: '0.78rem', color: 'var(--accent-primary)' }}>
-                          {host.server_version || '—'}
-                        </code>
-                      </td>
-                      <td>
-                        <span style={{
-                          padding: '3px 9px',
-                          borderRadius: '999px',
-                          fontSize: '0.74rem',
-                          fontWeight: 700,
-                          background: isOnline ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)',
-                          color: isOnline ? '#10b981' : '#ef4444',
-                        }}>
-                          {isOnline ? `Online (${host.latency_ms ?? 1}ms)` : 'Offline / Lỗi kết nối'}
-                        </span>
-                      </td>
-                      <td style={{ fontSize: '0.79rem', color: 'var(--text-muted)' }}>
-                        {host.last_checked_at ? new Date(host.last_checked_at).toLocaleString() : '—'}
-                      </td>
-                      <td style={{ textAlign: 'right' }}>
-                        <div style={{ display: 'inline-flex', gap: '6px' }}>
-                          <button
-                            type="button"
-                            className="secondary-light"
-                            style={{ padding: '6px 10px', fontSize: '0.77rem' }}
-                            disabled={!!loading}
-                            onClick={() => testRemoteDb(host)}
-                          >
-                            <Wifi size={13} /> Kiểm tra
-                          </button>
-                          <button
-                            type="button"
-                            className="danger"
-                            style={{ padding: '6px 10px' }}
-                            disabled={!!loading}
-                            onClick={() => removeRemoteDb(host)}
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {remoteDbs.length === 0 && (
-                  <tr>
-                    <td colSpan="6">
-                      <EmptyState
-                        icon={Database}
-                        title="Chưa cấu hình Remote Database Node nào"
-                        subtitle="Mặc định SPanel sử dụng MariaDB nội bộ trên máy chủ. Bạn có thể thêm máy chủ MySQL/MariaDB rời khi cần mở rộng tầng cơ sở dữ liệu."
-                      />
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <RemoteDbHostsPanel request={request} hosts={remoteDbs} loading={loading} onChanged={() => loadClusterStatus(true)} />
       )}
+
+      {activeTab === 'dns_sync' && <ClusterDnsSyncPanel request={request} />}
+
+      {activeTab === 'transfers' && <ClusterTransfersPanel request={request} nodes={nodes} />}
 
       {/* TAB 3: SYNC LOGS */}
       {activeTab === 'logs' && (

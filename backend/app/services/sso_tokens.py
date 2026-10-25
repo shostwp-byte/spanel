@@ -11,12 +11,17 @@ PANEL_LOGIN_TTL_SECONDS = 300
 TOKEN_DIR = Path("/tmp/spanel-phpmyadmin-sso")
 
 
-def create_phpmyadmin_token(db_user: str, db_password: str, db_name: str) -> str:
+def create_phpmyadmin_token(db_user: str, db_password: str, db_name: str, server: int = 1) -> str:
+    """`server` is phpMyAdmin's server index: 1 is the local MariaDB, 2 and up
+    the remote MySQL hosts (remote_mysql.phpmyadmin_server_index)."""
+    if not isinstance(server, int) or not 1 <= server <= 99:
+        raise ValueError("Invalid phpMyAdmin server index")
     return _create_token({
         "kind": "phpmyadmin",
         "db_user": db_user,
         "db_password": db_password,
         "db_name": db_name,
+        "server": server,
     }, TOKEN_TTL_SECONDS)
 
 

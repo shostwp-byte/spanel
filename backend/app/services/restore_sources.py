@@ -8,7 +8,7 @@ Three kinds of source:
   manual full-user backups in users/<account>/, plus uploads and copies
   fetched earlier. The page before this one listed only users/restore, so the
   scheduled backups sitting on the server could not be restored from it;
-- target: a destination saved under Backup Destination, S3 or SFTP;
+- target: a destination saved under Backup Destination, S3, SFTP, FTP or FTPS;
 - remote: another server over SFTP, FTP or FTPS, with details typed in for
   this restore and never stored.
 
@@ -350,6 +350,8 @@ def list_source(source: dict, db) -> dict:
                 raise RestoreSourceError(str(exc)) from None
             return {"items": _newest_first(rows), "location": f"s3://{target.bucket}/{prefix}".rstrip("/"),
                     "host_key": None}
+        if (target.kind or "sftp") in ("ftp", "ftps"):
+            return _list_ftp_target(target)
         folder = remote_folder(target.remote_path)
         with _target_sftp(target) as (client, seen):
             rows = _sftp_list(client, folder)
@@ -375,6 +377,42 @@ def list_source(source: dict, db) -> dict:
             "host_key": None}
 
 
+def _ftp_target_source(target: SftpBackupTarget) -> dict:
+    return {"kind": "remote", "protocol": target.kind, "host": target.host,
+            "port": int(target.port or DEFAULT_PORTS[target.kind]), "username": target.username,
+            "password": decrypt(target.password) if target.password else "",
+            "path": target.remote_path}
+
+
+def _list_ftp_target(target: SftpBackupTarget) -> dict:
+    """A saved FTP(S) destination: its folder, one level of <hostname> and one
+    of <account> below it, the layout scheduled backups are written in."""
+    source = _ftp_target_source(target)
+    folder = remote_folder(target.remote_path)
+    ftp = _ftp_open(source)
+    rows: list[dict] = []
+    try:
+        rows.extend(_ftp_list(ftp, folder))
+        for host_dir in _ftp_dirs(ftp, folder):
+            for user_dir in _ftp_dirs(ftp, posixpath.join(folder, host_dir)):
+                for row in _ftp_list(ftp, posixpath.join(folder, host_dir, user_dir)):
+                    row["username"], row["hostname"] = user_dir, host_dir
+                    rows.append(row)
+    except (ftplib.Error, OSError, EOFError) as exc:
+        raise RestoreSourceError(f"FTP: the listing failed ({exc or type(exc).__name__})") from None
+    finally:
+        _ftp_close(ftp)
+    return {"items": _newest_first(rows), "location": f"{target.kind}://{target.host}{folder}", "host_key": None}
+
+
+def _ftp_dirs(ftp: ftplib.FTP, folder: str) -> list[str]:
+    try:
+        return [name for name, facts in ftp.mlsd(folder, facts=["type"])
+                if facts.get("type") == "dir" and not name.startswith(".")]
+    except ftplib.error_perm:
+        return []  # no MLSD, or no such folder: the flat listing is all there is
+
+
 def push(source: dict, local_file: str, db) -> str:
     """Put an uploaded archive in a destination or on another server, so it
     is listed there (the page's Upload backup, for a source that is not this
@@ -387,6 +425,8 @@ def push(source: dict, local_file: str, db) -> str:
                 return backup_s3.upload(target, local_file, remote_name=name)["remote_file"]
             except backup_s3.S3Error as exc:
                 raise RestoreSourceError(str(exc)) from None
+        if (target.kind or "sftp") in ("ftp", "ftps"):
+            return push(_ftp_target_source(target), local_file, db)
         folder = remote_folder(target.remote_path)
         with _target_sftp(target) as (client, seen):
             _sftp_put(client, local_file, folder, name)
@@ -457,6 +497,9 @@ def fetch(source: dict, key: str, size: int, db) -> tuple[str, bool]:
     if source["kind"] == "local":
         return local_path(key), False
     _room_for(size)
+    if source["kind"] == "target" and (_target(db, source.get("target_id")).kind or "sftp") in ("ftp", "ftps"):
+        target = _target(db, source.get("target_id"))
+        return fetch(_ftp_target_source(target), key, size, db)
     if source["kind"] == "target":
         target = _target(db, source.get("target_id"))
         if (target.kind or "sftp") == "s3":

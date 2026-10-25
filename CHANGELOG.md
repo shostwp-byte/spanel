@@ -4,6 +4,83 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
+## [Chưa phát hành] — sau v1.0.7
+
+Các tính năng dưới đây đã có test tự động nhưng **chưa cài thử trên máy chủ thật**. Trước khi gắn tag, chạy hết [docs/STAGING_CHECKLIST.md](docs/STAGING_CHECKLIST.md).
+
+### ⚠️ Lưu ý khi nâng cấp
+- **PHP-FPM:** mỗi tài khoản có master PHP-FPM riêng (`spanel-php<ver>-fpm@<user>.service`) chạy trong `user-<uid>.slice`. `update.sh` tự chuyển từng site và chỉ gỡ pool cũ khi nginx đã trỏ sang socket mới.
+- **Giới hạn tài nguyên:** trước đây giới hạn đặt trong gói (CPU, RAM, tasks, IO, inode, MySQL) bị mất sau mỗi request và mọi tài khoản thực tế chạy theo mặc định. Từ bản này, giới hạn trong gói **được áp dụng thật**. Kiểm tra lại các gói trước khi cập nhật.
+- **Cụm đa máy chủ:** request giữa các node phải có chữ ký, nên **mọi node phải cập nhật**. Tạo token node mới (scope `cluster:*`) để chuyển tài khoản giữa các node.
+- **Billing API:** token cũ `provisioning:read/write` vẫn dùng được. Token `sso:admin` bắt buộc phải có IP Allowlist.
+
+### Cách ly tài nguyên
+- PHP-FPM theo từng tài khoản, nằm trong slice ngay từ khi worker sinh ra; giới hạn IO cho scope.
+- Quota đĩa của kernel, có giới hạn inode (tuỳ chọn, `SPANEL_DISK_QUOTA=kernel`; không bao giờ tự remount).
+- Giới hạn MySQL theo giờ: số query, update và kết nối.
+
+### Cụm đa máy chủ và Remote MySQL
+- Remote MySQL đủ vòng đời: tạo, xoá, đổi mật khẩu, backup và khôi phục đúng máy chủ, tạm khoá và mở khoá, phpMyAdmin, TLS có kiểm tra CA. Tài khoản DB chỉ mở cho IP của web node, không dùng `%`.
+- Ký request giữa các node (HMAC, timestamp, nonce); token node được mã hoá khi lưu; mặc định kiểm tra TLS, hỗ trợ pin fingerprint.
+- Đồng bộ DNS có outbox bền vững, tự gửi lại và đối chiếu định kỳ. Mỗi zone có node gốc, serial luôn tăng, và zone của node nhận không bao giờ bị ghi đè.
+- Chuyển tài khoản giữa các node SPanel (backup mã hoá một lần → upload có chữ ký → khôi phục → tuỳ chọn chuyển DNS và tạm khoá ở nguồn).
+- Kiểm tra sức khoẻ node định kỳ, gợi ý node đặt tài khoản; kiểm tra trùng có chế độ fail-closed.
+
+### WHMCS, API và webhook
+- Sửa UsageUpdate (route bị che), xoá lịch sử webhook, và sự kiện provisioning không phát webhook.
+- API: scope chi tiết, CIDR allowlist, hạn dùng và xoay vòng token, giới hạn tốc độ, `Idempotency-Key`, dọn sạch khi tạo tài khoản thất bại, danh sách tài khoản, băng thông thật.
+- Webhook có outbox với retry, chữ ký kèm timestamp và danh mục sự kiện.
+- Module WHMCS: SSO cho khách và admin, ListAccounts, tab admin, các nút tuỳ chỉnh, configurable options, backup trước khi terminate; CI lint PHP 7.4 và 8.3.
+- Tài liệu API tiếng Việt và tiếng Anh, kèm `docs/openapi.json`.
+
+### Mail và DNS
+- Autoresponder được áp dụng thật (Sieve vacation).
+- Xoay DKIM bằng 2 selector; chỉnh chính sách DMARC; MTA-STS, TLS-RPT, autoconfig/autodiscover.
+- Chứng chỉ riêng cho `mail.<domain>` (chọn theo SNI ở Exim và Dovecot).
+- Quản lý hàng đợi mail; auto-hold hoạt động thật; Rspamd học spam khi kéo thư vào hoặc ra khỏi Junk; cảnh báo quota.
+- DNS: thêm các bản ghi TLSA, HTTPS, SVCB, PTR, DS, SSHFP, NAPTR; import và export file BIND; secondary qua AXFR/NOTIFY; template zone theo gói.
+
+### Vá lỗi, chịu lỗi, sao lưu
+- Bộ lập lịch theo khung giờ bảo trì cho tự cập nhật panel và vá core stack có lịch (có `nginx -t` trước và sau); unattended-upgrades tránh các gói do panel quản lý.
+- Rollback cập nhật khôi phục cả `spanel.db`, venv và file hệ thống.
+- Cảnh báo watchdog qua webhook (Slack, Discord, JSON); khôi phục `spanel.db` từ hot backup.
+- Panel tự backup ra ngoài máy (mã hoá) và có lệnh `spanel dr-restore` để dựng lại máy chủ.
+- Retention trên S3/SFTP/FTP, có thêm đích FTP/FTPS; kiểm tra backup định kỳ và khôi phục thử SQL.
+
+### Bảo mật
+- Helper chạy từ `/` và đặt `PYTHONSAFEPATH`, để thư mục do user `spanel` sở hữu không bao giờ lọt vào Python chạy bằng root.
+- Nhận tài khoản chuyển từ node khác: archive không thể ghi đè một tài khoản đang có trên máy.
+
+---
+
+## [v1.0.7] — 2026-10-24
+
+### ⚠️ Lưu ý khi nâng cấp từ v1.0.6
+- **Webhook Git Auto-Deploy phải cấu hình lại.** URL webhook đã đổi công thức và mọi lần push phải có chữ ký (`X-Hub-Signature-256` của GitHub hoặc `X-Gitlab-Token` của GitLab) bằng **Webhook Secret** riêng. Webhook cài trước v1.0.7 bị từ chối với thông báo "Legacy pre-v1.0.7 webhook URL". Vào **Applications**, sao chép lại **Webhook URL** và **Webhook Secret** rồi dán vào GitHub/GitLab.
+- **Đổi khoá webhook:** đặt `WEBHOOK_SECRET_KEY` trong `.env` để đổi toàn bộ URL và secret webhook mà không đụng tới `SECRET_KEY`.
+- **Mã hoá backup theo lịch:** đặt `SPANEL_BACKUP_PASSPHRASE` (tối thiểu 12 ký tự) trong `.env` để mọi bản backup tự động được mã hoá AES-256. Không có giao diện nhập passphrase cho từng lịch.
+- **Cron của khách hàng** được chuyển sang `/etc/cron.d/spanel-user-<user>` và chạy trong `spanel-cron-jail`. Bản sao crontab cũ được lưu ở `/var/backups/spanel/cron-spool-backup/<thời điểm>/`; dòng nào không chuyển được sẽ có cảnh báo trong log cập nhật.
+- **Process Monitor** chỉ cho kill tiến trình của tài khoản hosting (uid 1000–64999). Dịch vụ hệ thống khởi động lại tại **System Services**.
+
+### 🔒 Bảo mật
+- Cron khách hàng: toàn bộ lệnh và chuyển hướng nằm trong một chuỗi `/bin/sh -c '...'` chạy sau `runuser`. Backend và `cron-write` dùng chung một ngữ pháp kiểm tra; dấu `%` chưa escape bị từ chối.
+- Bước chuyển đổi cron trong `update.sh` không còn chạy mã của panel bằng root.
+- `spanel-api` giữ `ProtectProc=invisible`; Process Monitor đọc tiến trình qua `spanel-helper`.
+- Khoá audit riêng `/etc/spanel/audit-hmac.key`, anchor chuỗi audit do root ghi.
+- Tắt cấp phát cơ sở dữ liệu trên MySQL từ xa cho tới khi hoàn thiện vòng đời.
+
+### 🛠️ Sửa lỗi
+- Backup theo lịch chạy lại được (lỗi `TypeError` ở mọi lần chạy trong bản thử nghiệm).
+- Cron giữ đúng thư mục làm việc khi ghi vào `/etc/cron.d`.
+- Watchdog timer chạy được; bỏ `apt-mark hold` tự động và gỡ hold cũ.
+- `Alt-Svc` chỉ gửi một lần và chỉ khi nginx có HTTP/3; `reuseport` của QUIC được chuyển cho vhost khác (kể cả vhost dùng IP riêng) khi xoá vhost đang giữ nó.
+- Giải nén archive: quét đồng bộ có giới hạn, phần vượt giới hạn được đưa vào hàng đợi quét nền.
+
+### 🧪 Kiểm thử
+- Khôi phục thư mục `tests/` và thêm CI GitHub Actions (backend, migration, cú pháp shell, build frontend, chặn PR xoá code hàng loạt).
+
+---
+
 ## [v1.0.6] — 2026-10-20
 
 ### 🛠️ Khắc phục Lỗi Triển khai VPS & Cơ sở Dữ liệu (Deployment & Migration Hotfixes)

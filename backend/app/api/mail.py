@@ -6,7 +6,7 @@ domains; an administrator sees every domain, and alone chooses relays, sets a
 domain's own DNS records and reads the logs.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -67,13 +67,45 @@ class ForwarderUpdate(BaseModel):
 class AutoresponderIn(BaseModel):
     domain_id: int = Field(gt=0)
     local_part: str = Field(min_length=1, max_length=64)
-    subject: str = Field(max_length=255)
-    body: str = Field()
+    subject: str = Field(max_length=mail.AUTORESPONDER_SUBJECT_MAX)
+    body: str = Field(max_length=mail.AUTORESPONDER_BODY_MAX + 200)
+    enabled: bool = True
+    # YYYY-MM-DD; empty is open-ended.
+    start_date: str = Field(default="", max_length=10)
+    end_date: str = Field(default="", max_length=10)
+    interval_days: int = Field(default=1, ge=1, le=30)
 
 
 class AutoresponderUpdate(BaseModel):
-    subject: str = Field(max_length=255)
-    body: str = Field()
+    subject: str = Field(max_length=mail.AUTORESPONDER_SUBJECT_MAX)
+    body: str = Field(max_length=mail.AUTORESPONDER_BODY_MAX + 200)
+    # None keeps what is saved (an older page sends only subject and body).
+    enabled: bool | None = None
+    start_date: str | None = Field(default=None, max_length=10)
+    end_date: str | None = Field(default=None, max_length=10)
+    interval_days: int | None = Field(default=None, ge=1, le=30)
+
+
+class MailHostsIn(BaseModel):
+    # Of mail, mta-sts, autoconfig, autodiscover; mail is always served.
+    hosts: list[str] = Field(default_factory=lambda: ["mail"], max_length=4)
+
+
+class MtaStsIn(BaseModel):
+    # testing, enforce or none; "" is off.
+    mode: str = Field(default="", max_length=10)
+    tls_rpt: list[str] = Field(default_factory=list, max_length=mail.DMARC_MAX_REPORT_ADDRESSES)
+
+
+class DmarcIn(BaseModel):
+    p: str = Field(max_length=12)
+    sp: str = Field(default="", max_length=12)
+    pct: int = Field(default=100, ge=0, le=100)
+    rua: list[str] = Field(default_factory=list, max_length=mail.DMARC_MAX_REPORT_ADDRESSES)
+    ruf: list[str] = Field(default_factory=list, max_length=mail.DMARC_MAX_REPORT_ADDRESSES)
+    adkim: str = Field(default="r", max_length=1)
+    aspf: str = Field(default="r", max_length=1)
+    fo: str = Field(default="", max_length=8)
 
 
 class DnsRecordIn(BaseModel):
@@ -122,12 +154,19 @@ class MailSettingsIn(BaseModel):
     spam_subject_tag: str | None = Field(default=None, max_length=32)
     greylisting: bool | None = None
     default_quota_mb: int | None = Field(default=None, ge=1, le=mail.MAX_USER_QUOTA_MB)
+    dkim_rotate_days: int | None = Field(default=None, ge=0, le=3650)
+    dkim_retire_days: int | None = Field(default=None, ge=1, le=60)
     allow: list[str] | None = Field(default=None, max_length=mail.MAX_ALLOW)
     block: list[str] | None = Field(default=None, max_length=mail.MAX_ALLOW)
 
 
 class AllowIn(BaseModel):
     value: str = Field(min_length=3, max_length=254)
+
+
+class QueueActionIn(BaseModel):
+    action: str = Field(pattern="^(retry|freeze|thaw|delete)$")
+    ids: list[str] = Field(min_length=1, max_length=mail.MAX_QUEUE_BATCH)
 
 
 # --- overview and domains ----------------------------------------------------------------
@@ -199,10 +238,95 @@ def put_domain_relay(domain_id: int, payload: DomainRelayIn, request: Request, d
 @router.post("/domains/{domain_id}/dkim/rotate")
 def post_rotate_dkim(domain_id: int, request: Request, db: Session = Depends(get_db),
                      current_user: User = Depends(get_current_user)):
+    """Start a DKIM key rotation: the next key is published under a selector
+    of its own; mail is signed with it only once DNS shows it."""
     ensure_role(current_user.role, Role.end_user)
     row = _answer(lambda: mail.rotate_dkim(db, current_user, domain_id))
-    log_action(db, current_user.id, "mail_dkim_rotate", row.domain, "", request=request)
-    return {"domain": row.domain, "records": mail.dns_records(row)}
+    log_action(db, current_user.id, "mail_dkim_rotate", row.domain, row.dkim_next_selector, request=request)
+    return mail.dns_view(db, row, current_user)
+
+
+@router.post("/domains/{domain_id}/dkim/advance")
+def post_advance_dkim(domain_id: int, request: Request, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    """Check DNS and take the rotation's next step now: switch signing to the
+    new key once DNS shows it, or retire the previous key early."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.get_domain(db, current_user, domain_id))
+    step = _answer(lambda: mail.advance_dkim(db, row, manual=True))
+    if step == "wait" and row.dkim_state == "publishing":
+        raise HTTPException(status_code=409, detail="Public DNS does not show the new DKIM record yet. Publish it, then try again in a while.")
+    log_action(db, current_user.id, "mail_dkim_advance", row.domain, step, request=request)
+    return {"step": step, **mail.dns_view(db, row, current_user)}
+
+
+@router.post("/domains/{domain_id}/dkim/cancel")
+def post_cancel_dkim(domain_id: int, request: Request, db: Session = Depends(get_db),
+                     current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.get_domain(db, current_user, domain_id))
+    _answer(lambda: mail.cancel_dkim_rotation(db, row))
+    log_action(db, current_user.id, "mail_dkim_cancel", row.domain, "", request=request)
+    return mail.dns_view(db, row, current_user)
+
+
+@router.get("/domains/{domain_id}/dmarc")
+def get_dmarc(domain_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.get_domain(db, current_user, domain_id))
+    return mail.dmarc_view(row)
+
+
+@router.put("/domains/{domain_id}/dmarc")
+def put_dmarc(domain_id: int, payload: DmarcIn, request: Request, db: Session = Depends(get_db),
+              current_user: User = Depends(get_current_user)):
+    """Save the domain's DMARC policy; its record follows in this server's zone."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_dmarc(db, current_user, domain_id, payload.model_dump()))
+    view = mail.dmarc_view(row)
+    log_action(db, current_user.id, "mail_dmarc", row.domain, view["record"], request=request)
+    return mail.dns_view(db, row, current_user)
+
+
+@router.delete("/domains/{domain_id}/dmarc")
+def delete_dmarc(domain_id: int, request: Request, db: Session = Depends(get_db),
+                 current_user: User = Depends(get_current_user)):
+    """Back to the panel's default DMARC record."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_dmarc(db, current_user, domain_id, None))
+    log_action(db, current_user.id, "mail_dmarc", row.domain, "default", request=request)
+    return mail.dns_view(db, row, current_user)
+
+
+@router.post("/domains/{domain_id}/mail-hosts")
+def post_mail_hosts(domain_id: int, payload: MailHostsIn, request: Request, db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_user)):
+    """Serve mail.<domain> (and mta-sts., autoconfig., autodiscover.) with a
+    Let's Encrypt certificate of their own; Exim and Dovecot answer mail.<domain>
+    with it."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_mail_hosts(db, current_user, domain_id, payload.hosts))
+    log_action(db, current_user.id, "mail_hosts", row.domain, row.mail_hosts, request=request)
+    return mail.dns_view(db, row, current_user, check=False)
+
+
+@router.put("/domains/{domain_id}/mta-sts")
+def put_mta_sts(domain_id: int, payload: MtaStsIn, request: Request, db: Session = Depends(get_db),
+                current_user: User = Depends(get_current_user)):
+    """The domain's MTA-STS mode and TLS-RPT report addresses."""
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.set_mta_sts(db, current_user, domain_id, payload.mode, payload.tls_rpt))
+    log_action(db, current_user.id, "mail_mta_sts", row.domain, row.mta_sts_mode or "off", request=request)
+    return mail.dns_view(db, row, current_user, check=False)
+
+
+@router.delete("/domains/{domain_id}/mail-hosts")
+def delete_mail_hosts(domain_id: int, request: Request, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.end_user)
+    row = _answer(lambda: mail.remove_mail_hosts(db, current_user, domain_id))
+    log_action(db, current_user.id, "mail_hosts", row.domain, "off", request=request)
+    return mail.dns_view(db, row, current_user, check=False)
 
 
 @router.post("/domains/{domain_id}/webmail-host")
@@ -314,19 +438,23 @@ def get_autoresponders(domain_id: int | None = None, q: str = "", page: int = 1,
 def post_autoresponder(payload: AutoresponderIn, request: Request, db: Session = Depends(get_db),
                        current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.end_user)
-    row = _answer(lambda: mail.create_autoresponder(db, current_user, payload.domain_id, payload.local_part,
-                                                    payload.subject, payload.body))
+    row = _answer(lambda: mail.create_autoresponder(
+        db, current_user, payload.domain_id, payload.local_part, payload.subject, payload.body,
+        enabled=payload.enabled, start_date=payload.start_date, end_date=payload.end_date,
+        interval_days=payload.interval_days))
     log_action(db, current_user.id, "mail_autoresponder_create", row.address, row.subject, request=request)
-    return {"id": row.id, "address": row.address, "subject": row.subject}
+    return {"id": row.id, "address": row.address, "subject": row.subject, "enabled": row.enabled}
 
 
 @router.put("/autoresponders/{autoresponder_id}")
 def put_autoresponder(autoresponder_id: int, payload: AutoresponderUpdate, request: Request, db: Session = Depends(get_db),
                       current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.end_user)
-    row = _answer(lambda: mail.update_autoresponder(db, current_user, autoresponder_id, payload.subject, payload.body))
+    row = _answer(lambda: mail.update_autoresponder(
+        db, current_user, autoresponder_id, payload.subject, payload.body, enabled=payload.enabled,
+        start_date=payload.start_date, end_date=payload.end_date, interval_days=payload.interval_days))
     log_action(db, current_user.id, "mail_autoresponder_update", row.address, row.subject, request=request)
-    return {"id": row.id, "address": row.address, "subject": row.subject}
+    return {"id": row.id, "address": row.address, "subject": row.subject, "enabled": row.enabled}
 
 
 @router.delete("/autoresponders/{autoresponder_id}")
@@ -422,6 +550,40 @@ def relay_test(payload: RelayTestIn, request: Request, db: Session = Depends(get
 def get_log(lines: int = 200, q: str = "", current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
     return {"lines": _answer(lambda: mail.mail_log(lines, q)), "queue": mail.queue_size()}
+
+
+@router.get("/queue")
+def get_queue(q: str = Query(default="", max_length=200), state: str = Query(default="", pattern="^(|frozen|active)$"),
+              page: int = Query(default=1, ge=1), per_page: int = Query(default=50, ge=1, le=200),
+              current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return _answer(lambda: mail.queue_list(q, state, page, per_page))
+
+
+@router.get("/queue/{message_id}")
+def get_queue_message(message_id: str, current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    return _answer(lambda: mail.queue_message(message_id))
+
+
+@router.post("/queue/action")
+def post_queue_action(payload: QueueActionIn, request: Request, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    """Retry, hold (freeze), release (thaw) or delete queued messages."""
+    ensure_role(current_user.role, Role.admin)
+    lines = _answer(lambda: mail.queue_action(payload.action, payload.ids))
+    log_action(db, current_user.id, f"mail_queue_{payload.action}", ", ".join(payload.ids[:20]),
+               f"{len(payload.ids)} message(s)", request=request)
+    return {"lines": lines}
+
+
+@router.post("/queue/retry-all")
+def post_queue_retry_all(request: Request, db: Session = Depends(get_db),
+                         current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.admin)
+    _answer(mail.queue_retry_all)
+    log_action(db, current_user.id, "mail_queue_retry_all", "queue", "", request=request)
+    return {"ok": True}
 
 
 @router.get("/rspamd/stat")

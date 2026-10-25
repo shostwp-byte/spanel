@@ -177,6 +177,10 @@ RELEASE_ZIP_URL="${RELEASE_ZIP_URL:-}"             # optional archive URL templa
 SKIP_PULL="${SKIP_PULL:-false}"
 UPDATE_STATE_FILE="${UPDATE_STATE_FILE:-/var/lib/spanel/update-status.json}"
 RELEASE_WORK_DIR="${RELEASE_WORK_DIR:-}"
+# Opt-in: SPANEL_DISK_QUOTA=kernel turns on kernel user quota for the
+# filesystem holding /home (also possible from Resource Monitor). Only fstab
+# is edited; a remount or reboot stays the administrator's call.
+SPANEL_DISK_QUOTA="${SPANEL_DISK_QUOTA:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -579,7 +583,7 @@ server {
 }
 NGINX
   sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${api_scheme}://127.0.0.1:${panel_port}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
-  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php 2>/dev/null || true
+  sed -i -E "s#('secure' => )(true|false)#\1${pma_secure}#" /etc/phpmyadmin/conf.d/spanel-signon.php /usr/share/phpmyadmin/spanel-signon.php /etc/phpmyadmin/conf.d/spanel-remote-servers.php 2>/dev/null || true
   [[ -n "$host" ]] && sed -i -E "/PmaAbsoluteUri/s#'https?://[^']+/phpmyadmin/'#'${tools_scheme}://${host}/phpmyadmin/'#" /etc/phpmyadmin/conf.d/spanel-signon.php 2>/dev/null || true
 }
 
@@ -697,16 +701,18 @@ migrate_site_cron_php_binary() {
   local py_bin="$APP_DIR/backend/.venv/bin/python"
   [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
 
-  local backup_dir="/var/backups/spanel/cron-spool-backup"
+  local backup_dir
+  backup_dir="/var/backups/spanel/cron-spool-backup/$(date +%Y%m%d%H%M%S)"
   install -d -m 0700 -o root -g root "$backup_dir"
-  local spool_json
+  local spool_json dumped_users
   spool_json="$(mktemp /run/spanel-cron-spool.XXXXXX.json)"
   chown root:spanel "$spool_json"
   chmod 0640 "$spool_json"
 
   # Stage 1 (root, isolated /usr/bin/python3 -I — never imports from $APP_DIR):
-  # Back up and dump legacy /var/spool/cron/crontabs entries to JSON.
-  /usr/bin/python3 -I - "$backup_dir" "$spool_json" <<'PY_DUMP'
+  # Back up and dump legacy /var/spool/cron/crontabs entries to JSON. Prints
+  # the users it dumped; only those can be cleaned up in stage 3.
+  dumped_users="$(/usr/bin/python3 -I - "$backup_dir" "$spool_json" <<'PY_DUMP'
 import json
 import shutil
 import sys
@@ -731,12 +737,16 @@ if spool_dir.is_dir():
         try:
             shutil.copy2(spool, bak_path)
             bak_path.chmod(0o600)
-        except OSError:
-            pass
+        except OSError as exc:
+            # No copy, no migration: cron-write drops the user's crontab.
+            print(f"WARNING: cron migration skipped user={spool.name}: backup failed: {exc}", file=sys.stderr)
+            continue
         payload[spool.name] = raw_text.splitlines()
+        print(spool.name)
 
 spool_json.write_text(json.dumps(payload), encoding="utf-8")
 PY_DUMP
+  )" || dumped_users=""
 
   # Stage 2 (unprivileged spanel account via sudo -u spanel + SPANEL_USE_HELPER=true):
   # Migrate legacy spool lines and enforce spanel-cron-jail across all sites.
@@ -801,14 +811,24 @@ PY_MIGRATE
   )" || true
   rm -f "$spool_json"
 
-  # Stage 3 (root): Only remove legacy spool crontab when 100% of # spanel: lines for that user succeeded.
+  # Stage 3 (root): remove a legacy spool crontab once all of its # spanel:
+  # lines were migrated. Stage 2 ran as spanel, so its output only selects
+  # among the users stage 1 dumped; it can never name root or anyone else.
   local line migrated_user
   while IFS= read -r line; do
     if [[ "$line" =~ ^MIGRATED_USER_OK:([a-z_][a-z0-9_-]{0,31})$ ]]; then
       migrated_user="${BASH_REMATCH[1]}"
+      grep -qxF -- "$migrated_user" <<<"$dumped_users" || continue
       crontab -r -u "$migrated_user" 2>/dev/null || true
     fi
   done <<<"$mig_out"
+  if [[ -n "$dumped_users" ]]; then
+    # cron-write also drops a user's crontab on its first successful write,
+    # so a line that failed above survives only in this copy.
+    log "Legacy tenant crontabs backed up to ${backup_dir}"
+  else
+    rmdir "$backup_dir" 2>/dev/null || true
+  fi
 }
 
 ensure_terminal_tools() {
@@ -1203,6 +1223,15 @@ SERVICE
     if [[ -n "$(env_get PANEL_SSL_CERT)" && -n "$(env_get PANEL_SSL_KEY)" ]]; then
       scheme="https"
     fi
+    # Older copies always opened server 1 and forced host=localhost, so a
+    # database on a remote MySQL host could not be opened. Same file and
+    # placeholders as install.sh; re-running it is harmless.
+    if [[ -f "$SOURCE_DIR/installer/files/phpmyadmin-spanel-signon.php" ]]; then
+      local pma_cookie_secure="false"
+      [[ "$scheme" == "https" ]] && pma_cookie_secure="true"
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/phpmyadmin-spanel-signon.php" /usr/share/phpmyadmin/spanel-signon.php
+      sed -i "s#__SPANEL_API_BASE__#${scheme}://127.0.0.1:${panel_port}/api/databases/phpmyadmin-sso/#; s#__SPANEL_PMA_COOKIE_SECURE__#${pma_cookie_secure}#" /usr/share/phpmyadmin/spanel-signon.php
+    fi
     sed -i -E "/api\/databases\/phpmyadmin-sso/s#'[^']+/api/databases/phpmyadmin-sso/'#'${scheme}://127.0.0.1:${panel_port}/api/databases/phpmyadmin-sso/'#" /usr/share/phpmyadmin/spanel-signon.php || true
   fi
 }
@@ -1563,6 +1592,11 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
     if [[ -f "$SOURCE_DIR/installer/files/spanel-cron-jail.sh" ]]; then
       install -m 0755 -o root -g root "$SOURCE_DIR/installer/files/spanel-cron-jail.sh" /usr/local/bin/spanel-cron-jail
     fi
+    # The Email addon's renderer: root's, read by the helper only.
+    if [[ -f "$SOURCE_DIR/installer/files/spanel_mailtool.py" ]]; then
+      install -d -m 0755 -o root -g root /usr/local/lib/spanel
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel_mailtool.py" /usr/local/lib/spanel/spanel_mailtool.py
+    fi
     if [[ -f "$SOURCE_DIR/installer/files/spanel_webshells.yar" ]]; then
       install -d -m 0755 -o root -g spanel /etc/spanel/yara
       install -m 0644 -o root -g spanel "$SOURCE_DIR/installer/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
@@ -1579,6 +1613,16 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
       install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-watchdog.timer" /etc/systemd/system/spanel-watchdog.timer
       systemctl daemon-reload >/dev/null 2>&1 || true
       systemctl enable --now spanel-watchdog.timer >/dev/null 2>&1 || true
+    fi
+    # The maintenance window runner (panel auto-update, core stack and PHP
+    # patching, panel self-backup, backup verification). Replaces the
+    # in-process thread that only fired if a check landed inside the hour.
+    if [[ -f "$SOURCE_DIR/installer/files/spanel-maintenance.service" && -f "$SOURCE_DIR/installer/files/spanel-maintenance.timer" ]]; then
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-maintenance.service" /etc/systemd/system/spanel-maintenance.service
+      sed -i "s#/opt/spanel#${APP_DIR}#g" /etc/systemd/system/spanel-maintenance.service
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel-maintenance.timer" /etc/systemd/system/spanel-maintenance.timer
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable --now spanel-maintenance.timer >/dev/null 2>&1 || true
     fi
     install -m 0440 -o root -g root  "$SOURCE_DIR/installer/files/spanel-sudoers"   /etc/sudoers.d/spanel
     visudo -c -f /etc/sudoers.d/spanel >/dev/null
@@ -1619,6 +1663,19 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
     # that refusal exactly the way it hid the memory guard's.
     if [[ -f /etc/clamav/clamd.conf ]]; then
       sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper clamav-tune >/dev/null ||         echo "  (warning: could not raise clamd's scan limits; large uploads stay unscanned)"
+    fi
+    if [[ "$SPANEL_DISK_QUOTA" == "kernel" ]]; then
+      log "Enabling kernel disk quota (SPANEL_DISK_QUOTA=kernel)"
+      sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper quota-enable | sed -n -E 's/^(state|hint|backup)=/  \1: /p' || \
+        echo "  (warning: could not enable kernel disk quota; the panel's own accounting still applies)"
+    fi
+    # The Email addon's Exim and Dovecot configuration follows the new helper
+    # (autoresponders, DKIM selectors, per-domain certificates, spam
+    # training, quota warnings). A no-op where the addon is not installed.
+    if [[ -f /etc/exim4/spanel/settings.json ]]; then
+      log "Refreshing the Email addon's configuration"
+      sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper mail-reconfigure >/dev/null || \
+        echo "  (warning: could not rewrite the mail configuration; the previous one stays in force)"
     fi
     # The helper is fresh now, so the clock unit can run without flashing
     # up as a failed unit first.
@@ -1749,6 +1806,14 @@ if id -u spanel >/dev/null 2>&1; then
 else
   python -c "from app.core.database import run_migrations; run_migrations()"
 fi
+# Remote MySQL hosts now live in the panel database (moved out of
+# multi-server.json by the migration above); give phpMyAdmin the list.
+if id -u spanel >/dev/null 2>&1 && [[ -d /etc/phpmyadmin/conf.d ]]; then
+  log "Refreshing phpMyAdmin remote MySQL servers"
+  sudo -u spanel env HOME="$APP_DIR" SPANEL_USE_HELPER=true "$APP_DIR/backend/.venv/bin/python" -c \
+    "from app.core.database import SessionLocal; from app.services import remote_mysql; s = SessionLocal(); ok = remote_mysql.sync_phpmyadmin_servers(s); s.close(); raise SystemExit(0 if ok else 1)" || \
+    echo "  (warning: could not refresh phpMyAdmin's remote server list; saving a host in the panel retries)"
+fi
 systemctl enable --now spanel-backup-scheduler.timer >/dev/null 2>&1 || true
 systemctl enable --now spanel-malware-scheduler.timer >/dev/null 2>&1 || true
 systemctl enable --now spanel-notify.timer >/dev/null 2>&1 || true
@@ -1758,7 +1823,19 @@ SITE_REFRESH_INPUTS=(
   "$SOURCE_DIR/backend/app/services"
   "$SOURCE_DIR/backend/app/templates"
 )
-if ! step_inputs_changed site-refresh "${SITE_REFRESH_INPUTS[@]}"; then
+# The site refresh is also what moves sites onto their account's own PHP-FPM
+# master (spanel-php<ver>-fpm@<user>, inside user-<uid>.slice): each
+# ensure_site_runtime writes the pool there and starts that master next to the
+# distro one, rewrite_vhost then points nginx at whichever master serves the
+# site, and nginx reloads once at the end. A site whose account master does not
+# start stays on php<ver>-fpm and is logged. While any pool is still on a
+# distro master the refresh runs on every update, so those sites keep being
+# retried; afterwards php-fpm-legacy-prune retires the distro copies nginx no
+# longer names. Zero downtime: the old pool serves until nginx has switched.
+legacy_php_pools_left() {
+  compgen -G '/etc/php/*/fpm/pool.d/spanel-*.conf' >/dev/null
+}
+if ! step_inputs_changed site-refresh "${SITE_REFRESH_INPUTS[@]}" && ! legacy_php_pools_left; then
   log "Managed site config unchanged since last update; skipping the per-site refresh"
 elif id -u spanel >/dev/null 2>&1; then
   log "Refreshing managed site configuration"
@@ -1827,6 +1904,14 @@ with SessionLocal() as db:
         print(f"WARNING: could not refresh HTTP flood zones: {exc}")
 PY
   step_mark_done site-refresh "${SITE_REFRESH_INPUTS[@]}"
+  if legacy_php_pools_left; then
+    log "Retiring PHP-FPM pools that moved to per-account masters"
+    sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper php-fpm-legacy-prune | sed 's/^/  /' || \
+      log "WARNING: could not retire the moved PHP-FPM pools; the boot retune will"
+    if legacy_php_pools_left; then
+      log "Some PHP-FPM pools are still served by the distro php-fpm (their account master did not start or no site uses them); see journalctl -u 'spanel-php*-fpm@*'"
+    fi
+  fi
 fi
 
 # Clear what deleted websites left on disk. A Let's Encrypt renewal config for a
@@ -1937,6 +2022,9 @@ for php_ini_dir in /etc/php/*/; do
       phpenmod -v "$php_ver" "$mod" 2>/dev/null || true
     done
     systemctl reload "php${php_ver}-fpm" 2>/dev/null || true
+    # The per-account masters read the same conf.d (a glob only matches
+    # loaded, i.e. running, instances).
+    systemctl reload "spanel-php${php_ver}-fpm@*.service" 2>/dev/null || true
   fi
 done
 
@@ -1995,8 +2083,6 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # This file is the list of what the helper needs from the sandbox. The jail was
 # added without adding its requirement here, which is how it shipped broken.
 RestrictNamespaces=mnt
-ProtectProc=default
-ProcSubset=all
 SERVICE
 systemctl daemon-reload
 systemctl restart spanel-api

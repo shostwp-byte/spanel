@@ -42,6 +42,11 @@ const INTEGRATION_PLATFORMS = [
 const WEBHOOK_EVENT_PRESETS = [
   { id: 'all', label: 'Tất cả sự kiện (*)', value: '*' },
   {
+    id: 'accounts',
+    label: 'Vòng đời tài khoản Billing (account.*)',
+    value: 'account.*',
+  },
+  {
     id: 'provisioning',
     label: 'Chỉ sự kiện Provisioning / Billing',
     value: 'provisioning_create,provisioning_suspend,provisioning_unsuspend,provisioning_terminate,provisioning_change_package,provisioning_change_password',
@@ -63,7 +68,13 @@ const PROVISIONING_ENDPOINTS = [
   { method: 'PATCH', path: '/accounts/{external_id}/package', desc: 'Nâng cấp / Hạ cấp gói tài nguyên (Upgrade / Downgrade Package)' },
   { method: 'PATCH', path: '/accounts/{external_id}/password', desc: 'Đặt lại mật khẩu đăng nhập Panel & xoay vòng mật khẩu SFTP' },
   { method: 'POST', path: '/accounts/{external_id}/login', desc: 'Tạo đường dẫn đăng nhập 1-click SSO (hiệu lực 300 giây)' },
-  { method: 'GET', path: '/accounts/usage', desc: 'Đồng bộ dung lượng ổ cứng, số lượng Website & Database của toàn bộ tài khoản' },
+  { method: 'GET', path: '/accounts/usage', desc: 'Đồng bộ dung lượng ổ cứng, băng thông tháng, số lượng Website & Database của toàn bộ tài khoản' },
+  { method: 'GET', path: '/accounts?page=1&per_page=100', desc: 'Liệt kê tài khoản (phân trang) cho WHMCS ListAccounts / GetUserCount' },
+  { method: 'POST', path: '/accounts/{external_id}/sftp-password', desc: 'Đặt lại mật khẩu SFTP/SSH ngẫu nhiên (trả về 1 lần)' },
+  { method: 'POST', path: '/accounts/{external_id}/backup', desc: 'Xếp hàng sao lưu toàn bộ tài khoản (chạy nền)' },
+  { method: 'GET', path: '/reseller-plans', desc: 'Lấy danh sách gói Reseller' },
+  { method: 'POST', path: '/admin/login', desc: 'Link SSO đăng nhập Admin (chỉ với scope sso:admin)' },
+  { method: 'POST', path: '/token/rotate', desc: 'Token tự xoay vòng (scope tokens:rotate)' },
 ];
 
 export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanelHost }) {
@@ -88,6 +99,8 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     name: 'WHMCS Billing',
     allowed_ips: '',
     scopes: 'provisioning:read,provisioning:write',
+    expires_in_days: '',
+    rate_limit_per_minute: '',
   });
   const [createdApiToken, setCreatedApiToken] = useState('');
   const [showEndpointsRef, setShowEndpointsRef] = useState(false);
@@ -402,6 +415,8 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
           name: newApiToken.name.trim(),
           scopes: newApiToken.scopes || 'provisioning:read,provisioning:write',
           allowed_ips: newApiToken.allowed_ips.trim(),
+          expires_in_days: Number(newApiToken.expires_in_days) > 0 ? Number(newApiToken.expires_in_days) : null,
+          rate_limit_per_minute: Number(newApiToken.rate_limit_per_minute) > 0 ? Number(newApiToken.rate_limit_per_minute) : 0,
         }),
       },
       t('Creating API token...')
@@ -434,6 +449,25 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     );
     if (data) {
       setNotice(`Đã thu hồi API token ${token.name}.`);
+      await loadApiTokens();
+    }
+  }
+
+  async function rotateApiToken(token) {
+    const graceInput = prompt(
+      `Xoay vòng (rotate) API token "${token.name}". Token cũ còn dùng được thêm bao nhiêu phút để kịp cập nhật WHMCS? (0 = ngừng ngay)`,
+      '60'
+    );
+    if (graceInput === null) return;
+    const grace = Math.max(0, Math.min(10080, parseInt(graceInput, 10) || 0));
+    const data = await request(
+      `/provisioning/v1/tokens/${token.id}/rotate`,
+      { method: 'POST', body: JSON.stringify({ grace_minutes: grace }) },
+      `Rotating ${token.name}...`
+    );
+    if (data) {
+      setCreatedApiToken(data.token || '');
+      setNotice(`Đã tạo token thay thế cho ${token.name}. Sao chép ngay, token chỉ hiển thị 1 lần.`);
       await loadApiTokens();
     }
   }
@@ -1059,7 +1093,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
             {/* Create Token Form */}
             <div style={{
               display: 'grid',
-              gridTemplateColumns: 'minmax(180px, 1.2fr) minmax(220px, 1.8fr) minmax(180px, 1fr) auto',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
               gap: '12px',
               alignItems: 'end',
               padding: '14px 16px',
@@ -1086,7 +1120,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                 <input
                   value={newApiToken.allowed_ips}
                   onChange={(e) => setNewApiToken((prev) => ({ ...prev, allowed_ips: e.target.value }))}
-                  placeholder="Tùy chọn: 103.1.2.3, 103.1.2.4"
+                  placeholder="Tùy chọn: 103.1.2.3, 103.1.2.0/24"
                 />
               </label>
 
@@ -1100,7 +1134,38 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                 >
                   <option value="provisioning:read,provisioning:write">Toàn quyền (Đọc & Ghi Provisioning)</option>
                   <option value="provisioning:read">Chỉ đọc (Đồng bộ Gói & Dung lượng)</option>
+                  <option value="plans:read,accounts:read,accounts:write,usage:read,sso">WHMCS chuẩn (phân quyền chi tiết)</option>
+                  <option value="plans:read,accounts:read,accounts:write,usage:read,sso,sso:admin">WHMCS + Đăng nhập Admin (Admin SSO)</option>
+                  <option value="accounts:read,usage:read">Chỉ đồng bộ tài khoản & dung lượng</option>
                 </select>
+              </label>
+
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                  Hết hạn sau (ngày, để trống = không hết hạn)
+                </span>
+                <input
+                  type="number"
+                  min="1"
+                  max="3650"
+                  value={newApiToken.expires_in_days}
+                  onChange={(e) => setNewApiToken((prev) => ({ ...prev, expires_in_days: e.target.value }))}
+                  placeholder="VD: 365"
+                />
+              </label>
+
+              <label style={{ margin: 0 }}>
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                  Giới hạn request/phút (để trống = 120)
+                </span>
+                <input
+                  type="number"
+                  min="1"
+                  max="6000"
+                  value={newApiToken.rate_limit_per_minute}
+                  onChange={(e) => setNewApiToken((prev) => ({ ...prev, rate_limit_per_minute: e.target.value }))}
+                  placeholder="120"
+                />
               </label>
 
               <button
@@ -1155,11 +1220,25 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                         }}>
                           {token.is_active ? 'Đang hoạt động' : 'Đã thu hồi'}
                         </span>
+                        {token.is_active && token.expires_at && (
+                          <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                            Hết hạn: {new Date(`${token.expires_at}${String(token.expires_at).endsWith('Z') ? '' : 'Z'}`).toLocaleString()}
+                          </div>
+                        )}
                       </td>
                       <td style={{ fontSize: '0.81rem', color: 'var(--text-muted)' }}>
                         {token.last_used_at ? new Date(token.last_used_at).toLocaleString() : 'Chưa từng gọi'}
                       </td>
-                      <td style={{ textAlign: 'right' }}>
+                      <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        <button
+                          type="button"
+                          className="secondary-light"
+                          style={{ padding: '6px 12px', fontSize: '0.78rem', marginRight: '6px' }}
+                          disabled={!!loading || !token.is_active}
+                          onClick={() => rotateApiToken(token)}
+                        >
+                          <RotateCcw size={14} /> Xoay vòng
+                        </button>
                         <button
                           type="button"
                           className="danger"
@@ -1197,7 +1276,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   2. Outbound Event Webhooks (Perfex CRM, ERP, n8n, Automation)
                 </h3>
                 <p style={{ margin: '4px 0 0', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
-                  Tự động đẩy thông báo JSON (kèm chữ ký bảo mật <code>X-SPanel-Signature</code> HMAC-SHA256) sang hệ thống CRM / Billing bên ngoài khi phát sinh sự kiện trên SPanel.
+                  Tự động đẩy thông báo JSON (ký HMAC-SHA256 qua <code>X-SPanel-Timestamp</code> + <code>X-SPanel-Signature-256</code>, giữ <code>X-SPanel-Signature</code> cũ) sang hệ thống CRM / Billing khi phát sinh sự kiện; gửi lỗi sẽ tự thử lại với backoff tới 8 lần.
                 </p>
               </div>
               <button
@@ -1497,8 +1576,19 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                               background: isOk ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)',
                               color: isOk ? '#10b981' : '#ef4444',
                             }}>
-                              {deliv.status_code ? `HTTP ${deliv.status_code}` : (isOk ? '200 OK' : 'Timeout / Error')}
+                              {deliv.status_code ? `HTTP ${deliv.status_code}` : (isOk ? '200 OK' : (deliv.status === 'pending' && !deliv.attempts ? 'Đang chờ gửi' : 'Timeout / Error'))}
                             </span>
+                            {deliv.status === 'pending' && deliv.attempts > 0 && (
+                              <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '3px' }}>
+                                Thử lại {deliv.attempts}/{deliv.max_attempts}
+                                {deliv.next_attempt_at ? ` · lần tới ${new Date(deliv.next_attempt_at).toLocaleTimeString()}` : ''}
+                              </div>
+                            )}
+                            {deliv.status === 'failed' && deliv.attempts > 1 && (
+                              <div style={{ fontSize: '0.7rem', color: '#ef4444', marginTop: '3px' }}>
+                                Đã bỏ sau {deliv.attempts} lần thử
+                              </div>
+                            )}
                           </td>
                           <td style={{ fontSize: '0.78rem', fontFamily: 'monospace', color: 'var(--text-muted)' }}>
                             {deliv.latency_ms ? `${deliv.latency_ms} ms` : '—'}

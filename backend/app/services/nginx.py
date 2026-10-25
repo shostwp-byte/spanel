@@ -374,7 +374,7 @@ def _nginx_supports_http3() -> bool:
 def _quic_needs_reuseport(prefix: str = "", domain: str = "", ipv6_bind: bool = False) -> bool:
     """Nginx allows `reuseport` on at most one `listen ... quic` directive per address:port."""
     target_token = "listen [::]:443 quic reuseport;" if ipv6_bind else f"listen {prefix}443 quic reuseport;"
-    conf_dir = Path("/etc/nginx/conf.d")
+    conf_dir = Path(settings.nginx_sites_available)
     if not conf_dir.is_dir():
         return True
     exclude_name = f"{domain}.conf" if domain else ""
@@ -394,11 +394,8 @@ def _listen_443_directives(
     ipv6: Optional[bool] = None,
     domain: str = "",
     reuseport: Optional[bool] = None,
-    include_reuseport: Optional[bool] = None,
 ) -> list[str]:
     """Build TCP 443 (SSL/HTTP2) and optional UDP 443 (QUIC/HTTP3) listen directives."""
-    if reuseport is None and include_reuseport is not None:
-        reuseport = include_reuseport
     prefix = f"{ip_address}:" if ip_address and ip_address != "*" else ""
     has_http3 = _nginx_supports_http3()
     directives = [f"listen {prefix}443 ssl http2;"]
@@ -415,32 +412,37 @@ def _listen_443_directives(
     return directives
 
 
+_QUIC_LISTEN_RE = re.compile(r"^(\s*listen\s+)(\S*443)\s+quic(\s+reuseport)?;", re.M)
+
+
 def _ensure_quic_reuseport_owner() -> None:
-    """Ensure that if a vhost carrying `quic reuseport` was deleted, the first remaining QUIC vhost inherits it."""
-    conf_dir = Path("/etc/nginx/conf.d")
+    """Give `reuseport` back to every QUIC address (443, <ip>:443, [::]:443)
+    that lost its only holder when a vhost was deleted: the first remaining
+    vhost listening there inherits it."""
+    conf_dir = Path(settings.nginx_sites_available)
     if not conf_dir.is_dir():
         return
     try:
-        conf_files = sorted(conf_dir.glob("*.conf"))
-        contents = {cf: cf.read_text(encoding="utf-8", errors="ignore") for cf in conf_files}
+        contents = {cf: cf.read_text(encoding="utf-8", errors="ignore") for cf in sorted(conf_dir.glob("*.conf"))}
     except OSError:
         return
-    for plain_tok, rp_tok in (
-        ("listen 443 quic;", "listen 443 quic reuseport;"),
-        ("listen [::]:443 quic;", "listen [::]:443 quic reuseport;"),
-    ):
-        if any(rp_tok in text for text in contents.values()):
-            continue
-        for cf in conf_files:
-            text = contents[cf]
-            if plain_tok in text:
-                updated = text.replace(plain_tok, rp_tok, 1)
-                try:
-                    cf.write_text(updated, encoding="utf-8")
-                    contents[cf] = updated
-                except OSError:
-                    pass
-                break
+    owned = {m.group(2) for text in contents.values() for m in _QUIC_LISTEN_RE.finditer(text) if m.group(3)}
+
+    def _claim(match: re.Match) -> str:
+        address = match.group(2)
+        if match.group(3) or address in owned:
+            return match.group(0)
+        owned.add(address)
+        return f"{match.group(1)}{address} quic reuseport;"
+
+    for cf, text in contents.items():
+        updated = _QUIC_LISTEN_RE.sub(_claim, text)
+        if updated != text:
+            try:
+                cf.write_text(updated, encoding="utf-8")
+            except OSError:
+                pass
+
 
 # Block-opening directives that nest scopes; matched against the original
 # text so the trailing ``{`` is preserved.
@@ -1156,7 +1158,7 @@ def _replace_php_fpm_socket(content: str, php_version: str) -> str:
 
 
 def _replace_fastcgi_socket(content: str, socket_path: str) -> str:
-    if not re.fullmatch(r"/run/php/[A-Za-z0-9_.-]+\.sock", socket_path or ""):
+    if not site_users.is_valid_php_fpm_socket(socket_path):
         raise ValueError("Invalid PHP-FPM socket path")
     return re.sub(
         r"fastcgi_pass\s+unix:[^;]+;",
@@ -1463,6 +1465,8 @@ def render_vhost(
     }[app_type]
     template = env.get_template(template_name)
     php_fpm_socket = php_fpm_socket_override or _php_fpm_socket(php_version)
+    if not site_users.is_valid_php_fpm_socket(php_fpm_socket):
+        raise ValueError("Invalid PHP-FPM socket path")
     safe_http_flood_config = validate_http_flood_config(http_flood_config)
 
     resolved_bind_address = bind_address or get_website_ip(safe_domain)
