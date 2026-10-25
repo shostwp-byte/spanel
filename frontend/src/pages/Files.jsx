@@ -418,7 +418,12 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
 
   async function writeFile() {
     const data = await request('/maintenance/files/write', { method: 'POST', body: JSON.stringify({ ...fileTargetBody(), path: filePath, content: fileContent }) }, t('Saving file...'));
-    if (data) { await listFiles(fileListPath); await loadCurrentUser(); }
+    if (data) {
+      const savedPath = data.path || data.target || filePath;
+      setNotice(t('Saved {path}', { path: savedPath }));
+      await listFiles(fileListPath);
+      await loadCurrentUser();
+    }
   }
 
   async function downloadFile(path) {

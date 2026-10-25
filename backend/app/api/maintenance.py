@@ -1785,6 +1785,58 @@ async def upload_app_file(
     return {"stored": stored}
 
 
+@router.get("/files/list")
+def list_files_by_query(
+    website_id: int | None = Query(default=None),
+    app_id: int | None = Query(default=None),
+    path: str = Query(default=""),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    target = get_file_target(db, current_user, website_id, app_id)
+    return {"items": file_manager.list_files(target, path)}
+
+
+@router.get("/files/read")
+def read_file_by_query(
+    path: str,
+    website_id: int | None = Query(default=None),
+    app_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    target = get_file_target(db, current_user, website_id, app_id)
+    try:
+        content = file_manager.read_text_file(
+            target,
+            path,
+            allow_sensitive=is_admin_role(current_user.role),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"content": content}
+
+
+@router.get("/files/download")
+def download_file_by_query(
+    path: str,
+    website_id: int | None = Query(default=None),
+    app_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    target = get_file_target(db, current_user, website_id, app_id)
+    try:
+        resolved = file_manager.download_file_path(
+            target,
+            path,
+            allow_sensitive=is_admin_role(current_user.role),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(str(resolved), filename=resolved.name)
+
+
 @router.get("/files/{website_id}")
 def list_files(website_id: int, path: str = Query(default=""), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = get_owned_website(db, current_user, website_id)
@@ -1995,7 +2047,7 @@ def write_file(payload: FileWrite, db: Session = Depends(get_db), current_user: 
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"target": target}
+    return {"target": target, "path": payload.path}
 
 
 @router.post("/files/{website_id}/upload")
