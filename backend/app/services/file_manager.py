@@ -389,6 +389,7 @@ def make_directory(website: Website, parent_path: str, name: str) -> str:
     return str(target)
 
 
+
 def rename_entry(website: Website, relative_path: str, new_name: str, allow_executable: bool = False) -> str:
     source = _safe_path(website, relative_path)
     if not source.exists():
@@ -418,6 +419,7 @@ def rename_entry(website: Website, relative_path: str, new_name: str, allow_exec
     site_users.fix_site_path(str(target), website.linux_user, check=True)
     _clear_fastcgi_cache()
     return str(target)
+
 
 
 def chmod_entry(website: Website, relative_path: str, mode: str) -> str:
@@ -565,6 +567,7 @@ def create_text_file(
     return str(target)
 
 
+
 def write_text_file(
     website: Website,
     relative_path: str,
@@ -585,6 +588,7 @@ def write_text_file(
     site_users.fix_site_path(str(target), website.linux_user, check=True)
     _clear_fastcgi_cache()
     return str(target)
+
 
 
 def upload_file(
@@ -879,6 +883,52 @@ def _total_size(paths: Iterable[Path]) -> int:
         elif path.is_file():
             total += path.stat().st_size
     return total
+
+
+def duplicate_entry(
+    website: Website,
+    relative_path: str,
+    new_name: str,
+    allow_executable: bool = False,
+    allow_sensitive: bool = False,
+    quota_check: Optional[QuotaCheck] = None,
+) -> str:
+    source = _safe_path(website, relative_path)
+    if not source.exists():
+        raise ValueError("File or folder not found")
+    root = Path(website.root_path).resolve()
+    if source == root:
+        raise ValueError("Cannot duplicate website root")
+    if source.is_symlink():
+        raise ValueError("Symlinks are not allowed")
+    _assert_tree_read_allowed(source, "Duplicating", allow_sensitive)
+    _assert_tree_write_allowed(source, "Duplicating", allow_executable)
+    target = source.parent / _safe_entry_name(new_name)
+    if target.exists() or target.is_symlink():
+        raise ValueError("File or folder already exists")
+    _assert_write_allowed(target, "Duplicating", allow_executable)
+    if quota_check:
+        quota_check(_total_size([source]), 0)
+    if website.linux_user:
+        _run_as_site_user(
+            website,
+            root,
+            "cp",
+            [
+                "-R",
+                "--",
+                _helper_relative_path(website, source),
+                _helper_relative_path(website, target),
+            ],
+            ["cp", "-R", "--", str(source), str(target)],
+        )
+    elif source.is_dir():
+        shutil.copytree(source, target, copy_function=shutil.copy2)
+    else:
+        shutil.copy2(source, target)
+    site_users.fix_site_path(str(target), website.linux_user, check=True)
+    _clear_fastcgi_cache()
+    return str(target)
 
 
 def _archive_output_name(output_name: str, archive_format: str) -> str:

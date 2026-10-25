@@ -981,3 +981,731 @@ button.file-mode:disabled {
   border-color: var(--border-hover);
   opacity: 1;
 }
+
+/* ============================================================================
+   Upgraded DirectAdmin-style File Manager Layout (Tree + Context Menu + Inline Editor)
+   ============================================================================ */
+
+.da-fm-section {
+  padding: 0;
+}
+
+.da-fm-layout {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  gap: 0;
+  min-height: calc(100vh - 132px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+/* --- Left Directory Tree Sidebar ("My Files") --- */
+.da-fm-sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  min-width: 0;
+  user-select: none;
+}
+
+.da-fm-sidebar-header {
+  padding: 8px 8px 6px;
+}
+
+.da-fm-myfiles-btn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  height: 36px;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 5px;
+  background: #3592eb !important;
+  color: #ffffff !important;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.da-fm-myfiles-btn:hover {
+  background: #2581db !important;
+  color: #ffffff !important;
+}
+
+.da-fm-tree-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 6px 14px;
+}
+
+.da-tree-branch {
+  display: flex;
+  flex-direction: column;
+}
+
+.da-tree-row {
+  display: flex;
+  align-items: center;
+  min-height: 30px;
+  height: 30px;
+  border-radius: 4px;
+  padding-right: 6px;
+  transition: background-color 0.12s ease;
+}
+
+.da-tree-row:hover {
+  background: var(--surface-alt);
+}
+
+.da-tree-row.active {
+  background: rgba(53, 146, 235, 0.16);
+}
+
+[data-theme="dark"] .da-tree-row.active {
+  background: rgba(53, 146, 235, 0.24);
+}
+
+.da-tree-Caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent !important;
+  color: var(--text-muted) !important;
+  box-shadow: none !important;
+  cursor: pointer;
+  flex: 0 0 20px;
+}
+
+.da-tree-Caret:hover {
+  color: var(--text) !important;
+}
+
+.da-tree-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent !important;
+  color: var(--text) !important;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.da-tree-row.active .da-tree-label {
+  color: #1d6ec2 !important;
+  font-weight: 600;
+}
+
+[data-theme="dark"] .da-tree-row.active .da-tree-label {
+  color: #6cb6ff !important;
+}
+
+.da-tree-label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.da-folder-svg {
+  flex: 0 0 16px;
+}
+
+.da-tree-link-icon {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+
+.da-tree-loading {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+
+/* --- Right Main Workspace --- */
+.da-fm-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--surface);
+}
+
+.da-fm-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-wrap: wrap;
+}
+
+.da-file-breadcrumb {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px;
+  min-width: 0;
+}
+
+.da-crumb-home,
+.da-crumb-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  height: 26px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent !important;
+  color: #2b89e6 !important;
+  font-size: 13.5px;
+  font-weight: 500;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.da-crumb-home:hover,
+.da-crumb-link:hover {
+  background: rgba(43, 137, 230, 0.08) !important;
+}
+
+.da-crumb-current {
+  font-weight: 600;
+  color: #1971c2 !important;
+}
+
+[data-theme="dark"] .da-crumb-home,
+[data-theme="dark"] .da-crumb-link {
+  color: #58a6ff !important;
+}
+
+.da-crumb-sep {
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+.da-fm-quick-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.da-fm-quota-pill {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 3px 8px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.da-quick-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+/* --- Contextual Action Bar (Selected: X / Y + flat action buttons) --- */
+.da-fm-actionbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.da-fm-selected-count {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 500;
+  margin-right: 6px;
+  white-space: nowrap;
+}
+
+.da-actionbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent !important;
+  color: var(--text-secondary) !important;
+  font-size: 12.5px;
+  font-weight: 500;
+  box-shadow: none !important;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.da-actionbar-btn:hover:not(:disabled) {
+  background: var(--surface-alt) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+
+.da-actionbar-btn.danger:hover:not(:disabled) {
+  background: var(--danger-bg) !important;
+  border-color: var(--danger-border) !important;
+  color: var(--danger) !important;
+}
+
+.da-actionbar-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.da-fm-jobs {
+  padding: 6px 14px 0;
+}
+
+/* --- File Table Header & Rows (Name | Size | Permissions | Last modified | UID/GID) --- */
+.da-fm-table-header {
+  display: grid;
+  grid-template-columns: 34px minmax(220px, 2.2fr) minmax(85px, 0.7fr) minmax(115px, 0.9fr) minmax(135px, 1fr) minmax(120px, 0.9fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  font-weight: 500;
+  scrollbar-gutter: stable;
+}
+
+.da-fm-table-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: auto;
+  max-height: calc(100vh - 260px);
+  scrollbar-gutter: stable;
+}
+
+.da-fm-row {
+  display: grid;
+  grid-template-columns: 34px minmax(220px, 2.2fr) minmax(85px, 0.7fr) minmax(115px, 0.9fr) minmax(135px, 1fr) minmax(120px, 0.9fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 4px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  transition: background-color 0.1s ease;
+  cursor: default;
+}
+
+.da-fm-row:hover {
+  background: var(--surface-alt);
+}
+
+.da-fm-row.selected {
+  background: rgba(53, 146, 235, 0.14);
+}
+
+[data-theme="dark"] .da-fm-row.selected {
+  background: rgba(53, 146, 235, 0.22);
+}
+
+.da-fm-check-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.da-fm-check-cell input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  min-height: 0;
+  margin: 0;
+  accent-color: #2b89e6;
+  cursor: pointer;
+}
+
+.da-fm-name-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  min-width: 0;
+  height: auto;
+  min-height: 28px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent !important;
+  color: var(--text) !important;
+  font-size: 13.5px;
+  font-weight: 400;
+  text-align: left;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.da-fm-name-btn:hover {
+  color: #2b89e6 !important;
+}
+
+.da-fm-name-btn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.da-table-folder-svg,
+.da-table-file-icon {
+  flex: 0 0 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.da-symlink-badge {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
+.da-fm-size,
+.da-fm-modified,
+.da-fm-uid {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.da-fm-perms,
+.da-fm-perms-btn {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.da-fm-perms-btn {
+  justify-self: start;
+  height: auto;
+  min-height: 24px;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent !important;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.da-fm-perms-btn:hover:not(:disabled) {
+  background: var(--surface) !important;
+  border-color: var(--border) !important;
+  color: #2b89e6 !important;
+}
+
+.da-fm-uid-cell {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.da-fm-row-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent !important;
+  color: var(--text-muted) !important;
+  box-shadow: none !important;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.12s ease;
+}
+
+.da-fm-row:hover .da-fm-row-menu-btn,
+.da-fm-row.selected .da-fm-row-menu-btn,
+.da-fm-row-menu-btn:focus-visible {
+  opacity: 1;
+}
+
+.da-fm-row-menu-btn:hover {
+  background: var(--surface) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+
+/* --- Floating Context Menu Dialog (Folder vs File) --- */
+.da-context-menu {
+  position: fixed;
+  z-index: 95;
+  min-width: 196px;
+  padding: 6px 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.18), 0 2px 8px rgba(15, 23, 42, 0.08);
+  display: flex;
+  flex-direction: column;
+}
+
+.da-context-item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 11px;
+  width: 100%;
+  min-height: 34px;
+  height: 34px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent !important;
+  color: var(--text) !important;
+  font-size: 13px;
+  font-weight: 400;
+  text-align: left;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.da-context-item svg {
+  color: var(--text-secondary);
+  flex: 0 0 15px;
+}
+
+.da-context-item:hover {
+  background: var(--surface-alt) !important;
+  color: #2b89e6 !important;
+}
+
+.da-context-item:hover svg {
+  color: #2b89e6;
+}
+
+.da-context-item.danger:hover {
+  background: var(--danger-bg) !important;
+  color: var(--danger) !important;
+}
+
+.da-context-item.danger:hover svg {
+  color: var(--danger);
+}
+
+.da-context-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+
+/* --- Clean Action Modal Dialogs --- */
+.da-action-dialog {
+  width: min(440px, 100%);
+}
+
+.da-dialog-body {
+  display: grid;
+  gap: 12px;
+}
+
+.da-dialog-field {
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.da-dialog-field input,
+.da-dialog-field select {
+  width: 100%;
+}
+
+.da-quick-dest {
+  display: grid;
+  gap: 6px;
+}
+
+.da-quick-dest small {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.da-delete-preview-list {
+  margin: 0;
+  padding: 8px 12px 8px 26px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  max-height: 150px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+/* --- In-Page File Content Editor (No New Browser Tab) --- */
+.da-inline-editor {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: calc(100vh - 190px);
+  background: var(--surface);
+}
+
+.da-inline-editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-alt);
+  flex-wrap: wrap;
+}
+
+.da-inline-editor-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.da-editor-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.da-inline-editor-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.da-inline-editor-filename {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+.da-inline-editor-filename svg {
+  color: #2b89e6;
+  flex: 0 0 auto;
+}
+
+.da-editor-dirty-pill {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  color: var(--warning-text);
+}
+
+.da-inline-editor-path {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.da-inline-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.da-inline-editor-actions button {
+  height: 32px;
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12.5px;
+}
+
+.da-inline-editor-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 520px;
+  position: relative;
+}
+
+.da-inline-editor-body .code-editor-host {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 520px;
+}
+
+@media (max-width: 1024px) {
+  .da-fm-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .da-fm-sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    max-height: 220px;
+  }
+
+  .da-fm-table-header,
+  .da-fm-row {
+    grid-template-columns: 30px minmax(180px, 2fr) 80px 100px 120px;
+  }
+
+  .da-fm-table-header > span:nth-child(6),
+  .da-fm-row > .da-fm-uid-cell,
+  .da-fm-row > .da-fm-uid {
+    display: none;
+  }
+}
+
