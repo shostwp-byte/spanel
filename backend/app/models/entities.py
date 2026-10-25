@@ -98,6 +98,11 @@ class UserPackage(Base):
     tasks_max: Mapped[int] = mapped_column(Integer, default=512)
     mysql_storage_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
     mysql_max_db_size_mb: Mapped[int] = mapped_column(Integer, default=0)
+    # MariaDB per-account hourly limits for every database user the account
+    # owns (MAX_QUERIES/UPDATES/CONNECTIONS_PER_HOUR). 0 = no limit.
+    mysql_max_queries_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_updates_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_connections_per_hour: Mapped[int] = mapped_column(Integer, default=0)
 
     owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
 
@@ -148,6 +153,27 @@ class User(Base):
     sftp_accounts_limit: Mapped[int] = mapped_column(Integer, default=3)
     # Copied from the package like the limits above.
     mail_accounts_limit: Mapped[int] = mapped_column(Integer, default=10)
+    # Resource limits, copied from the package like the limits above and
+    # applied by resource_monitor.apply_user_cgroup_limits (cgroups, kernel
+    # quota) and mariadb (database accounts). The columns long existed in the
+    # table (core.database._ensure_resource_limit_columns) but were not mapped
+    # here, so a value set on a user never survived the request.
+    bandwidth_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
+    inode_limit: Mapped[int] = mapped_column(Integer, default=0)
+    database_limit: Mapped[int] = mapped_column(Integer, default=5)
+    cpu_quota_percent: Mapped[int] = mapped_column(Integer, default=100)
+    io_read_mbps: Mapped[int] = mapped_column(Integer, default=0)
+    io_write_mbps: Mapped[int] = mapped_column(Integer, default=0)
+    iops_read_max: Mapped[int] = mapped_column(Integer, default=0)
+    iops_write_max: Mapped[int] = mapped_column(Integer, default=0)
+    memory_high_mb: Mapped[int] = mapped_column(Integer, default=1024)
+    memory_max_mb: Mapped[int] = mapped_column(Integer, default=2048)
+    tasks_max: Mapped[int] = mapped_column(Integer, default=512)
+    mysql_storage_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_db_size_mb: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_queries_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_updates_per_hour: Mapped[int] = mapped_column(Integer, default=0)
+    mysql_max_connections_per_hour: Mapped[int] = mapped_column(Integer, default=0)
     # When this account's Linux/SFTP password was last set on its own.
     #
     # NULL is load-bearing: it means the Linux password has never been set
@@ -299,12 +325,42 @@ class WebsiteAlias(Base):
     website: Mapped[Website] = relationship(back_populates="aliases")
 
 
+class RemoteDbHost(Base):
+    """A MySQL/MariaDB server other than the local one that customer databases
+    can live on. The admin password is Fernet-encrypted (app.core.secrets); the
+    CA certificate is public material and stored as PEM."""
+
+    __tablename__ = "remote_db_hosts"
+    __table_args__ = (UniqueConstraint("host", "port", name="uq_remote_db_hosts_host_port"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    host: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int] = mapped_column(Integer, default=3306)
+    admin_user: Mapped[str] = mapped_column(String(64), default="root")
+    admin_password: Mapped[str] = mapped_column(String(1024), default="")
+    use_tls: Mapped[bool] = mapped_column(Boolean, default=False)
+    ca_cert: Mapped[str] = mapped_column(Text, default="")
+    # Comma separated MySQL host patterns the customer accounts are created
+    # for. Empty means "the address this server reaches the host from".
+    allowed_client_hosts: Mapped[str] = mapped_column(String(512), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(16), default="unknown")
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    server_version: Mapped[str] = mapped_column(String(128), default="")
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class DatabaseAccount(Base):
     __tablename__ = "database_accounts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     website_id: Mapped[Optional[int]] = mapped_column(ForeignKey("websites.id", ondelete="CASCADE"), nullable=True)
+    # NULL is the local MariaDB. A host with databases on it cannot be deleted.
+    db_host_id: Mapped[Optional[int]] = mapped_column(ForeignKey("remote_db_hosts.id"), nullable=True, index=True)
     db_name: Mapped[str] = mapped_column(String(64), unique=True)
     db_user: Mapped[str] = mapped_column(String(64), unique=True)
     db_password: Mapped[str] = mapped_column(String(255))
@@ -315,6 +371,21 @@ class DatabaseAccount(Base):
 
     owner: Mapped["User"] = relationship()
     website: Mapped[Optional[Website]] = relationship(back_populates="database")
+    db_host: Mapped[Optional[RemoteDbHost]] = relationship()
+
+    @property
+    def db_host_name(self) -> str:
+        return self.db_host.name if self.db_host is not None else "localhost"
+
+    @property
+    def db_host_address(self) -> str:
+        """What a site's config puts in DB_HOST to reach this database."""
+        if self.db_host is None:
+            return "localhost"
+        host = self.db_host.host
+        if ":" in host:
+            host = f"[{host}]"
+        return host if int(self.db_host.port or 3306) == 3306 else f"{host}:{self.db_host.port}"
 
 
 class AuditLog(Base):
@@ -434,6 +505,107 @@ class ApiToken(Base):
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # NULL never expires, which is what every token issued before expiry
+    # existed keeps doing.
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Requests per minute; 0 means the panel default.
+    rate_limit_per_minute: Mapped[int] = mapped_column(Integer, default=0)
+    # The administrator who issued it. Admin single sign-on logs in as this
+    # account and nobody else, so a token without one cannot use it.
+    created_by_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class ProvisioningIdempotencyKey(Base):
+    """A write request a billing system may retry with the same Idempotency-Key.
+
+    The response is kept (encrypted: it can carry a one-time SFTP password) so
+    a retry after a timeout gets the original answer instead of a second
+    account. Rows older than a day are purged.
+    """
+
+    __tablename__ = "provisioning_idempotency_keys"
+    __table_args__ = (UniqueConstraint("token_id", "idem_key", name="uq_provisioning_idempotency_token_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    token_id: Mapped[int] = mapped_column(Integer)
+    idem_key: Mapped[str] = mapped_column(String(255))
+    method: Mapped[str] = mapped_column(String(10), default="")
+    path: Mapped[str] = mapped_column(String(500), default="")
+    request_hash: Mapped[str] = mapped_column(String(64), default="")
+    # 0 while the first request is still running.
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    response_body: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ClusterZoneOrigin(Base):
+    """Which cluster node a DNS zone on this server belongs to.
+
+    origin_uid NULL: the zone was made here and this server is its master; a
+    peer may never overwrite or delete it. Otherwise it is a replica pushed by
+    that node, and only that node may change it. No row: a zone from before
+    the cluster tracked origins (see cluster_dns.apply_incoming).
+    """
+
+    __tablename__ = "cluster_zone_origins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    zone: Mapped[str] = mapped_column(String(253), unique=True, index=True)
+    origin_uid: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    origin_name: Mapped[str] = mapped_column(String(120), default="")
+    origin_owner: Mapped[str] = mapped_column(String(64), default="")
+    # The origin's SOA serial of the last snapshot applied, and its content hash.
+    source_serial: Mapped[int] = mapped_column(Integer, default=0)
+    content_hash: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ClusterDnsOutbox(Base):
+    """A zone change still to be delivered to one peer. One row per (peer,
+    zone): later changes fold into it, since what is sent is always the zone
+    as it is at sending time."""
+
+    __tablename__ = "cluster_dns_outbox"
+    __table_args__ = (UniqueConstraint("node_id", "zone", name="uq_cluster_dns_outbox_node_zone"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    zone: Mapped[str] = mapped_column(String(253), index=True)
+    action: Mapped[str] = mapped_column(String(16), default="upsert")
+    # pending | conflict | failed (gave up after the retry budget)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ClusterTransferJob(Base):
+    """An account moved between two SPanel nodes, seen from either end:
+    direction 'out' on the node it leaves, 'in' on the node it arrives at."""
+
+    __tablename__ = "cluster_transfer_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    job_uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    direction: Mapped[str] = mapped_column(String(8), default="out")
+    username: Mapped[str] = mapped_column(String(64), index=True)
+    node_id: Mapped[str] = mapped_column(String(40), default="")
+    node_name: Mapped[str] = mapped_column(String(120), default="")
+    # queued | running | done | failed
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    step: Mapped[str] = mapped_column(String(32), default="queued")
+    message: Mapped[str] = mapped_column(Text, default="")
+    options: Mapped[str] = mapped_column(Text, default="{}")
+    archive_name: Mapped[str] = mapped_column(String(255), default="")
+    archive_sha256: Mapped[str] = mapped_column(String(64), default="")
+    archive_size: Mapped[int] = mapped_column(Integer, default=0)
+    remote_job_uid: Mapped[str] = mapped_column(String(32), default="")
+    created_by: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class McpToken(Base):
@@ -615,12 +787,47 @@ class WebhookEndpoint(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     url: Mapped[str] = mapped_column(String(500))
-    secret: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Encrypted with app.core.secrets ("fernet:..."); rows written before that
+    # hold plaintext until the webhook worker re-saves them on start.
+    secret: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     events: Mapped[str] = mapped_column(Text, default="*")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    
+
     owner: Mapped[User] = relationship(foreign_keys=[user_id])
+
+
+class WebhookOutbox(Base):
+    """One event for one endpoint, kept until delivered or given up on.
+
+    Doubles as the delivery history the panel shows. A failed attempt is
+    retried with exponential backoff by the worker in services/webhooks.py.
+    """
+
+    __tablename__ = "webhook_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    # Sent as X-SPanel-Delivery; the same across retries of this row.
+    delivery_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    endpoint_id: Mapped[Optional[int]] = mapped_column(ForeignKey("webhook_endpoints.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Owner of the endpoint, for scoping the history.
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    url: Mapped[str] = mapped_column(String(500), default="")
+    event: Mapped[str] = mapped_column(String(100), default="", index=True)
+    payload: Mapped[str] = mapped_column(Text, default="{}")
+    # pending (queued or waiting for a retry), delivering, success, failed (given up)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=8)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    last_status_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    response_preview: Mapped[str] = mapped_column(Text, default="")
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    has_signature: Mapped[bool] = mapped_column(Boolean, default=False)
+    replayed_from: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class NotificationPref(Base):
@@ -753,7 +960,31 @@ class MailDomain(Base):
     # Outgoing mail: "" follows the server's default relay, "direct" sends
     # without one, anything else is the id of a relay.
     relay: Mapped[str] = mapped_column(String(40), default="")
-    # An administrator's own DNS values for it, JSON: {"spf", "dmarc", "records"}.
+    # DKIM with two selectors (mail.py, "DKIM rotation"): mail is signed with
+    # dkim_selector; a rotation first publishes dkim_next_* and only signs with
+    # it once DNS shows it, then keeps dkim_old_* published until it retires.
+    dkim_selector: Mapped[str] = mapped_column(String(63), default="spanel")
+    dkim_next_selector: Mapped[str] = mapped_column(String(63), default="")
+    dkim_next_public: Mapped[str] = mapped_column(Text, default="")
+    dkim_old_selector: Mapped[str] = mapped_column(String(63), default="")
+    dkim_old_public: Mapped[str] = mapped_column(Text, default="")
+    # "" (one key), "publishing" (next key in DNS, not signing yet) or
+    # "retiring" (signing with the new key, the old one still published).
+    dkim_state: Mapped[str] = mapped_column(String(16), default="")
+    dkim_state_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    dkim_rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # The DMARC policy as JSON ({"p", "sp", "pct", "rua", "ruf", "adkim",
+    # "aspf"}); "" is the panel's default record.
+    dmarc_policy: Mapped[str] = mapped_column(Text, default="")
+    # MTA-STS: "" off, "testing", "enforce" or "none" (withdrawing a policy).
+    mta_sts_mode: Mapped[str] = mapped_column(String(10), default="")
+    # The id in _mta-sts.<domain>; changes whenever the policy does.
+    mta_sts_id: Mapped[str] = mapped_column(String(32), default="")
+    # TLS-RPT report addresses, one per line ("" publishes no _smtp._tls record).
+    tls_rpt: Mapped[str] = mapped_column(Text, default="")
+    # The mail hosts served here with their own certificate, comma separated
+    # labels: mail, mta-sts, autoconfig, autodiscover. "" is none.
+    mail_hosts: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -802,6 +1033,13 @@ class MailAutoresponder(Base):
     local_part: Mapped[str] = mapped_column(String(64))
     subject: Mapped[str] = mapped_column(String(255), default='')
     body: Mapped[str] = mapped_column(Text, default='')
+    # A Sieve vacation in the mailbox (mail-sync writes it): on between the
+    # two dates (YYYY-MM-DD, "" is open-ended), at most one reply to a sender
+    # every interval_days.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    start_date: Mapped[str] = mapped_column(String(10), default='')
+    end_date: Mapped[str] = mapped_column(String(10), default='')
+    interval_days: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     @property

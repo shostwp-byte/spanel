@@ -240,6 +240,9 @@ class UserPackageCreate(BaseModel):
     tasks_max: int = Field(default=512, ge=-1, le=1000000)
     mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: int = Field(default=0, ge=-1, le=1000000000)
 
     @field_validator("personal_dns_mode", mode="before")
     @classmethod
@@ -312,6 +315,9 @@ class UserPackageUpdate(BaseModel):
     tasks_max: Optional[int] = Field(default=None, ge=-1, le=1000000)
     mysql_storage_limit_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
     mysql_max_db_size_mb: Optional[int] = Field(default=None, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
 
     @field_validator("personal_dns_mode", mode="before")
     @classmethod
@@ -405,6 +411,9 @@ class UserPackageOut(BaseModel):
     tasks_max: int = 512
     mysql_storage_limit_mb: int = 0
     mysql_max_db_size_mb: int = 0
+    mysql_max_queries_per_hour: int = 0
+    mysql_max_updates_per_hour: int = 0
+    mysql_max_connections_per_hour: int = 0
 
     owner_id: Optional[int] = None
     created_at: Optional[datetime] = None
@@ -442,6 +451,9 @@ class UserCreate(BaseModel):
     tasks_max: int = Field(default=512, ge=-1, le=1000000)
     mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: int = Field(default=0, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: int = Field(default=0, ge=-1, le=1000000000)
     terminal_enabled: Optional[bool] = None
 
     @field_validator("role", mode="before")
@@ -518,6 +530,9 @@ class UserUpdate(BaseModel):
     tasks_max: Optional[int] = Field(default=None, ge=-1, le=1000000)
     mysql_storage_limit_mb: Optional[int] = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: Optional[int] = Field(default=0, ge=-1, le=1048576)
+    mysql_max_queries_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_updates_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
+    mysql_max_connections_per_hour: Optional[int] = Field(default=None, ge=-1, le=1000000000)
 
 
 class UserPasswordUpdate(BaseModel):
@@ -882,7 +897,8 @@ class DatabaseCreate(BaseModel):
     db_name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     db_user: Optional[str] = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9_]+$")
     db_password: Optional[str] = Field(default=None, min_length=12, max_length=128)
-    remote_db_host_id: Optional[str] = Field(default=None, max_length=64)
+    # A RemoteDbHost id; None creates the database on the local MariaDB.
+    db_host_id: Optional[int] = Field(default=None, ge=1)
 
     @field_validator("db_name", mode="before")
     @classmethod
@@ -1057,6 +1073,9 @@ class DatabaseOut(BaseModel):
     size_bytes: int = 0
     write_locked: bool = False
     write_locked_reason: Optional[str] = None
+    db_host_id: Optional[int] = None
+    db_host_name: str = "localhost"
+    db_host_address: str = "localhost"
 
     class Config:
         from_attributes = True
@@ -1467,7 +1486,7 @@ class SftpBackupTargetCreate(BaseModel):
     """An SSH server or an object store. `kind` decides which fields matter."""
 
     name: str = Field(min_length=2, max_length=100, pattern=r"^[A-Za-z0-9._ -]+$")
-    kind: str = Field(default="sftp", pattern=r"^(sftp|s3)$")
+    kind: str = Field(default="sftp", pattern=r"^(sftp|s3|ftp|ftps)$")
 
     # S3 and anything that speaks its API
     endpoint: Optional[str] = Field(default=None, max_length=255)
@@ -1534,6 +1553,13 @@ class SftpBackupTargetCreate(BaseModel):
                        if not getattr(self, name)]
             if missing:
                 raise ValueError("An S3 target needs " + ", ".join(missing))
+        elif self.kind in ("ftp", "ftps"):
+            if not self.host or not self.username or not self.password:
+                raise ValueError("An FTP target needs a host, a username and a password")
+            if self.private_key:
+                raise ValueError("An FTP target takes a password, not a private key")
+            if self.port == 22:
+                self.port = 21  # the form's SFTP default
         else:
             if not self.host or not self.username:
                 raise ValueError("An SFTP target needs a host and a username")
@@ -1648,6 +1674,14 @@ class DaBulkImportRequest(BaseModel):
     archive_paths: list[str]
     force: bool = False
 
+class ProvisioningLimits(BaseModel):
+    """Per-account overrides of the package limits, e.g. from WHMCS
+    configurable options. Each field left out keeps the package value; 0 means
+    unlimited, as it does on the package."""
+    storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    bandwidth_limit_mb: Optional[int] = Field(default=None, ge=0, le=1_000_000_000)
+    website_limit: Optional[int] = Field(default=None, ge=0, le=100_000)
+
 class ProvisioningAccountCreate(BaseModel):
     external_id: str = Field(min_length=1, max_length=255)
     username: str = Field(min_length=3, max_length=32, pattern=r"^[a-z_][a-z0-9_-]{2,31}$")
@@ -1660,6 +1694,9 @@ class ProvisioningAccountCreate(BaseModel):
     install_wordpress: bool = False
     enable_ssl: bool = False
     is_reseller: bool = False
+    # Reseller quota package (ResellerPackage.id); only for is_reseller.
+    reseller_package_id: Optional[int] = Field(default=None, ge=1)
+    limits: Optional[ProvisioningLimits] = None
 
     @field_validator("username")
     @classmethod
@@ -1704,9 +1741,21 @@ class ProvisioningAccountOut(BaseModel):
     status: str
     panel_url: Optional[str] = None
     created_at: Optional[datetime] = None
+    # Only in the response to the create that set it: the account's own
+    # SFTP/SSH password, never stored readable by the panel.
+    sftp_password: Optional[str] = None
+    is_reseller: bool = False
+    reseller_package_id: Optional[int] = None
+    last_action: str = ""
 
     class Config:
         from_attributes = True
+
+class ProvisioningAccountList(BaseModel):
+    items: list[ProvisioningAccountOut]
+    total: int
+    page: int
+    per_page: int
 
 class ProvisioningSuspendRequest(BaseModel):
     reason: str = ""
@@ -1716,11 +1765,23 @@ class ProvisioningPasswordChange(BaseModel):
 
 class ProvisioningPackageChange(BaseModel):
     package_id: int = Field(ge=1)
+    reseller_package_id: Optional[int] = Field(default=None, ge=1)
+    limits: Optional[ProvisioningLimits] = None
 
 class ApiTokenCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     scopes: str = "provisioning:read,provisioning:write"
+    # Addresses and CIDR ranges, comma separated. Empty allows any address.
     allowed_ips: str = ""
+    # None keeps the token valid until revoked, as tokens always were.
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    # 0 uses the panel default.
+    rate_limit_per_minute: int = Field(default=0, ge=0, le=6000)
+
+class ApiTokenRotate(BaseModel):
+    # How long the old token keeps working after the new one is issued, so the
+    # billing system can be switched over without failed calls. 0 = at once.
+    grace_minutes: int = Field(default=0, ge=0, le=10080)
 
 class ApiTokenOut(BaseModel):
     id: int
@@ -1730,6 +1791,9 @@ class ApiTokenOut(BaseModel):
     is_active: bool
     last_used_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    rate_limit_per_minute: int = 0
 
     class Config:
         from_attributes = True
@@ -1747,6 +1811,8 @@ class ProvisioningUsageOut(BaseModel):
     database_count: int
     bandwidth_used_bytes: int = 0
     bandwidth_limit_bytes: Optional[int] = None
+    # Accounts a reseller owns; their usage is included in the figures above.
+    user_count: int = 0
 
 
 class McpTokenCreate(BaseModel):

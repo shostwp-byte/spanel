@@ -9,14 +9,19 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api import addons as addons_api, auth, dashboard, databases, demo_mode as demo_mode_api, dns as dns_api, fail2ban as fail2ban_api, firewall, mail as mail_api, maintenance, malware, mcp as mcp_api, notifications as notifications_api, packages, panel_settings as panel_settings_api, provisioning, services, sftp_accounts as sftp_accounts_api, site_apps as site_apps_api, terminal, updates, users, waf, websites
 from app.api import migration, resellers, ips, app_installer, ai, message_templates, server_tls, processes, name_servers, message_all, custombuild, resources, multi_server, licensing
+from app.api import remote_mysql as remote_mysql_api
+from app.api import backup_ops
 from app.core.config import settings
 from app.core.database import run_migrations
 from app.core.version import APP_VERSION
-from app.services import panel_settings as panel_brand_settings, auto_updater, resource_monitor
+from app.services import panel_settings as panel_brand_settings, auto_updater, resource_monitor, cluster_worker, webhooks as webhooks_service
 
 run_migrations()
 auto_updater.start_auto_update_daemon()
 resource_monitor.start_resource_monitor_daemon()
+cluster_worker.start_cluster_daemon()
+# Delivers queued webhooks and retries failed ones (services/webhooks.py).
+webhooks_service.start_webhook_worker()
 
 logger = logging.getLogger("spanel")
 
@@ -81,6 +86,8 @@ def _sync_dns_zones() -> None:
         with SessionLocal() as db:
             dns.sync_quietly(db)
             mail.sync_quietly(db)
+        # DKIM rotations move along in the background from here on.
+        mail.start_maintenance_daemon()
 
     threading.Thread(target=run, name="spanel-dns-sync", daemon=True).start()
 
@@ -186,6 +193,7 @@ app.include_router(services.router, prefix="/api")
 app.include_router(updates.router, prefix="/api")
 app.include_router(waf.router, prefix="/api")
 app.include_router(maintenance.router, prefix="/api")
+app.include_router(backup_ops.router, prefix="/api")
 app.include_router(panel_settings_api.router, prefix="/api")
 app.include_router(malware.router, prefix="/api")
 app.include_router(terminal.router, prefix="/api")
@@ -212,6 +220,7 @@ app.include_router(message_all.router, prefix="/api")
 app.include_router(custombuild.router, prefix="/api")
 app.include_router(resources.router, prefix="/api")
 app.include_router(multi_server.router, prefix="/api")
+app.include_router(remote_mysql_api.router, prefix="/api")
 app.include_router(licensing.router, prefix="/api")
 app.include_router(server_tls.router)
 

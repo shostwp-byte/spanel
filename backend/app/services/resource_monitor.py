@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.permissions import Role, is_admin_role
 from app.models.entities import DatabaseAccount, User, UserPackage, Website
-from app.services import mariadb, nginx, site_users, storage_quota
+from app.services import db_backends, mariadb, nginx, site_users, storage_quota
 from app.services.shell import shell
 
 logger = logging.getLogger("spanel.resource_monitor")
@@ -163,10 +163,9 @@ def cached_user_live_metrics(user_id: int) -> dict[str, Any]:
 def snipe_user_slow_queries(db: Session, user_id: int, max_time_sec: int = 2) -> list[dict]:
     """Manually or automatically kill slow/heavy SELECT queries belonging to a user's database accounts."""
     dbs = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user_id).all()
-    db_users = [d.db_user for d in dbs if d.db_user]
-    if not db_users:
+    if not any(d.db_user for d in dbs):
         return []
-    killed = mariadb.snipe_slow_scraping_queries(db_users, max_time_sec=max_time_sec)
+    killed = db_backends.snipe_slow_queries(dbs, max_time_sec=max_time_sec)
     if killed:
         with _lock:
             _user_sniped_queries_count[user_id] = int(_user_sniped_queries_count.get(user_id, 0)) + len(killed)
@@ -195,6 +194,8 @@ def apply_user_cgroup_limits(user: User) -> bool:
         str(max(0, int(getattr(user, "iops_read_max", 0) or 0))),
         str(max(0, int(getattr(user, "iops_write_max", 0) or 0))),
         str(max(0, int(getattr(user, "storage_limit_mb", 0) or 0))),
+        # Enforced by kernel quota (setquota) when quota-enable turned it on.
+        str(max(0, int(getattr(user, "inode_limit", 0) or 0))),
     ]
     try:
         shell.privileged(
@@ -210,6 +211,20 @@ def apply_user_cgroup_limits(user: User) -> bool:
         return False
 
 
+def apply_user_mysql_limits(db: Session, user: User) -> int:
+    """Put the package's per-hour MariaDB limits on every database account the
+    user owns. Returns how many accounts took them."""
+    limits = mariadb.owner_hourly_limits(user)
+    applied = 0
+    for account in db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == user.id).all():
+        try:
+            if mariadb.enforce_db_user_hourly_limits(account.db_user, *limits):
+                applied += 1
+        except Exception:
+            logger.debug("Could not apply hourly MariaDB limits to %s", account.db_user, exc_info=True)
+    return applied
+
+
 def apply_user_cgroup_limits_async(user_id: int) -> None:
     def _runner():
         try:
@@ -217,6 +232,7 @@ def apply_user_cgroup_limits_async(user_id: int) -> None:
                 u = db.query(User).filter(User.id == user_id).first()
                 if u:
                     apply_user_cgroup_limits(u)
+                    apply_user_mysql_limits(db, u)
         except Exception:
             pass
 
@@ -273,16 +289,14 @@ def set_user_under_attack_mode(
             logger.debug("Could not apply Nginx flood shield for %s", user.username, exc_info=True)
 
         # Tighten MariaDB per-user connection & statement time caps (8 conns, 3s timeout) + snipe active slow queries
-        db_users = []
         for d in dbs:
-            db_users.append(d.db_user)
             try:
-                mariadb.enforce_db_user_resource_limits(d.db_user, max_user_connections=8, max_statement_time=3)
+                db_backends.backend_for(d).enforce_resource_limits(d.db_user, max_user_connections=8, max_statement_time=3)
             except Exception:
                 pass
-        if db_users:
+        if dbs:
             try:
-                mariadb.snipe_slow_scraping_queries(db_users, max_time_sec=2)
+                db_backends.snipe_slow_queries(dbs, max_time_sec=2)
             except Exception:
                 pass
 
@@ -325,7 +339,7 @@ def set_user_under_attack_mode(
 
         for d in dbs:
             try:
-                mariadb.enforce_db_user_resource_limits(d.db_user, max_user_connections=25, max_statement_time=15)
+                db_backends.backend_for(d).enforce_resource_limits(d.db_user, max_user_connections=25, max_statement_time=15)
             except Exception:
                 pass
 
@@ -386,12 +400,16 @@ def collect_and_enforce_mysql_quotas(db: Session) -> dict[int, int]:
     sizes_map = _query_mysql_sizes_map()
     all_dbs = db.query(DatabaseAccount).all()
     users_by_id = {u.id: u for u in db.query(User).all()}
+    # Databases on a remote host are measured there; the local map only knows
+    # the local server, which may well have an unrelated schema of the same name.
+    remote_sizes = db_backends.remote_database_sizes([d for d in all_dbs if d.db_host_id])
 
     user_totals: dict[int, int] = {}
     changed = False
 
     for db_acc in all_dbs:
-        sz = sizes_map.get(db_acc.db_name, int(getattr(db_acc, "size_bytes", 0) or 0))
+        source = remote_sizes if db_acc.db_host_id else sizes_map
+        sz = source.get(db_acc.db_name, int(getattr(db_acc, "size_bytes", 0) or 0))
         if getattr(db_acc, "size_bytes", 0) != sz:
             db_acc.size_bytes = sz
             changed = True
@@ -402,7 +420,14 @@ def collect_and_enforce_mysql_quotas(db: Session) -> dict[int, int]:
                 _db_limits_initialized.add(db_acc.db_user)
         if need_conn_limit:
             try:
-                mariadb.enforce_db_user_resource_limits(db_acc.db_user, max_user_connections=25, max_statement_time=15)
+                db_backends.backend_for(db_acc).enforce_resource_limits(db_acc.db_user, max_user_connections=25, max_statement_time=15)
+            except Exception:
+                pass
+            # Accounts created by any path (site provisioning, imports,
+            # restores) pick up their owner's package limits here.
+            try:
+                if db_acc.owner is not None:
+                    mariadb.enforce_db_user_hourly_limits(db_acc.db_user, *mariadb.owner_hourly_limits(db_acc.owner))
             except Exception:
                 pass
         user_totals[db_acc.owner_id] = user_totals.get(db_acc.owner_id, 0) + sz
@@ -460,7 +485,7 @@ def collect_and_enforce_mysql_quotas(db: Session) -> dict[int, int]:
 
             if should_auto_lock and not currently_locked:
                 try:
-                    mariadb.set_database_write_lock(db_acc.db_name, db_acc.db_user, True)
+                    db_backends.backend_for(db_acc).set_write_lock(db_acc.db_name, db_acc.db_user, True)
                     db_acc.write_locked = True
                     db_acc.write_locked_reason = reason
                     changed = True
@@ -473,7 +498,7 @@ def collect_and_enforce_mysql_quotas(db: Session) -> dict[int, int]:
                 below_total = not storage_limit_bytes or cached_total_storage < int(storage_limit_bytes * 0.95)
                 if below_single and below_mysql and below_total:
                     try:
-                        mariadb.set_database_write_lock(db_acc.db_name, db_acc.db_user, False)
+                        db_backends.backend_for(db_acc).set_write_lock(db_acc.db_name, db_acc.db_user, False)
                         db_acc.write_locked = False
                         db_acc.write_locked_reason = None
                         changed = True
@@ -601,6 +626,9 @@ def collect_live_process_metrics(db: Session) -> None:
         try:
             now_mono = time.monotonic()
             curr_mysql_stats = mariadb.collect_user_statistics()
+            remote_dbs = [d for d in all_dbs if d.db_host_id]
+            if remote_dbs:
+                curr_mysql_stats.update(db_backends.remote_user_statistics(remote_dbs))
             with _lock:
                 prev_stats = dict(_prev_mysql_user_stats)
                 prev_ts = float(_prev_mysql_stats_ts)
@@ -959,10 +987,7 @@ def inspect_slow_bottlenecks(
                 header = lines[0]
                 m_pool = re.search(r"\[pool\s+([^\]]+)\]", header)
                 pool_name = m_pool.group(1) if m_pool else sf.stem
-                linux_user = ""
-                m_lu = re.match(r"^spanel-([a-z0-9_-]+)-[0-9a-f]{12}-", pool_name)
-                if m_lu:
-                    linux_user = m_lu.group(1)
+                linux_user = site_users.linux_user_from_pool_name(pool_name)
                 owner_user = user_by_name.get(linux_user)
                 owner_id = owner_user.id if owner_user else None
                 if allowed_user_ids is not None and owner_id not in allowed_user_ids:

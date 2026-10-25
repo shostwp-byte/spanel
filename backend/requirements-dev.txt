@@ -1,0 +1,4 @@
+# Test-only dependencies (CI installs these on top of requirements.txt).
+pytest==9.1.1
+# starlette.testclient (FastAPI's TestClient) needs httpx2 since starlette 1.x.
+httpx2==2.14.0

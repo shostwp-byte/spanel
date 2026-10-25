@@ -1,80 +1,113 @@
-# spanel WHMCS server module
+# SPanel WHMCS server module
 
-Compatible with WHMCS on PHP 8.1+.
+Compatible with WHMCS 7.x / 8.x on PHP 7.4 – 8.3. No dependencies besides
+the PHP cURL extension. Full API reference: [`docs/API_AND_WHMCS.md`](../../../docs/API_AND_WHMCS.md).
 
 ## Install
 
 Copy this directory to WHMCS:
 
 ```text
-modules/servers/spanel/
+<whmcs>/modules/servers/spanel/
+├── spanel.php
+├── hooks.php
+└── templates/clientarea.tpl
 ```
 
-## spanel token
+## SPanel token
 
-In spanel admin API, create provisioning token with scopes:
+In SPanel, **Settings → API & Billing Integration**, create a token with
+either the legacy scopes
 
 ```text
 provisioning:read,provisioning:write
 ```
 
+or the fine-grained ones
+
+```text
+plans:read,accounts:read,accounts:write,usage:read,sso
+```
+
+Add `sso:admin` only if WHMCS admins should get the server-level
+"Login to SPanel as Admin" button: it signs in as the SPanel administrator
+who created the token. Restrict the token to the WHMCS server's address
+(CIDR ranges allowed) and give it an expiry if your policy wants rotation.
+
 ## WHMCS server config
 
-Go to **System Settings → Servers → Add New Server**.
+**System Settings → Servers → Add New Server**
 
 | Field | Value |
 |---|---|
-| Module | spanel Hosting |
+| Module | SPanel Hosting |
 | Hostname | panel domain or IP |
-| IP Address | optional |
-| Assigned IP Addresses | empty |
-| NS fields | empty |
-| Type | spanel Hosting |
-| Username | empty |
-| Password | spanel API token, if not using Access Hash |
-| Access Hash | spanel API token |
-| Secure | checked if HTTPS |
-| Port | spanel port, usually `2222` |
+| Access Hash | SPanel API token (or put it in Password) |
+| Secure | checked if the panel uses HTTPS |
+| Port | `2222` (default) |
 
-## Product config
+**Test Connection** must succeed before products can be configured.
 
-Go to **System Settings → Products/Services → Module Settings**.
+## Product config (Module Settings)
 
-| Option | Example |
-|---|---|
-| Package | select a spanel package |
-| App Type | `php` |
-| PHP Version | `8.4` |
-| Install WordPress | unchecked by default |
-| Auto SSL | unchecked by default |
+| # | Option | Notes |
+|---|---|---|
+| 1 | Package | SPanel package (loaded from the panel) |
+| 2 | App Type | `php`, `static`, `wordpress` |
+| 3 | PHP Version | |
+| 4 | Install WordPress | needs a domain |
+| 5 | Auto SSL | needs a domain |
+| 6 | Is Reseller | create a reseller account |
+| 7 | Reseller Package | reseller quota package (with Is Reseller) |
+| 8 | Backup Before Terminate | full backup first; terminate waits for it |
 
-Disable **Require Domain** on the WHMCS product if customers should be able to order without entering a domain.
-If **Install WordPress** or **Auto SSL** is enabled, a domain is still required.
-When no domain is provided, spanel creates only the panel user; the App Type setting is ignored until a website is added later.
-Provisioning generates a unique internal spanel email alias per service. Customers log in with the spanel username.
-The module stores the generated spanel username and password on the WHMCS service before returning success, so WHMCS welcome emails can include service credentials.
-The module also supports one-time SSO login links through the spanel provisioning API.
-After replacing the module files, save the WHMCS product Module Settings once so WHMCS reloads the service-list hook.
+### Configurable options → limits
+
+Configurable options with these names override the package limits for the
+service (on create and on upgrade/downgrade):
+
+| Option name (case-insensitive) | SPanel limit | Value |
+|---|---|---|
+| Disk Space, Disk, Storage, Web Space | disk (MB) | `2048`, `10 GB`, or a number with "(GB)" in the option name |
+| Bandwidth, Traffic, Monthly Bandwidth | monthly bandwidth (MB) | same as disk |
+| Websites, Sites, Domains, Addon Domains | websites | count |
+
+`Unlimited` (or 0) means unlimited.
+
+### SFTP password
+
+SPanel gives every account its own SFTP/SSH password, separate from the
+panel password, and keeps no readable copy. Create a product custom field
+named **SFTP Password** (text, tick *Admin Only* if customers should not see
+it) and the module stores the password there on create, when a password
+change rotates it, and from the **Reset SFTP Password** button.
+
+## Supported functions
+
+CreateAccount, SuspendAccount, UnsuspendAccount, TerminateAccount,
+ChangePassword, ChangePackage, UsageUpdate (disk + monthly bandwidth),
+TestConnection, ServiceSingleSignOn, AdminSingleSignOn, ListAccounts and
+GetUserCount (server sync / import), AdminServicesTabFields,
+AdminCustomButtonArray and ClientAreaCustomButtonArray (Reset SFTP Password,
+Create Backup), ClientArea, LoginLink.
 
 ## Mapping
 
-| WHMCS | spanel |
+| WHMCS | SPanel |
 |---|---|
 | Service ID | `external_id = whmcs:{serviceid}` |
-| Username | generated and stored on the WHMCS service |
+| Username | generated `sp{serviceid}_xxxxxxxx`, stored on the service |
 | Email | generated internal alias per service |
-| Domain | Primary website domain, optional |
-| Product Package | spanel `UserPackage.id` |
+| Domain | primary website, optional |
+| configoption1 | `UserPackage.id` |
 
-## Supported actions
+A create that times out is safe to retry: the module saves the generated
+credentials before calling SPanel and sends an `Idempotency-Key`, so the
+retry gets the account (and the one-time SFTP password) the first call made.
 
-- CreateAccount
-- SuspendAccount
-- UnsuspendAccount
-- TerminateAccount
-- ChangePassword
-- ChangePackage
-- UsageUpdate
-- LoginLink
-- ClientArea
-- TestConnection
+## Development
+
+```bash
+php -l modules/servers/spanel/spanel.php
+php tests/php/spanel_module_test.php
+```

@@ -4,6 +4,15 @@ import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
+// Types beyond the everyday ones, and those whose priority has its own field.
+const MORE_DNS_TYPES = ['HTTPS', 'SVCB', 'TLSA', 'SSHFP', 'DS', 'NAPTR', 'PTR'];
+const PRIORITY_TYPES = ['MX', 'SRV', 'HTTPS', 'SVCB'];
+const MORE_DNS_PLACEHOLDERS = {
+  HTTPS: '. alpn=h3,h2', SVCB: 'svc.example.net alpn=h2 port=8443', TLSA: '3 1 1 <sha-256 in hex>',
+  SSHFP: '4 2 <sha-256 in hex>', DS: '12345 13 2 <digest in hex>', NAPTR: '100 10 "S" "SIP+D2U" "" _sip._udp.example.com',
+  PTR: 'host.example.com',
+};
+
 export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlock }) {
   const {
     loading, setLoading, setError, setNotice,
@@ -25,6 +34,11 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
   const [dnsDnssec, setDnsDnssec] = useState(null);
   const [dnsRecordFilter, setDnsRecordFilter] = useState('');
   const [dnsSettings, setDnsSettings] = useState(null);
+  const [zoneFile, setZoneFile] = useState(null);
+  const [zoneSecondaries, setZoneSecondaries] = useState(null);
+  const [dnsPackages, setDnsPackages] = useState([]);
+  const [packagePick, setPackagePick] = useState('');
+  const zoneTypes = [...DNS_TYPES, ...MORE_DNS_TYPES.filter(type => !DNS_TYPES.includes(type))];
 
   useEffect(() => { loadDnsInfo(); loadDnsZones(); }, []);
   useEffect(() => { if (dnsTab === 'settings') loadDnsSettings(); }, [dnsTab]);
@@ -45,7 +59,9 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
 
   async function loadDnsSettings() {
     const data = await request('/dns/settings', { silent: true });
-    if (data) setDnsSettings({ ...data, ns1: data.nameservers?.[0] || '', ns2: data.nameservers?.[1] || '' });
+    if (data) setDnsSettings({ ...data, ns1: data.nameservers?.[0] || '', ns2: data.nameservers?.[1] || '', package_templates: data.package_templates || {} });
+    const packages = await request('/packages', { silent: true });
+    if (Array.isArray(packages)) setDnsPackages(packages);
   }
 
   async function openDnsZone(zone) {
@@ -57,6 +73,8 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
     setDnsRecordEdit(null);
     setDnsRecordFilter('');
     setDnsRecordForm(emptyDnsRecord());
+    setZoneFile(null);
+    setZoneSecondaries(null);
     const data = await request(`${dnsPath(zone)}/records`);
     if (!data) { setDnsZone(null); return; }
     setDnsZone({ zone, records: data.records || [] });
@@ -66,6 +84,44 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
     ]);
     setDnsDelegation(check || { status: 'unknown', expected: [], found: [] });
     setDnsDnssec(sec ? { ...sec, status: sec.status || 'ok' } : { enabled: false, status: 'unknown', ds_records: [], dnskey_records: [] });
+    if (isAdmin) {
+      const secondaries = await request(`${dnsPath(zone)}/secondaries`, { silent: true });
+      if (secondaries) setZoneSecondaries({ ...secondaries, notify: (secondaries.also_notify || []).join(', '), axfr: (secondaries.allow_axfr || []).join(', ') });
+    }
+  }
+
+  async function exportZoneFile() {
+    const data = await request(`${dnsPath(dnsZone.zone)}/export`, { silent: true });
+    if (!data) return;
+    const blob = new Blob([data.text], { type: 'text/plain' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = data.filename || 'zone.txt';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
+  async function previewZoneFile() {
+    const data = await request(`${dnsPath(dnsZone.zone)}/import/preview`, { method: 'POST', body: JSON.stringify({ text: zoneFile.text, mode: zoneFile.mode }) }, t('Reading the zone file...'));
+    if (data) setZoneFile(prev => ({ ...prev, preview: data }));
+  }
+
+  async function importZoneFile() {
+    if (zoneFile.mode === 'replace' && !confirm(t('Replace every record set the file has? Records of those names and types that are not in the file are deleted.'))) return;
+    const data = await request(`${dnsPath(dnsZone.zone)}/import`, { method: 'POST', body: JSON.stringify({ text: zoneFile.text, mode: zoneFile.mode }) }, t('Importing...'));
+    if (!data) return;
+    applyDnsRecords(data);
+    setZoneFile(null);
+    setNotice(t('Zone file imported: {n} record set(s) written.', { n: data.rrsets }));
+  }
+
+  async function saveSecondaries() {
+    const split = text => String(text || '').split(/[\s,;]+/).map(item => item.trim()).filter(Boolean);
+    const body = { also_notify: split(zoneSecondaries.notify), allow_axfr: split(zoneSecondaries.axfr) };
+    const data = await request(`${dnsPath(dnsZone.zone)}/secondaries`, { method: 'PUT', body: JSON.stringify(body) }, t('Saving...'));
+    if (data) { setZoneSecondaries({ ...data, notify: (data.also_notify || []).join(', '), axfr: (data.allow_axfr || []).join(', ') }); setNotice(t('Secondary nameservers saved.')); }
   }
 
   async function toggleZoneDnssec(enable) {
@@ -83,7 +139,7 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
   }
 
   function dnsRecordBody(form) {
-    const withPriority = ['MX', 'SRV'].includes(form.type);
+    const withPriority = PRIORITY_TYPES.includes(form.type);
     return {
       name: String(form.name || '').trim() || '@',
       type: form.type,
@@ -175,6 +231,7 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
       ttl: Number(f.ttl) || 3600,
       auto_zone: !!f.auto_zone,
       template: f.template || '',
+      package_templates: f.package_templates || {},
     };
     const data = await request('/dns/settings', { method: 'PUT', body: JSON.stringify(body) }, t('Saving DNS settings...'));
     if (!data) return;
@@ -196,17 +253,24 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
       NS: t('Hands a subdomain to other nameservers.'),
       SRV: t('Where a service runs: weight port target, with the priority in its own field. The name is like _sip._tcp.'),
       CAA: t('Which certificate authorities may issue for the domain, for example 0 issue letsencrypt.org.'),
+      HTTPS: t('Where and how browsers reach the site: the target (. for the name itself) and parameters such as alpn=h3,h2, with the priority in its own field (0 makes it an alias).'),
+      SVCB: t('Like HTTPS, for other services: a target and parameters, the priority in its own field.'),
+      TLSA: t('DANE: the certificate a TLS service presents, as usage selector matching-type and the hash. The name is like _443._tcp.www.'),
+      SSHFP: t('The fingerprint of an SSH host key: algorithm, fingerprint type and the fingerprint (ssh-keygen -r prints them).'),
+      DS: t('Delegation signer of a subdomain handed to other nameservers with DNSSEC: key tag, algorithm, digest type and digest.'),
+      NAPTR: t('Rewrite rule for ENUM or SIP: order preference "flags" "service" "regexp" replacement.'),
+      PTR: t('Reverse DNS: the host name of an address. Only in a reverse zone (in-addr.arpa or ip6.arpa).'),
     }[type] || '';
   }
 
   function renderDnsRecordFields(form, set, { lockType = false } = {}) {
-    const hasPriority = ['MX', 'SRV'].includes(form.type);
+    const hasPriority = PRIORITY_TYPES.includes(form.type);
     const current = Number(form.ttl) || 0;
     const ttls = !current || DNS_TTLS.includes(current) ? DNS_TTLS : [...DNS_TTLS, current].sort((a, b) => a - b);
     return <div className={"dns-record-fields"}>
       <label className="field"><span className="field-label">{t('Type')}</span>
         <select value={form.type} disabled={lockType} onChange={e => set({ type: e.target.value })}>
-          {DNS_TYPES.map(type => <option key={type} value={type}>{type}</option>)}
+          {zoneTypes.map(type => <option key={type} value={type}>{type}</option>)}
         </select></label>
       <label className="field"><span className="field-label">{t('Name')}</span>
         <input value={form.name} placeholder="@" spellCheck={false} autoCapitalize="off" onChange={e => set({ name: e.target.value })} /></label>
@@ -215,7 +279,7 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
       <label className="field dns-value-field"><span className="field-label">{t('Value')}</span>
         {form.type === 'TXT'
           ? <textarea rows={2} value={form.value} placeholder={DNS_PLACEHOLDERS.TXT} spellCheck={false} onChange={e => set({ value: e.target.value.replace(/[\r\n]+/g, ' ') })} />
-          : <input value={form.value} placeholder={DNS_PLACEHOLDERS[form.type]} spellCheck={false} autoCapitalize="off" onChange={e => set({ value: e.target.value })} />}</label>
+          : <input value={form.value} placeholder={DNS_PLACEHOLDERS[form.type] || MORE_DNS_PLACEHOLDERS[form.type]} spellCheck={false} autoCapitalize="off" onChange={e => set({ value: e.target.value })} />}</label>
       <label className="field"><span className="field-label">TTL</span>
         <select value={form.ttl} onChange={e => set({ ttl: e.target.value })}>
           <option value="">{t('Default ({ttl})', { ttl: dnsTtlLabel(dnsInfo?.default_ttl || 3600) })}</option>
@@ -329,6 +393,16 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
         <label className="field dns-template"><span className="field-label">{t('Records for new zones')}</span>
           <textarea rows={6} value={f.template || ''} spellCheck={false} onChange={e => set({ template: e.target.value })} /></label>
         <p className="hint dns-template-hint">{t('One record per line: name, type, then the value; an MX value starts with its priority. {ip} is the address for new zones, {domain} the zone, and {spf} the SPF record:')} <code>{f.spf}</code>. {t('Zones that already exist are not changed.')}</p>
+        {dnsPackages.length > 0 && <>
+          <label className="field"><span className="field-label">{t('Records for new zones of a hosting package')}</span>
+            <select value={packagePick} onChange={e => setPackagePick(e.target.value)}>
+              <option value="">{t('Choose a package')}</option>
+              {dnsPackages.map(item => <option key={item.id} value={String(item.id)}>{item.name}{(f.package_templates || {})[String(item.id)] ? ' *' : ''}</option>)}
+            </select></label>
+          {packagePick && <label className="field dns-template"><span className="field-label">{t('Empty uses the records above.')}</span>
+            <textarea rows={5} value={(f.package_templates || {})[packagePick] || ''} spellCheck={false}
+              onChange={e => set({ package_templates: { ...(f.package_templates || {}), [packagePick]: e.target.value } })} /></label>}
+        </>}
         <p className="hint">{t('A changed nameserver is written into the NS and SOA records of every zone. Register both names as glue (child nameserver) records at the registrar of their domain, pointing at this server.')} {address && t('This server: {address}.', { address })}</p>
         <div className="actions">
           <button type="button" disabled={!String(f.ns1 || '').trim() || !String(f.ns2 || '').trim() || !!loading} onClick={saveDnsSettings}><Save size={14}/> {t('Save settings')}</button>
@@ -426,6 +500,51 @@ export function DnsPage({ request, isAdmin, users, emptyDnsRecord, renderCopyBlo
           </div>
         )}
       </div>
+      <div className="create-inline" style={{ marginBottom: '14px' }}>
+        <div className="create-inline-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+          <strong>{t('Zone file (BIND)')}</strong>
+          <div className="actions">
+            <button type="button" className="mini secondary-light" disabled={!!loading || records === null} onClick={exportZoneFile}><Download size={13}/> {t('Export')}</button>
+            <button type="button" className="mini secondary-light" disabled={!!loading || records === null} onClick={() => setZoneFile(prev => prev ? null : { text: '', mode: 'merge', preview: null })}><Upload size={13}/> {t('Import')}</button>
+          </div>
+        </div>
+        {zoneFile && <>
+          <textarea rows={8} value={zoneFile.text} spellCheck={false} placeholder={'$ORIGIN ' + zone.name + '.\n@ 3600 IN A 192.0.2.10\nwww 3600 IN CNAME @'}
+            onChange={e => setZoneFile(prev => ({ ...prev, text: e.target.value, preview: null }))} />
+          <div className="mail-toolbar">
+            <input type="file" accept=".zone,.txt,.db,text/plain" aria-label={t('Zone file')} onChange={async e => { const file = e.target.files?.[0]; if (file) { const text = await file.text(); setZoneFile(prev => ({ ...prev, text, preview: null })); } }} />
+            <select value={zoneFile.mode} onChange={e => setZoneFile(prev => ({ ...prev, mode: e.target.value, preview: null }))}>
+              <option value="merge">{t('Add to the records here')}</option>
+              <option value="replace">{t('Replace the record sets in the file')}</option>
+            </select>
+            <button type="button" className="secondary-light" disabled={!!loading || !zoneFile.text.trim()} onClick={previewZoneFile}><Eye size={14}/> {t('Preview')}</button>
+            <button type="button" disabled={!!loading || !zoneFile.preview || zoneFile.preview.errors.length > 0 || !!zoneFile.preview.problem} onClick={importZoneFile}><Upload size={14}/> {t('Import')}</button>
+          </div>
+          {zoneFile.preview && <div className="hint">
+            <p>{t('{add} to add, {same} already here, {removed} to remove, {skipped} left out.', {
+              add: zoneFile.preview.records.filter(r => r.action === 'add').length,
+              same: zoneFile.preview.records.filter(r => r.action === 'exists').length,
+              removed: zoneFile.preview.removed.length, skipped: zoneFile.preview.skipped.length })}</p>
+            {zoneFile.preview.problem && <p className="badge bad">{zoneFile.preview.problem}</p>}
+            {zoneFile.preview.errors.map((item, index) => <p key={`e${index}`}><span className="badge bad">{t('Refused')}</span> <code>{item.name} {item.type} {item.value}</code> {item.error}</p>)}
+            {zoneFile.preview.records.filter(r => r.action === 'add').slice(0, 50).map((r, index) => <p key={`a${index}`}><span className="badge ok">+</span> <code>{r.name} {r.type} {r.priority != null ? `${r.priority} ` : ''}{r.content}</code></p>)}
+            {zoneFile.preview.removed.slice(0, 50).map((r, index) => <p key={`r${index}`}><span className="badge warn">-</span> <code>{r.name} {r.type} {r.content}</code></p>)}
+            {zoneFile.preview.skipped.slice(0, 20).map((r, index) => <p key={`s${index}`}><span className="badge">{t('Left out')}</span> <code>{r.name} {r.type}</code> {r.reason}</p>)}
+          </div>}
+          <p className="hint">{t("SOA and the zone's own NS records stay as the DNS settings make them. Every other record is checked as if typed here.")}</p>
+        </>}
+      </div>
+      {isAdmin && zoneSecondaries && <div className="create-inline" style={{ marginBottom: '14px' }}>
+        <div className="create-inline-head"><strong>{t('Secondary nameservers')}</strong>{zoneSecondaries.kind === 'Master' && <span className="badge ok">{t('Primary zone')}</span>}</div>
+        <div className="mail-settings-grid">
+          <label className="field"><span className="field-label">{t('Send NOTIFY to (IP addresses)')}</span>
+            <input value={zoneSecondaries.notify} placeholder="192.0.2.53" spellCheck={false} onChange={e => setZoneSecondaries(prev => ({ ...prev, notify: e.target.value }))} /></label>
+          <label className="field"><span className="field-label">{t('Allow zone transfers (AXFR) from')}</span>
+            <input value={zoneSecondaries.axfr} placeholder="192.0.2.53, 198.51.100.0/24" spellCheck={false} onChange={e => setZoneSecondaries(prev => ({ ...prev, axfr: e.target.value }))} /></label>
+        </div>
+        <p className="hint">{t('Other nameservers that copy this zone from here. Zone transfers are refused to anyone not listed; the first zone with secondaries turns transfers on in PowerDNS.')}</p>
+        <div className="actions"><button type="button" className="secondary-light" disabled={!!loading} onClick={saveSecondaries}><Save size={14}/> {t('Save')}</button></div>
+      </div>}
       <div className="create-inline dns-record-form">
         <div className="create-inline-head"><strong>{t('Add a record')}</strong></div>
         {renderDnsRecordFields(form, patch => setDnsRecordForm(prev => ({ ...prev, ...patch })))}

@@ -461,10 +461,12 @@ def test_p1_cron_jail_audit_hmac_backup_etm_yara_exim4():
     fm_text = (repo_root / "backend" / "app" / "services" / "file_manager.py").read_text(encoding="utf-8")
     assert fm_text.count("scan_upload_realtime") >= 2
 
-    # P1.6: Core stack patch & upgrade_php_version do not hold packages permanently by default
+    # P1.6: Core stack patch & upgrade_php_version do not hold packages (the
+    # core stack no longer offers holds at all; unattended-upgrades is kept off
+    # those packages with a Package-Blacklist instead)
     import inspect
     sig = inspect.signature(updates.upgrade_core_stack_packages)
-    assert sig.parameters["hold_packages"].default is False
+    assert "hold_packages" not in sig.parameters
     php_upgrade_body = helper_text.split("upgrade_php_version() {", 1)[1].split("\n}\n", 1)[0]
     assert "apt-mark unhold" in php_upgrade_body
     assert "apt-mark hold " not in php_upgrade_body
@@ -526,9 +528,10 @@ def test_p2_fastcgi_cache_http3_limits_github_hmac_remote_mysql(tmp_path):
     assert site_apps.verify_github_webhook_signature(app_obj, raw_body, url_token_sig) is False
     assert site_apps.verify_github_webhook_signature(app_obj, raw_body, "") is False
 
-    # P2.5: Unrequested Remote MySQL provisioning is blocked with HTTP 501 in databases.py
+    # P2.5: Remote MySQL provisioning is a real feature now (tests/test_rdb_*.py
+    # cover its lifecycle); the 501 stub that stood in for it is gone.
     databases_api_text = (repo_root / "backend" / "app" / "api" / "databases.py").read_text(encoding="utf-8")
-    assert "status_code=501" in databases_api_text
+    assert "status_code=501" not in databases_api_text
 
 
 if __name__ == "__main__":

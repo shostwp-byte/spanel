@@ -48,7 +48,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -70,7 +70,9 @@ SSO_KEY_FILE = Path("/etc/spanel/webmail-sso.key")
 RSPAMD_KEY_FILE = Path("/etc/spanel/rspamd-controller.key")
 RSPAMD_CONTROLLER = "http://127.0.0.1:11334"
 SETTINGS_KEY = "mail"
+# The selector of every domain's first key; a rotation moves to s<date>.
 DKIM_SELECTOR = "spanel"
+DKIM_SELECTOR_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 WEBMAIL_PORT = 2096
 SSO_TOKEN_SECONDS = 60
 DEFAULT_QUOTA_MB = 1024
@@ -102,6 +104,10 @@ SETTINGS_DEFAULTS = {
     "spam_subject_tag": "[SPAM]",
     "greylisting": True,
     "default_quota_mb": DEFAULT_QUOTA_MB,
+    # DKIM keys rotate on their own every so many days (0: only by hand),
+    # and a replaced key stays published this long.
+    "dkim_rotate_days": 0,
+    "dkim_retire_days": 7,
 }
 PORTS = {"imap": 993, "pop3": 995, "smtps": 465, "submission": 587}
 
@@ -177,7 +183,9 @@ def after_install(db: Session) -> None:
     made again; the records shown follow. Then every domain is served again."""
     for row in db.query(MailDomain).all():
         try:
-            row.dkim_public = _dkim_public(row.domain)
+            row.dkim_public = _dkim_public(row.domain, row.dkim_selector or DKIM_SELECTOR)
+            if row.dkim_next_selector:
+                row.dkim_next_public = _dkim_public(row.domain, row.dkim_next_selector)
         except MailError:
             continue
     db.commit()
@@ -401,9 +409,12 @@ def box_path(owner: User, account: MailAccount) -> str:
 
 # --- mail domains -------------------------------------------------------------------------
 
-def _dkim_public(domain: str, rotate: bool = False) -> str:
-    args = [domain, "rotate"] if rotate else [domain]
-    result = _helper("mail-dkim", *args)
+def _dkim_public(domain: str, selector: str = DKIM_SELECTOR) -> str:
+    """The public key of a domain's selector, the helper making the key pair
+    first if there is none."""
+    if not DKIM_SELECTOR_RE.fullmatch(selector or ""):
+        raise MailError("That is not a DKIM selector.")
+    result = _helper("mail-dkim", domain, selector)
     key = (result.stdout or "").strip().splitlines()[-1:] if (result.stdout or "").strip() else []
     if not key or not re.fullmatch(r"[A-Za-z0-9+/=]{200,1000}", key[0]):
         if app_settings.command_dry_run or not shell_uses_helper():
@@ -446,15 +457,18 @@ def add_domain(db: Session, actor: User, domain: str, owner_id: int | None = Non
 def delete_domain(db: Session, actor: User, domain_id: int) -> str:
     """Email off for a domain: its mailboxes with their mail, its forwarders."""
     row = get_domain(db, actor, domain_id)
-    name, webmail = row.domain, bool(row.webmail_host)
+    name, webmail, hosts = row.domain, bool(row.webmail_host), bool(row.mail_hosts)
     owner = db.query(User).filter(User.id == row.owner_id).first()
     db.query(MailAccount).filter(MailAccount.domain == name).delete(synchronize_session=False)
     db.query(MailForwarder).filter(MailForwarder.domain == name).delete(synchronize_session=False)
+    db.query(MailAutoresponder).filter(MailAutoresponder.domain == name).delete(synchronize_session=False)
     db.delete(row)
     db.commit()
     sync(db)
     if webmail:
         shell.privileged("mail-webmail-host-remove", helper_args=[name], check=False, fallback=["true"])
+    if hosts:
+        shell.privileged("mail-hosts-remove", helper_args=[name], check=False, fallback=["true"])
     # Last, once nothing routes there any more.
     if owner is not None:
         shell.privileged("mail-purge-domain", helper_args=[linux_user_of(owner), name], check=False,
@@ -469,7 +483,10 @@ def delete_for_owner(db: Session, owner: User) -> list[str]:
     for row in rows:
         if row.webmail_host:
             shell.privileged("mail-webmail-host-remove", helper_args=[row.domain], check=False, fallback=["true"])
+        if row.mail_hosts:
+            shell.privileged("mail-hosts-remove", helper_args=[row.domain], check=False, fallback=["true"])
         db.query(MailForwarder).filter(MailForwarder.domain == row.domain).delete(synchronize_session=False)
+        db.query(MailAutoresponder).filter(MailAutoresponder.domain == row.domain).delete(synchronize_session=False)
         db.delete(row)
     db.query(MailAccount).filter(MailAccount.owner_id == owner.id).delete(synchronize_session=False)
     db.flush()
@@ -499,13 +516,10 @@ def set_catch_all(db: Session, actor: User, domain_id: int, target: str) -> Mail
 
 
 def rotate_dkim(db: Session, actor: User, domain_id: int) -> MailDomain:
+    """The "New DKIM key" button: a two-selector rotation, never a key
+    replaced in place (see DKIM rotation below)."""
     _require_active()
-    row = get_domain(db, actor, domain_id)
-    row.dkim_public = _dkim_public(row.domain, rotate=True)
-    db.commit()
-    sync(db)
-    publish_dns_quietly(db, row)
-    return row
+    return start_dkim_rotation(db, get_domain(db, actor, domain_id))
 
 
 def set_webmail_host(db: Session, actor: User, domain_id: int, enabled: bool) -> MailDomain:
@@ -528,6 +542,152 @@ def set_webmail_host(db: Session, actor: User, domain_id: int, enabled: bool) ->
     return row
 
 
+# --- mail hosts: mail.<domain> and the others, with a certificate of their own ------------------
+# mail.<domain> is the domain's MX; with its own certificate Exim and Dovecot
+# answer it by SNI, so mail apps and MTA-STS senders see a name that matches.
+# mta-sts., autoconfig. and autodiscover. serve what their names say. One
+# Let's Encrypt certificate (the webroot flow webmail.<domain> uses) covers
+# the hosts turned on; the helper's mail-hosts-apply does the rest.
+
+MAIL_HOST_LABELS = ("mail", "mta-sts", "autoconfig", "autodiscover")
+
+
+def served_hosts(row: MailDomain) -> list[str]:
+    labels = [label.strip() for label in (row.mail_hosts or "").split(",")]
+    return [label for label in MAIL_HOST_LABELS if label in labels]
+
+
+def client_host(row: MailDomain | None) -> str:
+    """The name mail apps use for a domain: mail.<domain> once it has its own
+    certificate, else the server's own name (the panel's certificate)."""
+    if row is not None and "mail" in served_hosts(row):
+        return f"mail.{row.domain}"
+    return _hostname_or_blank()
+
+
+def normalize_hosts(labels) -> list[str]:
+    chosen = {str(label or "").strip().lower() for label in labels or []}
+    unknown = chosen - set(MAIL_HOST_LABELS)
+    if unknown:
+        raise MailError("The mail hosts are mail, mta-sts, autoconfig and autodiscover.")
+    chosen.add("mail")
+    return [label for label in MAIL_HOST_LABELS if label in chosen]
+
+
+def _points_here(name: str) -> bool | None:
+    """Whether public DNS sends name to this server; None if DNS could not be asked."""
+    answer = _resolve(name, "A")
+    if answer is None:
+        return None
+    own = set(server_addresses()[0]) | ({server_ip()} if server_ip() else set())
+    return bool(set(answer) & own)
+
+
+def set_mail_hosts(db: Session, actor: User, domain_id: int, labels) -> MailDomain:
+    """Serve the domain's mail hosts with a certificate of their own."""
+    _require_active()
+    row = get_domain(db, actor, domain_id)
+    chosen = normalize_hosts(labels)
+    names = [f"{label}.{row.domain}" for label in chosen]
+    taken = [name for name in names
+             if db.query(Website).filter(func.lower(Website.domain) == name).first() is not None
+             or db.query(WebsiteAlias).filter(func.lower(WebsiteAlias.domain) == name).first() is not None
+             or name == panel_host()]
+    if taken:
+        raise MailError(f"{', '.join(taken)} is already a website or the panel's own address on this server.", status=409)
+    # Where this server runs the domain's DNS, the names go in first.
+    publish_dns_quietly(db, row, hosts=set(chosen))
+    elsewhere = [name for name in names if _points_here(name) is False]
+    if elsewhere:
+        raise MailError(f"Point {', '.join(elsewhere)} at this server first (an A record to {server_ip() or 'its address'}); "
+                        "a certificate is issued only for names that reach it.")
+    _apply_mail_hosts(row, chosen)
+    row.mail_hosts = ",".join(chosen)
+    db.commit()
+    publish_dns_quietly(db, row)
+    return row
+
+
+def _apply_mail_hosts(row: MailDomain, chosen: list[str]) -> None:
+    mode = row.mta_sts_mode or ""
+    payload = {"domain": row.domain, "hosts": chosen, "email": app_settings.ssl_email or "",
+               "mta_sts": {"mode": mode, "max_age": MTA_STS_MAX_AGE} if mode in MTA_STS_MODES else None}
+    _helper("mail-hosts-apply", input=json.dumps(payload), timeout=600)
+
+
+def remove_mail_hosts(db: Session, actor: User, domain_id: int) -> MailDomain:
+    _require_active()
+    row = get_domain(db, actor, domain_id)
+    if row.mta_sts_mode in ("testing", "enforce"):
+        # Senders keep the policy for max_age and would refuse mail.<domain>
+        # once its certificate is gone.
+        raise MailError("Set MTA-STS to none and wait a week before the mail hosts stop being served.", status=409)
+    _helper("mail-hosts-remove", row.domain, timeout=300)
+    row.mail_hosts = ""
+    db.commit()
+    publish_dns_quietly(db, row)
+    return row
+
+
+# --- MTA-STS and TLS-RPT ----------------------------------------------------------------------------
+# MTA-STS (RFC 8461) tells other mail servers to deliver to mail.<domain>
+# only over TLS with a certificate that matches: the policy file on
+# https://mta-sts.<domain>/ (written by the helper from the mode alone) and
+# _mta-sts.<domain> TXT naming its id. TLS-RPT (RFC 8460) asks them to report
+# TLS failures to the addresses in _smtp._tls.<domain>.
+
+MTA_STS_MODES = ("testing", "enforce", "none")
+MTA_STS_MAX_AGE = 604800
+
+
+def tls_rpt_addresses(row: MailDomain) -> list[str]:
+    return [line.strip() for line in (row.tls_rpt or "").splitlines() if line.strip()]
+
+
+def mta_sts_view(row: MailDomain) -> dict:
+    served = served_hosts(row)
+    return {"mode": row.mta_sts_mode or "", "id": row.mta_sts_id or "", "tls_rpt": tls_rpt_addresses(row),
+            "ready": "mail" in served and "mta-sts" in served, "max_age": MTA_STS_MAX_AGE,
+            "policy_url": f"https://mta-sts.{row.domain}/.well-known/mta-sts.txt"}
+
+
+def set_mta_sts(db: Session, actor: User, domain_id: int, mode: str, tls_rpt) -> MailDomain:
+    """The domain's MTA-STS mode ("" off) and TLS-RPT addresses."""
+    _require_active()
+    row = get_domain(db, actor, domain_id)
+    mode = (mode or "").strip().lower()
+    if mode and mode not in MTA_STS_MODES:
+        raise MailError("The MTA-STS mode is testing, enforce or none, or empty for off.")
+    if mode and not {"mail", "mta-sts"} <= set(served_hosts(row)):
+        raise MailError(f"Serve mail.{row.domain} and mta-sts.{row.domain} first (Mail hosts): the policy is "
+                        f"published there, and enforce needs mail.{row.domain}'s own certificate.")
+    addresses = _report_addresses(tls_rpt, "TLS report")
+    old_mode, old_id, old_rpt = row.mta_sts_mode or "", row.mta_sts_id or "", tls_rpt_addresses(row)
+    if mode != old_mode:
+        row.mta_sts_mode = mode
+        row.mta_sts_id = datetime.utcnow().strftime("%Y%m%d%H%M%S") if mode else ""
+    row.tls_rpt = "\n".join(addresses)
+    db.flush()
+    if mode != old_mode and served_hosts(row):
+        try:
+            _apply_mail_hosts(row, served_hosts(row))
+        except MailError:
+            db.rollback()
+            raise
+    db.commit()
+    # The TXT records follow; one turned off leaves the zone.
+    if old_mode and not mode and old_id:
+        withdraw_dns_quietly(db, row, f"_mta-sts.{row.domain}", "TXT", f"v=STSv1; id={old_id}")
+    if old_rpt and not addresses:
+        withdraw_dns_quietly(db, row, f"_smtp._tls.{row.domain}", "TXT", render_tls_rpt(old_rpt))
+    publish_dns_quietly(db, row)
+    return row
+
+
+def render_tls_rpt(addresses: list[str]) -> str:
+    return "v=TLSRPTv1; rua=" + ",".join(f"mailto:{address}" for address in addresses)
+
+
 def webmail_host_taken(db: Session, domain: str) -> bool:
     """Whether a website name is the webmail.<domain> of a mail domain here."""
     name = (domain or "").strip().lower()
@@ -548,6 +708,10 @@ def domain_out(db: Session, row: MailDomain, owners: dict[int, User] | None = No
         "webmail_host": bool(row.webmail_host),
         "webmail_url": webmail_url(row) + "/",
         "relay": row.relay or "",
+        "dkim_selector": row.dkim_selector or DKIM_SELECTOR,
+        "dkim_state": row.dkim_state or "",
+        "mail_hosts": served_hosts(row),
+        "client_host": client_host(row),
         "mailboxes": db.query(MailAccount).filter(MailAccount.domain == row.domain).count(),
         "forwarders": db.query(MailForwarder).filter(MailForwarder.domain == row.domain).count(),
         "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -847,6 +1011,147 @@ _SPF_TOKEN_RE = re.compile(r"^[+~?-]?(?:include|ip4|ip6|a|mx|exists|ptr)(?::[A-Z
 _SPF_ALL = ("~all", "-all", "?all", "+all", "all")
 
 
+# --- DMARC: the domain's policy, as its owner sets it ----------------------------------------
+# Stored as JSON in mail_domains.dmarc_policy; "" is DEFAULT_DMARC. The record
+# is rendered from the stored fields only, so nothing typed reaches DNS as is.
+
+DMARC_POLICIES = ("none", "quarantine", "reject")
+DMARC_ALIGNMENT = ("r", "s")
+DMARC_MAX_REPORT_ADDRESSES = 5
+_DMARC_FO_RE = re.compile(r"^[01ds](?::[01ds]){0,3}$")
+DMARC_DEFAULT_POLICY = {"p": "quarantine", "sp": "", "pct": 100, "rua": [], "ruf": [], "adkim": "r", "aspf": "r",
+                        "fo": ""}
+
+
+def _report_addresses(values, what: str) -> list[str]:
+    if isinstance(values, str):
+        values = re.split(r"[\s,;]+", values)
+    clean: list[str] = []
+    for raw in values or []:
+        text = str(raw or "").strip()
+        if text.lower().startswith("mailto:"):
+            text = text[len("mailto:"):]
+        if not text:
+            continue
+        try:
+            address = normalize_destination(text)
+        except MailError as exc:
+            raise MailError(f"Each {what} address is an email address, such as dmarc@example.com.") from exc
+        if address not in clean:
+            clean.append(address)
+    if len(clean) > DMARC_MAX_REPORT_ADDRESSES:
+        raise MailError(f"At most {DMARC_MAX_REPORT_ADDRESSES} {what} addresses.")
+    return clean
+
+
+def normalize_dmarc(payload: dict) -> dict:
+    """A DMARC policy as the editor sends it, checked field by field."""
+    if not isinstance(payload, dict):
+        raise MailError("A DMARC policy has a p, and may have sp, pct, rua, ruf, adkim, aspf and fo.")
+    policy = str(payload.get("p") or "").strip().lower()
+    if policy not in DMARC_POLICIES:
+        raise MailError("The DMARC policy (p) is none, quarantine or reject.")
+    subdomains = str(payload.get("sp") or "").strip().lower()
+    if subdomains and subdomains not in DMARC_POLICIES:
+        raise MailError("The subdomain policy (sp) is none, quarantine or reject, or empty to follow p.")
+    try:
+        pct = int(payload.get("pct") if payload.get("pct") not in (None, "") else 100)
+    except (TypeError, ValueError) as exc:
+        raise MailError("The percentage (pct) is a whole number from 0 to 100.") from exc
+    if not 0 <= pct <= 100:
+        raise MailError("The percentage (pct) is a whole number from 0 to 100.")
+    alignment = {}
+    for key in ("adkim", "aspf"):
+        value = str(payload.get(key) or "r").strip().lower()
+        if value not in DMARC_ALIGNMENT:
+            raise MailError(f"{key} is r (relaxed) or s (strict).")
+        alignment[key] = value
+    failure = str(payload.get("fo") or "").strip().lower()
+    if failure and not _DMARC_FO_RE.fullmatch(failure):
+        raise MailError("The failure options (fo) are 0, 1, d or s, joined by colons, such as 1:d.")
+    return {"p": policy, "sp": subdomains, "pct": pct, "rua": _report_addresses(payload.get("rua"), "aggregate report"),
+            "ruf": _report_addresses(payload.get("ruf"), "failure report"), **alignment, "fo": failure}
+
+
+def render_dmarc(policy: dict) -> str:
+    """The _dmarc TXT record of a checked policy, tags in RFC 7489's order."""
+    parts = ["v=DMARC1", f"p={policy['p']}"]
+    if policy.get("sp"):
+        parts.append(f"sp={policy['sp']}")
+    if int(policy.get("pct", 100)) != 100:
+        parts.append(f"pct={int(policy['pct'])}")
+    if policy.get("rua"):
+        parts.append("rua=" + ",".join(f"mailto:{address}" for address in policy["rua"]))
+    if policy.get("ruf"):
+        parts.append("ruf=" + ",".join(f"mailto:{address}" for address in policy["ruf"]))
+    parts += [f"adkim={policy.get('adkim') or 'r'}", f"aspf={policy.get('aspf') or 'r'}"]
+    if policy.get("fo"):
+        parts.append(f"fo={policy['fo']}")
+    return "; ".join(parts)
+
+
+def parse_dmarc(text: str) -> dict:
+    """A DMARC record as published -> the editor's fields. Raises MailError for
+    a record that is not DMARC or that the editor could not express."""
+    tags = {}
+    for part in (text or "").split(";"):
+        key, _, value = part.strip().partition("=")
+        if key:
+            tags[key.strip().lower()] = value.strip()
+    if tags.get("v", "").upper() != "DMARC1":
+        raise MailError("That is not a DMARC record.")
+    return normalize_dmarc({
+        "p": tags.get("p"), "sp": tags.get("sp", ""), "pct": tags.get("pct", 100), "adkim": tags.get("adkim", "r"),
+        "aspf": tags.get("aspf", "r"), "fo": tags.get("fo", ""),
+        "rua": [item for item in tags.get("rua", "").split(",") if item.strip()],
+        "ruf": [item for item in tags.get("ruf", "").split(",") if item.strip()],
+    })
+
+
+def dmarc_policy(row: MailDomain) -> dict:
+    """The domain's DMARC policy: what its owner saved, or the default."""
+    try:
+        stored = json.loads(row.dmarc_policy) if row.dmarc_policy else None
+        if isinstance(stored, dict):
+            return normalize_dmarc(stored)
+    except (ValueError, MailError):
+        logger.warning("Stored DMARC policy of %s is unusable; the default applies", row.domain)
+    return dict(DMARC_DEFAULT_POLICY)
+
+
+def dmarc_external_domains(row: MailDomain, policy: dict) -> list[str]:
+    """Report domains outside the mail domain: each must publish
+    <domain>._report._dmarc.<report domain> TXT "v=DMARC1" (RFC 7489 7.1)."""
+    out = []
+    for address in policy.get("rua", []) + policy.get("ruf", []):
+        target = address.rpartition("@")[2]
+        if target != row.domain and not target.endswith("." + row.domain) and target not in out:
+            out.append(target)
+    return out
+
+
+def dmarc_view(row: MailDomain) -> dict:
+    policy = dmarc_policy(row)
+    return {"policy": policy, "record": render_dmarc(policy), "custom": bool(row.dmarc_policy),
+            "external": [{"domain": target, "name": f"{row.domain}._report._dmarc.{target}", "value": "v=DMARC1"}
+                         for target in dmarc_external_domains(row, policy)]}
+
+
+def set_dmarc(db: Session, actor: User, domain_id: int, payload: dict | None) -> MailDomain:
+    """Save the domain's DMARC policy (None goes back to the default) and put
+    the record in its zone here, replacing the one there."""
+    row = get_domain(db, actor, domain_id)
+    row.dmarc_policy = "" if payload is None else json.dumps(normalize_dmarc(payload), sort_keys=True)
+    db.commit()
+    from app.services import dns
+
+    try:
+        publish_dns(db, row, replace=False, force_keys={"dmarc"})
+    except (dns.DnsError, dns.DnsInputError) as exc:
+        logger.warning("DMARC record not published for %s: %s", row.domain, exc)
+    return row
+
+
 def _fqdn(label: str, domain: str) -> str:
     """A record name as written ("@", "mail", "x._domainkey"), made absolute
     within the domain."""
@@ -1006,10 +1311,17 @@ def dns_records(row: MailDomain) -> list[dict]:
         records.append({"key": "mx", "type": "MX", "name": domain, "value": _hostname_or_blank(), "priority": 10})
     records += [
         {"key": "spf", "type": "TXT", "name": domain, "value": suggested_spf(relay)},
-        {"key": "dkim", "type": "TXT", "name": f"{DKIM_SELECTOR}._domainkey.{domain}",
+        {"key": "dkim", "type": "TXT", "name": f"{row.dkim_selector or DKIM_SELECTOR}._domainkey.{domain}",
          "value": f"v=DKIM1; k=rsa; p={row.dkim_public}"},
-        {"key": "dmarc", "type": "TXT", "name": f"_dmarc.{domain}", "value": DEFAULT_DMARC},
     ]
+    # A rotation publishes the next key before mail is signed with it, and
+    # keeps the previous one until mail signed with it has been checked.
+    for key, selector, public in (("dkim-next", row.dkim_next_selector, row.dkim_next_public),
+                                  ("dkim-old", row.dkim_old_selector, row.dkim_old_public)):
+        if selector and public:
+            records.append({"key": key, "type": "TXT", "name": f"{selector}._domainkey.{domain}",
+                            "value": f"v=DKIM1; k=rsa; p={public}"})
+    records.append({"key": "dmarc", "type": "TXT", "name": f"_dmarc.{domain}", "value": render_dmarc(dmarc_policy(row))})
     if relay:
         for index, item in enumerate(relay.get("dns_records") or []):
             records.append({
@@ -1019,7 +1331,40 @@ def dns_records(row: MailDomain) -> list[dict]:
             })
     if ip:
         records.append({"key": "webmail", "type": "A", "name": f"webmail.{domain}", "value": ip, "optional": True})
+        # The other mail hosts: published once they are served (Mail hosts on
+        # the DNS page), and needed in DNS before their certificate is issued.
+        for label in MAIL_HOST_LABELS[1:]:
+            records.append({"key": label, "type": "A", "name": f"{label}.{domain}", "value": ip, "optional": True,
+                            "host": label})
+    # Where mail apps find the servers (RFC 6186, RFC 8314): the name they
+    # connect to is mail.<domain> once it has its own certificate.
+    host = client_host(row)
+    if host:
+        for key, service, port in (("srv-imaps", "_imaps._tcp", PORTS["imap"]),
+                                   ("srv-pop3s", "_pop3s._tcp", PORTS["pop3"]),
+                                   ("srv-submissions", "_submissions._tcp", PORTS["smtps"]),
+                                   ("srv-submission", "_submission._tcp", PORTS["submission"])):
+            records.append({"key": key, "type": "SRV", "name": f"{service}.{domain}", "value": f"1 {port} {host}",
+                            "priority": 0})
+    if "autodiscover" in served_hosts(row):
+        records.append({"key": "srv-autodiscover", "type": "SRV", "name": f"_autodiscover._tcp.{domain}",
+                        "value": f"1 443 autodiscover.{domain}", "priority": 0, "host": "autodiscover"})
+    if row.mta_sts_mode in MTA_STS_MODES and row.mta_sts_id:
+        records.append({"key": "mta-sts-txt", "type": "TXT", "name": f"_mta-sts.{domain}",
+                        "value": f"v=STSv1; id={row.mta_sts_id}", "host": "mta-sts"})
+    if tls_rpt_addresses(row):
+        records.append({"key": "tls-rpt", "type": "TXT", "name": f"_smtp._tls.{domain}",
+                        "value": render_tls_rpt(tls_rpt_addresses(row))})
     return records
+
+
+# Records the panel alone writes: in the zone they always follow the panel.
+PANEL_RECORD_KEYS = ("srv-imaps", "srv-pop3s", "srv-submissions", "srv-submission", "srv-autodiscover",
+                     "mta-sts-txt", "tls-rpt")
+
+
+def _srv_text(text: str) -> str:
+    return " ".join(part.rstrip(".").lower() for part in (text or "").split())
 
 
 def _resolve(name: str, rtype: str) -> list[str] | None:
@@ -1049,6 +1394,13 @@ def _resolve(name: str, rtype: str) -> list[str] | None:
         else:
             out.append(item.to_text())
     return out
+
+
+DKIM_KEYS = ("dkim", "dkim-next", "dkim-old")
+
+
+def _dkim_record_public(row: MailDomain, key: str) -> str:
+    return {"dkim": row.dkim_public, "dkim-next": row.dkim_next_public, "dkim-old": row.dkim_old_public}.get(key) or ""
 
 
 def _zone_lookup(zone_name: str):
@@ -1094,13 +1446,16 @@ def check_dns(row: MailDomain, lookup=None, zone_name: str = "") -> list[dict]:
             txt = lookup(name, "TXT")
             found = None if txt is None else [t for t in txt if t.lower().startswith("v=spf1")]
             ok = bool(found) and len(found) == 1 and spf_covers(found[0], relay)
-        elif key == "dkim":
+        elif key in DKIM_KEYS:
+            public = _dkim_record_public(row, key)
             found = lookup(name, "TXT")
-            ok = found is not None and any(row.dkim_public and row.dkim_public in t.replace(" ", "") for t in found)
+            ok = found is not None and any(public and public in t.replace(" ", "") for t in found)
         elif key == "dmarc":
             txt = lookup(name, "TXT")
             found = None if txt is None else [t for t in txt if t.upper().startswith("V=DMARC1")]
-            ok = bool(found)
+            # Any DMARC record will do until the owner sets a policy; then it
+            # has to be that one.
+            ok = bool(found) and (not row.dmarc_policy or any(_squash(t) == _squash(want) for t in found))
         elif key == "mx":
             found = lookup(name, "MX")
             # mail.<domain>, the server's own name, or any name that points here.
@@ -1111,6 +1466,10 @@ def check_dns(row: MailDomain, lookup=None, zone_name: str = "") -> list[dict]:
         elif rtype in ("MX", "CNAME"):
             found = lookup(name, rtype)
             ok = found is not None and want.rstrip(".").lower() in found
+        elif rtype == "SRV":
+            found = lookup(name, rtype)
+            wanted = _srv_text(f"{record.get('priority') or 0} {want}")
+            ok = found is not None and any(_srv_text(item) == wanted for item in found)
         else:
             found = lookup(name, rtype)
             ok = found is not None and want in found
@@ -1156,6 +1515,10 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
     return {
         "domain": row.domain,
         "records": records,
+        "dkim": dkim_view(row),
+        "dmarc": dmarc_view(row),
+        "hosts": {"served": served_hosts(row), "available": list(MAIL_HOST_LABELS), "client": client_settings(row)},
+        "mta_sts": mta_sts_view(row),
         "hosted_zone": zone.name if zone else "",
         "relay": {
             "choice": row.relay or "",
@@ -1168,7 +1531,8 @@ def dns_view(db: Session, row: MailDomain, actor: User, check: bool = True) -> d
     }
 
 
-def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
+def publish_dns(db: Session, row: MailDomain, *, replace: bool, force_keys: set[str] | frozenset = frozenset(),
+                hosts: set[str] | None = None) -> list[str]:
     """Keep the domain's mail records in its zone, when DNS Manager serves it.
 
     DKIM and the relay's records always follow the panel, and so does an SPF
@@ -1196,15 +1560,23 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
     def same(existing: list[str], content: str, rtype: str) -> bool:
         if rtype == "TXT":
             return [dns._untxt(item) for item in existing] == [dns._untxt(content)]
+        if rtype == "SRV":
+            return [_srv_text(item) for item in existing] == [_srv_text(content)]
         return [item.rstrip(".").lower() for item in existing] == [content.rstrip(".").lower()]
 
+    wanted_hosts = set(served_hosts(row)) | set(hosts or ())
     for record in dns_records(row):
         key, rtype = record["key"], record["type"]
         if not record["value"]:
             continue
+        if record.get("host") and record["host"] not in wanted_hosts:
+            continue
         name = dns._absolute(record["name"])
         if rtype == "MX":
             content = f"{record.get('priority') if record.get('priority') is not None else 10} {dns._absolute(record['value'])}"
+        elif rtype == "SRV":
+            weight, port, target = record["value"].split()
+            content = f"{record.get('priority') or 0} {weight} {port} {dns._absolute(target)}"
         elif rtype == "CNAME":
             content = dns._absolute(record["value"])
         elif rtype == "TXT":
@@ -1212,8 +1584,8 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
         else:
             content = record["value"]
         existing = current(name, rtype)
-        if key == "dkim" or record.get("source") == "relay":
-            if rtype == "TXT" and key != "dkim":
+        if key in DKIM_KEYS or key in PANEL_RECORD_KEYS or record.get("source") == "relay":
+            if rtype == "TXT" and key not in DKIM_KEYS and key not in PANEL_RECORD_KEYS:
                 # Another TXT of the same name (a verification string, say) stays.
                 wanted = [item for item in existing if dns._untxt(item) != record["value"]] + [content]
                 if sorted(wanted) != sorted(existing):
@@ -1227,7 +1599,7 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
                 continue
             if not spf_now or replace or (len(spf_now) == 1 and spf_is_panels(spf_now[0])):
                 changes[(name, rtype)] = (ttl, others + [content])
-        elif not existing or (replace and not same(existing, content, rtype)):
+        elif not existing or ((replace or key in force_keys) and not same(existing, content, rtype)):
             # mx, mail, dmarc, webmail
             changes[(name, rtype)] = (ttl, [content])
     # A name that is a CNAME cannot hold another record. The button says so;
@@ -1245,11 +1617,11 @@ def publish_dns(db: Session, row: MailDomain, *, replace: bool) -> list[str]:
     return sorted({name.rstrip(".") for name, _ in changes})
 
 
-def publish_dns_quietly(db: Session, row: MailDomain) -> list[str]:
+def publish_dns_quietly(db: Session, row: MailDomain, hosts: set[str] | None = None) -> list[str]:
     from app.services import dns
 
     try:
-        return publish_dns(db, row, replace=False)
+        return publish_dns(db, row, replace=False, hosts=hosts)
     except (MailError, dns.DnsError, dns.DnsInputError) as exc:
         logger.warning("Mail records not published for %s: %s", row.domain, exc)
         return []
@@ -1268,6 +1640,259 @@ def publish_all_quietly(db: Session, zone_name: str = "") -> list[str]:
             continue
         written += publish_dns_quietly(db, row)
     return written
+
+
+def withdraw_dns(db: Session, row: MailDomain, name: str, rtype: str, value: str) -> bool:
+    """Take one record the panel published out of the domain's zone here,
+    leaving anything else at that name. True when it was there."""
+    from app.services import dns
+
+    zone = _hosted_zone(db, row)
+    if zone is None:
+        return False
+    data = dns._zone_data(zone.name)
+    absolute = dns._absolute(name)
+    rrset = dns._rrset(data, absolute, rtype)
+    contents = dns._contents(rrset)
+
+    def matches(content: str) -> bool:
+        text = dns._untxt(content) if rtype == "TXT" else content
+        return _squash(text) == _squash(value)
+
+    kept = [content for content in contents if not matches(content)]
+    if len(kept) == len(contents):
+        return False
+    dns._serial_follows_edits(zone.name, data)
+    dns._patch(zone.name, {(absolute, rtype): ((rrset or {}).get("ttl", dns.DEFAULT_TTL), kept)})
+    return True
+
+
+def withdraw_dns_quietly(db: Session, row: MailDomain, name: str, rtype: str, value: str) -> bool:
+    from app.services import dns
+
+    try:
+        return withdraw_dns(db, row, name, rtype, value)
+    except (MailError, dns.DnsError, dns.DnsInputError) as exc:
+        logger.warning("Mail record %s %s not withdrawn: %s", name, rtype, exc)
+        return False
+
+
+# --- DKIM rotation ------------------------------------------------------------------------------
+# Two selectors, so no signature ever fails: the next key is published under
+# a selector of its own (s<date>) while mail is still signed with the current
+# one. Exim switches only once public DNS shows the new record - or when it
+# does not show the current one either, so the switch breaks nothing - and
+# the previous key stays published for DKIM_RETIRE_DAYS, until mail signed
+# with it has been checked, before it and its record go. The maintenance
+# loop moves each domain along; an administrator may also have it rotate on
+# its own every dkim_rotate_days.
+
+DKIM_MIN_PUBLISH = 3600
+DKIM_RETIRE_DAYS = 7
+DKIM_STATES = ("", "publishing", "retiring")
+
+
+def new_dkim_selector(row: MailDomain, now: datetime) -> str:
+    base = "s" + now.strftime("%Y%m%d")
+    taken = {row.dkim_selector or DKIM_SELECTOR, row.dkim_next_selector, row.dkim_old_selector}
+    selector, number = base, 1
+    while selector in taken:
+        number += 1
+        selector = f"{base}-{number}"
+    return selector
+
+
+def dkim_next_step(row: MailDomain, now: datetime, *, current_status: str = "", next_status: str = "",
+                   rotate_days: int = 0, retire_days: int = DKIM_RETIRE_DAYS, manual: bool = False) -> str:
+    """What a domain's DKIM rotation does next: "switch", "retire", "start",
+    "wait" or "none". The DNS statuses are check_dns's (ok, missing,
+    different, unknown) for the current and the next selector's record."""
+    state = row.dkim_state or ""
+    since = row.dkim_state_at or now
+    if state == "publishing":
+        if next_status == "unknown":
+            return "wait"
+        safe = next_status == "ok" or current_status in ("missing", "different")
+        if safe and (manual or (now - since).total_seconds() >= DKIM_MIN_PUBLISH):
+            return "switch"
+        return "wait"
+    if state == "retiring":
+        if manual or (now - since).total_seconds() >= max(1, retire_days) * 86400:
+            return "retire"
+        return "wait"
+    if rotate_days > 0:
+        last = row.dkim_rotated_at or row.created_at
+        if last is not None and (now - last).total_seconds() >= rotate_days * 86400:
+            return "start"
+    return "none"
+
+
+def start_dkim_rotation(db: Session, row: MailDomain, now: datetime | None = None) -> MailDomain:
+    """Make and publish the next key; mail stays signed with the current one."""
+    if (row.dkim_state or "") != "":
+        raise MailError("A DKIM key rotation is already under way for this domain.", status=409)
+    now = now or datetime.utcnow()
+    selector = new_dkim_selector(row, now)
+    public = _dkim_public(row.domain, selector)
+    row.dkim_next_selector, row.dkim_next_public = selector, public
+    row.dkim_state, row.dkim_state_at = "publishing", now
+    db.commit()
+    publish_dns_quietly(db, row)
+    return row
+
+
+def _dkim_statuses(db: Session, row: MailDomain) -> tuple[str, str]:
+    """check_dns's status of the current and the next selector's record in
+    public DNS: what receiving servers see."""
+    statuses = {record["key"]: record["status"] for record in check_dns(row) if record["key"] in DKIM_KEYS}
+    return statuses.get("dkim", "unknown"), statuses.get("dkim-next", "unknown")
+
+
+def _switch_dkim(db: Session, row: MailDomain, now: datetime) -> None:
+    previous = (row.dkim_selector or DKIM_SELECTOR, row.dkim_public or "")
+    row.dkim_selector, row.dkim_public = row.dkim_next_selector, row.dkim_next_public
+    row.dkim_old_selector, row.dkim_old_public = previous
+    row.dkim_next_selector, row.dkim_next_public = "", ""
+    row.dkim_state, row.dkim_state_at, row.dkim_rotated_at = "retiring", now, now
+    db.flush()
+    try:
+        sync(db)
+    except MailError:
+        db.rollback()
+        raise
+    db.commit()
+    publish_dns_quietly(db, row)
+
+
+def _retire_dkim(db: Session, row: MailDomain) -> None:
+    selector, public = row.dkim_old_selector, row.dkim_old_public
+    if selector:
+        result = shell.privileged("mail-dkim-drop", helper_args=[row.domain, selector], check=False,
+                                  fallback=["true"])
+        if result.returncode != 0:
+            logger.warning("DKIM key %s of %s not removed: %s", selector, row.domain, result.stderr)
+        if public:
+            withdraw_dns_quietly(db, row, f"{selector}._domainkey.{row.domain}", "TXT", f"v=DKIM1; k=rsa; p={public}")
+    row.dkim_old_selector, row.dkim_old_public = "", ""
+    row.dkim_state, row.dkim_state_at = "", None
+    db.commit()
+
+
+def cancel_dkim_rotation(db: Session, row: MailDomain) -> MailDomain:
+    """Drop the next key before mail was ever signed with it."""
+    if row.dkim_state != "publishing":
+        raise MailError("There is no new DKIM key waiting to be used.", status=409)
+    selector, public = row.dkim_next_selector, row.dkim_next_public
+    if selector:
+        shell.privileged("mail-dkim-drop", helper_args=[row.domain, selector], check=False, fallback=["true"])
+        if public:
+            withdraw_dns_quietly(db, row, f"{selector}._domainkey.{row.domain}", "TXT", f"v=DKIM1; k=rsa; p={public}")
+    row.dkim_next_selector, row.dkim_next_public = "", ""
+    row.dkim_state, row.dkim_state_at = "", None
+    db.commit()
+    return row
+
+
+def advance_dkim(db: Session, row: MailDomain, *, now: datetime | None = None, manual: bool = False) -> str:
+    """Take one step of the domain's rotation if it is due; returns the step."""
+    now = now or datetime.utcnow()
+    settings = current_settings()
+    current_status = next_status = ""
+    if row.dkim_state == "publishing":
+        current_status, next_status = _dkim_statuses(db, row)
+    step = dkim_next_step(row, now, current_status=current_status, next_status=next_status,
+                          rotate_days=int(settings.get("dkim_rotate_days") or 0),
+                          retire_days=int(settings.get("dkim_retire_days") or DKIM_RETIRE_DAYS), manual=manual)
+    if step == "switch":
+        _switch_dkim(db, row, now)
+    elif step == "retire":
+        _retire_dkim(db, row)
+    elif step == "start" and not manual:
+        start_dkim_rotation(db, row, now)
+    return step
+
+
+MAINTENANCE_SECONDS = 900
+_maintenance_started = False
+
+
+def maintenance_tick(db: Session, now: datetime | None = None) -> dict[str, str]:
+    """One pass of the background work every mail domain may have due: the
+    next step of its DKIM rotation. A domain that fails is logged and left
+    for the next pass. Returns {domain: step} for the steps taken."""
+    if not active():
+        return {}
+    done = {}
+    for row in db.query(MailDomain).order_by(MailDomain.domain).all():
+        try:
+            step = advance_dkim(db, row, now=now)
+        except Exception:  # noqa: BLE001 - one domain never stops the others
+            logger.warning("DKIM rotation step failed for %s", row.domain, exc_info=True)
+            db.rollback()
+            continue
+        if step not in ("none", "wait"):
+            done[row.domain] = step
+            logger.info("DKIM rotation of %s: %s", row.domain, step)
+    return done
+
+
+def _maintenance_lock():
+    """An exclusive lock, so of several API workers one does the pass."""
+    try:
+        import fcntl
+    except ImportError:  # not Linux: tests and development
+        return None
+    path = panel_settings.SETTINGS_DIR / "mail-maintenance.lock"
+    try:
+        handle = open(path, "a")  # noqa: SIM115 - held for the pass
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return handle
+
+
+def start_maintenance_daemon() -> None:
+    global _maintenance_started
+    if _maintenance_started:
+        return
+    _maintenance_started = True
+
+    def loop() -> None:
+        from app.core.database import SessionLocal
+
+        while True:
+            time.sleep(MAINTENANCE_SECONDS)
+            lock = _maintenance_lock()
+            if lock is False:
+                continue
+            try:
+                with SessionLocal() as db:
+                    maintenance_tick(db)
+            except Exception:  # noqa: BLE001 - the loop outlives any one failure
+                logger.warning("Mail maintenance failed", exc_info=True)
+            finally:
+                if lock:
+                    lock.close()
+
+    threading.Thread(target=loop, name="spanel-mail-maintenance", daemon=True).start()
+
+
+def dkim_view(row: MailDomain) -> dict:
+    settings = current_settings()
+    retire_days = int(settings.get("dkim_retire_days") or DKIM_RETIRE_DAYS)
+    retire_at = None
+    if row.dkim_state == "retiring" and row.dkim_state_at:
+        retire_at = (row.dkim_state_at + timedelta(days=retire_days)).isoformat()
+    return {
+        "selector": row.dkim_selector or DKIM_SELECTOR,
+        "state": row.dkim_state or "",
+        "state_at": row.dkim_state_at.isoformat() if row.dkim_state_at else None,
+        "next_selector": row.dkim_next_selector or "",
+        "old_selector": row.dkim_old_selector or "",
+        "rotated_at": row.dkim_rotated_at.isoformat() if row.dkim_rotated_at else None,
+        "retire_at": retire_at,
+        "rotate_days": int(settings.get("dkim_rotate_days") or 0),
+    }
 
 
 def set_domain_relay(db: Session, actor: User, domain_id: int, choice: str) -> MailDomain:
@@ -1293,7 +1918,8 @@ def build_state(db: Session) -> dict:
     for row in domains:
         by_owner.setdefault(row.owner_id, []).append(row.domain)
     state: dict = {
-        "domains": [{"domain": row.domain, "catch_all": row.catch_all or ""} for row in domains],
+        "domains": [{"domain": row.domain, "catch_all": row.catch_all or "",
+                     "dkim_selector": row.dkim_selector or DKIM_SELECTOR} for row in domains],
         "mailboxes": [],
         "forwarders": [],
         # A mailbox may send as any domain of the account that owns it.
@@ -1332,6 +1958,14 @@ def build_state(db: Session) -> dict:
     state["relay_routes"] = {row.domain: row.relay for row in domains if row.relay == "direct" or row.relay in relay_ids}
     default = _stored().get("default_relay") or ""
     state["default_relay"] = default if default in relay_ids else ""
+    # Switched-on autoresponders of mailboxes; the helper writes each as a
+    # Sieve vacation into the mailbox and removes the others'.
+    boxes = set(state["senders"])
+    state["autoresponders"] = [
+        autoresponder_state(row)
+        for row in db.query(MailAutoresponder).order_by(MailAutoresponder.domain, MailAutoresponder.local_part).all()
+        if row.enabled and row.address in boxes
+    ]
     return state
 
 
@@ -1479,6 +2113,12 @@ def save_settings(payload: dict) -> dict:
         merged["max_message_mb"] = whole("max_message_mb", 1, 200, "The largest message is 1 to 200 MB.")
     if "default_quota_mb" in payload:
         merged["default_quota_mb"] = whole("default_quota_mb", 1, MAX_USER_QUOTA_MB, "The size of a new mailbox is 1 to 51200 MB.")
+    if "dkim_rotate_days" in payload:
+        merged["dkim_rotate_days"] = whole("dkim_rotate_days", 0, 3650, "DKIM keys rotate every 0 (never on their own) to 3650 days.")
+        if 0 < merged["dkim_rotate_days"] < 30:
+            raise MailError("Rotate DKIM keys every 30 days or more, or 0 for only by hand.")
+    if "dkim_retire_days" in payload:
+        merged["dkim_retire_days"] = whole("dkim_retire_days", 1, 60, "A replaced DKIM key stays published 1 to 60 days.")
     if "spam_header_score" in payload:
         merged["spam_header_score"] = score("spam_header_score")
     if "spam_rewrite_score" in payload:
@@ -1742,6 +2382,101 @@ def queue_size() -> int | None:
     return int(text) if result.returncode == 0 and text.isdigit() else None
 
 
+# The queue: listed from `exim -bp`, each message acted on by its id. Exim
+# 4.97 (Ubuntu 24.04) writes ids as 6-11-4 characters, older ones 6-6-2.
+QUEUE_ID_RE = re.compile(r"^[0-9A-Za-z]{6}-(?:[0-9A-Za-z]{11}-[0-9A-Za-z]{4}|[0-9A-Za-z]{6}-[0-9A-Za-z]{2})$")
+QUEUE_ACTIONS = ("retry", "freeze", "thaw", "delete")
+MAX_QUEUE_BATCH = 100
+_QUEUE_HEAD_RE = re.compile(
+    r"^\s*(?P<age>\d+[smhdw])\s+(?P<size>\d+(?:\.\d+)?[KMG]?)\s+(?P<id>\S+)\s+<(?P<sender>[^>]*)>"
+    r"(?P<frozen>\s+\*\*\* frozen \*\*\*)?\s*$")
+_QUEUE_RCPT_RE = re.compile(r"^\s+(?:(?P<mark>\+?D)\s+)?(?P<address>\S+)\s*$")
+_AGE_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_queue(text: str) -> list[dict]:
+    """`exim -bp` output -> one dict a message: id, age (as printed and in
+    seconds), size, sender ("" for a bounce), frozen, recipients with whether
+    each is delivered. Lines that fit nothing are skipped."""
+    messages: list[dict] = []
+    current = None
+    for line in (text or "").splitlines():
+        if not line.strip():
+            current = None
+            continue
+        head = _QUEUE_HEAD_RE.match(line)
+        if head and QUEUE_ID_RE.fullmatch(head.group("id")):
+            age = head.group("age")
+            current = {"id": head.group("id"), "age": age, "age_seconds": int(age[:-1]) * _AGE_SECONDS[age[-1]],
+                       "size": head.group("size"), "sender": head.group("sender"),
+                       "frozen": bool(head.group("frozen")), "recipients": []}
+            messages.append(current)
+            continue
+        rcpt = _QUEUE_RCPT_RE.match(line)
+        if current is not None and rcpt:
+            current["recipients"].append({"address": rcpt.group("address"), "delivered": bool(rcpt.group("mark"))})
+    for message in messages:
+        message["pending"] = sum(1 for item in message["recipients"] if not item["delivered"])
+    return messages
+
+
+def queue_list(q: str = "", state: str = "", page: int = 1, per_page: int = 50) -> dict:
+    """The queue, oldest first, searched by id, sender or recipient; state
+    "frozen" (held) or "active" narrows it."""
+    _require_active()
+    result = _helper("mail-queue-list", timeout=120)
+    messages = parse_queue(result.stdout)
+    term = (q or "").strip().lower()
+    if term:
+        messages = [item for item in messages if term in item["id"].lower() or term in item["sender"].lower()
+                    or any(term in rcpt["address"].lower() for rcpt in item["recipients"])]
+    if state == "frozen":
+        messages = [item for item in messages if item["frozen"]]
+    elif state == "active":
+        messages = [item for item in messages if not item["frozen"]]
+    messages.sort(key=lambda item: -item["age_seconds"])
+    page, per_page = _page(page, per_page)
+    return {"items": messages[(page - 1) * per_page: page * per_page], "total": len(messages),
+            "frozen": sum(1 for item in messages if item["frozen"]), "page": page, "per_page": per_page}
+
+
+def _queue_id(value: str) -> str:
+    qid = str(value or "").strip()
+    if not QUEUE_ID_RE.fullmatch(qid):
+        raise MailError("That is not a message id of the mail queue.")
+    return qid
+
+
+def queue_message(qid: str) -> dict:
+    """A queued message's envelope and headers - never its body."""
+    _require_active()
+    result = _helper("mail-queue-show", _queue_id(qid), timeout=60)
+    return {"id": qid, "headers": result.stdout or ""}
+
+
+def queue_action(action: str, ids) -> list[str]:
+    """retry, freeze (hold), thaw (release) or delete messages; Exim's lines."""
+    _require_active()
+    if action not in QUEUE_ACTIONS:
+        raise MailError("The queue actions are retry, freeze, thaw and delete.")
+    clean = []
+    for value in ids or []:
+        qid = _queue_id(value)
+        if qid not in clean:
+            clean.append(qid)
+    if not clean:
+        raise MailError("Choose at least one message.")
+    if len(clean) > MAX_QUEUE_BATCH:
+        raise MailError(f"At most {MAX_QUEUE_BATCH} messages at a time.")
+    result = _helper("mail-queue-action", action, *clean, timeout=120)
+    return [line for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def queue_retry_all() -> None:
+    _require_active()
+    _helper("mail-queue-retry-all", timeout=60)
+
+
 def _controller(path: str):
     try:
         key = RSPAMD_KEY_FILE.read_text(encoding="utf-8").strip()
@@ -1883,13 +2618,42 @@ def sso_url(db: Session, actor: User, account_id: int) -> str:
 
 # --- backups ---------------------------------------------------------------------------------------
 
+PEM_KEY_RE = re.compile(r"^-----BEGIN (?:RSA )?PRIVATE KEY-----\n[A-Za-z0-9+/=\n]{100,12000}\n-----END (?:RSA )?PRIVATE KEY-----\n?$")
+
+
+def _dkim_keys_for_backup(row: MailDomain) -> dict[str, str]:
+    """The domain's DKIM private keys in use ({selector: PEM}), so a restore
+    signs with the keys its DNS already publishes instead of new ones."""
+    if not active():
+        return {}
+    result = shell.privileged("mail-dkim-export", helper_args=[row.domain], check=False, sensitive=True,
+                              fallback=["bash", "-lc", "echo '{}'"])
+    try:
+        keys = json.loads((result.stdout or "").strip().splitlines()[-1]) if result.returncode == 0 else {}
+    except (IndexError, ValueError):
+        keys = {}
+    wanted = {row.dkim_selector or DKIM_SELECTOR, row.dkim_next_selector, row.dkim_old_selector} - {""}
+    return {str(selector): str(pem) for selector, pem in (keys or {}).items()
+            if selector in wanted and PEM_KEY_RE.fullmatch(str(pem).replace("\r\n", "\n"))}
+
+
 def backup_manifest(db: Session, user: User) -> dict:
-    """An account's mail domains, mailboxes (password hashes) and forwarders."""
+    """An account's mail domains (with their DKIM keys), mailboxes (password
+    hashes), forwarders and autoresponders."""
     domains = db.query(MailDomain).filter(MailDomain.owner_id == user.id).order_by(MailDomain.domain).all()
     names = [row.domain for row in domains]
     return {
-        "domains": [{"domain": row.domain, "catch_all": row.catch_all or "", "relay": row.relay or ""}
+        "domains": [{"domain": row.domain, "catch_all": row.catch_all or "", "relay": row.relay or "",
+                     "dkim_selector": row.dkim_selector or DKIM_SELECTOR,
+                     "dkim_keys": _dkim_keys_for_backup(row),
+                     "dmarc": dmarc_policy(row) if row.dmarc_policy else None,
+                     "tls_rpt": tls_rpt_addresses(row)}
                     for row in domains],
+        "autoresponders": [{"local_part": row.local_part, "domain": row.domain, "subject": row.subject,
+                            "body": row.body, "enabled": bool(row.enabled), "start_date": row.start_date or "",
+                            "end_date": row.end_date or "", "interval_days": int(row.interval_days or 1)}
+                           for row in db.query(MailAutoresponder).filter(MailAutoresponder.domain.in_(names or [""]))
+                           .order_by(MailAutoresponder.domain, MailAutoresponder.local_part).all()],
         "mailboxes": [{"local_part": account.local_part, "domain": account.domain, "password_hash": account.password_hash,
                        "quota_mb": account.quota_mb, "enabled": bool(account.enabled)}
                       for account in db.query(MailAccount).filter(MailAccount.owner_id == user.id)
@@ -1932,6 +2696,27 @@ def restore_manifest(db: Session, user: User, section, stage_mail) -> list[str]:
         row.catch_all = normalize_destination(catch_all) if catch_all else ""
         relay = str(entry.get("relay") or "")
         row.relay = relay if relay == "direct" or relay in {item["id"] for item in _relays()} else ""
+        if isinstance(entry.get("tls_rpt"), list):
+            try:
+                row.tls_rpt = "\n".join(_report_addresses(entry["tls_rpt"], "TLS report"))
+            except MailError as exc:
+                raise ValueError(f"Invalid TLS report address for {name} in backup: {exc.message}") from exc
+        if isinstance(entry.get("dmarc"), dict):
+            try:
+                row.dmarc_policy = json.dumps(normalize_dmarc(entry["dmarc"]), sort_keys=True)
+            except MailError as exc:
+                raise ValueError(f"Invalid DMARC policy for {name} in backup: {exc.message}") from exc
+        # The key its DNS publishes comes back with it; without one (an older
+        # archive) mail-sync makes a new key and the DNS page shows the record.
+        keys = entry.get("dkim_keys") if isinstance(entry.get("dkim_keys"), dict) else {}
+        selector = str(entry.get("dkim_selector") or DKIM_SELECTOR)
+        pem = str(keys.get(selector) or "").replace("\r\n", "\n")
+        if DKIM_SELECTOR_RE.fullmatch(selector) and PEM_KEY_RE.fullmatch(pem):
+            public = _import_dkim_key(name, selector, pem)
+            if public:
+                row.dkim_selector, row.dkim_public = selector, public
+                row.dkim_next_selector = row.dkim_next_public = row.dkim_old_selector = row.dkim_old_public = ""
+                row.dkim_state, row.dkim_state_at = "", None
         db.flush()
     for entry in section.get("mailboxes") or []:
         try:
@@ -1974,19 +2759,127 @@ def restore_manifest(db: Session, user: User, section, stage_mail) -> list[str]:
         else:
             row.destinations = "\n".join(targets)
         db.flush()
+    owned = {row.domain for row in db.query(MailDomain).filter(MailDomain.owner_id == user.id).all()}
+    for entry in section.get("autoresponders") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            local = normalize_local(str(entry.get("local_part") or ""))
+            domain = normalize_domain(str(entry.get("domain") or ""))
+            values = normalize_autoresponder(entry.get("subject"), entry.get("body"), entry.get("start_date"),
+                                             entry.get("end_date"), entry.get("interval_days") or 1)
+        except MailError as exc:
+            raise ValueError(f"Invalid autoresponder in backup: {exc.message}") from exc
+        if domain not in owned:
+            raise ValueError(f"Autoresponder outside the account's mail domains: {local}@{domain}")
+        row = db.query(MailAutoresponder).filter(MailAutoresponder.domain == domain,
+                                                 MailAutoresponder.local_part == local).first()
+        if row is None:
+            row = MailAutoresponder(domain=domain, local_part=local)
+            db.add(row)
+        for key, value in values.items():
+            setattr(row, key, value)
+        row.enabled = bool(entry.get("enabled", True))
+        db.flush()
     return restored
+
+
+def _import_dkim_key(domain: str, selector: str, pem: str) -> str:
+    """Put a DKIM private key from a backup in place; its public key, or ""."""
+    result = shell.privileged("mail-dkim-import", helper_args=[domain, selector], input=pem, check=False,
+                              sensitive=True, fallback=["true"])
+    lines = (result.stdout or "").strip().splitlines()
+    if result.returncode != 0 or not lines or not re.fullmatch(r"[A-Za-z0-9+/=]{200,1000}", lines[-1]):
+        logger.warning("DKIM key of %s not restored: %s", domain, _helper_message(result.stderr))
+        return ""
+    return lines[-1]
 
 
 # --- disk space ------------------------------------------------------------------------------------
 
-def client_settings() -> dict:
-    host = _hostname_or_blank()
+def client_settings(row: MailDomain | None = None) -> dict:
+    host = client_host(row)
     return {"host": host, "imap_port": PORTS["imap"], "pop3_port": PORTS["pop3"], "smtp_port": PORTS["smtps"],
             "submission_port": PORTS["submission"], "webmail": webmail_url()}
 
 # --- autoresponders ------------------------------------------------------------------------------
+# A Sieve vacation in the mailbox: mail-sync hands the list to the helper,
+# which renders each one (spanel_mailtool.render_vacation) into the mailbox's
+# home, where Dovecot runs it on delivery (sieve_before2). Only a mailbox can
+# answer: mail to a forwarder never reaches Dovecot.
 
-def create_autoresponder(db: Session, actor: User, domain_id: int, local_part: str, subject: str, body: str) -> MailAutoresponder:
+AUTORESPONDER_SUBJECT_MAX = 255
+AUTORESPONDER_BODY_MAX = 8000
+AUTORESPONDER_DAYS = (1, 30)
+
+
+def _clean_text(value, limit: int, multiline: bool, what: str) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.strip() if not multiline else text.strip("\n").rstrip()
+    if not text:
+        raise MailError(f"The autoresponder needs a {what}.")
+    if len(text) > limit:
+        raise MailError(f"The autoresponder's {what} is at most {limit} characters.")
+    for char in text:
+        code = ord(char)
+        if (char == "\n" and multiline) or char == "\t":
+            continue
+        if code < 32 or code == 127 or 0x80 <= code < 0xA0 or char in "  ":
+            raise MailError(f"The autoresponder's {what} cannot contain control characters.")
+    return text
+
+
+def _clean_date(value, what: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise MailError(f"The {what} date is a day such as 2026-12-24.") from exc
+    if not 1900 <= parsed.year <= 2199:
+        raise MailError(f"The {what} date is a day such as 2026-12-24.")
+    return parsed.isoformat()
+
+
+def normalize_autoresponder(subject, body, start_date="", end_date="", interval_days=1) -> dict:
+    """An autoresponder as typed, checked the way the helper checks it."""
+    start, end = _clean_date(start_date, "start"), _clean_date(end_date, "end")
+    if start and end and end < start:
+        raise MailError("The autoresponder ends before it starts.")
+    try:
+        days = int(interval_days if interval_days not in (None, "") else 1)
+    except (TypeError, ValueError) as exc:
+        raise MailError("Answer the same sender at most once every 1 to 30 days.") from exc
+    if not AUTORESPONDER_DAYS[0] <= days <= AUTORESPONDER_DAYS[1]:
+        raise MailError("Answer the same sender at most once every 1 to 30 days.")
+    return {
+        "subject": _clean_text(subject, AUTORESPONDER_SUBJECT_MAX, False, "subject"),
+        "body": _clean_text(body, AUTORESPONDER_BODY_MAX, True, "message"),
+        "start_date": start,
+        "end_date": end,
+        "interval_days": days,
+    }
+
+
+def autoresponder_state(row: MailAutoresponder) -> dict:
+    """What mail-sync sends the helper for one autoresponder."""
+    return {"address": row.address, "subject": row.subject, "body": row.body, "start": row.start_date or "",
+            "end": row.end_date or "", "days": int(row.interval_days or 1)}
+
+
+def _sync_or_rollback(db: Session) -> None:
+    try:
+        sync(db)
+    except MailError:
+        db.rollback()
+        raise
+    db.commit()
+
+
+def create_autoresponder(db: Session, actor: User, domain_id: int, local_part: str, subject: str, body: str,
+                         *, enabled: bool = True, start_date: str = "", end_date: str = "",
+                         interval_days: int = 1) -> MailAutoresponder:
     _require_active()
     domain = get_domain(db, actor, domain_id)
     if not _is_admin(actor) and getattr(actor, "package", None) is not None:
@@ -2002,27 +2895,35 @@ def create_autoresponder(db: Session, actor: User, domain_id: int, local_part: s
     local = normalize_local(local_part)
     if db.query(MailAutoresponder).filter(MailAutoresponder.domain == domain.domain, MailAutoresponder.local_part == local).first():
         raise MailError("That address already has an autoresponder.", status=409)
-    row = MailAutoresponder(domain=domain.domain, local_part=local, subject=subject, body=body)
+    if not db.query(MailAccount).filter(MailAccount.domain == domain.domain, MailAccount.local_part == local).first():
+        raise MailError("An autoresponder answers the mail of a mailbox: create the mailbox first.")
+    values = normalize_autoresponder(subject, body, start_date, end_date, interval_days)
+    row = MailAutoresponder(domain=domain.domain, local_part=local, enabled=bool(enabled), **values)
     db.add(row)
     db.flush()
-    try:
-        sync(db)
-    except Exception as exc:
-        db.rollback()
-        raise exc
+    _sync_or_rollback(db)
+    db.refresh(row)
     return row
 
-def update_autoresponder(db: Session, actor: User, autoresponder_id: int, subject: str, body: str) -> MailAutoresponder:
+
+def update_autoresponder(db: Session, actor: User, autoresponder_id: int, subject: str, body: str,
+                         *, enabled: bool | None = None, start_date: str | None = None, end_date: str | None = None,
+                         interval_days: int | None = None) -> MailAutoresponder:
     row = get_autoresponder(db, actor, autoresponder_id)
-    row.subject = subject
-    row.body = body
+    values = normalize_autoresponder(
+        subject, body,
+        row.start_date if start_date is None else start_date,
+        row.end_date if end_date is None else end_date,
+        row.interval_days if interval_days is None else interval_days,
+    )
+    for key, value in values.items():
+        setattr(row, key, value)
+    if enabled is not None:
+        row.enabled = bool(enabled)
     db.flush()
-    try:
-        sync(db)
-    except Exception as exc:
-        db.rollback()
-        raise exc
+    _sync_or_rollback(db)
     return row
+
 
 def get_autoresponder(db: Session, actor: User, autoresponder_id: int) -> MailAutoresponder:
     row = db.query(MailAutoresponder).filter(MailAutoresponder.id == autoresponder_id).first()
@@ -2036,24 +2937,33 @@ def delete_autoresponder(db: Session, actor: User, autoresponder_id: int) -> str
     address = row.address
     db.delete(row)
     db.flush()
-    try:
-        sync(db)
-    except Exception as exc:
-        db.rollback()
-        raise exc
+    _sync_or_rollback(db)
     return address
+
 
 def autoresponder_out(db: Session, row: MailAutoresponder, domains: dict[str, MailDomain]) -> dict:
     domain = domains.get(row.domain)
+    today = datetime.now().date().isoformat()
+    active_now = bool(row.enabled) and (not row.start_date or row.start_date <= today) \
+        and (not row.end_date or today <= row.end_date)
     return {
         "id": row.id,
         "address": row.address,
         "domain": row.domain,
+        "domain_id": domain.id if domain else None,
         "local_part": row.local_part,
         "subject": row.subject,
         "body": row.body,
+        "enabled": bool(row.enabled),
+        "start_date": row.start_date or "",
+        "end_date": row.end_date or "",
+        "interval_days": int(row.interval_days or 1),
+        "active_now": active_now,
+        "has_mailbox": db.query(MailAccount).filter(MailAccount.domain == row.domain,
+                                                    MailAccount.local_part == row.local_part).first() is not None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
+
 
 def list_autoresponders(db: Session, actor: User, domain_id: int | None = None, q: str = "", page: int = 1, per_page: int = 50) -> dict:
     query = db.query(MailAutoresponder)

@@ -20,7 +20,7 @@ import os
 import re
 from pathlib import Path
 
-from app.services import php
+from app.services import php, site_users
 
 # Mirrors PHP_FPM_DEFAULT_WORKER_MB in spanel-helper.sh. The pool maths divides
 # the PHP budget by this, so it is also what a sensible memory_limit is built
@@ -89,12 +89,27 @@ def cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
 
 
+PHP_ETC_DIR = Path("/etc/php")
+
+
+def _managed_pool_files(php_version: str = "*") -> list[Path]:
+    """SPanel pool files of the per-account masters and of the distro masters.
+
+    Mirrors managed_php_pool_files in spanel-helper.sh. A pool that is moving
+    from the distro master to its account's master briefly exists in both.
+    """
+    files = sorted(site_users.PHP_FPM_USER_ROOT.glob(f"{php_version}/*/pool.d/spanel-*.conf"))
+    files += sorted(PHP_ETC_DIR.glob(f"{php_version}/fpm/pool.d/spanel-*.conf"))
+    return files
+
+
 def pool_count() -> int:
-    """Managed FPM pools, which is what the per-pool share is divided by."""
-    found = 0
-    for version_dir in Path("/etc/php").glob("*/fpm/pool.d"):
-        found += len(list(version_dir.glob("spanel-*.conf")))
-    return max(1, found)
+    """Managed FPM pools, which is what the per-pool share is divided by.
+
+    Counted by name, as the helper does, so a pool caught mid-move between the
+    distro master and its account's master is still one pool.
+    """
+    return max(1, len({pool_file.name for pool_file in _managed_pool_files()}))
 
 
 def reserved_memory_mb(total_mb: int) -> int:
@@ -505,10 +520,6 @@ _POOL_KEYS = ("pm.max_children", "pm.process_idle_timeout", "pm.max_requests", "
 _POOL_NAME_RE = re.compile(r"^\[([^\]]+)\]", re.M)
 
 
-def _pool_dir(php_version: str) -> Path:
-    return Path(f"/etc/php/{php_version}/fpm/pool.d")
-
-
 def current_pool_settings(php_version: str) -> list[dict]:
     """What is actually written in each of this version's FPM pool files.
 
@@ -519,18 +530,23 @@ def current_pool_settings(php_version: str) -> list[dict]:
     reads them directly; no helper round-trip needed.
     """
     pools: list[dict] = []
-    pool_dir = _pool_dir(php_version)
-    if not pool_dir.is_dir():
-        return pools
-    for pool_file in sorted(pool_dir.glob("spanel-*.conf")):
+    seen: set[str] = set()
+    for pool_file in _managed_pool_files(php_version):
+        # The account master's copy comes first and is the one serving.
+        if pool_file.name in seen:
+            continue
+        seen.add(pool_file.name)
         try:
             text = pool_file.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         values = _read_ini_values([pool_file], set(_POOL_KEYS))
         name = _POOL_NAME_RE.search(text)
+        legacy = PHP_ETC_DIR in pool_file.parents
         pools.append({
             "pool": name.group(1) if name else pool_file.stem,
+            # Which master serves it: the distro one, or the account's own.
+            "served_by": f"php{php_version}-fpm" if legacy else f"spanel-php{php_version}-fpm@{pool_file.parent.parent.name}",
             "max_children": values.get("pm.max_children", ""),
             "idle_timeout": values.get("pm.process_idle_timeout", ""),
             "max_requests": values.get("pm.max_requests", ""),
