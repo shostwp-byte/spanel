@@ -150,7 +150,7 @@ function InlineCodeEditor({ value, mode, disabled, wrapEnabled = false, onChange
 function TreeFolderIcon({ open = false }) {
   return (
     <svg className="da-folder-svg" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-      <path fill={open ? '#2b89e6' : '#3592eb'} d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" />
+      <path fill="currentColor" opacity={open ? '1' : '0.85'} d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" />
     </svg>
   );
 }
@@ -159,29 +159,29 @@ function TableEntryIcon({ item }) {
   if (item?.is_dir) {
     return (
       <svg className="da-table-folder-svg" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-        <path fill="#55a8f7" d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" />
-        <path fill="#3b93ea" d="M2 10h20v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8z" />
+        <path fill="currentColor" opacity="0.78" d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z" />
+        <path fill="currentColor" d="M2 10h20v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8z" />
       </svg>
     );
   }
   const name = (item?.name || '').toLowerCase();
-  let badge = 'FILE', badgeColor = '#8c8c8c';
-  if (name.endsWith('.php') || name.endsWith('.phtml')) { badge = 'PHP'; badgeColor = '#6f74b5'; }
-  else if (name.endsWith('.html') || name.endsWith('.htm')) { badge = 'HTML'; badgeColor = '#d97724'; }
-  else if (name.endsWith('.css') || name.endsWith('.scss')) { badge = 'CSS'; badgeColor = '#2b89e6'; }
-  else if (/\.(js|jsx|ts|tsx)$/.test(name)) { badge = 'JS'; badgeColor = '#d4a017'; }
-  else if (name.endsWith('.json')) { badge = 'JSON'; badgeColor = '#5a8f5c'; }
-  else if (/\.(txt|md|log)$/.test(name)) { badge = 'TXT'; badgeColor = '#8a857b'; }
-  else if (/\.(zip|tar\.gz|tgz|gz)$/.test(name)) { badge = 'ZIP'; badgeColor = '#b0652b'; }
-  else if (name.endsWith('.sql')) { badge = 'SQL'; badgeColor = '#0284c7'; }
-  else if (name.startsWith('.')) { badge = 'CFG'; badgeColor = '#7d7a74'; }
+  let badge = 'FILE';
+  if (name.endsWith('.php') || name.endsWith('.phtml')) badge = 'PHP';
+  else if (name.endsWith('.html') || name.endsWith('.htm')) badge = 'HTML';
+  else if (name.endsWith('.css') || name.endsWith('.scss')) badge = 'CSS';
+  else if (/\.(js|jsx|ts|tsx)$/.test(name)) badge = 'JS';
+  else if (name.endsWith('.json')) badge = 'JSON';
+  else if (/\.(txt|md|log)$/.test(name)) badge = 'TXT';
+  else if (/\.(zip|tar\.gz|tgz|gz)$/.test(name)) badge = 'ZIP';
+  else if (name.endsWith('.sql')) badge = 'SQL';
+  else if (name.startsWith('.')) badge = 'CFG';
   return (
     <span className="da-table-file-icon" aria-hidden="true">
       <svg viewBox="0 0 24 28" width="20" height="24">
-        <path fill="#dedad2" d="M3 1h12l6 6v19a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1z" />
-        <path fill="#c2bdb3" d="M15 1v6h6z" />
-        <rect x="3" y="18" width="18" height="7" rx="1" fill={badgeColor} />
-        <text x="12" y="23.3" textAnchor="middle" fill="#ffffff" fontSize="5.4" fontWeight="700" fontFamily="sans-serif">{badge}</text>
+        <path className="da-file-svg-page" d="M3 1h12l6 6v19a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1z" />
+        <path className="da-file-svg-fold" d="M15 1v6h6z" />
+        <rect className="da-file-svg-badge" x="3" y="18" width="18" height="7" rx="1.2" />
+        <text className="da-file-svg-text" x="12" y="23.3" textAnchor="middle" fontSize="5.4" fontWeight="700" fontFamily="sans-serif">{badge}</text>
       </svg>
     </span>
   );
