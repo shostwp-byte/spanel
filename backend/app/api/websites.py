@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.secrets import encrypt
-from app.models.entities import CloudflareCredential, DatabaseAccount, SiteApp, User, Website, WebsiteAlias
+from app.models.entities import AuditLog, CloudflareCredential, DatabaseAccount, SiteApp, User, Website, WebsiteAlias
 from app.schemas.schemas import (
     CloudflareZoneOut,
     SharedSslRequest,
@@ -43,7 +44,12 @@ def _command_error(result):
     return (result.stderr or result.stdout or f"Command failed with code {result.returncode}").strip()
 
 
-def _cleanup_failed_site(root_path: str, linux_user: str | None, delete_files: bool = True) -> None:
+def _cleanup_failed_site(root_path: str, linux_user: str | None, delete_files: bool = True, domain: str | None = None) -> None:
+    if domain:
+        try:
+            nginx.delete_wordpress_vhost(domain)
+        except Exception:
+            pass
     if delete_files:
         try:
             if linux_user:
@@ -374,20 +380,258 @@ def _read_ssl_input(upload: UploadFile | None, text: str | None, label: str, req
     return ssl.read_ssl_part(text or "", label=label, required=required)
 
 
+_VHOST_ROOT_FROM_RE = re.compile(r"disable_symlinks\s+if_not_owner\s+from=([^;\s]+);")
+_VHOST_DOCROOT_RE = re.compile(r"^\s*root\s+([^;\s]+);", re.MULTILINE)
+_VHOST_PHP_VER_RE = re.compile(r"php(\d+\.\d+)-fpm")
+
+
+def _domain_matches_user(domain: str, user: User) -> bool:
+    clean_domain = (domain or "").strip().lower()
+    uname = (getattr(user, "username", "") or "").strip().lower()
+    uemail = (getattr(user, "email", "") or "").strip().lower()
+    if not clean_domain or not uname:
+        return False
+    try:
+        if not settings.command_dry_run and (Path("/home") / uname / clean_domain).is_dir():
+            return True
+    except OSError:
+        pass
+    if uemail.endswith("@" + clean_domain):
+        return True
+    compact_domain = re.sub(r"[^a-z0-9]", "", clean_domain)
+    first_label = re.sub(r"[^a-z0-9]", "", clean_domain.split(".")[0])
+    compact_user = re.sub(r"[^a-z0-9]", "", uname)
+    if len(compact_user) >= 3:
+        if compact_domain.startswith(compact_user):
+            return True
+        if len(first_label) >= 3 and compact_user.startswith(first_label):
+            return True
+        if first_label == compact_user:
+            return True
+    return False
+
+
+def reconcile_websites_from_disk(db: Session) -> None:
+    """Self-heal missing Website rows from managed Nginx vhosts on disk and
+    reconcile domain ownership when a domain's owner_id is dangling or was
+    inadvertently created under admin instead of its matching customer account.
+    """
+    if settings.command_dry_run:
+        return
+    try:
+        from app.models.entities import DnsZone
+    except Exception:
+        DnsZone = None
+
+    try:
+        all_users = db.query(User).order_by(User.id.asc()).all()
+        if not all_users:
+            return
+        users_by_id = {u.id: u for u in all_users}
+        users_by_name = {(u.username or "").strip().lower(): u for u in all_users if u.username}
+        end_users = [
+            u for u in all_users
+            if not is_admin_role(u.role) and normalize_role(u.role) != Role.reseller
+        ]
+        primary_admin = next((u for u in all_users if is_admin_role(u.role)), all_users[0])
+
+        known_websites = db.query(Website).all()
+        known_domains = {(w.domain or "").strip().lower() for w in known_websites if w.domain}
+        known_domains |= {(a.domain or "").strip().lower() for a in db.query(WebsiteAlias).all() if a.domain}
+
+        # 1. Recover missing Website rows from /etc/nginx/conf.d/*.conf
+        conf_dir = Path("/etc/nginx/conf.d")
+        if conf_dir.is_dir():
+            for conf_file in sorted(conf_dir.glob("*.conf")):
+                stem = conf_file.stem.strip().lower()
+                if (
+                    not stem
+                    or stem in known_domains
+                    or stem.startswith(("00-", "spanel-", "default", "http-flood"))
+                    or not site_users.DOMAIN_RE.match(stem)
+                ):
+                    continue
+                last_audit = (
+                    db.query(AuditLog)
+                    .filter(AuditLog.target == stem)
+                    .order_by(AuditLog.id.desc())
+                    .first()
+                )
+                if last_audit and last_audit.action in {"delete_website", "delete_user", "provisioning_terminate"}:
+                    try:
+                        nginx.delete_wordpress_vhost(stem)
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    text = conf_file.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if (
+                    "disable_symlinks if_not_owner from=" not in text
+                    and "# SPANEL ACME CHALLENGE" not in text
+                    and "# SPANEL CUSTOM INCLUDE" not in text
+                ):
+                    continue
+
+                m_root = _VHOST_ROOT_FROM_RE.search(text)
+                root_path = m_root.group(1).strip() if m_root else ""
+                document_root = "public_html"
+                for m_doc in _VHOST_DOCROOT_RE.finditer(text):
+                    candidate = m_doc.group(1).strip()
+                    if candidate in {"/var/www/spanel-acme", "/usr/share/phpmyadmin"}:
+                        continue
+                    if not root_path:
+                        p_cand = Path(candidate)
+                        if p_cand.name == "public_html":
+                            root_path = str(p_cand.parent)
+                        else:
+                            root_path = candidate
+                    elif candidate.startswith(root_path.rstrip("/") + "/"):
+                        rel = candidate[len(root_path.rstrip("/")) + 1:].strip("/")
+                        if rel:
+                            document_root = rel
+                    break
+
+                if not root_path or not root_path.startswith("/home/"):
+                    continue
+
+                m_php = _VHOST_PHP_VER_RE.search(text)
+                php_version = m_php.group(1) if m_php else "8.4"
+                if "# SPANEL FASTCGI CACHE SERVER BEGIN" in text:
+                    app_type = "wordpress"
+                elif "proxy_pass " in text:
+                    app_type = "application"
+                elif "fastcgi_pass " in text:
+                    app_type = "php"
+                else:
+                    app_type = "static"
+
+                parts = Path(root_path).parts
+                vhost_user = parts[2].lower() if len(parts) > 2 else ""
+
+                owner = None
+                if vhost_user and vhost_user in users_by_name and not is_admin_role(users_by_name[vhost_user].role):
+                    owner = users_by_name[vhost_user]
+                if owner is None and DnsZone is not None:
+                    z = db.query(DnsZone).filter(DnsZone.name == stem).first()
+                    if z and z.owner_id and z.owner_id in users_by_id and not is_admin_role(users_by_id[z.owner_id].role):
+                        owner = users_by_id[z.owner_id]
+                if owner is None:
+                    for u in end_users:
+                        if _domain_matches_user(stem, u):
+                            owner = u
+                            break
+                if owner is None:
+                    owner = users_by_name.get(vhost_user) or primary_admin
+
+                target_linux_user = site_users.linux_user_for_panel_username(owner.username)
+                target_root_path = site_users.site_root_for_panel_user(owner.username, stem)
+                runtime_php = php_version if app_type in {"wordpress", "php"} else None
+                try:
+                    if root_path != target_root_path:
+                        site_users.move_site_runtime(root_path, target_root_path, target_linux_user, runtime_php)
+                        root_path = target_root_path
+                    else:
+                        site_users.ensure_site_runtime(stem, root_path, runtime_php, target_linux_user)
+                except Exception:
+                    pass
+
+                ssl_live = Path("/etc/letsencrypt/live") / stem
+                has_le = False
+                try:
+                    has_le = (ssl_live / "fullchain.pem").is_file() and (ssl_live / "privkey.pem").is_file()
+                except OSError:
+                    has_le = "listen 443 ssl" in text
+
+                recovered = Website(
+                    domain=stem,
+                    owner_id=owner.id,
+                    root_path=root_path,
+                    document_root=document_root,
+                    linux_user=target_linux_user,
+                    php_version=php_version,
+                    app_type=app_type,
+                    nginx_rewrite_mode="front_controller" if app_type == "wordpress" else "none",
+                    ssl_enabled=bool(has_le or "listen 443 ssl" in text),
+                    ssl_mode="letsencrypt" if (has_le or "listen 443 ssl" in text) else "none",
+                    status="active",
+                )
+                db.add(recovered)
+                db.commit()
+                db.refresh(recovered)
+                known_domains.add(stem)
+                known_websites.append(recovered)
+                try:
+                    _ensure_default_waf_file(recovered.domain)
+                    _rewrite_website_vhost(recovered)
+                except Exception:
+                    pass
+
+        # 2. Reconcile websites whose owner_id is dangling or set to admin when a matching end_user exists
+        site_counts: dict[int, int] = {u.id: 0 for u in all_users}
+        for w in known_websites:
+            if w.owner_id in site_counts:
+                site_counts[w.owner_id] += 1
+
+        for w in known_websites:
+            current_owner = users_by_id.get(w.owner_id)
+            if current_owner is not None and not is_admin_role(current_owner.role):
+                continue
+            matched_user = None
+            w_linux = (w.linux_user or "").strip().lower()
+            if w_linux and w_linux in users_by_name and not is_admin_role(users_by_name[w_linux].role):
+                matched_user = users_by_name[w_linux]
+            if matched_user is None and DnsZone is not None:
+                z = db.query(DnsZone).filter(DnsZone.name == w.domain).first()
+                if z and z.owner_id and z.owner_id in users_by_id and not is_admin_role(users_by_id[z.owner_id].role):
+                    matched_user = users_by_id[z.owner_id]
+            if matched_user is None:
+                for u in end_users:
+                    eff_limit = int(u.website_limit if u.website_limit is not None else (u.package.website_limit if getattr(u, "package", None) else 0) or 0)
+                    if eff_limit > 0 and site_counts.get(u.id, 0) >= eff_limit:
+                        continue
+                    if _domain_matches_user(w.domain, u):
+                        matched_user = u
+                        break
+            if matched_user is None:
+                continue
+
+            new_linux_user = site_users.linux_user_for_panel_username(matched_user.username)
+            new_root_path = site_users.site_root_for_panel_user(matched_user.username, w.domain)
+            runtime_php = w.php_version if (w.app_type or "wordpress") in {"wordpress", "php"} else None
+            try:
+                if w.root_path != new_root_path or w.linux_user != new_linux_user:
+                    site_users.move_site_runtime(w.root_path, new_root_path, new_linux_user, runtime_php)
+                    w.root_path = new_root_path
+                    w.linux_user = new_linux_user
+                    _ensure_default_waf_file(w.domain)
+                    _rewrite_website_vhost(w, root_path=new_root_path, linux_user=new_linux_user)
+            except Exception:
+                w.root_path = new_root_path
+                w.linux_user = new_linux_user
+
+            if w.owner_id in site_counts and site_counts[w.owner_id] > 0:
+                site_counts[w.owner_id] -= 1
+            w.owner_id = matched_user.id
+            site_counts[matched_user.id] = site_counts.get(matched_user.id, 0) + 1
+            if DnsZone is not None:
+                z = db.query(DnsZone).filter(DnsZone.name == w.domain).first()
+                if z and z.owner_id != matched_user.id:
+                    z.owner_id = matched_user.id
+            db.commit()
+    except Exception:
+        db.rollback()
+
+
 @router.post("", response_model=WebsiteOut)
 def create_website(payload: WebsiteCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Create a website. If install_wordpress is False, only creates the domain
     folder + Nginx vhost (no DB, no WordPress files)."""
+    reconcile_websites_from_disk(db)
     requested_owner_id = payload.owner_id
     if requested_owner_id is not None and requested_owner_id != current_user.id:
         ensure_role(current_user.role, Role.admin)
-    if _hostname_conflicts(db, payload.domain) or nginx.vhost_exists(payload.domain):
-        raise HTTPException(status_code=409, detail="Domain already exists")
-    from app.services import mail
-
-    if mail.webmail_host_taken(db, payload.domain):
-        # The Email addon serves webmail.<domain> for that mail domain already.
-        raise HTTPException(status_code=409, detail="That name is the webmail address of a mail domain here.")
 
     if requested_owner_id is not None:
         owner = db.query(User).filter(User.id == requested_owner_id).first()
@@ -395,6 +639,50 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
             raise HTTPException(status_code=404, detail="Owner not found")
     else:
         owner = current_user
+        if is_admin_role(current_user.role):
+            end_users = [
+                u for u in db.query(User).order_by(User.id.asc()).all()
+                if not is_admin_role(u.role) and normalize_role(u.role) != Role.reseller
+            ]
+            for u in end_users:
+                if _domain_matches_user(payload.domain, u):
+                    u_count = db.query(Website).filter(Website.owner_id == u.id).count()
+                    eff_limit = int(u.website_limit if u.website_limit is not None else (u.package.website_limit if getattr(u, "package", None) else 0) or 0)
+                    if eff_limit == 0 or u_count < eff_limit:
+                        owner = u
+                        break
+
+    existing_website = db.query(Website).filter(Website.domain == payload.domain).first()
+    if existing_website is not None:
+        existing_owner = db.query(User).filter(User.id == existing_website.owner_id).first()
+        if existing_website.owner_id == owner.id:
+            return _sync_live_ssl_flags(db, [existing_website])[0]
+        if existing_owner is None or (is_admin_role(existing_owner.role) and not is_admin_role(owner.role)):
+            new_linux_user = site_users.linux_user_for_panel_username(owner.username)
+            new_root_path = site_users.site_root_for_panel_user(owner.username, existing_website.domain)
+            runtime_php = existing_website.php_version if (existing_website.app_type or "wordpress") in {"wordpress", "php"} else None
+            try:
+                if existing_website.root_path != new_root_path or existing_website.linux_user != new_linux_user:
+                    site_users.move_site_runtime(existing_website.root_path, new_root_path, new_linux_user, runtime_php)
+                    existing_website.root_path = new_root_path
+                    existing_website.linux_user = new_linux_user
+                    _ensure_default_waf_file(existing_website.domain)
+                    _rewrite_website_vhost(existing_website, root_path=new_root_path, linux_user=new_linux_user)
+            except Exception:
+                existing_website.root_path = new_root_path
+                existing_website.linux_user = new_linux_user
+            existing_website.owner_id = owner.id
+            db.commit()
+            db.refresh(existing_website)
+            return _sync_live_ssl_flags(db, [existing_website])[0]
+
+    if _hostname_conflicts(db, payload.domain):
+        raise HTTPException(status_code=409, detail="Domain already exists")
+    from app.services import mail
+
+    if mail.webmail_host_taken(db, payload.domain):
+        # The Email addon serves webmail.<domain> for that mail domain already.
+        raise HTTPException(status_code=409, detail="That name is the webmail address of a mail domain here.")
 
     owner_id = owner.id
     existing_sites = db.query(Website).filter(Website.owner_id == owner_id).all()
@@ -443,11 +731,11 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
             )
         except HTTPException:
             mariadb.drop_database(db_info["db_name"], db_info["db_user"])
-            _cleanup_failed_site(root_path, linux_user)
+            _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise
         except Exception as exc:
             mariadb.drop_database(db_info["db_name"], db_info["db_user"])
-            _cleanup_failed_site(root_path, linux_user)
+            _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             _ensure_default_waf_file(payload.domain)
@@ -462,11 +750,11 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
             )
         except HTTPException:
             mariadb.drop_database(db_info["db_name"], db_info["db_user"])
-            _cleanup_failed_site(root_path, linux_user)
+            _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise
         except Exception as exc:
             mariadb.drop_database(db_info["db_name"], db_info["db_user"])
-            _cleanup_failed_site(root_path, linux_user)
+            _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app_type_value = "wordpress"
     else:
@@ -496,10 +784,10 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
                 app_port=selected_app.port if selected_app else None,
             )
         except HTTPException:
-            _cleanup_failed_site(root_path, linux_user)
+            _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise
         except Exception as exc:
-            _cleanup_failed_site(root_path, linux_user)
+            _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         db_info = None
 
@@ -637,6 +925,7 @@ def install_wordpress_on_website(
 
 @router.get("", response_model=List[WebsiteOut])
 def list_websites(q: str = Query(default="", max_length=255), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    reconcile_websites_from_disk(db)
     search = (q or "").strip().lower()
     if is_admin_role(current_user.role):
         query = db.query(Website)
@@ -746,7 +1035,8 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
     if not _is_authorized_for_website(db, website, current_user):
         ensure_role(current_user.role, Role.admin)
     if payload.domain is not None and payload.domain != website.domain:
-        if _hostname_conflicts(db, payload.domain) or nginx.vhost_exists(payload.domain):
+        reconcile_websites_from_disk(db)
+        if _hostname_conflicts(db, payload.domain):
             raise HTTPException(status_code=409, detail="Domain already exists")
         old_domain = website.domain
         website.domain = payload.domain

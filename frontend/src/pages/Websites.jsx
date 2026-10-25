@@ -34,7 +34,7 @@ export function WebsitesPage({
   const [websiteSettingsForm, setWebsiteSettingsForm] = useState(websiteConfigForm());
   const [logViewer, setLogViewer] = useState(null);
   const [terminalViewer, setTerminalViewer] = useState(null);
-  const [websiteList, setWebsiteList] = useState(() => (Array.isArray(websites) ? websites : []));
+  const [websiteList, setWebsiteList] = useState([]);
   const [websiteSearch, setWebsiteSearch] = useState('');
   const [websiteSearching, setWebsiteSearching] = useState(false);
   const isSubdomainMode = mode === 'subdomains';
@@ -80,7 +80,7 @@ export function WebsitesPage({
 
   const installedPhpList = (phpVersions?.installed?.length ? phpVersions.installed : ctxPhpVersions?.installed?.length ? ctxPhpVersions.installed : ['8.4']);
   useEffect(() => { if (loadPhpVersions) loadPhpVersions({ silent: true }); }, []);
-  useEffect(() => { loadWebsiteList(); }, [websiteSearch]);
+  useEffect(() => { loadWebsiteList(); }, [websiteSearch, currentUser?.id]);
   useEffect(() => {
     if (websiteList.length === 0) {
       const id = setInterval(() => loadWebsiteList(websiteSearch, false), 5000);
@@ -113,13 +113,6 @@ export function WebsitesPage({
     if (!confirm(t('Delete this website including files, vhost, database, and its SSL certificate?'))) return;
     const data = await request(`/websites/${id}?delete_files=true&delete_database=true`, { method: 'DELETE' }, t('Deleting website...'));
     if (data) {
-      setWebsiteList(prev => (Array.isArray(prev) ? prev.filter(s => String(s.id) !== String(id)) : []));
-      setWebsites(prev => (Array.isArray(prev) ? prev.filter(s => String(s.id) !== String(id)) : []));
-      setSelectedDomainIds(prev => prev.filter(item => String(item) !== String(id)));
-      setSelectedSubdomainIds(prev => prev.filter(item => String(item) !== String(id)));
-      if (nginxCustomEditing && String(nginxCustomEditing.id) === String(id)) setNginxCustomEditing(null);
-      if (logViewer && String(logViewer.id) === String(id)) setLogViewer(null);
-      if (terminalViewer && String(terminalViewer.id) === String(id)) setTerminalViewer(null);
       await loadWebsiteList(websiteSearch, false);
       if (refreshAll) await refreshAll();
     }
@@ -582,7 +575,7 @@ export function WebsitesPage({
     </div>;
   }
 
-  const allKnownSites = Array.isArray(websiteList) ? websiteList : (Array.isArray(websites) ? websites : []);
+  const allKnownSites = websiteList.length ? websiteList : websites;
   const allDomainSet = React.useMemo(
     () => new Set(allKnownSites.map(s => String(s.domain || '').toLowerCase()).filter(Boolean)),
     [allKnownSites]
@@ -700,13 +693,10 @@ export function WebsitesPage({
   async function deleteSelectedSubdomains() {
     if (!selectedSubdomainIds.length) return;
     if (!confirm(t('Delete {n} selected subdomain(s) including files, virtual host, and SSL certificate?', { n: selectedSubdomainIds.length }))) return;
-    const idsToDelete = new Set(selectedSubdomainIds.map(id => String(id)));
     for (const id of selectedSubdomainIds) {
       await request(`/websites/${id}?delete_files=true&delete_database=true`, { method: 'DELETE' }, t('Deleting subdomain...'));
     }
     setSelectedSubdomainIds([]);
-    setWebsiteList(prev => (Array.isArray(prev) ? prev.filter(s => !idsToDelete.has(String(s.id))) : []));
-    setWebsites(prev => (Array.isArray(prev) ? prev.filter(s => !idsToDelete.has(String(s.id))) : []));
     await loadWebsiteList(websiteSearch, false);
     if (refreshAll) await refreshAll();
   }
@@ -744,13 +734,10 @@ export function WebsitesPage({
   async function handleDeleteSelectedDomains() {
     if (!selectedDomainIds.length) return;
     if (!confirm(t('Delete {n} selected domain(s) including files, virtual host, database, and SSL certificate?', { n: selectedDomainIds.length }))) return;
-    const idsToDelete = new Set(selectedDomainIds.map(id => String(id)));
     for (const id of selectedDomainIds) {
       await request(`/websites/${id}?delete_files=true&delete_database=true`, { method: 'DELETE' }, t('Deleting website...'));
     }
     setSelectedDomainIds([]);
-    setWebsiteList(prev => (Array.isArray(prev) ? prev.filter(s => !idsToDelete.has(String(s.id))) : []));
-    setWebsites(prev => (Array.isArray(prev) ? prev.filter(s => !idsToDelete.has(String(s.id))) : []));
     await loadWebsiteList(websiteSearch, false);
     if (refreshAll) await refreshAll();
   }
@@ -1097,9 +1084,9 @@ export function WebsitesPage({
                         minWidth: '185px',
                         padding: '8px 10px',
                         borderRadius: '10px',
-                        background: 'var(--bg-elevated, #ffffff)',
-                        border: '1px solid var(--border-strong, #cbd5e1)',
-                        boxShadow: '0 14px 32px -6px rgba(15, 23, 42, 0.24)',
+                        background: 'var(--bg-elevated)',
+                        border: '1px solid var(--border-strong)',
+                        boxShadow: 'var(--shadow-lg)',
                         display: 'flex',
                         flexDirection: 'column',
                         gap: '6px',
@@ -1470,9 +1457,8 @@ export function WebsitesPage({
                 position: 'fixed',
                 inset: 0,
                 zIndex: 1000,
-                background: 'rgba(15, 23, 42, 0.62)',
-                backdropFilter: 'blur(5px)',
-                WebkitBackdropFilter: 'blur(5px)',
+                background: 'rgba(15, 23, 42, 0.55)',
+                backdropFilter: 'blur(4px)',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -1485,10 +1471,10 @@ export function WebsitesPage({
                 style={{
                   width: '100%',
                   maxWidth: '520px',
-                  borderRadius: '16px',
-                  background: 'var(--bg-elevated, #ffffff)',
-                  border: '1px solid var(--border-strong, #cbd5e1)',
-                  boxShadow: '0 24px 48px -12px rgba(15, 23, 42, 0.38)',
+                  borderRadius: '14px',
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border-strong)',
+                  boxShadow: 'var(--shadow-lg)',
                   overflow: 'hidden',
                 }}
               >
@@ -1498,49 +1484,34 @@ export function WebsitesPage({
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'space-between',
-                    padding: '18px 24px',
-                    background: 'var(--surface-alt, #f8fafc)',
+                    padding: '16px 20px',
                     borderBottom: '1px solid var(--border)',
                   }}
                 >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                     <div
                       style={{
-                        width: '38px',
-                        height: '38px',
-                        borderRadius: '10px',
+                        width: '32px',
+                        height: '32px',
+                        borderRadius: '8px',
                         background: 'rgba(22, 163, 74, 0.14)',
-                        border: '1px solid rgba(22, 163, 74, 0.28)',
                         color: '#16a34a',
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        flexShrink: 0,
                       }}
                     >
-                      <Globe size={18} />
+                      <Globe size={17} />
                     </div>
-                    <div>
-                      <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 700, color: 'var(--text)', lineHeight: 1.25 }}>
-                        {t('Add Subdomain')}
-                      </h3>
-                      <p style={{ margin: '2px 0 0', fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.3 }}>
-                        {t('Create a subdomain virtual host under your domain')}
-                      </p>
-                    </div>
+                    <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: 'var(--text)' }}>
+                      {t('Add Subdomain')}
+                    </h3>
                   </div>
                   <button
                     type="button"
                     className="secondary-light"
                     onClick={() => setSubdomainModalOpen(false)}
-                    style={{
-                      padding: '4px',
-                      height: '32px',
-                      minHeight: '32px',
-                      width: '32px',
-                      borderRadius: '8px',
-                      background: 'var(--bg-elevated, #ffffff)',
-                    }}
+                    style={{ padding: '4px', height: '30px', minHeight: '30px', width: '30px' }}
                     aria-label={t('Close')}
                   >
                     <X size={16} />
@@ -1550,11 +1521,10 @@ export function WebsitesPage({
                 <div
                   className="modal-body"
                   style={{
-                    padding: '22px 24px',
-                    background: 'var(--bg-elevated, #ffffff)',
+                    padding: '20px',
                     display: 'flex',
                     flexDirection: 'column',
-                    gap: '18px',
+                    gap: '16px',
                   }}
                 >
                   <div>
@@ -1564,7 +1534,7 @@ export function WebsitesPage({
                         fontSize: '13px',
                         fontWeight: 600,
                         color: 'var(--text)',
-                        marginBottom: '8px',
+                        marginBottom: '6px',
                       }}
                     >
                       {t('Subdomain')}
@@ -1575,11 +1545,10 @@ export function WebsitesPage({
                         display: 'grid',
                         gridTemplateColumns: '1fr auto minmax(165px, 46%)',
                         alignItems: 'center',
-                        gap: '8px',
+                        gap: '6px',
                       }}
                     >
                       <input
-                        type="text"
                         autoFocus
                         value={subdomainPrefix}
                         onChange={e => setSubdomainPrefix(e.target.value)}
@@ -1588,30 +1557,12 @@ export function WebsitesPage({
                         }}
                         placeholder={t('sub (e.g. blog, shop, api)')}
                         aria-label={t('Subdomain prefix')}
-                        style={{
-                          height: '42px',
-                          minHeight: '42px',
-                          background: 'var(--bg-elevated, #ffffff)',
-                          border: '1.5px solid var(--border-strong, #cbd5e1)',
-                          borderRadius: '8px',
-                          fontSize: '14px',
-                          fontWeight: 500,
-                        }}
                       />
-                      <span style={{ fontWeight: 700, fontSize: '18px', color: 'var(--text-secondary)' }}>.</span>
+                      <span style={{ fontWeight: 700, fontSize: '16px', color: 'var(--text-muted)' }}>.</span>
                       <select
                         value={subdomainParent || (rootDomains[0]?.domain || '')}
                         onChange={e => setSubdomainParent(e.target.value)}
                         aria-label={t('Parent domain')}
-                        style={{
-                          height: '42px',
-                          minHeight: '42px',
-                          background: 'var(--bg-elevated, #ffffff)',
-                          border: '1.5px solid var(--border-strong, #cbd5e1)',
-                          borderRadius: '8px',
-                          fontSize: '13.5px',
-                          fontWeight: 600,
-                        }}
                       >
                         {rootDomains.map(d => (
                           <option key={d.id} value={d.domain}>
@@ -1629,7 +1580,62 @@ export function WebsitesPage({
                         fontSize: '13px',
                         fontWeight: 600,
                         color: 'var(--text)',
-                        marginBottom: '8px',
+                        marginBottom: '6px',
+                      }}
+                    >
+                      {t('Document Root')}
+                    </label>
+                    <div
+                      style={{
+                        padding: '10px 12px',
+                        borderRadius: '8px',
+                        background: 'var(--surface-alt)',
+                        border: '1px solid var(--border)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}
+                    >
+                      <label
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          fontSize: '13px',
+                          fontWeight: 500,
+                          color: 'var(--text)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        <input
+                          type="radio"
+                          name="subdomain-docroot-mode"
+                          checked={subdomainDocrootMode === 'default'}
+                          onChange={() => setSubdomainDocrootMode('default')}
+                        />
+                        <span>{t('Default')}</span>
+                      </label>
+                      <code
+                        style={{
+                          fontSize: '12px',
+                          color: 'var(--text-secondary)',
+                          paddingLeft: '24px',
+                          wordBreak: 'break-all',
+                        }}
+                      >
+                        /domains/{previewSubdomain}/public_html
+                      </code>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label
+                      style={{
+                        display: 'block',
+                        fontSize: '13px',
+                        fontWeight: 600,
+                        color: 'var(--text)',
+                        marginBottom: '6px',
                       }}
                     >
                       {t('PHP Version')}
@@ -1638,15 +1644,6 @@ export function WebsitesPage({
                       value={installedPhpList.includes(phpVersion) ? phpVersion : (installedPhpList[0] || '8.4')}
                       onChange={e => setPhpVersion(e.target.value)}
                       aria-label={t('PHP version')}
-                      style={{
-                        height: '42px',
-                        minHeight: '42px',
-                        background: 'var(--bg-elevated, #ffffff)',
-                        border: '1.5px solid var(--border-strong, #cbd5e1)',
-                        borderRadius: '8px',
-                        fontSize: '13.5px',
-                        fontWeight: 600,
-                      }}
                     >
                       {installedPhpList.map(v => (
                         <option key={v} value={v}>
@@ -1654,52 +1651,6 @@ export function WebsitesPage({
                         </option>
                       ))}
                     </select>
-                  </div>
-
-                  <div
-                    style={{
-                      padding: '12px 14px',
-                      borderRadius: '10px',
-                      background: 'var(--surface-alt, #f8fafc)',
-                      border: '1px solid var(--border)',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '8px',
-                    }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
-                      <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                        <FolderOpen size={14} style={{ color: 'var(--primary)' }} />
-                        {t('Document Root')}
-                      </span>
-                      <span
-                        style={{
-                          fontSize: '11px',
-                          fontWeight: 600,
-                          padding: '2px 8px',
-                          borderRadius: '999px',
-                          background: 'var(--bg-elevated, #ffffff)',
-                          border: '1px solid var(--border)',
-                          color: 'var(--text-secondary)',
-                        }}
-                      >
-                        {t('Default')}
-                      </span>
-                    </div>
-                    <code
-                      style={{
-                        fontSize: '12.5px',
-                        fontFamily: 'var(--font-mono)',
-                        color: 'var(--text)',
-                        wordBreak: 'break-all',
-                        padding: '6px 10px',
-                        borderRadius: '6px',
-                        background: 'var(--bg-elevated, #ffffff)',
-                        border: '1px solid var(--border)',
-                      }}
-                    >
-                      /domains/{previewSubdomain}/public_html
-                    </code>
                   </div>
                 </div>
 
@@ -1710,21 +1661,15 @@ export function WebsitesPage({
                     alignItems: 'center',
                     justifyContent: 'flex-end',
                     gap: '10px',
-                    padding: '14px 24px',
+                    padding: '14px 20px',
                     borderTop: '1px solid var(--border)',
-                    background: 'var(--surface-alt, #f8fafc)',
+                    background: 'var(--surface-alt)',
                   }}
                 >
                   <button
                     type="button"
                     className="secondary-light"
                     onClick={() => setSubdomainModalOpen(false)}
-                    style={{
-                      height: '38px',
-                      minHeight: '38px',
-                      padding: '0 16px',
-                      background: 'var(--bg-elevated, #ffffff)',
-                    }}
                   >
                     {t('Cancel')}
                   </button>
@@ -1733,9 +1678,6 @@ export function WebsitesPage({
                     disabled={!!loading || !subdomainPrefix.trim() || !subdomainParent}
                     onClick={createSubdomain}
                     style={{
-                      height: '38px',
-                      minHeight: '38px',
-                      padding: '0 18px',
                       background: '#16a34a',
                       borderColor: '#15803d',
                       color: '#ffffff',
@@ -2059,9 +2001,9 @@ export function WebsitesPage({
                       minWidth: '190px',
                       padding: '8px 10px',
                       borderRadius: '10px',
-                      background: 'var(--bg-elevated, #ffffff)',
-                      border: '1px solid var(--border-strong, #cbd5e1)',
-                      boxShadow: '0 14px 32px -6px rgba(15, 23, 42, 0.24)',
+                      background: 'var(--bg-elevated)',
+                      border: '1px solid var(--border-strong)',
+                      boxShadow: 'var(--shadow-lg)',
                       display: 'flex',
                       flexDirection: 'column',
                       gap: '6px',
@@ -2535,9 +2477,8 @@ export function WebsitesPage({
               position: 'fixed',
               inset: 0,
               zIndex: 1000,
-              background: 'rgba(15, 23, 42, 0.62)',
-              backdropFilter: 'blur(5px)',
-              WebkitBackdropFilter: 'blur(5px)',
+              background: 'rgba(15, 23, 42, 0.55)',
+              backdropFilter: 'blur(4px)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -2550,10 +2491,10 @@ export function WebsitesPage({
               style={{
                 width: '100%',
                 maxWidth: '520px',
-                borderRadius: '16px',
-                background: 'var(--bg-elevated, #ffffff)',
-                border: '1px solid var(--border-strong, #cbd5e1)',
-                boxShadow: '0 24px 48px -12px rgba(15, 23, 42, 0.38)',
+                borderRadius: '14px',
+                background: 'var(--bg-elevated)',
+                border: '1px solid var(--border-strong)',
+                boxShadow: 'var(--shadow-lg)',
                 overflow: 'hidden',
               }}
             >
@@ -2563,49 +2504,34 @@ export function WebsitesPage({
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
-                  padding: '18px 24px',
-                  background: 'var(--surface-alt, #f8fafc)',
+                  padding: '16px 20px',
                   borderBottom: '1px solid var(--border)',
                 }}
               >
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <div
                     style={{
-                      width: '38px',
-                      height: '38px',
-                      borderRadius: '10px',
+                      width: '32px',
+                      height: '32px',
+                      borderRadius: '8px',
                       background: 'rgba(22, 163, 74, 0.14)',
-                      border: '1px solid rgba(22, 163, 74, 0.28)',
                       color: '#16a34a',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
-                      flexShrink: 0,
                     }}
                   >
-                    <Globe size={18} />
+                    <Globe size={17} />
                   </div>
-                  <div>
-                    <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 700, color: 'var(--text)', lineHeight: 1.25 }}>
-                      {t('Add Domain')}
-                    </h3>
-                    <p style={{ margin: '2px 0 0', fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.3 }}>
-                      {t('Create a new domain virtual host and document root')}
-                    </p>
-                  </div>
+                  <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: 'var(--text)' }}>
+                    {t('Add Domain')}
+                  </h3>
                 </div>
                 <button
                   type="button"
                   className="secondary-light"
                   onClick={() => setCreateFormOpen(false)}
-                  style={{
-                    padding: '4px',
-                    height: '32px',
-                    minHeight: '32px',
-                    width: '32px',
-                    borderRadius: '8px',
-                    background: 'var(--bg-elevated, #ffffff)',
-                  }}
+                  style={{ padding: '4px', height: '30px', minHeight: '30px', width: '30px' }}
                   aria-label={t('Close')}
                 >
                   <X size={16} />
@@ -2615,11 +2541,10 @@ export function WebsitesPage({
               <div
                 className="modal-body"
                 style={{
-                  padding: '22px 24px',
-                  background: 'var(--bg-elevated, #ffffff)',
+                  padding: '20px',
                   display: 'flex',
                   flexDirection: 'column',
-                  gap: '18px',
+                  gap: '16px',
                 }}
               >
                 <div>
@@ -2629,13 +2554,12 @@ export function WebsitesPage({
                       fontSize: '13px',
                       fontWeight: 600,
                       color: 'var(--text)',
-                      marginBottom: '8px',
+                      marginBottom: '6px',
                     }}
                   >
                     {t('Domain')}
                   </label>
                   <input
-                    type="text"
                     autoFocus
                     value={domain}
                     onChange={e => setDomain(e.target.value)}
@@ -2643,16 +2567,60 @@ export function WebsitesPage({
                       if (e.key === 'Enter' && domain.trim()) createWordPress();
                     }}
                     placeholder="domain.com"
-                    style={{
-                      height: '42px',
-                      minHeight: '42px',
-                      background: 'var(--bg-elevated, #ffffff)',
-                      border: '1.5px solid var(--border-strong, #cbd5e1)',
-                      borderRadius: '8px',
-                      fontSize: '14px',
-                      fontWeight: 500,
-                    }}
                   />
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                  <div>
+                    <label
+                      style={{
+                        display: 'block',
+                        fontSize: '13px',
+                        fontWeight: 600,
+                        color: 'var(--text)',
+                        marginBottom: '6px',
+                      }}
+                    >
+                      {t('Bandwidth')}
+                    </label>
+                    <div
+                      style={{
+                        padding: '8px 12px',
+                        borderRadius: '8px',
+                        background: 'var(--surface-alt)',
+                        border: '1px solid var(--border)',
+                        fontSize: '13px',
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      {t('Same as Main Account')}
+                    </div>
+                  </div>
+                  <div>
+                    <label
+                      style={{
+                        display: 'block',
+                        fontSize: '13px',
+                        fontWeight: 600,
+                        color: 'var(--text)',
+                        marginBottom: '6px',
+                      }}
+                    >
+                      {t('Disk Usage')}
+                    </label>
+                    <div
+                      style={{
+                        padding: '8px 12px',
+                        borderRadius: '8px',
+                        background: 'var(--surface-alt)',
+                        border: '1px solid var(--border)',
+                        fontSize: '13px',
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      {t('Same as Main Account')}
+                    </div>
+                  </div>
                 </div>
 
                 <div>
@@ -2662,7 +2630,34 @@ export function WebsitesPage({
                       fontSize: '13px',
                       fontWeight: 600,
                       color: 'var(--text)',
-                      marginBottom: '8px',
+                      marginBottom: '6px',
+                    }}
+                  >
+                    {t('Document Root')}
+                  </label>
+                  <div
+                    style={{
+                      padding: '9px 12px',
+                      borderRadius: '8px',
+                      background: 'var(--surface-alt)',
+                      border: '1px solid var(--border)',
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: '12.5px',
+                      color: 'var(--text-secondary)',
+                    }}
+                  >
+                    /domains/{previewNewDomain}/public_html
+                  </div>
+                </div>
+
+                <div>
+                  <label
+                    style={{
+                      display: 'block',
+                      fontSize: '13px',
+                      fontWeight: 600,
+                      color: 'var(--text)',
+                      marginBottom: '6px',
                     }}
                   >
                     {t('PHP Version')}
@@ -2671,15 +2666,6 @@ export function WebsitesPage({
                     value={installedPhpList.includes(phpVersion) ? phpVersion : (installedPhpList[0] || '8.4')}
                     onChange={e => setPhpVersion(e.target.value)}
                     aria-label={t('PHP version')}
-                    style={{
-                      height: '42px',
-                      minHeight: '42px',
-                      background: 'var(--bg-elevated, #ffffff)',
-                      border: '1.5px solid var(--border-strong, #cbd5e1)',
-                      borderRadius: '8px',
-                      fontSize: '13.5px',
-                      fontWeight: 600,
-                    }}
                   >
                     {installedPhpList.map(v => (
                       <option key={v} value={v}>
@@ -2687,90 +2673,6 @@ export function WebsitesPage({
                       </option>
                     ))}
                   </select>
-                </div>
-
-                <div
-                  style={{
-                    padding: '14px',
-                    borderRadius: '10px',
-                    background: 'var(--surface-alt, #f8fafc)',
-                    border: '1px solid var(--border)',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: '12px',
-                  }}
-                >
-                  <div>
-                    <div
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '6px',
-                        fontSize: '12px',
-                        fontWeight: 600,
-                        color: 'var(--text-secondary)',
-                        marginBottom: '6px',
-                      }}
-                    >
-                      <FolderOpen size={14} style={{ color: 'var(--primary)' }} />
-                      <span>{t('Document Root')}</span>
-                    </div>
-                    <div
-                      style={{
-                        padding: '8px 10px',
-                        borderRadius: '6px',
-                        background: 'var(--bg-elevated, #ffffff)',
-                        border: '1px solid var(--border)',
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: '12.5px',
-                        color: 'var(--text)',
-                        wordBreak: 'break-all',
-                      }}
-                    >
-                      /domains/{previewNewDomain}/public_html
-                    </div>
-                  </div>
-
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                    <div
-                      style={{
-                        padding: '8px 10px',
-                        borderRadius: '8px',
-                        background: 'var(--bg-elevated, #ffffff)',
-                        border: '1px solid var(--border)',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '2px',
-                      }}
-                    >
-                      <span style={{ fontSize: '11.5px', fontWeight: 600, color: 'var(--text-muted)', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
-                        <Activity size={12} style={{ color: 'var(--primary)' }} />
-                        {t('Bandwidth')}
-                      </span>
-                      <span style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--text)' }}>
-                        {t('Same as Main Account')}
-                      </span>
-                    </div>
-                    <div
-                      style={{
-                        padding: '8px 10px',
-                        borderRadius: '8px',
-                        background: 'var(--bg-elevated, #ffffff)',
-                        border: '1px solid var(--border)',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '2px',
-                      }}
-                    >
-                      <span style={{ fontSize: '11.5px', fontWeight: 600, color: 'var(--text-muted)', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
-                        <HardDrive size={12} style={{ color: 'var(--primary)' }} />
-                        {t('Disk Usage')}
-                      </span>
-                      <span style={{ fontSize: '12.5px', fontWeight: 600, color: 'var(--text)' }}>
-                        {t('Same as Main Account')}
-                      </span>
-                    </div>
-                  </div>
                 </div>
               </div>
 
@@ -2781,21 +2683,15 @@ export function WebsitesPage({
                   alignItems: 'center',
                   justifyContent: 'flex-end',
                   gap: '10px',
-                  padding: '14px 24px',
+                  padding: '14px 20px',
                   borderTop: '1px solid var(--border)',
-                  background: 'var(--surface-alt, #f8fafc)',
+                  background: 'var(--surface-alt)',
                 }}
               >
                 <button
                   type="button"
                   className="secondary-light"
                   onClick={() => setCreateFormOpen(false)}
-                  style={{
-                    height: '38px',
-                    minHeight: '38px',
-                    padding: '0 16px',
-                    background: 'var(--bg-elevated, #ffffff)',
-                  }}
                 >
                   {t('Cancel')}
                 </button>
@@ -2804,9 +2700,6 @@ export function WebsitesPage({
                   disabled={!!loading || !domain.trim()}
                   onClick={createWordPress}
                   style={{
-                    height: '38px',
-                    minHeight: '38px',
-                    padding: '0 18px',
                     background: '#16a34a',
                     borderColor: '#15803d',
                     color: '#ffffff',
@@ -2830,9 +2723,8 @@ export function WebsitesPage({
               position: 'fixed',
               inset: 0,
               zIndex: 1000,
-              background: 'rgba(15, 23, 42, 0.62)',
-              backdropFilter: 'blur(5px)',
-              WebkitBackdropFilter: 'blur(5px)',
+              background: 'rgba(15, 23, 42, 0.55)',
+              backdropFilter: 'blur(4px)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
@@ -2845,10 +2737,10 @@ export function WebsitesPage({
               style={{
                 width: '100%',
                 maxWidth: '480px',
-                borderRadius: '16px',
-                background: 'var(--bg-elevated, #ffffff)',
-                border: '1px solid var(--border-strong, #cbd5e1)',
-                boxShadow: '0 24px 48px -12px rgba(15, 23, 42, 0.38)',
+                borderRadius: '14px',
+                background: 'var(--bg-elevated)',
+                border: '1px solid var(--border-strong)',
+                boxShadow: 'var(--shadow-lg)',
                 overflow: 'hidden',
               }}
             >
@@ -2858,49 +2750,34 @@ export function WebsitesPage({
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
-                  padding: '18px 24px',
-                  background: 'var(--surface-alt, #f8fafc)',
+                  padding: '16px 20px',
                   borderBottom: '1px solid var(--border)',
                 }}
               >
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                   <div
                     style={{
-                      width: '38px',
-                      height: '38px',
-                      borderRadius: '10px',
-                      background: 'var(--primary-light, rgba(79, 70, 229, 0.14))',
-                      border: '1px solid var(--primary-soft, rgba(79, 70, 229, 0.25))',
+                      width: '32px',
+                      height: '32px',
+                      borderRadius: '8px',
+                      background: 'var(--primary-10)',
                       color: 'var(--primary)',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
-                      flexShrink: 0,
                     }}
                   >
-                    <Pencil size={17} />
+                    <Pencil size={16} />
                   </div>
-                  <div>
-                    <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 700, color: 'var(--text)', lineHeight: 1.25 }}>
-                      {t('Rename Domain')}
-                    </h3>
-                    <p style={{ margin: '2px 0 0', fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.3 }}>
-                      {t('Update domain name and virtual host configuration')}
-                    </p>
-                  </div>
+                  <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 700, color: 'var(--text)' }}>
+                    {t('Rename Domain')}
+                  </h3>
                 </div>
                 <button
                   type="button"
                   className="secondary-light"
                   onClick={() => setRenameModalOpen(false)}
-                  style={{
-                    padding: '4px',
-                    height: '32px',
-                    minHeight: '32px',
-                    width: '32px',
-                    borderRadius: '8px',
-                    background: 'var(--bg-elevated, #ffffff)',
-                  }}
+                  style={{ padding: '4px', height: '30px', minHeight: '30px', width: '30px' }}
                   aria-label={t('Close')}
                 >
                   <X size={16} />
@@ -2910,11 +2787,10 @@ export function WebsitesPage({
               <div
                 className="modal-body"
                 style={{
-                  padding: '22px 24px',
-                  background: 'var(--bg-elevated, #ffffff)',
+                  padding: '20px',
                   display: 'flex',
                   flexDirection: 'column',
-                  gap: '18px',
+                  gap: '16px',
                 }}
               >
                 <div>
@@ -2924,7 +2800,7 @@ export function WebsitesPage({
                       fontSize: '13px',
                       fontWeight: 600,
                       color: 'var(--text)',
-                      marginBottom: '8px',
+                      marginBottom: '6px',
                     }}
                   >
                     {t('Select Domain')}
@@ -2936,15 +2812,6 @@ export function WebsitesPage({
                       setRenameTargetId(val);
                       const found = rootDomains.find(d => String(d.id) === val);
                       if (found) setRenameNewDomain(found.domain);
-                    }}
-                    style={{
-                      height: '42px',
-                      minHeight: '42px',
-                      background: 'var(--bg-elevated, #ffffff)',
-                      border: '1.5px solid var(--border-strong, #cbd5e1)',
-                      borderRadius: '8px',
-                      fontSize: '13.5px',
-                      fontWeight: 600,
                     }}
                   >
                     {rootDomains.map(d => (
@@ -2962,13 +2829,12 @@ export function WebsitesPage({
                       fontSize: '13px',
                       fontWeight: 600,
                       color: 'var(--text)',
-                      marginBottom: '8px',
+                      marginBottom: '6px',
                     }}
                   >
                     {t('New Domain Name')}
                   </label>
                   <input
-                    type="text"
                     autoFocus
                     value={renameNewDomain}
                     onChange={e => setRenameNewDomain(e.target.value)}
@@ -2976,15 +2842,6 @@ export function WebsitesPage({
                       if (e.key === 'Enter' && renameNewDomain.trim()) handleRenameDomain();
                     }}
                     placeholder="new-domain.com"
-                    style={{
-                      height: '42px',
-                      minHeight: '42px',
-                      background: 'var(--bg-elevated, #ffffff)',
-                      border: '1.5px solid var(--border-strong, #cbd5e1)',
-                      borderRadius: '8px',
-                      fontSize: '14px',
-                      fontWeight: 500,
-                    }}
                   />
                 </div>
               </div>
@@ -2996,21 +2853,15 @@ export function WebsitesPage({
                   alignItems: 'center',
                   justifyContent: 'flex-end',
                   gap: '10px',
-                  padding: '14px 24px',
+                  padding: '14px 20px',
                   borderTop: '1px solid var(--border)',
-                  background: 'var(--surface-alt, #f8fafc)',
+                  background: 'var(--surface-alt)',
                 }}
               >
                 <button
                   type="button"
                   className="secondary-light"
                   onClick={() => setRenameModalOpen(false)}
-                  style={{
-                    height: '38px',
-                    minHeight: '38px',
-                    padding: '0 16px',
-                    background: 'var(--bg-elevated, #ffffff)',
-                  }}
                 >
                   {t('Cancel')}
                 </button>
@@ -3018,11 +2869,6 @@ export function WebsitesPage({
                   type="button"
                   disabled={!!loading || !renameNewDomain.trim()}
                   onClick={handleRenameDomain}
-                  style={{
-                    height: '38px',
-                    minHeight: '38px',
-                    padding: '0 18px',
-                  }}
                 >
                   <Save size={14} />
                   {t('Rename Domain')}

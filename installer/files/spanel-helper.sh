@@ -489,7 +489,10 @@ panel_snapshot_create() {
   [[ -f "/usr/local/sbin/spanel-update" ]] && cp -a "/usr/local/sbin/spanel-update" "$work/sbin/spanel-update"
 
   if [[ -f "${APP_DIR}/backend/spanel.db" ]]; then
-    if command -v sqlite3 >/dev/null 2>&1; then
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c 'import sqlite3, sys; src=sqlite3.connect(sys.argv[1], timeout=15); dst=sqlite3.connect(sys.argv[2], timeout=15); src.backup(dst); dst.close(); src.close()' "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak" 2>/dev/null \
+        || cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
+    elif command -v sqlite3 >/dev/null 2>&1; then
       sqlite3 "${APP_DIR}/backend/spanel.db" ".backup '${work}/backend/spanel.db.bak'" 2>/dev/null || cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
     else
       cp -a "${APP_DIR}/backend/spanel.db" "$work/backend/spanel.db.bak"
@@ -569,6 +572,7 @@ panel_snapshot_restore() {
     mv -f "/usr/local/sbin/spanel-update.new" "/usr/local/sbin/spanel-update"
   fi
   if [[ -f "$work/backend/spanel.db.bak" && "${2:-}" == "--restore-db" ]]; then
+    rm -f "${APP_DIR}/backend/spanel.db-wal" "${APP_DIR}/backend/spanel.db-shm" "${APP_DIR}/backend/spanel.db-journal" 2>/dev/null || true
     cp -a "$work/backend/spanel.db.bak" "${APP_DIR}/backend/spanel.db"
     chown spanel:spanel "${APP_DIR}/backend/spanel.db" 2>/dev/null || true
   fi
@@ -9435,10 +9439,19 @@ EOF
     old_user="${old_user%%/*}"
     ensure_panel_user_home "$user"
     if [[ "$old_target" != "$new_target" ]]; then
-      [[ ! -e "$new_target" ]] || deny "target path already exists: $new_target"
       delete_site_php_pools "$old_user" "$old_target"
       mkdir -p "$(dirname "$new_target")"
-      mv "$old_target" "$new_target"
+      if [[ -d "$old_target" && -d "$new_target" ]]; then
+        cp -a "$old_target"/. "$new_target"/ 2>/dev/null || true
+        rm -rf "$old_target"
+      elif [[ -e "$old_target" && ! -e "$new_target" ]]; then
+        mv "$old_target" "$new_target"
+      elif [[ -e "$old_target" ]]; then
+        rm -rf "$new_target"
+        mv "$old_target" "$new_target"
+      else
+        mkdir -p "$new_target"
+      fi
     fi
     if [[ -d "$new_target/public" && ! -e "$new_target/public_html" ]]; then
       mv "$new_target/public" "$new_target/public_html"

@@ -86,6 +86,12 @@ def run_migrations() -> None:
     import app.models.entities  # noqa: F401
     Base.metadata.create_all(bind=engine)
     _ensure_resource_limit_columns()
+    try:
+        from app.api.websites import reconcile_websites_from_disk
+        with SessionLocal() as db:
+            reconcile_websites_from_disk(db)
+    except Exception:
+        pass
 
 
 def _ensure_resource_limit_columns() -> None:

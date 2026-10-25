@@ -1657,12 +1657,9 @@ function AppContent() {
     ]);
     if (siteData) {
       setWebsites(siteData);
-      const preferredSiteId = standaloneEditor?.websiteId || selectedWebsiteId;
-      const stillExists = preferredSiteId && siteData.some(s => String(s.id) === String(preferredSiteId));
+      const stillExists = selectedWebsiteId && siteData.some(s => String(s.id) === String(selectedWebsiteId));
       if (!stillExists) {
         setSelectedWebsiteId(siteData[0] ? String(siteData[0].id) : '');
-      } else if (standaloneEditor?.websiteId && String(selectedWebsiteId) !== String(standaloneEditor.websiteId)) {
-        setSelectedWebsiteId(String(standaloneEditor.websiteId));
       }
     }
     if (refreshedUser?.role === 'admin' || refreshedUser?.role === 'reseller') {
@@ -1984,7 +1981,12 @@ function AppContent() {
       setDomain('');
       setCreateFormOpen(false);
       setNotice(t('Added domain {domain}. Root folder: /domains/{domain}/public_html', { domain: cleanDomain }));
-      refreshAll();
+      setWebsites(prev => {
+        const list = Array.isArray(prev) ? prev : [];
+        const exists = list.some(s => s.id === data.id);
+        return exists ? list.map(s => (s.id === data.id ? data : s)) : [data, ...list];
+      });
+      await refreshAll();
     }
   }
 
@@ -2376,61 +2378,44 @@ function AppContent() {
 
 
   function fileTargetQuery() {
-    const effAppId = fileAppId || standaloneEditor?.appId || '';
-    const effSiteId = selectedWebsiteId || standaloneEditor?.websiteId || '';
-    return effAppId ? `app_id=${encodeURIComponent(effAppId)}` : `website_id=${encodeURIComponent(effSiteId)}`;
+    return fileAppId ? `app_id=${encodeURIComponent(fileAppId)}` : `website_id=${encodeURIComponent(selectedWebsiteId)}`;
   }
 
-  async function listFiles(path = fileListPath, overrideSiteId = null, overrideAppId = null) {
-    const base = fileTargetBase(overrideSiteId, overrideAppId);
-    if (!hasFileTarget() || base.endsWith('/')) return;
-    const data = await request(`${base}?path=${encodeURIComponent(path || '')}`, {}, t('Loading files...'));
-    const items = Array.isArray(data) ? data : data?.items;
-    if (Array.isArray(items)) {
-      setFiles(items);
+  async function listFiles(path = fileListPath) {
+    if (!hasFileTarget()) return;
+    const data = await request(`/maintenance/files/list?${fileTargetQuery()}&path=${encodeURIComponent(path || '')}`, {}, t('Loading files...'));
+    if (Array.isArray(data)) {
+      setFiles(data);
       setFileListPath(path || '');
       setFileUploadDir(path || '');
       setSelectedFilePaths([]);
     }
   }
 
-  async function readFile(nextPath = filePath, overrideSiteId = null, overrideAppId = null) {
-    const targetPath = nextPath || filePath || standaloneEditor?.path;
-    const base = fileTargetBase(overrideSiteId, overrideAppId);
-    if (!hasFileTarget() || !targetPath || base.endsWith('/')) return;
-    const data = await request(`${base}/read?path=${encodeURIComponent(targetPath)}`, {}, t('Reading file...'));
+  async function readFile(nextPath = filePath) {
+    if (!hasFileTarget() || !nextPath) return;
+    const data = await request(`${fileTargetBase()}?path=${encodeURIComponent(nextPath)}`, {}, t('Reading file...'));
     if (data && data.content !== undefined) {
-      setFilePath(targetPath);
+      setFilePath(nextPath);
       setFileContent(data.content);
-      setEditorCursor({ line: 1, column: 1 });
     }
   }
 
   async function writeFile() {
-    const targetPath = filePath || standaloneEditor?.path;
-    if (!hasFileTarget() || !targetPath) return;
+    if (!hasFileTarget() || !filePath) return;
     const data = await request('/maintenance/files/write', {
       method: 'POST',
-      body: JSON.stringify({ ...fileTargetBody(), path: targetPath, content: fileContent }),
+      body: JSON.stringify({ ...fileTargetBody(), path: filePath, content: fileContent }),
     }, t('Saving file...'));
-    if (data) {
-      const savedPath = data.path || data.target || targetPath;
-      setNotice(t('Saved {path}', { path: savedPath }));
-      if (!standaloneEditor) {
-        await listFiles(fileListPath);
-      }
-      await loadCurrentUser();
-    }
+    if (data) { setNotice(`Saved ${data.path}`); await listFiles(fileListPath); }
   }
 
   async function downloadFile(path) {
-    const targetPath = path || filePath || standaloneEditor?.path;
-    const base = fileTargetBase();
-    if (!hasFileTarget() || !targetPath || base.endsWith('/')) return;
+    if (!hasFileTarget()) return;
     try {
       setError('');
       setLoading('Downloading file...');
-      const res = await fetch(`${API}${base}/download?path=${encodeURIComponent(targetPath)}`, {
+      const res = await fetch(`${API}/maintenance/files/download?${fileTargetQuery()}&path=${encodeURIComponent(path)}`, {
         credentials: 'include',
       });
       if (!res.ok) {
@@ -2443,7 +2428,7 @@ function AppContent() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = targetPath.split('/').pop() || 'download';
+      a.download = path.split('/').pop() || 'download';
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -2773,10 +2758,10 @@ function AppContent() {
 
   useEffect(() => {
     if (!isAuthenticated || !standaloneEditor) return;
-    setSelectedWebsiteId(standaloneEditor.websiteId || '');
+    setSelectedWebsiteId(standaloneEditor.websiteId);
     setFileAppId(standaloneEditor.appId || '');
     setFilePath(standaloneEditor.path);
-    readFile(standaloneEditor.path, standaloneEditor.websiteId || '', standaloneEditor.appId || '');
+    readFile(standaloneEditor.path);
   }, [isAuthenticated, standaloneEditor]);
 
   useEffect(() => {
@@ -2789,7 +2774,7 @@ function AppContent() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [standaloneEditor, isAuthenticated, selectedWebsiteId, fileAppId, filePath, fileContent]);
+  }, [standaloneEditor, isAuthenticated, selectedWebsiteId, filePath, fileContent]);
 
   useEffect(() => {
     if (isAuthenticated) loadDashboardSummary();
@@ -3200,31 +3185,24 @@ function AppContent() {
   }
 
   // The file manager browses either a website root or an application root.
-  function fileTargetBody(overrideSiteId = null, overrideAppId = null) {
-    const effAppId = overrideAppId !== null ? overrideAppId : (fileAppId || standaloneEditor?.appId || '');
-    const effSiteId = overrideSiteId !== null ? overrideSiteId : (selectedWebsiteId || standaloneEditor?.websiteId || '');
-    return effAppId ? { app_id: Number(effAppId) } : { website_id: Number(effSiteId) };
+  function fileTargetBody() {
+    return fileAppId ? { app_id: Number(fileAppId) } : { website_id: Number(selectedWebsiteId) };
   }
 
-  function fileTargetBase(overrideSiteId = null, overrideAppId = null) {
-    const effAppId = overrideAppId !== null ? overrideAppId : (fileAppId || standaloneEditor?.appId || '');
-    const effSiteId = overrideSiteId !== null ? overrideSiteId : (selectedWebsiteId || standaloneEditor?.websiteId || '');
-    return effAppId ? `/maintenance/app-files/${effAppId}` : `/maintenance/files/${effSiteId}`;
+  function fileTargetBase() {
+    return fileAppId ? `/maintenance/app-files/${fileAppId}` : `/maintenance/files/${selectedWebsiteId}`;
   }
 
   function fileTargetKey() {
-    const effAppId = fileAppId || standaloneEditor?.appId || '';
-    const effSiteId = selectedWebsiteId || standaloneEditor?.websiteId || '';
-    return effAppId ? `app:${effAppId}` : (effSiteId ? `site:${effSiteId}` : '');
+    return fileAppId ? `app:${fileAppId}` : (selectedWebsiteId ? `site:${selectedWebsiteId}` : '');
   }
 
   function hasFileTarget() {
-    return !!(fileAppId || selectedWebsiteId || standaloneEditor?.appId || standaloneEditor?.websiteId);
+    return !!(fileAppId || selectedWebsiteId);
   }
 
   function currentFileApp() {
-    const effAppId = fileAppId || standaloneEditor?.appId || '';
-    return siteApps.items.find(app => String(app.id) === String(effAppId)) || null;
+    return siteApps.items.find(app => String(app.id) === String(fileAppId)) || null;
   }
 
   function FileTargetSelect() {
@@ -4072,30 +4050,21 @@ function AppContent() {
 
   function renderStandaloneEditor() {
     const editorLineCount = Math.max(1, String(fileContent || '').split('\n').length);
-    const activeEditorPath = filePath || standaloneEditor?.path || '';
-    const editorMode = editorLanguage(activeEditorPath);
-    const activeApp = currentFileApp();
-    const targetReady = hasFileTarget();
-    const siteLabel = activeApp?.name
-      || currentSite?.domain
-      || (fileAppId || standaloneEditor?.appId
-        ? `Application #${fileAppId || standaloneEditor?.appId}`
-        : (selectedWebsiteId || standaloneEditor?.websiteId
-          ? `Website #${selectedWebsiteId || standaloneEditor?.websiteId}`
-          : 'Website'));
+    const editorMode = editorLanguage(filePath);
+    const siteLabel = currentSite?.domain || (selectedWebsiteId ? `Website #${selectedWebsiteId}` : 'Website');
     return <main className="standalone-editor-page">
       <header className="standalone-editor-top">
         <div className="standalone-editor-title">
-          <strong>{activeEditorPath || 'No file selected'}</strong>
+          <strong>{filePath || 'No file selected'}</strong>
           <span>{siteLabel}</span>
         </div>
         <div className="standalone-editor-actions">
           <span className="editor-chip">{editorMode}</span>
           <span className="editor-chip">{t('{n} line(s)', { n: editorLineCount })}</span>
           <span className="editor-chip">Ln {editorCursor.line}, Col {editorCursor.column}</span>
-          <button className="secondary" disabled={!targetReady || !!loading} onClick={() => readFile(activeEditorPath)}><RefreshCw size={14} />{t('Reload')}</button>
-          <button disabled={!targetReady || !!loading} onClick={writeFile}>{t('Save')}</button>
-          <button disabled={!targetReady || !activeEditorPath || !!loading} onClick={() => downloadFile(activeEditorPath)}><Download size={14} /></button>
+          <button className="secondary" disabled={!selectedWebsiteId || !!loading} onClick={() => readFile(filePath)}><RefreshCw size={14} />{t('Reload')}</button>
+          <button disabled={!selectedWebsiteId || !!loading} onClick={writeFile}>{t('Save')}</button>
+          <button disabled={!selectedWebsiteId || !filePath || !!loading} onClick={() => downloadFile(filePath)}><Download size={14} /></button>
           <button className="secondary-light" onClick={() => window.close()}><X size={14} />{t('Close')}</button>
         </div>
 
@@ -4106,7 +4075,7 @@ function AppContent() {
         <CodeEditor
           value={fileContent}
           mode={editorMode}
-          disabled={!targetReady}
+          disabled={!selectedWebsiteId}
           onChange={setFileContent}
           onCursorChange={setEditorCursor}
         />
