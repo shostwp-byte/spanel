@@ -14,6 +14,14 @@
 
 set -euo pipefail
 
+# Much of this script runs as root with the working directory inside
+# $APP_DIR, which the panel account owns. `python3 -`, `-c` and `-m` put that
+# directory first on sys.path, so a json.py, venv.py or py_compile.py the
+# account dropped there would run as root. Python 3.11+ leaves it off with
+# this set; sudo's env_reset keeps it away from the `sudo -u spanel` steps,
+# which do import the panel from their cwd.
+export PYTHONSAFEPATH=1
+
 log()  { echo ""; echo "==> $1"; }
 fail() { echo "ERROR: $1" >&2; exit 1; }
 
@@ -340,15 +348,40 @@ write_update_state() {
   latest="${ref#v}"
   [[ "$latest" == "$ref" ]] && latest=""
   install -d -m 0750 "$(dirname "$UPDATE_STATE_FILE")"
-  python3 - "$UPDATE_STATE_FILE" "$status" "$ref" "$latest" "$current" "$message" "$now" <<'PY'
+  /usr/bin/python3 -I - "$UPDATE_STATE_FILE" "$status" "$ref" "$latest" "$current" "$message" "$now" <<'PY'
 import json
 import sys
 from pathlib import Path
 
+
+def save_state(path, state):
+    # A fresh file renamed over the old name, owner and mode set on the
+    # descriptor: a chown by name afterwards follows whatever link the panel
+    # account put there, and handed that file to spanel.
+    import os, pwd, tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".update-status.")
+    try:
+        try:
+            account = pwd.getpwnam("spanel")
+            os.fchown(fd, account.pw_uid, account.pw_gid)
+        except KeyError:
+            pass
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 path = Path(sys.argv[1])
 status, ref, latest, current, message, now = sys.argv[2:8]
 try:
-    state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    state = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and not path.is_symlink() else {}
 except Exception:
     state = {}
 
@@ -366,12 +399,8 @@ if status in {"checking", "updating"}:
     state["last_update_started_at"] = now
 elif status in {"completed", "failed"}:
     state["last_update_finished_at"] = now
-path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+save_state(path, state)
 PY
-  if id -u spanel >/dev/null 2>&1; then
-    chown spanel:spanel "$UPDATE_STATE_FILE" 2>/dev/null || true
-  fi
-  chmod 0640 "$UPDATE_STATE_FILE" 2>/dev/null || true
 }
 
 # Write progress markers (percent / phase / message) into the update state file
@@ -379,15 +408,40 @@ PY
 update_progress() {
   local percent="$1" phase="$2" message="${3:-}"
   install -d -m 0750 "$(dirname "$UPDATE_STATE_FILE")"
-  python3 - "$UPDATE_STATE_FILE" "$percent" "$phase" "$message" <<'PY'
+  /usr/bin/python3 -I - "$UPDATE_STATE_FILE" "$percent" "$phase" "$message" <<'PY'
 import json
 import sys
 from pathlib import Path
 
+
+def save_state(path, state):
+    # A fresh file renamed over the old name, owner and mode set on the
+    # descriptor: a chown by name afterwards follows whatever link the panel
+    # account put there, and handed that file to spanel.
+    import os, pwd, tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".update-status.")
+    try:
+        try:
+            account = pwd.getpwnam("spanel")
+            os.fchown(fd, account.pw_uid, account.pw_gid)
+        except KeyError:
+            pass
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 path = Path(sys.argv[1])
 percent, phase, message = sys.argv[2:5]
 try:
-    state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    state = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and not path.is_symlink() else {}
 except Exception:
     state = {}
 try:
@@ -398,12 +452,8 @@ if phase:
     state["progress_phase"] = phase
 if message:
     state["progress_message"] = message
-path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+save_state(path, state)
 PY
-  if id -u spanel >/dev/null 2>&1; then
-    chown spanel:spanel "$UPDATE_STATE_FILE" 2>/dev/null || true
-  fi
-  chmod 0640 "$UPDATE_STATE_FILE" 2>/dev/null || true
 }
 
 UPDATE_REF=""
@@ -1305,8 +1355,11 @@ ensure_panel_runtime_ownership() {
   # bypasses every argv check in spanel-helper, which is the whole point of the
   # sudo trampoline. Root keeps the venv; the service only reads and executes it.
   if [[ -d "$APP_DIR/backend" ]]; then
+    # -h: find hands chown every symlink in the tree as a command-line
+    # argument, and without -h chown follows it - a link to /etc/shadow
+    # planted here gave the file to spanel on the next update.
     find "$APP_DIR/backend" -path "$APP_DIR/backend/.venv" -prune \
-      -o -exec chown spanel:spanel {} + 2>/dev/null || true
+      -o -exec chown -h spanel:spanel {} + 2>/dev/null || true
     # Reclaim it on an upgrade from a build that handed it to spanel.
     [[ -d "$APP_DIR/backend/.venv" ]] && chown -R root:root "$APP_DIR/backend/.venv" 2>/dev/null || true
   fi
@@ -1320,7 +1373,7 @@ ensure_panel_runtime_ownership() {
   # script ever creates node_modules; spanel just needs to read it.
   if [[ -d "$APP_DIR/frontend" ]]; then
     find "$APP_DIR/frontend" -path "$APP_DIR/frontend/node_modules" -prune \
-      -o -exec chown spanel:spanel {} + 2>/dev/null || true
+      -o -exec chown -h spanel:spanel {} + 2>/dev/null || true
     # Reclaim it on an upgrade from a build that handed it to spanel.
     [[ -d "$APP_DIR/frontend/node_modules" ]] && chown -R root:root "$APP_DIR/frontend/node_modules" 2>/dev/null || true
   fi
@@ -1816,10 +1869,15 @@ fi
 source .venv/bin/activate
 # pip resolves the whole requirements file on every run even when nothing moved;
 # skip it unless requirements.txt changed or the venv was just rebuilt.
-if [[ "$venv_needs_recreate" == "true" ]] || step_inputs_changed backend-deps requirements.txt; then
+# requirements.txt from the release source, not from backend/: root installs
+# whatever it names, and backend/ is the panel account's. rsync's quick check
+# skips a file whose size and mtime already match, so a copy the account
+# rewrote there could survive the sync.
+release_requirements="$SOURCE_DIR/backend/requirements.txt"
+if [[ "$venv_needs_recreate" == "true" ]] || step_inputs_changed backend-deps "$release_requirements"; then
   pip install --upgrade pip
-  pip install -r requirements.txt
-  step_mark_done backend-deps requirements.txt
+  pip install -r "$release_requirements"
+  step_mark_done backend-deps "$release_requirements"
 else
   log "Backend dependencies unchanged since last update; skipping pip install"
 fi
@@ -1834,7 +1892,7 @@ if id -u spanel >/dev/null 2>&1; then
   sudo -u spanel "$APP_DIR/backend/.venv/bin/python" -c \
     "from app.core.database import run_migrations; run_migrations()"
 else
-  python -c "from app.core.database import run_migrations; run_migrations()"
+  PYTHONPATH="$APP_DIR/backend" python -c "from app.core.database import run_migrations; run_migrations()"
 fi
 # Remote MySQL hosts now live in the panel database (moved out of
 # multi-server.json by the migration above); give phpMyAdmin the list.
@@ -2059,7 +2117,11 @@ for php_ini_dir in /etc/php/*/; do
 done
 
 log "Compiling backend modules"
-python -m py_compile \
+# As spanel: the .pyc files land in backend/__pycache__, the account's
+# directory, and root writing there follows whatever links it holds.
+py_compile_as=()
+id -u spanel >/dev/null 2>&1 && py_compile_as=(sudo -u spanel)
+"${py_compile_as[@]}" "$APP_DIR/backend/.venv/bin/python" -m py_compile \
   app/main.py \
   app/api/auth.py \
   app/api/users.py \

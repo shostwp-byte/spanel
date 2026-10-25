@@ -683,7 +683,16 @@ ensure_cron_jail_binary() {
 }
 
 
-PANEL_SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+# Snapshots are what a rollback installs as root - spanel-helper itself
+# among them - so every directory on their path must be root's. They used
+# to sit under BACKUP_ROOT, which the panel account owns: it could rename
+# panel-snapshots/ away, create its own in its place, and have
+# panel-snapshot-restore install a helper of its choosing.
+PANEL_SNAPSHOT_DIR="/var/backups/spanel-panel-snapshots"
+LEGACY_PANEL_SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+# Where a database restore keeps the database it replaced. Root's: see
+# swap_panel_db.
+PANEL_DB_PRE_RESTORE_DIR="/var/backups/spanel-panel-snapshots/db-pre-restore"
 PANEL_DB_BACKUP_DIR="${SPANEL_DATA_DIR}/db-backups"
 DEFAULT_SNAPSHOT_KEEP=5
 # The units that open spanel.db. All of them are stopped while the file is
@@ -771,22 +780,46 @@ except sqlite3.Error:
 PY
 }
 
+start_panel_db_units() {
+  local timer
+  systemctl start spanel-api >/dev/null 2>&1 || true
+  for timer in "$@"; do
+    [[ -n "$timer" ]] && systemctl start "$timer" >/dev/null 2>&1 || true
+  done
+}
+
 # Replace the panel database with <src>, safely:
-#   1. integrity_check the replacement before anything is stopped;
+#   1. copy the replacement into a root-only staging directory and
+#      integrity_check that copy, before anything is stopped;
 #   2. stop the API and every timer/oneshot that opens the database;
 #   3. keep the current database (read through its WAL) as
-#      <db>.pre-restore-<ts>, so nothing is ever lost by a restore;
+#      PANEL_DB_PRE_RESTORE_DIR/spanel.db.pre-restore-<ts>, so nothing is
+#      ever lost by a restore;
 #   4. drop -wal/-shm (they belong to the old file) and move the copy in;
 #   5. start what was running again.
+#
+# The database lives in backend/, which the panel account owns. Root never
+# writes, chowns or deletes by name in there: a name the panel account
+# planted (a symlink, a name with spaces) would point root at any file on
+# the box. Everything in backend/ is done as spanel; root only reads the
+# current database (refusing a symlink) and writes into directories that are
+# root's own. <src> may sit in a spanel-writable directory too
+# (db-backups/), so it is checked after it has been copied, never before.
 swap_panel_db() {
-  local src="$1" db ts timer tmp
+  local src="$1" db dir ts tmp stage timer
   local -a active_timers=()
   db="$(panel_db_path)"
-  [[ -f "$src" ]] || deny "database copy not found"
-  sqlite_integrity_ok "$src" || deny "the database copy failed PRAGMA integrity_check; nothing was changed"
+  dir="$(dirname -- "$db")"
+  [[ -f "$src" && ! -L "$src" ]] || deny "database copy not found"
+  stage="$(mktemp -d /run/spanel-db-swap.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$stage'" EXIT
+  cp --no-dereference -- "$src" "$stage/new.db"
+  [[ -f "$stage/new.db" && ! -L "$stage/new.db" ]] || deny "database copy not found"
+  sqlite_integrity_ok "$stage/new.db" || deny "the database copy failed PRAGMA integrity_check; nothing was changed"
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  tmp="${db}.restore-${ts}"
-  install -m 0640 -o spanel -g spanel "$src" "$tmp"
+  [[ ! -L "$db" ]] || deny "refusing to restore over a symlinked database: $db"
+  install -d -o root -g spanel -m 0750 "$PANEL_DB_PRE_RESTORE_DIR"
 
   for timer in "${SPANEL_DB_TIMERS[@]}"; do
     if systemctl is-active --quiet "$timer" 2>/dev/null; then
@@ -807,33 +840,70 @@ swap_panel_db() {
     done
   done
 
+  local previous="${PANEL_DB_PRE_RESTORE_DIR}/spanel.db.pre-restore-${ts}"
   if [[ -f "$db" ]]; then
-    sqlite_online_copy "$db" "${db}.pre-restore-${ts}" || cp -a "$db" "${db}.pre-restore-${ts}"
-    chown spanel:spanel "${db}.pre-restore-${ts}" 2>/dev/null || true
-    chmod 0640 "${db}.pre-restore-${ts}" 2>/dev/null || true
+    # No cp fallback: a copy of the main file alone misses the WAL's rows,
+    # and a restore that cannot keep what it replaces does not run.
+    if ! sqlite_online_copy "$db" "$stage/previous.db"; then
+      start_panel_db_units "${active_timers[@]:-}"
+      deny "could not copy the current database aside; nothing was changed"
+    fi
+    install -m 0640 -o root -g spanel "$stage/previous.db" "$previous"
   fi
-  rm -f "${db}-wal" "${db}-shm"
-  mv -f "$tmp" "$db"
-  # Keep the three newest pre-restore copies.
-  ls -1t "${db}".pre-restore-* 2>/dev/null | tail -n +4 | xargs -r rm -f || true
 
-  systemctl start spanel-api >/dev/null 2>&1 || true
-  for timer in "${active_timers[@]:-}"; do
-    [[ -n "$timer" ]] && systemctl start "$timer" >/dev/null 2>&1 || true
-  done
-  echo "database_restored=${db} previous=${db}.pre-restore-${ts}"
+  # The replacement goes in under a fresh name, written by spanel from a
+  # descriptor root opened, then renamed over the database by spanel.
+  tmp="${db}.restore-${ts}"
+  if ! runuser -u spanel -- /bin/sh -c 'umask 027; cat >"$1"' sh "$tmp" <"$stage/new.db"; then
+    start_panel_db_units "${active_timers[@]:-}"
+    deny "could not write the restored database into ${dir}; nothing was changed"
+  fi
+  runuser -u spanel -- rm -f -- "${db}-wal" "${db}-shm"
+  runuser -u spanel -- mv -f -- "$tmp" "$db"
+
+  # Keep the three newest pre-restore copies. Root's own directory, but the
+  # names still go through NUL-separated lists, never a word-split one.
+  find "$PANEL_DB_PRE_RESTORE_DIR" -maxdepth 1 -type f -name 'spanel.db.pre-restore-*' -printf '%T@ %p\0' \
+    | sort -z -rn | tail -z -n +4 | cut -z -d' ' -f2- | xargs -0 -r rm -f -- || true
+
+  start_panel_db_units "${active_timers[@]:-}"
+  echo "database_restored=${db} previous=${previous}"
+}
+
+# Create the snapshot directory and bring over the snapshots the previous
+# location holds. Only regular files root owns are moved: the panel account
+# can create files in the old location but never root-owned ones, so what it
+# planted stays behind. A rename moves a link rather than following it, so
+# whatever arrived is checked again on this side.
+panel_snapshot_dir_ensure() {
+  local f dest
+  install -d -o root -g spanel -m 0750 "$PANEL_SNAPSHOT_DIR"
+  [[ -d "$LEGACY_PANEL_SNAPSHOT_DIR" && ! -L "$LEGACY_PANEL_SNAPSHOT_DIR" ]] || return 0
+  while IFS= read -r -d '' f; do
+    dest="${PANEL_SNAPSHOT_DIR}/$(basename -- "$f")"
+    [[ -e "$dest" || -L "$dest" ]] && continue
+    mv -n -- "$f" "$dest" 2>/dev/null || continue
+    if [[ -L "$dest" || ! -f "$dest" || "$(stat -c %u -- "$dest")" != 0 ]]; then
+      rm -f -- "$dest"
+    fi
+  done < <(find "$LEGACY_PANEL_SNAPSHOT_DIR" -maxdepth 1 -type f -user root \
+             \( -name 'snapshot-*.tar.gz' -o -name 'snapshot-*.json' \) -print0 2>/dev/null)
+  rmdir -- "$LEGACY_PANEL_SNAPSHOT_DIR" 2>/dev/null || true
+}
+
+# A snapshot archive restore may trust: a root-owned regular file in the
+# root-owned snapshot directory.
+panel_snapshot_trusted() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" && "$(stat -c %u -- "$path")" == 0 ]]
 }
 
 panel_snapshot_prune() {
   local keep="$1" s
-  local old_snaps=()
-  while IFS= read -r s; do
-    [[ -n "$s" ]] && old_snaps+=("$s")
-  done < <(ls -1t "${PANEL_SNAPSHOT_DIR}"/snapshot-*.tar.gz 2>/dev/null | tail -n +"$((keep + 1))" || true)
-  for s in "${old_snaps[@]:-}"; do
-    [[ -n "$s" ]] || continue
-    rm -f "$s" "${s%.tar.gz}.json" 2>/dev/null || true
-  done
+  while IFS= read -r -d '' s; do
+    rm -f -- "$s" "${s%.tar.gz}.json" 2>/dev/null || true
+  done < <(find "$PANEL_SNAPSHOT_DIR" -maxdepth 1 -type f -name 'snapshot-*.tar.gz' -printf '%T@ %p\0' 2>/dev/null \
+             | sort -z -rn | tail -z -n +"$((keep + 1))" | cut -z -d' ' -f2-)
 }
 
 panel_snapshot_create() {
@@ -841,7 +911,7 @@ panel_snapshot_create() {
   [[ "$reason" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || reason="manual"
   [[ "$keep" =~ ^[0-9]{1,2}$ ]] || deny "snapshot keep must be a number"
   (( keep >= 1 && keep <= 20 )) || deny "snapshot keep must be between 1 and 20"
-  install -d -o root -g spanel -m 0750 "$PANEL_SNAPSHOT_DIR"
+  panel_snapshot_dir_ensure
   local ver ts snap_id work tar_path meta_path size_bytes db revision="" glob path
   local -a system_paths=()
   ver="$(panel_current_version)"
@@ -864,8 +934,14 @@ panel_snapshot_create() {
   # Taken before spanel-update runs any migration, so restoring it is what
   # reverses one (Alembic downgrades are not written for this schema).
   db="$(panel_db_path)"
+  # backend/ is the panel account's: a symlink there would have root read
+  # some other file into an archive the panel account can read back.
   if [[ -f "$db" ]]; then
-    sqlite_online_copy "$db" "$work/backend/spanel.db.bak" || cp -a "$db" "$work/backend/spanel.db.bak"
+    [[ ! -L "$db" ]] || { rm -rf "$work"; deny "refusing to snapshot a symlinked database: $db"; }
+    if ! sqlite_online_copy "$db" "$work/backend/spanel.db.bak"; then
+      rm -rf "$work"
+      deny "could not copy the database into the snapshot; no snapshot was taken"
+    fi
     revision="$(sqlite_alembic_revision "$work/backend/spanel.db.bak")"
   fi
 
@@ -988,13 +1064,41 @@ state.update({"last_update_status": status, "progress_phase": status, "progress_
               "progress_message": message, "last_update_message": message, "rollback_snapshot_id": snap,
               "last_update_finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".update-status.")
+# Owner and mode on the descriptor, before the rename: a chown by name
+# afterwards would follow whatever the panel account put there meanwhile.
+try:
+    import pwd
+    account = pwd.getpwnam("spanel")
+    os.fchown(fd, account.pw_uid, account.pw_gid)
+except (KeyError, OSError):
+    pass
+os.fchmod(fd, 0o640)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
     json.dump(state, handle, indent=2, sort_keys=True)
     handle.write("\n")
-os.chmod(tmp, 0o640)
 os.replace(tmp, path)
 PY
-  chown spanel:spanel "${SPANEL_DATA_DIR}/update-status.json" 2>/dev/null || true
+}
+
+# Put <src_parent>/<name> back as <dst_parent>/<name>. The destination is
+# the panel account's tree, so the account does the moving and the writing:
+# root only streams the files out of its own extraction directory. Done by
+# root, a link the account dropped in at the right moment would have the
+# copy land - root-owned - wherever it points.
+#
+# The old tree is removed by root: the frontend build runs as root, so dist/
+# holds files the account cannot delete. rm -rf never follows a link, and
+# the name is fixed, so the account can at most point it at another *.prev.
+panel_snapshot_restore_tree() {
+  local src_parent="$1" name="$2" dst_parent="$3"
+  [[ -d "$src_parent/$name" && ! -L "$src_parent/$name" ]] || return 0
+  rm -rf -- "$dst_parent/$name.prev"
+  runuser -u spanel -- /bin/sh -c '
+    if [ -e "$1/$2" ] || [ -L "$1/$2" ]; then mv -- "$1/$2" "$1/$2.prev"; fi
+  ' sh "$dst_parent" "$name"
+  tar -C "$src_parent" -cf - "$name" \
+    | runuser -u spanel -- tar -C "$dst_parent" --no-same-owner -xf -
+  rm -rf -- "$dst_parent/$name.prev"
 }
 
 panel_snapshot_restore() {
@@ -1008,8 +1112,9 @@ panel_snapshot_restore() {
       *) deny "usage: panel-snapshot-restore <snapshot-id> [--restore-db] [--now]" ;;
     esac
   done
+  panel_snapshot_dir_ensure
   local tar_path="${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz"
-  [[ -f "$tar_path" ]] || deny "snapshot not found: $snap_id"
+  panel_snapshot_trusted "$tar_path" || deny "snapshot not found: $snap_id"
 
   # From the API this runs inside spanel-api's own cgroup, and stopping
   # spanel-api (to swap the database, or to restart it) would kill this
@@ -1028,25 +1133,9 @@ panel_snapshot_restore() {
   work="$(mktemp -d /tmp/spanel-restore.XXXXXX)"
   tar -xzf "$tar_path" -C "$work"
 
-  if [[ -d "$work/backend/app" ]]; then
-    rm -rf "${APP_DIR}/backend/app.prev" 2>/dev/null || true
-    [[ -d "${APP_DIR}/backend/app" ]] && mv "${APP_DIR}/backend/app" "${APP_DIR}/backend/app.prev"
-    cp -a "$work/backend/app" "${APP_DIR}/backend/app"
-    rm -rf "${APP_DIR}/backend/app.prev" 2>/dev/null || true
-    chown -R spanel:spanel "${APP_DIR}/backend/app" 2>/dev/null || true
-  fi
-  if [[ -d "$work/backend/alembic" ]]; then
-    rm -rf "${APP_DIR}/backend/alembic" 2>/dev/null || true
-    cp -a "$work/backend/alembic" "${APP_DIR}/backend/alembic"
-    chown -R spanel:spanel "${APP_DIR}/backend/alembic" 2>/dev/null || true
-  fi
-  if [[ -d "$work/frontend/dist" ]]; then
-    rm -rf "${APP_DIR}/frontend/dist.prev" 2>/dev/null || true
-    [[ -d "${APP_DIR}/frontend/dist" ]] && mv "${APP_DIR}/frontend/dist" "${APP_DIR}/frontend/dist.prev"
-    cp -a "$work/frontend/dist" "${APP_DIR}/frontend/dist"
-    rm -rf "${APP_DIR}/frontend/dist.prev" 2>/dev/null || true
-    chown -R spanel:spanel "${APP_DIR}/frontend/dist" 2>/dev/null || true
-  fi
+  panel_snapshot_restore_tree "$work/backend" app "${APP_DIR}/backend"
+  panel_snapshot_restore_tree "$work/backend" alembic "${APP_DIR}/backend"
+  panel_snapshot_restore_tree "$work/frontend" dist "${APP_DIR}/frontend"
   if [[ -f "$work/sbin/spanel-helper" ]]; then
     cp -a "$work/sbin/spanel-helper" "/usr/local/sbin/spanel-helper.new"
     chmod 0750 "/usr/local/sbin/spanel-helper.new"
@@ -1079,7 +1168,8 @@ panel_snapshot_restore() {
 panel_snapshot_delete() {
   local snap_id="${1:-}"
   [[ "$snap_id" =~ ^snapshot-[A-Za-z0-9._-]+$ ]] || deny "invalid snapshot id: $snap_id"
-  rm -f "${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz" "${PANEL_SNAPSHOT_DIR}/${snap_id}.json" 2>/dev/null || true
+  panel_snapshot_dir_ensure
+  rm -f -- "${PANEL_SNAPSHOT_DIR}/${snap_id}.tar.gz" "${PANEL_SNAPSHOT_DIR}/${snap_id}.json" 2>/dev/null || true
   echo "deleted=${snap_id}"
 }
 
