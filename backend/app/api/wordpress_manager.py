@@ -327,15 +327,19 @@ def _run_wp_cli(
     input_data: Optional[str] = None,
     sensitive: bool = False,
 ):
-    return wordpress_live.run_wp_cli(
-        linux_user,
-        php_version,
-        wp_dir,
-        args,
-        check=check,
-        input_data=input_data,
-        sensitive=sensitive,
-    )
+    php_flag = [f"--php-version={php_version}"] if php_version else []
+    full_args = [*args, f"--path={wp_dir}", "--no-color"]
+    try:
+        return shell.privileged(
+            "wp-site",
+            helper_args=[linux_user, *php_flag, *full_args],
+            fallback=["wp", *full_args],
+            check=check,
+            input=input_data,
+            sensitive=sensitive,
+        )
+    except Exception as exc:
+        return wordpress_live.run_wp_cli(linux_user, php_version, wp_dir, args, check=check)
 
 
 def _read_wp_file_text(
@@ -344,7 +348,29 @@ def _read_wp_file_text(
     linux_user: Optional[str] = None,
     site_root: Optional[Path] = None,
 ) -> str:
-    return wordpress_live.read_wp_file_text(wp_dir, rel_path, linux_user=linux_user, site_root=site_root)
+    target = wp_dir / rel_path
+    try:
+        if target.exists() and target.is_file():
+            return target.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    if linux_user and site_root and not settings.command_dry_run:
+        try:
+            try:
+                rel_to_root = str(target.relative_to(site_root)).replace("\\", "/")
+            except ValueError:
+                rel_to_root = f"public_html/{rel_path.lstrip('/')}"
+            res = shell.privileged(
+                "terminal-exec",
+                helper_args=[linux_user, str(site_root), "cat", rel_to_root],
+                fallback=["cat", str(target)],
+                check=False,
+            )
+            if res.returncode == 0 and res.stdout:
+                return res.stdout
+        except Exception:
+            pass
+    return ""
 
 
 def _write_wp_file_text(
@@ -355,7 +381,30 @@ def _write_wp_file_text(
     content: str,
     mode: str = "0644",
 ) -> None:
-    wordpress_live.write_wp_file_text(linux_user, site_root, wp_dir, rel_path, content, mode=mode)
+    target = wp_dir / rel_path
+    try:
+        rel_to_root = str(target.relative_to(site_root)).replace("\\", "/")
+    except ValueError:
+        rel_to_root = f"public_html/{rel_path.lstrip('/')}"
+    if not settings.command_dry_run:
+        try:
+            shell.privileged(
+                "site-file-write",
+                helper_args=[linux_user, str(site_root), rel_to_root, mode],
+                fallback=[
+                    "sh",
+                    "-c",
+                    'mkdir -p "$(dirname "$1")" && cat >"$1" && chmod "$2" "$1"',
+                    "sh",
+                    str(target),
+                    mode,
+                ],
+                input=content,
+                sensitive=True,
+                check=False,
+            )
+        except Exception:
+            pass
 
 
 def _parse_wp_config_details(config_text: str) -> Dict[str, Any]:
