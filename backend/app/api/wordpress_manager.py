@@ -562,12 +562,14 @@ def _evaluate_security_checks(
     return results
 
 
-def reconcile_wordpress_databases(db: Session) -> int:
+def reconcile_wordpress_databases(db: Session, *, provision_missing: bool = True) -> int:
     """Self-heal missing or orphaned DatabaseAccount rows for WordPress websites
     and ensure the MariaDB database, user credentials, and WordPress core tables
     are created and synchronized with wp-config.php."""
     reconciled = 0
     try:
+        from app.api.databases import effective_database_limit
+
         websites = db.query(Website).all()
         if not websites:
             return 0
@@ -608,6 +610,16 @@ def reconcile_wordpress_databases(db: Session) -> int:
 
             # If WordPress site has no wp-config.php or no DB_NAME yet, provision one now
             if not db_name:
+                if not provision_missing or not has_wp_files:
+                    continue
+                site_owner = db.query(User).filter(User.id == site.owner_id).first()
+                owner_db_limit = effective_database_limit(site_owner)
+                if owner_db_limit == 0:
+                    continue
+                if owner_db_limit > 0:
+                    owner_db_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == site.owner_id).count()
+                    if owner_db_count >= owner_db_limit:
+                        continue
                 seed = f"{site.domain}_{secrets.token_hex(2)}"
                 try:
                     db_info = mariadb.create_database(seed, prefix="wp")
@@ -1213,6 +1225,20 @@ def install_wp_instance(
         table_prefix += "_"
     if not WP_PREFIX_RE.fullmatch(table_prefix):
         table_prefix = "wp_sp_"
+
+    # 0. Enforce owner database quota before creating a new database
+    from app.api.databases import enforce_user_database_limit
+
+    site_owner = db.query(User).filter(User.id == site.owner_id).first() or current_user
+    reusing_existing_db = False
+    if payload.db_mode == "existing" and payload.db_name and payload.db_user:
+        existing_check = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == payload.db_name.strip()).first()
+        if existing_check is not None:
+            if existing_check.owner_id != site.owner_id and not is_admin_role(current_user.role):
+                raise HTTPException(status_code=403, detail="Cannot bind a database owned by another user.")
+            reusing_existing_db = True
+    if not reusing_existing_db:
+        enforce_user_database_limit(db, site_owner)
 
     # 1. Ensure runtime & PHP version
     php_ver = (payload.php_version or site.php_version or "8.4").strip()
@@ -2450,6 +2476,12 @@ def execute_wp_tool(
                 target_site = _get_accessible_website(target_site.id, db, current_user)
         if not target_site:
             raise HTTPException(status_code=404, detail="Vui lòng chọn tên miền đích hợp lệ.")
+
+        if act == "clone":
+            from app.api.databases import enforce_user_database_limit
+
+            target_owner = db.query(User).filter(User.id == target_site.owner_id).first() or current_user
+            enforce_user_database_limit(db, target_owner)
 
         target_site.app_type = "wordpress"
         db.commit()

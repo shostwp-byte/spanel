@@ -573,6 +573,8 @@ class UserOut(BaseModel):
     owner_username: Optional[str] = None
     owner_role: Optional[str] = None
     website_limit: int
+    subdomain_limit: int = 0
+    database_limit: int = 5
     storage_limit_mb: int
     terminal_enabled: bool = False
     storage_used_bytes: int = 0

@@ -8,7 +8,7 @@ import { NoAutofillInput } from '../components/NoAutofillInput.jsx';
 export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
   const {
     loading, setLoading, setError, setNotice, databases, setDatabases, dbSearch, setDbSearch, dbCreateOpen, setDbCreateOpen,
-    websites, readCookie, handleAuthExpired, formatApiError,
+    websites, currentUser, packages, readCookie, handleAuthExpired, formatApiError,
     copyText, generateRandomPassword, copiedField, setCopiedField,
   } = useAppContext();
   const [dbSearching, setDbSearching] = useState(false);
@@ -18,6 +18,14 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
   const [dbHosts, setDbHosts] = useState([]);
   const [createdDbInfo, setCreatedDbInfo] = useState(null);
   const [tableModal, setTableModal] = useState(null);
+
+  const userPkg = React.useMemo(
+    () => (packages || []).find(p => p.id === currentUser?.package_id || (currentUser?.package_name && p.name === currentUser.package_name)),
+    [packages, currentUser]
+  );
+  const rawDbLimit = userPkg?.database_limit ?? currentUser?.database_limit ?? -1;
+  const databaseLimit = currentUser?.role === 'admin' ? -1 : Number(rawDbLimit);
+  const isDbLimitReached = currentUser?.role !== 'admin' && databaseLimit >= 0 && databases.length >= databaseLimit;
 
   function fmtDbSize(bytes) {
     const n = Number(bytes) || 0;
@@ -73,6 +81,14 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
   }
 
   async function createDatabase() {
+    if (isDbLimitReached) {
+      setError(
+        databaseLimit === 0
+          ? t('Database creation is disabled for your hosting package (limit: 0).')
+          : t('Database limit reached ({used}/{limit}). Upgrade your package to add more databases.', { used: databases.length, limit: databaseLimit })
+      );
+      return;
+    }
     const validDbName = /^[a-zA-Z0-9_]+$/;
     const dbName = newDatabase.db_name.trim();
     const dbUser = newDatabase.db_user.trim();
@@ -141,15 +157,34 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
     const dbSearchActive = !!dbSearch.trim();
     // Like the website form: making one is occasional, finding one is why
     // the page is open. Open by itself only when there is nothing to find.
-    const dbCreateVisible = dbCreateOpen || (databases.length === 0 && !dbSearchActive);
+    const dbCreateVisible = !isDbLimitReached && (dbCreateOpen || (databases.length === 0 && !dbSearchActive));
     return <div className="section">
       <div className="section-title">
         <h2>{t('Databases')}</h2>
         <div className="actions">
           <button className="secondary" disabled={!!loading || dbSearching} onClick={() => loadDatabases(dbSearch, true)}><RefreshCw size={15} className={dbSearching ? 'spin' : ''}/>{t('Refresh')}</button>
-          {!dbCreateVisible && <button type="button" onClick={() => setDbCreateOpen(true)}><Plus size={15}/>{t('New database')}</button>}
+          {!dbCreateVisible && (
+            <button
+              type="button"
+              disabled={isDbLimitReached}
+              title={isDbLimitReached ? t('Database limit reached ({used}/{limit}). Upgrade your package to add more databases.', { used: databases.length, limit: databaseLimit }) : undefined}
+              onClick={() => setDbCreateOpen(true)}
+            >
+              <Plus size={15}/>{t('New database')}
+            </button>
+          )}
         </div>
       </div>
+      {isDbLimitReached && (
+        <div className="info-box" style={{ marginBottom: '12px', borderColor: 'rgba(245, 158, 11, 0.35)', background: 'rgba(245, 158, 11, 0.08)', color: 'var(--text)' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
+            <AlertCircle size={15} style={{ color: '#f59e0b', flexShrink: 0 }} />
+            {databaseLimit === 0
+              ? t('Database creation is disabled for your hosting package (limit: 0).')
+              : t('Database limit reached ({used}/{limit}). Upgrade your package or delete unused databases to create a new one.', { used: databases.length, limit: databaseLimit })}
+          </span>
+        </div>
+      )}
       {dbCreateVisible && <div className="create-inline">
         <div className="create-inline-head">
           <strong>{t('Create database')}</strong>
@@ -180,7 +215,11 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
           aria-label={t('Search databases')}
         />
         {dbSearch && <button className="mini secondary-light" type="button" onClick={() => setDbSearch('')} aria-label={t('Clear database search')} title={t('Clear search')}><X size={13}/></button>}
-        <span className="hint">{t('{count} databases', { count: databases.length })}</span>
+        <span className="hint">
+          {databaseLimit >= 0
+            ? `${databases.length} / ${databaseLimit} ${t('databases')}`
+            : t('{count} databases', { count: databases.length })}
+        </span>
       </div>
       {createdDbInfo && <div className="info-box db-created-box">
         <div className="db-created-head"><strong>{t('Database created successfully')}</strong><button className="mini secondary-light" onClick={() => setCreatedDbInfo(null)}><X size={13}/></button></div>

@@ -702,10 +702,13 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
             raise HTTPException(status_code=403, detail="Subdomain limit reached")
     else:
         eff_site_limit = int(owner.website_limit if owner.website_limit is not None else (owner.package.website_limit if getattr(owner, "package", None) else 0) or 0)
-        if not is_admin_role(owner.role) and eff_site_limit != 0 and existing_root_domains_count >= eff_site_limit:
+        if not is_admin_role(owner.role) and eff_site_limit > 0 and existing_root_domains_count >= eff_site_limit:
             raise HTTPException(status_code=403, detail="Website limit reached")
 
     install_wp = payload.install_wordpress and payload.app_type == "wordpress"
+    if install_wp:
+        from app.api.databases import enforce_user_database_limit
+        enforce_user_database_limit(db, owner)
     create_estimate_bytes = storage_quota.WORDPRESS_SITE_ESTIMATE_BYTES if install_wp else storage_quota.STATIC_SITE_ESTIMATE_BYTES
     try:
         storage_quota.enforce_user_storage_quota(db, owner, incoming_bytes=create_estimate_bytes)
@@ -872,6 +875,9 @@ def install_wordpress_on_website(
         )
     except storage_quota.StorageQuotaExceeded as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    from app.api.databases import enforce_user_database_limit
+    enforce_user_database_limit(db, owner)
 
     try:
         db_info = mariadb.create_database(website.domain, if_not_exists=False)

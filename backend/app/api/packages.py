@@ -1432,6 +1432,9 @@ def batch_import_packages(
         if existing:
             for k, v in field_values.items():
                 setattr(existing, k, v)
+            from app.api.users import _apply_package_limits
+            for u in db.query(User).filter(User.package_id == existing.id).all():
+                _apply_package_limits(u, existing)
             updated_count += 1
             imported_names.append(existing.name)
         else:
