@@ -2095,12 +2095,21 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     {renderSwitch(
                                       !!inst.toggles?.password_protection,
-                                      () =>
+                                      () => {
+                                        if (!inst.toggles?.password_protection && !inst.password_protection_configured) {
+                                          setPasswordAuthModalInst(inst);
+                                          setBasicAuthForm({
+                                            user: inst.basic_auth_user || 'preview',
+                                            password: '',
+                                          });
+                                          return;
+                                        }
                                         handleToggleSwitch(
                                           inst,
                                           'password_protection',
                                           !inst.toggles?.password_protection
-                                        )
+                                        );
+                                      }
                                     )}
                                     <button
                                       type="button"

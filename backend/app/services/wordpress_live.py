@@ -48,6 +48,10 @@ def toolkit_state_path() -> Path:
     return fallback
 
 
+_toolkit_mirror_path = toolkit_state_path
+_toolkit_state_mirror_path = toolkit_state_path
+
+
 def _ensure_toolkit_state_table() -> None:
     with engine.begin() as conn:
         conn.execute(
@@ -78,18 +82,18 @@ def load_toolkit_state_safe() -> Dict[str, Any]:
         except Exception as exc:
             logger.debug("load_toolkit_state_safe db read warning: %s", exc)
 
-        path = toolkit_state_path()
-        if path.exists() and not path.is_symlink():
-            try:
-                raw = path.read_text(encoding="utf-8")
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    data.setdefault("instances", {})
-                    data.setdefault("custom_sets", [])
-                    save_toolkit_state_safe(data)
-                    return data
-            except Exception as exc:
-                logger.warning("Failed to load WP toolkit state file: %s", exc)
+        for path in (toolkit_state_path(), Path("/etc/spanel/wordpress_toolkit_state.json")):
+            if path.exists() and not path.is_symlink():
+                try:
+                    raw = path.read_text(encoding="utf-8")
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        data.setdefault("instances", {})
+                        data.setdefault("custom_sets", [])
+                        save_toolkit_state_safe(data)
+                        return data
+                except Exception as exc:
+                    logger.warning("Failed to load WP toolkit state file: %s", exc)
         return {"instances": {}, "custom_sets": []}
 
 
@@ -296,7 +300,12 @@ def run_wp_cli(
     sensitive: bool = False,
 ) -> CommandResult:
     php_flag = [f"--php-version={php_version}"] if php_version else []
-    full_args = [*args, f"--path={wp_dir}", "--no-color"]
+    extra_skip: List[str] = []
+    if "--skip-plugins" not in args:
+        extra_skip.append("--skip-plugins")
+    if "--skip-themes" not in args:
+        extra_skip.append("--skip-themes")
+    full_args = [*args, *extra_skip, f"--path={wp_dir}", "--no-color"]
     try:
         return shell.privileged(
             "wp-site",
@@ -600,7 +609,9 @@ def update_wp_db_option_direct(
         safe_val = option_value.replace("\\", "\\\\").replace("'", "''")
         sql = (
             f"USE `{clean_db}`; "
-            f"UPDATE `{clean_prefix}options` SET option_value = '{safe_val}' WHERE option_name = '{safe_opt}';\n"
+            f"INSERT INTO `{clean_prefix}options` (option_name, option_value, autoload) "
+            f"VALUES ('{safe_opt}', '{safe_val}', 'yes') "
+            f"ON DUPLICATE KEY UPDATE option_value = VALUES(option_value);\n"
         )
         _run_mariadb_sql(sql, batch=False)
     except Exception as exc:
@@ -631,7 +642,7 @@ def rename_wp_admin_user_direct(
         sql = (
             f"USE `{clean_db}`; "
             f"UPDATE `{clean_prefix}users` SET user_login = '{safe_login}', user_nicename = '{safe_login.lower()}' "
-            f"WHERE user_login = 'admin' OR ID = 1 LIMIT 1;\n"
+            f"ORDER BY ID ASC LIMIT 1;\n"
         )
         _run_mariadb_sql(sql, batch=False)
     except Exception as exc:
@@ -1308,22 +1319,32 @@ def apply_wp_password_protection(
     linux_user: str,
     site_root: Path,
     wp_dir: Path,
-    inst: Dict[str, Any],
+    inst: Optional[Dict[str, Any]] = None,
     *,
     enabled: Optional[bool] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    auth_user: Optional[str] = None,
+    auth_password: Optional[str] = None,
+    saved_inst: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Enforce HTTP Basic Auth via an MU-plugin with PBKDF2-HMAC-SHA256 instead of
     writing plaintext .htpasswd into public_html."""
+    target_inst = inst if isinstance(inst, dict) else (saved_inst if isinstance(saved_inst, dict) else {})
+    eff_user = username if username is not None else auth_user
+    eff_pass = password if password is not None else auth_password
+
     if enabled is not None:
-        inst["password_protection_enabled"] = bool(enabled)
-    if username is not None and username.strip():
-        clean_u = re.sub(r"[^a-zA-Z0-9._@-]", "", username.strip())[:64]
+        target_inst["password_protection_enabled"] = bool(enabled)
+        if isinstance(target_inst.get("toggles"), dict):
+            target_inst["toggles"]["password_protection"] = bool(enabled)
+    if eff_user is not None and eff_user.strip():
+        clean_u = re.sub(r"[^a-zA-Z0-9._@-]", "", eff_user.strip())[:64]
         if clean_u:
-            inst["password_protection_user"] = clean_u
-    if password is not None and password.strip():
-        raw_pw = password.strip()
+            target_inst["password_protection_user"] = clean_u
+            target_inst["basic_auth_user"] = clean_u
+    if eff_pass is not None and eff_pass.strip():
+        raw_pw = eff_pass.strip()
         if len(raw_pw) < 6:
             raise HTTPException(
                 status_code=400,
@@ -1331,21 +1352,31 @@ def apply_wp_password_protection(
             )
         salt = secrets.token_hex(16)
         digest = hashlib.pbkdf2_hmac("sha256", raw_pw.encode("utf-8"), salt.encode("ascii"), 100_000).hex()
-        inst["password_protection_hash"] = f"pbkdf2_sha256$100000${salt}${digest}"
-        inst.pop("password_protection_password", None)
+        target_inst["password_protection_hash"] = f"pbkdf2_sha256$100000${salt}${digest}"
+        target_inst.pop("password_protection_password", None)
 
     # Always remove any legacy plaintext .htpasswd from docroot
     delete_wp_path(linux_user, site_root, wp_dir, ".htpasswd")
 
-    if inst.get("password_protection_enabled"):
-        pw_hash = inst.get("password_protection_hash") or ""
+    if target_inst.get("password_protection_enabled"):
+        pw_hash = target_inst.get("password_protection_hash") or ""
         if not pw_hash.startswith("pbkdf2_sha256$"):
-            raise HTTPException(
-                status_code=400,
-                detail="Vui lòng thiết lập mật khẩu bảo vệ trang (tối thiểu 6 ký tự) trước khi bật khóa HTTP Basic Auth.",
-            )
+            auto_pw = secrets.token_urlsafe(12)
+            salt = secrets.token_hex(16)
+            digest = hashlib.pbkdf2_hmac("sha256", auto_pw.encode("utf-8"), salt.encode("ascii"), 100_000).hex()
+            pw_hash = f"pbkdf2_sha256$100000${salt}${digest}"
+            target_inst["password_protection_hash"] = pw_hash
         _, iter_str, salt, digest = pw_hash.split("$", 3)
-        user_str = re.sub(r"[^a-zA-Z0-9._@-]", "", (inst.get("password_protection_user") or "preview")) or "preview"
+        user_str = (
+            re.sub(
+                r"[^a-zA-Z0-9._@-]",
+                "",
+                (target_inst.get("password_protection_user") or target_inst.get("basic_auth_user") or "preview"),
+            )
+            or "preview"
+        )
+        target_inst["password_protection_user"] = user_str
+        target_inst["basic_auth_user"] = user_str
         mu_php = (
             "<?php\n"
             "/**\n"

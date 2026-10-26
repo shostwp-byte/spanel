@@ -253,7 +253,7 @@ SECURITY_CHECK_DEFINITIONS: List[Dict[str, Any]] = [
 # ── State Persistence Helper ─────────────────────────────────────────────────
 
 def _toolkit_state_path() -> Path:
-    return wordpress_live._toolkit_state_mirror_path()
+    return wordpress_live.toolkit_state_path()
     base = Path("/etc/spanel") if Path("/etc/spanel").exists() else Path("./data")
     try:
         base.mkdir(parents=True, exist_ok=True)
@@ -502,7 +502,7 @@ def _set_wp_config_constant(config_text: str, name: str, raw_php_expr: str) -> s
     )
     new_line = f"define('{name}', {raw_php_expr});"
     if pattern.search(config_text):
-        return pattern.sub(new_line, config_text, count=1)
+        return pattern.sub(lambda _: new_line, config_text, count=1)
 
     anchor = re.search(r"(/\*.*?stop editing.*?\*/|require_once\s+ABSPATH)", config_text, re.IGNORECASE)
     if anchor:
@@ -824,7 +824,7 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
     db_size_mb = 0.0
     table_count = 0
     db_acc = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first() or linked_acc
-    db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg)
+    db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg.get("db_name") or saved.get("db_name"))
     db_name = db_acc.db_name if db_acc else ""
     db_user = db_acc.db_user if db_acc else ""
     try:
@@ -872,6 +872,10 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
         "password_protection": htpasswd_active or bool(toggles_saved.get("password_protection", False)),
         "disable_wp_cron": bool(cfg["disable_wp_cron"]) if config_text else bool(toggles_saved.get("disable_wp_cron", cfg["disable_wp_cron"])),
     }
+    if settings.command_dry_run:
+        toggles["maintenance_mode"] = maintenance_active or bool(toggles_saved.get("maintenance_mode", False))
+    else:
+        toggles["password_protection"] = htpasswd_active
 
     sec_checks = _evaluate_security_checks(
         wp_dir, cfg, saved, linux_user=linux_user, site_root=site_root, live_admin_user=live_admin_user
@@ -938,6 +942,7 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
         "toggles": toggles,
         "maintenance_message": saved.get("maintenance_message") or "Website đang được bảo trì và nâng cấp định kỳ. Vui lòng quay lại sau ít phút!",
         "basic_auth_user": saved.get("basic_auth_user") or "",
+        "password_protection_configured": bool(saved.get("password_protection_hash")),
         "cron_interval_minutes": int(saved.get("cron_interval_minutes") or 15),
         "plugins": plugins_list,
         "themes": themes_list,
@@ -1195,6 +1200,12 @@ def scan_wp_instances(
         inst_key = str(site.id)
         _, _, wp_dir = _resolve_site_paths(site, db)
         has_wp = (wp_dir / "wp-config.php").exists() or (wp_dir / "wp-includes/version.php").exists()
+        linux_user, site_root, wp_dir = _resolve_site_paths(site, db)
+        has_wp = (
+            has_wp
+            or wordpress_live.wp_path_exists(wp_dir, "wp-config.php", linux_user, site_root)
+            or wordpress_live.wp_path_exists(wp_dir, "wp-includes/version.php", linux_user, site_root)
+        )
         if has_wp or site.app_type == "wordpress":
             if site.app_type != "wordpress":
                 site.app_type = "wordpress"
@@ -1584,6 +1595,7 @@ def remove_wp_instance(
             cfg_file.unlink()
     except Exception:
         pass
+    wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-config.php")
 
     if drop_database and saved.get("db_name"):
         db_acc = db.query(DatabaseAccount).filter(
@@ -1766,13 +1778,19 @@ def update_wp_toggles(
 ):
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state()
+    if not isinstance(state.get("instances"), dict):
+        state["instances"] = {}
+    if not isinstance(state["instances"].get(str(site.id)), dict):
+        state["instances"][str(site.id)] = {"installed": True}
     inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
+    if not isinstance(inst.get("toggles"), dict):
+        inst["toggles"] = {}
     toggles = inst.setdefault("toggles", {})
     linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
     php_ver = site.php_version or "8.4"
     config_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
     cfg = _parse_wp_config_details(config_text)
-    db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg)
+    db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg.get("db_name") or inst.get("db_name"))
     db_name = db_acc.db_name if db_acc else ""
     table_prefix = cfg["table_prefix"] or inst.get("table_prefix") or "wp_"
     config_changed = False
@@ -1821,6 +1839,8 @@ def update_wp_toggles(
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, ".maintenance")
             _run_wp_cli(linux_user, php_ver, wp_dir, ["maintenance-mode", "deactivate"])
 
+    if payload.debugging is None and (payload.debug_log is not None or payload.debug_display is not None):
+        payload.debugging = bool(toggles.get("debugging", False))
     if payload.debugging is not None:
         toggles["debugging"] = payload.debugging
         if payload.debug_log is not None:
@@ -1851,7 +1871,7 @@ def update_wp_toggles(
                 site_root=site_root,
                 wp_dir=wp_dir,
                 enabled=bool(payload.password_protection),
-                auth_user=(payload.basic_auth_user or inst.get("basic_auth_user") or ""),
+                auth_user=(payload.basic_auth_user or inst.get("basic_auth_user") or inst.get("password_protection_user") or ""),
                 auth_password=(payload.basic_auth_password or ""),
                 saved_inst=inst,
             )
@@ -2586,8 +2606,17 @@ def execute_wp_tool(
         if act == "clone":
             from app.api.databases import enforce_user_database_limit
 
-            target_owner = db.query(User).filter(User.id == target_site.owner_id).first() or current_user
-            enforce_user_database_limit(db, target_owner)
+            has_target_db = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.website_id == target_site.id,
+                    DatabaseAccount.owner_id == target_site.owner_id,
+                )
+                .first()
+            )
+            if not has_target_db:
+                target_owner = db.query(User).filter(User.id == target_site.owner_id).first() or current_user
+                enforce_user_database_limit(db, target_owner)
 
         target_site.app_type = "wordpress"
         db.commit()
