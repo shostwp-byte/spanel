@@ -1595,7 +1595,7 @@ conn = sqlite3.connect(sys.argv[1], timeout=15)
 try:
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 if [[ -f "$APP_DIR/backend/spanel.db" ]] && command -v python3 >/dev/null 2>&1; then
-  python3 - "$APP_DIR/backend/spanel.db" <<'PY' 2>/dev/null || true
+  python3 -c '
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1], timeout=15)
 try:
@@ -1603,7 +1603,15 @@ try:
     conn.commit()
 finally:
     conn.close()
-PY
+' "$APP_DIR/backend/spanel.db" 2>/dev/null || true
+fi
+
+# Clean removed legacy directories and stale bytecode before rsync --delete
+# so excluded __pycache__/*.pyc files never block directory removal (rsync exit 23).
+rm -rf "$APP_DIR/backend/app/tests" 2>/dev/null || true
+if [[ -d "$APP_DIR/backend/app" ]]; then
+  find "$APP_DIR/backend/app" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  find "$APP_DIR/backend/app" -name '*.pyc' -type f -delete 2>/dev/null || true
 fi
 
 if command -v rsync >/dev/null 2>&1; then
@@ -2144,6 +2152,7 @@ id -u spanel >/dev/null 2>&1 && py_compile_as=(sudo -u spanel)
   app/api/waf.py \
   app/api/panel_settings.py \
   app/api/terminal.py \
+  app/api/wordpress_manager.py \
   app/services/firewall.py \
   app/services/nginx.py \
   app/services/panel_urls.py \
