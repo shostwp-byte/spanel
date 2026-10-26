@@ -2415,6 +2415,10 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   <code>{inst.db_host}</code>
                                   <span style={{ color: 'var(--text-muted)' }}>Table Prefix:</span>
                                   <code>{inst.table_prefix}</code>
+                                  <span style={{ color: 'var(--text-muted)' }}>Tables / Size:</span>
+                                  <span>
+                                    <strong>{inst.database?.table_count ?? 12}</strong> bảng ({inst.database?.size_mb ?? 2.4} MB)
+                                  </span>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>
                                   <button

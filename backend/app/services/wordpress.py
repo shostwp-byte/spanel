@@ -28,13 +28,17 @@ def _generate_wp_salts() -> str:
     return "\n".join(lines)
 
 
-def _render_wp_config(db_name: str, db_user: str, db_password: str) -> str:
+def _render_wp_config(db_name: str, db_user: str, db_password: str, table_prefix: str = "wp_") -> str:
     """Render wp-config.php directly so the DB password never appears in argv.
 
     PHP single-quoted strings only need ' and \\ escaping.
     """
     def esc(value: str) -> str:
         return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    clean_prefix = (table_prefix or "wp_").strip()
+    if not re.fullmatch(r"^[A-Za-z0-9_]{2,24}$", clean_prefix):
+        clean_prefix = "wp_"
 
     return (
         "<?php\n"
@@ -45,7 +49,7 @@ def _render_wp_config(db_name: str, db_user: str, db_password: str) -> str:
         "define('DB_CHARSET', 'utf8mb4');\n"
         "define('DB_COLLATE', '');\n"
         "\n"
-        "$table_prefix = 'wp_';\n"
+        f"$table_prefix = '{esc(clean_prefix)}';\n"
         "\n"
         f"{_generate_wp_salts()}\n"
         "\n"
@@ -78,6 +82,7 @@ def install_wordpress(
     php_version: str,
     linux_user: str | None = None,
     root_path: str | None = None,
+    table_prefix: str = "wp_",
 ) -> str:
     safe_user = _safe_value(admin_user, WP_USER_RE, "WordPress admin username")
     safe_title = _safe_value(title, WP_TITLE_RE, "WordPress site title")
@@ -91,17 +96,18 @@ def install_wordpress(
     wp_path = f"--path={public}"
 
     # WP-CLI runs as this website's isolated Linux user through the helper.
+    dl_args = ["core", "download", wp_path] if settings.command_dry_run else ["core", "download", "--force", wp_path]
     shell.privileged(
         "wp-site",
-        helper_args=[linux_user, *_wp_php_flag(php_version), "core", "download", wp_path],
-        fallback=["wp", "core", "download", wp_path],
+        helper_args=[linux_user, *_wp_php_flag(php_version), *dl_args],
+        fallback=["wp", *dl_args],
     )
 
     # Render wp-config.php directly to avoid leaking the DB password through
     # argv (which would be visible to other local users via /proc/<pid>/cmdline
     # or `ps auxww` while wp config create runs).
     config_path = public / "wp-config.php"
-    config_content = _render_wp_config(db["db_name"], db["db_user"], db["db_password"])
+    config_content = _render_wp_config(db["db_name"], db["db_user"], db["db_password"], table_prefix=table_prefix)
     if not settings.command_dry_run:
         shell.privileged(
             "site-file-write",
