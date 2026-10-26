@@ -95,9 +95,10 @@ def test_swap_checks_integrity_before_stopping_anything_and_keeps_the_old_db():
     body = _helper_function("swap_panel_db")
     check = body.index("sqlite_integrity_ok")
     assert check < body.index("systemctl stop")
-    assert body.index("pre-restore-") < body.index('mv -f "$tmp" "$db"')
+    swap = body.index('runuser -u spanel -- mv -f -- "$tmp" "$db"')
+    assert body.index("pre-restore-") < swap
     # The WAL and shared memory of the old file must not be applied to the new one.
-    assert body.index('rm -f "${db}-wal" "${db}-shm"') < body.index('mv -f "$tmp" "$db"')
+    assert body.index('runuser -u spanel -- rm -f -- "${db}-wal" "${db}-shm"') < swap
     assert "spanel-api" in body and "SPANEL_DB_TIMERS" in body
     # A running oneshot (apt in the maintenance runner, a backup) is waited
     # for, never killed.

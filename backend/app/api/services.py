@@ -124,7 +124,8 @@ def restore_db_hot_backup(
     with a reason before anything stops. The helper checks again as root,
     then - in a unit of its own, since it has to stop this API - stops the
     API and the timers that open the database, keeps the current file as
-    spanel.db.pre-restore-<time>, swaps, and starts everything again.
+    /var/backups/spanel-panel-snapshots/db-pre-restore/spanel.db.pre-restore-<time>,
+    swaps, and starts everything again.
     """
     ensure_role(current_user.role, Role.admin)
     try:
