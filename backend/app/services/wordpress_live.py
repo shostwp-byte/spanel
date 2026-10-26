@@ -2,7 +2,6 @@ import json
 import logging
 import re
 import secrets
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -14,12 +13,13 @@ from app.core.config import settings
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, Website
 from app.services import mariadb, nginx, site_users, wordpress
-from app.services.shell import shell
+from app.services.shell import CommandResult, shell
 
 logger = logging.getLogger("spanel.wordpress_live")
 
 WP_SLUG_RE = re.compile(r"^[a-zA-Z0-9._-]{1,120}$")
 WP_PREFIX_RE = re.compile(r"^[a-zA-Z0-9_]{2,24}$")
+DB_IDENT_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
 
 
 def run_wp_cli(
@@ -31,17 +31,23 @@ def run_wp_cli(
     check: bool = False,
     input_data: Optional[str] = None,
     sensitive: bool = False,
-):
+) -> CommandResult:
     php_flag = [f"--php-version={php_version}"] if php_version else []
     full_args = [*args, f"--path={wp_dir}", "--no-color"]
-    return shell.privileged(
-        "wp-site",
-        helper_args=[linux_user, *php_flag, *full_args],
-        fallback=["wp", *full_args],
-        check=check,
-        input=input_data,
-        sensitive=sensitive,
-    )
+    try:
+        return shell.privileged(
+            "wp-site",
+            helper_args=[linux_user, *php_flag, *full_args],
+            fallback=["wp", *full_args],
+            check=check,
+            input=input_data,
+            sensitive=sensitive,
+        )
+    except Exception as exc:
+        if check:
+            raise
+        logger.debug("run_wp_cli fallback error: %s", exc)
+        return CommandResult(command="wp", returncode=1, stdout="", stderr=str(exc))
 
 
 def read_wp_file_text(
@@ -84,26 +90,37 @@ def write_wp_file_text(
     mode: str = "0644",
 ) -> None:
     target = wp_dir / rel_path
+    safe_mode = "0640" if mode == "0640" else "0644"
     try:
         rel_to_root = str(target.relative_to(site_root)).replace("\\", "/")
     except ValueError:
         rel_to_root = f"public_html/{rel_path.lstrip('/')}"
     if not settings.command_dry_run:
-        shell.privileged(
-            "site-file-write",
-            helper_args=[linux_user, str(site_root), rel_to_root, mode],
-            fallback=[
-                "sh",
-                "-c",
-                'mkdir -p "$(dirname "$1")" && cat >"$1" && chmod "$2" "$1"',
-                "sh",
-                str(target),
-                mode,
-            ],
-            input=content,
-            sensitive=True,
-            check=False,
-        )
+        try:
+            res = shell.privileged(
+                "site-file-write",
+                helper_args=[linux_user, str(site_root), rel_to_root, safe_mode],
+                fallback=[
+                    "sh",
+                    "-c",
+                    'mkdir -p "$(dirname "$1")" && cat >"$1" && chmod "$2" "$1"',
+                    "sh",
+                    str(target),
+                    safe_mode,
+                ],
+                input=content,
+                sensitive=True,
+                check=False,
+            )
+            if res.returncode == 0:
+                return
+        except Exception as exc:
+            logger.debug("write_wp_file_text helper warning: %s", exc)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
 
 
 def delete_wp_path(
@@ -119,17 +136,16 @@ def delete_wp_path(
             return
     except Exception:
         pass
-    try:
-        rel_to_root = str(target.relative_to(site_root)).replace("\\", "/")
-    except ValueError:
-        rel_to_root = f"public_html/{rel_path.lstrip('/')}"
     if not settings.command_dry_run:
-        shell.privileged(
-            "site-file-delete",
-            helper_args=[linux_user, str(site_root), rel_to_root],
-            fallback=["rm", "-rf", str(target)],
-            check=False,
-        )
+        try:
+            shell.privileged(
+                "rm-site",
+                helper_args=[linux_user, str(site_root), str(target)],
+                fallback=["rm", "-rf", "--", str(target)],
+                check=False,
+            )
+        except Exception as exc:
+            logger.debug("delete_wp_path warning: %s", exc)
 
 
 def wp_path_exists(
@@ -152,8 +168,8 @@ def wp_path_exists(
                 rel_to_root = f"public_html/{rel_path.lstrip('/')}"
             res = shell.privileged(
                 "terminal-exec",
-                helper_args=[linux_user, str(site_root), "test", "-e", rel_to_root],
-                fallback=["test", "-e", str(target)],
+                helper_args=[linux_user, str(site_root), "stat", rel_to_root],
+                fallback=["stat", str(target)],
                 check=False,
             )
             return res.returncode == 0
@@ -184,6 +200,20 @@ def extract_wp_cli_json(raw_stdout: Optional[str]) -> Optional[Any]:
     return None
 
 
+def _run_mariadb_sql(sql: str, batch: bool = True) -> CommandResult:
+    extra = ["-N", "-B"] if batch else []
+    try:
+        return shell.run(
+            mariadb._mysql_args(extra),
+            check=False,
+            input=sql,
+            sensitive=True,
+        )
+    except Exception as exc:
+        logger.debug("_run_mariadb_sql warning: %s", exc)
+        return CommandResult(command="mysql", returncode=1, stdout="", stderr=str(exc))
+
+
 def query_wp_db_live_meta(db_name: str, table_prefix: str = "wp_") -> Dict[str, Any]:
     """Query live WordPress options and primary administrator directly from MariaDB."""
     meta: Dict[str, Any] = {
@@ -195,29 +225,26 @@ def query_wp_db_live_meta(db_name: str, table_prefix: str = "wp_") -> Dict[str, 
         "stylesheet": "",
         "template": "",
         "active_plugin_slugs": None,
-        "auto_update_plugin_slugs": set(),
+        "auto_update_plugin_slugs": [],
     }
-    if not db_name or settings.command_dry_run:
-        return meta
-    if not mariadb.IDENT_RE.fullmatch(db_name) or not WP_PREFIX_RE.fullmatch(table_prefix):
-        return meta
-
-    options_table = f"{table_prefix}options"
-    users_table = f"{table_prefix}users"
-    sql = (
-        f"USE `{db_name}`; "
-        f"SELECT 'OPT', option_name, REPLACE(REPLACE(option_value, '\\r', ' '), '\\n', ' ') "
-        f"FROM `{options_table}` "
-        f"WHERE option_name IN ('blogname','blogdescription','admin_email','blog_public','stylesheet','template','active_plugins','auto_update_plugins'); "
-        f"SELECT 'USR', user_login, user_email FROM `{users_table}` ORDER BY ID ASC LIMIT 5;"
-    )
     try:
-        res = shell.privileged(
-            "mariadb-exec",
-            fallback=["mysql", "-u", "root", "-N", "-B"],
-            input=sql,
-            check=False,
+        clean_db = (db_name or "").strip()
+        clean_prefix = (table_prefix or "wp_").strip()
+        if not clean_db or settings.command_dry_run:
+            return meta
+        if not DB_IDENT_RE.fullmatch(clean_db) or not WP_PREFIX_RE.fullmatch(clean_prefix):
+            return meta
+
+        options_table = f"{clean_prefix}options"
+        users_table = f"{clean_prefix}users"
+        sql = (
+            f"USE `{clean_db}`; "
+            f"SELECT 'OPT', option_name, REPLACE(REPLACE(option_value, '\\r', ' '), '\\n', ' ') "
+            f"FROM `{options_table}` "
+            f"WHERE option_name IN ('blogname','blogdescription','admin_email','blog_public','stylesheet','template','active_plugins','auto_update_plugins'); "
+            f"SELECT 'USR', user_login, user_email FROM `{users_table}` ORDER BY ID ASC LIMIT 5;\n"
         )
+        res = _run_mariadb_sql(sql, batch=True)
         if res.returncode != 0 or not res.stdout:
             return meta
         admin_candidates: List[tuple[str, str]] = []
@@ -242,22 +269,22 @@ def query_wp_db_live_meta(db_name: str, table_prefix: str = "wp_") -> Dict[str, 
                 elif key == "template":
                     meta["template"] = val
                 elif key == "active_plugins":
-                    slugs = set()
+                    slugs: List[str] = []
                     for item in re.findall(r's:\d+:"([^"]+)";', val):
                         slug_part = item.split("/")[0].strip()
                         if slug_part.endswith(".php"):
                             slug_part = slug_part[:-4]
-                        if slug_part:
-                            slugs.add(slug_part.lower())
+                        if slug_part and slug_part.lower() not in slugs:
+                            slugs.append(slug_part.lower())
                     meta["active_plugin_slugs"] = slugs
                 elif key == "auto_update_plugins":
-                    auto_slugs = set()
+                    auto_slugs: List[str] = []
                     for item in re.findall(r's:\d+:"([^"]+)";', val):
                         slug_part = item.split("/")[0].strip()
                         if slug_part.endswith(".php"):
                             slug_part = slug_part[:-4]
-                        if slug_part:
-                            auto_slugs.add(slug_part.lower())
+                        if slug_part and slug_part.lower() not in auto_slugs:
+                            auto_slugs.append(slug_part.lower())
                     meta["auto_update_plugin_slugs"] = auto_slugs
             elif kind == "USR" and key:
                 admin_candidates.append((key, val))
@@ -279,54 +306,55 @@ def query_wp_db_live_meta(db_name: str, table_prefix: str = "wp_") -> Dict[str, 
 
 
 def update_wp_db_option_direct(db_name: str, table_prefix: str, option_name: str, option_value: str) -> None:
-    if not db_name or settings.command_dry_run:
-        return
-    if not mariadb.IDENT_RE.fullmatch(db_name) or not WP_PREFIX_RE.fullmatch(table_prefix):
-        return
-    safe_opt = option_name.replace("'", "''")
-    safe_val = option_value.replace("\\", "\\\\").replace("'", "''")
-    sql = (
-        f"USE `{db_name}`; "
-        f"UPDATE `{table_prefix}options` SET option_value = '{safe_val}' WHERE option_name = '{safe_opt}';"
-    )
-    shell.privileged(
-        "mariadb-exec",
-        fallback=["mysql", "-u", "root"],
-        input=sql,
-        check=False,
-    )
+    try:
+        clean_db = (db_name or "").strip()
+        clean_prefix = (table_prefix or "wp_").strip()
+        if not clean_db or settings.command_dry_run:
+            return
+        if not DB_IDENT_RE.fullmatch(clean_db) or not WP_PREFIX_RE.fullmatch(clean_prefix):
+            return
+        safe_opt = option_name.replace("'", "''")
+        safe_val = option_value.replace("\\", "\\\\").replace("'", "''")
+        sql = (
+            f"USE `{clean_db}`; "
+            f"UPDATE `{clean_prefix}options` SET option_value = '{safe_val}' WHERE option_name = '{safe_opt}';\n"
+        )
+        _run_mariadb_sql(sql, batch=False)
+    except Exception as exc:
+        logger.debug("update_wp_db_option_direct warning: %s", exc)
 
 
 def rename_wp_admin_user_direct(db_name: str, table_prefix: str, new_login: str) -> None:
-    if not db_name or not new_login or settings.command_dry_run:
-        return
-    if not mariadb.IDENT_RE.fullmatch(db_name) or not WP_PREFIX_RE.fullmatch(table_prefix):
-        return
-    if not wordpress.WP_USER_RE.fullmatch(new_login):
-        return
-    safe_login = new_login.replace("'", "''")
-    sql = (
-        f"USE `{db_name}`; "
-        f"UPDATE `{table_prefix}users` SET user_login = '{safe_login}', user_nicename = '{safe_login.lower()}' "
-        f"WHERE user_login = 'admin' OR ID = 1 LIMIT 1;"
-    )
-    shell.privileged(
-        "mariadb-exec",
-        fallback=["mysql", "-u", "root"],
-        input=sql,
-        check=False,
-    )
+    try:
+        clean_db = (db_name or "").strip()
+        clean_prefix = (table_prefix or "wp_").strip()
+        if not clean_db or not new_login or settings.command_dry_run:
+            return
+        if not DB_IDENT_RE.fullmatch(clean_db) or not WP_PREFIX_RE.fullmatch(clean_prefix):
+            return
+        if not wordpress.WP_USER_RE.fullmatch(new_login):
+            return
+        safe_login = new_login.replace("'", "''")
+        sql = (
+            f"USE `{clean_db}`; "
+            f"UPDATE `{clean_prefix}users` SET user_login = '{safe_login}', user_nicename = '{safe_login.lower()}' "
+            f"WHERE user_login = 'admin' OR ID = 1 LIMIT 1;\n"
+        )
+        _run_mariadb_sql(sql, batch=False)
+    except Exception as exc:
+        logger.debug("rename_wp_admin_user_direct warning: %s", exc)
 
 
 def rename_wp_table_prefix_direct(db_name: str, old_prefix: str, new_prefix: str) -> bool:
-    if not db_name or old_prefix == new_prefix or settings.command_dry_run:
-        return False
-    if not mariadb.IDENT_RE.fullmatch(db_name):
-        return False
-    if not WP_PREFIX_RE.fullmatch(old_prefix) or not WP_PREFIX_RE.fullmatch(new_prefix):
-        return False
     try:
-        tables = mariadb.get_database_tables_breakdown(db_name)
+        clean_db = (db_name or "").strip()
+        if not clean_db or old_prefix == new_prefix or settings.command_dry_run:
+            return False
+        if not DB_IDENT_RE.fullmatch(clean_db):
+            return False
+        if not WP_PREFIX_RE.fullmatch(old_prefix) or not WP_PREFIX_RE.fullmatch(new_prefix):
+            return False
+        tables = mariadb.get_database_tables_breakdown(clean_db)
         matching = [
             t["table_name"]
             for t in tables
@@ -336,19 +364,14 @@ def rename_wp_table_prefix_direct(db_name: str, old_prefix: str, new_prefix: str
             return False
         rename_pairs = [f"`{tbl}` TO `{new_prefix}{tbl[len(old_prefix):]}`" for tbl in matching]
         sql = (
-            f"USE `{db_name}`; "
+            f"USE `{clean_db}`; "
             f"RENAME TABLE {', '.join(rename_pairs)}; "
             f"UPDATE `{new_prefix}options` SET option_name = '{new_prefix}user_roles' "
             f"WHERE option_name = '{old_prefix}user_roles'; "
             f"UPDATE `{new_prefix}usermeta` SET meta_key = CONCAT('{new_prefix}', SUBSTRING(meta_key, {len(old_prefix) + 1})) "
-            f"WHERE meta_key LIKE '{old_prefix}%';"
+            f"WHERE meta_key LIKE '{old_prefix}%';\n"
         )
-        res = shell.privileged(
-            "mariadb-exec",
-            fallback=["mysql", "-u", "root"],
-            input=sql,
-            check=False,
-        )
+        res = _run_mariadb_sql(sql, batch=False)
         return res.returncode == 0
     except Exception as exc:
         logger.warning("rename_wp_table_prefix_direct warning: %s", exc)
@@ -421,87 +444,94 @@ def discover_live_plugins(
     db_meta: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Return the exact live plugins installed on this WordPress site. Never returns fake/mock plugins."""
-    if linux_user and not settings.command_dry_run:
-        res = run_wp_cli(
-            linux_user,
-            php_version or "8.4",
-            wp_dir,
-            ["plugin", "list", "--format=json", "--skip-plugins", "--skip-themes"],
-        )
-        parsed = extract_wp_cli_json(res.stdout) if res.returncode == 0 else None
-        if isinstance(parsed, list):
-            return [
-                {
-                    "slug": str(item.get("name") or "").strip(),
-                    "name": (item.get("title") or str(item.get("name") or "").replace("-", " ").title()).strip(),
-                    "version": str(item.get("version") or "1.0.0").strip(),
-                    "latest_version": str(item.get("update_version") or item.get("version") or "1.0.0").strip(),
-                    "update_available": item.get("update") == "available",
-                    "status": "active" if item.get("status") in ("active", "active-network") else "inactive",
-                    "auto_update": item.get("auto_update") == "on",
-                }
-                for item in parsed
-                if isinstance(item, dict)
-                and item.get("name")
-                and item.get("status") not in ("must-use", "dropin")
-            ]
-
-    plugins_dir = wp_dir / "wp-content" / "plugins"
-    entries: List[tuple[str, bool]] = []
-    if plugins_dir.exists() and plugins_dir.is_dir():
-        try:
-            for item in sorted(plugins_dir.iterdir()):
-                if item.name.startswith(".") or item.name.lower() == "index.php":
-                    continue
-                if item.is_dir():
-                    entries.append((item.name, True))
-                elif item.is_file() and item.name.endswith(".php"):
-                    entries.append((item.stem, False))
-        except Exception:
-            pass
-    elif linux_user and site_root and not settings.command_dry_run:
-        try:
-            try:
-                rel_plugins = str(plugins_dir.relative_to(site_root)).replace("\\", "/")
-            except ValueError:
-                rel_plugins = "public_html/wp-content/plugins"
-            res_ls = shell.privileged(
-                "site-file-list",
-                helper_args=[linux_user, str(site_root), rel_plugins],
-                check=False,
+    try:
+        if linux_user and not settings.command_dry_run:
+            res = run_wp_cli(
+                linux_user,
+                php_version or "8.4",
+                wp_dir,
+                ["plugin", "list", "--format=json", "--skip-plugins", "--skip-themes"],
             )
-            if res_ls.returncode == 0 and res_ls.stdout:
-                for line in res_ls.stdout.splitlines():
-                    parts = line.split("\t")
-                    if len(parts) >= 4:
-                        ftype, fname = parts[0], parts[3].strip()
-                        if fname.startswith(".") or fname.lower() == "index.php":
-                            continue
-                        if ftype == "directory":
-                            entries.append((fname, True))
-                        elif ftype == "file" and fname.endswith(".php"):
-                            entries.append((fname[:-4], False))
-        except Exception:
-            pass
+            parsed = extract_wp_cli_json(res.stdout) if res.returncode == 0 else None
+            if isinstance(parsed, list):
+                return [
+                    {
+                        "slug": str(item.get("name") or "").strip(),
+                        "name": (item.get("title") or str(item.get("name") or "").replace("-", " ").title()).strip(),
+                        "version": str(item.get("version") or "1.0.0").strip(),
+                        "latest_version": str(item.get("update_version") or item.get("version") or "1.0.0").strip(),
+                        "update_available": item.get("update") == "available",
+                        "status": "active" if item.get("status") in ("active", "active-network") else "inactive",
+                        "auto_update": item.get("auto_update") == "on",
+                    }
+                    for item in parsed
+                    if isinstance(item, dict)
+                    and item.get("name")
+                    and item.get("status") not in ("must-use", "dropin")
+                ]
 
-    active_slugs = (db_meta or {}).get("active_plugin_slugs")
-    auto_slugs = (db_meta or {}).get("auto_update_plugin_slugs") or set()
-    found: List[Dict[str, Any]] = []
-    for slug, is_dir in entries:
-        p_name, p_ver = _parse_plugin_header_metadata(
-            wp_dir, slug, is_dir, linux_user=linux_user, site_root=site_root
-        )
-        is_active = (slug.lower() in active_slugs) if isinstance(active_slugs, set) else False
-        found.append({
-            "slug": slug,
-            "name": p_name,
-            "version": p_ver,
-            "latest_version": p_ver,
-            "update_available": False,
-            "status": "active" if is_active else "inactive",
-            "auto_update": slug.lower() in auto_slugs,
-        })
-    return found
+        plugins_dir = wp_dir / "wp-content" / "plugins"
+        entries: List[tuple[str, bool]] = []
+        listed_ok = False
+        try:
+            if plugins_dir.exists() and plugins_dir.is_dir():
+                for item in sorted(plugins_dir.iterdir()):
+                    if item.name.startswith(".") or item.name.lower() == "index.php":
+                        continue
+                    if item.is_dir():
+                        entries.append((item.name, True))
+                    elif item.is_file() and item.name.endswith(".php"):
+                        entries.append((item.stem, False))
+                listed_ok = True
+        except Exception:
+            listed_ok = False
+
+        if not listed_ok and linux_user and site_root and not settings.command_dry_run:
+            try:
+                try:
+                    rel_plugins = str(plugins_dir.relative_to(site_root)).replace("\\", "/")
+                except ValueError:
+                    rel_plugins = "public_html/wp-content/plugins"
+                res_ls = shell.privileged(
+                    "terminal-exec",
+                    helper_args=[linux_user, str(site_root), "ls", "-1F", rel_plugins],
+                    fallback=["ls", "-1F", str(plugins_dir)],
+                    check=False,
+                )
+                if res_ls.returncode == 0 and res_ls.stdout:
+                    for raw_entry in res_ls.stdout.splitlines():
+                        fname = raw_entry.strip()
+                        if not fname or fname.startswith(".") or fname.lower() in ("index.php", "index.php*"):
+                            continue
+                        if fname.endswith("/"):
+                            entries.append((fname[:-1], True))
+                        elif fname.endswith(".php") or fname.endswith(".php*"):
+                            clean_f = fname.rstrip("*")
+                            entries.append((clean_f[:-4], False))
+            except Exception:
+                pass
+
+        active_slugs = set((db_meta or {}).get("active_plugin_slugs") or [])
+        auto_slugs = set((db_meta or {}).get("auto_update_plugin_slugs") or [])
+        found: List[Dict[str, Any]] = []
+        for slug, is_dir in entries:
+            p_name, p_ver = _parse_plugin_header_metadata(
+                wp_dir, slug, is_dir, linux_user=linux_user, site_root=site_root
+            )
+            is_active = slug.lower() in active_slugs
+            found.append({
+                "slug": slug,
+                "name": p_name,
+                "version": p_ver,
+                "latest_version": p_ver,
+                "update_available": False,
+                "status": "active" if is_active else "inactive",
+                "auto_update": slug.lower() in auto_slugs,
+            })
+        return found
+    except Exception as exc:
+        logger.warning("discover_live_plugins warning: %s", exc)
+        return []
 
 
 def discover_live_themes(
@@ -512,72 +542,78 @@ def discover_live_themes(
     db_meta: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Return the exact live themes installed on this WordPress site. Never returns fake/mock themes."""
-    if linux_user and not settings.command_dry_run:
-        res = run_wp_cli(
-            linux_user,
-            php_version or "8.4",
-            wp_dir,
-            ["theme", "list", "--format=json", "--skip-plugins", "--skip-themes"],
-        )
-        parsed = extract_wp_cli_json(res.stdout) if res.returncode == 0 else None
-        if isinstance(parsed, list):
-            return [
-                {
-                    "slug": str(item.get("name") or "").strip(),
-                    "name": (item.get("title") or str(item.get("name") or "").replace("-", " ").title()).strip(),
-                    "version": str(item.get("version") or "1.0").strip(),
-                    "latest_version": str(item.get("update_version") or item.get("version") or "1.0").strip(),
-                    "update_available": item.get("update") == "available",
-                    "status": "active" if item.get("status") == "active" else "inactive",
-                }
-                for item in parsed
-                if isinstance(item, dict) and item.get("name")
-            ]
-
-    themes_dir = wp_dir / "wp-content" / "themes"
-    slugs: List[str] = []
-    if themes_dir.exists() and themes_dir.is_dir():
-        try:
-            for item in sorted(themes_dir.iterdir()):
-                if item.is_dir() and not item.name.startswith("."):
-                    slugs.append(item.name)
-        except Exception:
-            pass
-    elif linux_user and site_root and not settings.command_dry_run:
-        try:
-            try:
-                rel_themes = str(themes_dir.relative_to(site_root)).replace("\\", "/")
-            except ValueError:
-                rel_themes = "public_html/wp-content/themes"
-            res_ls = shell.privileged(
-                "site-file-list",
-                helper_args=[linux_user, str(site_root), rel_themes],
-                check=False,
+    try:
+        if linux_user and not settings.command_dry_run:
+            res = run_wp_cli(
+                linux_user,
+                php_version or "8.4",
+                wp_dir,
+                ["theme", "list", "--format=json", "--skip-plugins", "--skip-themes"],
             )
-            if res_ls.returncode == 0 and res_ls.stdout:
-                for line in res_ls.stdout.splitlines():
-                    parts = line.split("\t")
-                    if len(parts) >= 4 and parts[0] == "directory":
-                        fname = parts[3].strip()
-                        if not fname.startswith("."):
-                            slugs.append(fname)
-        except Exception:
-            pass
+            parsed = extract_wp_cli_json(res.stdout) if res.returncode == 0 else None
+            if isinstance(parsed, list):
+                return [
+                    {
+                        "slug": str(item.get("name") or "").strip(),
+                        "name": (item.get("title") or str(item.get("name") or "").replace("-", " ").title()).strip(),
+                        "version": str(item.get("version") or "1.0").strip(),
+                        "latest_version": str(item.get("update_version") or item.get("version") or "1.0").strip(),
+                        "update_available": item.get("update") == "available",
+                        "status": "active" if item.get("status") == "active" else "inactive",
+                    }
+                    for item in parsed
+                    if isinstance(item, dict) and item.get("name")
+                ]
 
-    active_stylesheet = ((db_meta or {}).get("stylesheet") or "").strip().lower()
-    found: List[Dict[str, Any]] = []
-    for idx, slug in enumerate(slugs):
-        t_name, t_ver = _parse_theme_header_metadata(wp_dir, slug, linux_user=linux_user, site_root=site_root)
-        is_active = (slug.lower() == active_stylesheet) if active_stylesheet else (idx == 0)
-        found.append({
-            "slug": slug,
-            "name": t_name,
-            "version": t_ver,
-            "latest_version": t_ver,
-            "update_available": False,
-            "status": "active" if is_active else "inactive",
-        })
-    return found
+        themes_dir = wp_dir / "wp-content" / "themes"
+        slugs: List[str] = []
+        listed_ok = False
+        try:
+            if themes_dir.exists() and themes_dir.is_dir():
+                for item in sorted(themes_dir.iterdir()):
+                    if item.is_dir() and not item.name.startswith("."):
+                        slugs.append(item.name)
+                listed_ok = True
+        except Exception:
+            listed_ok = False
+
+        if not listed_ok and linux_user and site_root and not settings.command_dry_run:
+            try:
+                try:
+                    rel_themes = str(themes_dir.relative_to(site_root)).replace("\\", "/")
+                except ValueError:
+                    rel_themes = "public_html/wp-content/themes"
+                res_ls = shell.privileged(
+                    "terminal-exec",
+                    helper_args=[linux_user, str(site_root), "ls", "-1F", rel_themes],
+                    fallback=["ls", "-1F", str(themes_dir)],
+                    check=False,
+                )
+                if res_ls.returncode == 0 and res_ls.stdout:
+                    for raw_entry in res_ls.stdout.splitlines():
+                        fname = raw_entry.strip()
+                        if fname.endswith("/") and not fname.startswith("."):
+                            slugs.append(fname[:-1])
+            except Exception:
+                pass
+
+        active_stylesheet = ((db_meta or {}).get("stylesheet") or "").strip().lower()
+        found: List[Dict[str, Any]] = []
+        for idx, slug in enumerate(slugs):
+            t_name, t_ver = _parse_theme_header_metadata(wp_dir, slug, linux_user=linux_user, site_root=site_root)
+            is_active = (slug.lower() == active_stylesheet) if active_stylesheet else (idx == 0)
+            found.append({
+                "slug": slug,
+                "name": t_name,
+                "version": t_ver,
+                "latest_version": t_ver,
+                "update_available": False,
+                "status": "active" if is_active else "inactive",
+            })
+        return found
+    except Exception as exc:
+        logger.warning("discover_live_themes warning: %s", exc)
+        return []
 
 
 def create_live_snapshot_archive(
@@ -595,24 +631,34 @@ def create_live_snapshot_archive(
     try:
         snap_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
-        shell.privileged(
-            "terminal-exec",
-            helper_args=[linux_user, str(site_root), "mkdir", "-p", "wp-snapshots"],
-            fallback=["mkdir", "-p", str(snap_dir)],
-            check=False,
-        )
+        try:
+            shell.privileged(
+                "terminal-exec",
+                helper_args=[linux_user, str(site_root), "mkdir", "-p", "wp-snapshots"],
+                fallback=["mkdir", "-p", str(snap_dir)],
+                check=False,
+            )
+        except Exception:
+            pass
     sql_dump = wp_dir / ".spanel-db-snapshot.sql"
     if db_name:
         try:
             mariadb.export_database(db_name, str(sql_dump))
         except Exception as exc:
             logger.warning("Snapshot DB dump warning: %s", exc)
-    shell.privileged(
-        "terminal-exec",
-        helper_args=[linux_user, str(site_root), "tar", "-czf", f"wp-snapshots/{snap_id}", "-C", str(wp_dir), "."],
-        fallback=["tar", "-czf", str(snap_file), "-C", str(wp_dir), "."],
-        check=False,
-    )
+    try:
+        rel_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
+    except ValueError:
+        rel_wp = "public_html"
+    try:
+        shell.privileged(
+            "terminal-exec",
+            helper_args=[linux_user, str(site_root), "tar", "-czf", f"wp-snapshots/{snap_id}", "-C", rel_wp, "."],
+            fallback=["tar", "-czf", str(snap_file), "-C", str(wp_dir), "."],
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning("Snapshot tar warning: %s", exc)
     delete_wp_path(linux_user, site_root, wp_dir, ".spanel-db-snapshot.sql")
     try:
         if snap_file.exists():
@@ -620,34 +666,6 @@ def create_live_snapshot_archive(
     except Exception:
         pass
     return real_size_mb
-
-
-def create_live_snapshot(
-    site: Website,
-    linux_user: str,
-    site_root: Path,
-    wp_dir: Path,
-    db_name: str,
-    inst: Dict[str, Any],
-    snapshot_label: Optional[str],
-    detected_wp_ver: str,
-) -> str:
-    snap_id = f"wp-snap-{site.domain.replace('.', '-')}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.tar.gz"
-    real_size_mb = create_live_snapshot_archive(linux_user, site_root, wp_dir, db_name, snap_id)
-
-    snaps = list(inst.get("snapshots") or [])
-    snaps.insert(
-        0,
-        {
-            "id": snap_id,
-            "label": (snapshot_label or "Manual Recovery Point").strip(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "size_mb": real_size_mb,
-            "wp_version": detected_wp_ver or inst.get("wp_version") or "6.7.2",
-        },
-    )
-    inst["snapshots"] = snaps
-    return snap_id
 
 
 def restore_live_snapshot(
@@ -662,11 +680,15 @@ def restore_live_snapshot(
         raise HTTPException(status_code=400, detail="Vui lòng chọn bản Snapshot cần khôi phục.")
     snap_file = site_root / "wp-snapshots" / snap_id
     if not settings.command_dry_run:
-        if not snap_file.exists():
+        if not wp_path_exists(site_root, f"wp-snapshots/{snap_id}", linux_user, site_root):
             raise HTTPException(status_code=404, detail=f"Không tìm thấy tệp Snapshot {snap_id} trên ổ đĩa.")
+        try:
+            rel_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
+        except ValueError:
+            rel_wp = "public_html"
         shell.privileged(
             "terminal-exec",
-            helper_args=[linux_user, str(site_root), "tar", "-xzf", f"wp-snapshots/{snap_id}", "-C", str(wp_dir)],
+            helper_args=[linux_user, str(site_root), "tar", "-xzf", f"wp-snapshots/{snap_id}", "-C", rel_wp],
             fallback=["tar", "-xzf", str(snap_file), "-C", str(wp_dir)],
             check=False,
         )
@@ -694,12 +716,15 @@ def delete_live_snapshot(
                 snap_file.unlink()
         except Exception:
             pass
-        shell.privileged(
-            "site-file-delete",
-            helper_args=[linux_user, str(site_root), f"wp-snapshots/{snap_id}"],
-            fallback=["rm", "-f", str(snap_file)],
-            check=False,
-        )
+        try:
+            shell.privileged(
+                "rm-site",
+                helper_args=[linux_user, str(site_root), str(snap_file)],
+                fallback=["rm", "-f", "--", str(snap_file)],
+                check=False,
+            )
+        except Exception:
+            pass
     inst["snapshots"] = [s for s in (inst.get("snapshots") or []) if s.get("id") != snap_id]
     return snap_id
 
@@ -794,16 +819,44 @@ def execute_live_clone_or_sync(
             clone_db_pass = mariadb.random_password(20)
 
     if sync_files and not settings.command_dry_run and str(wp_dir) != str(target_wp_dir):
-        try:
-            target_wp_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
         delete_wp_path(target_linux_user, target_site_root, target_wp_dir, "index.html")
-        tmp_tar = Path(f"/tmp/spanel-wp-clone-{secrets.token_hex(6)}.tar.gz")
+        tmp_tar = Path(f"/tmp/spanel-upload-wpclone-{secrets.token_hex(6)}.tar.gz")
         try:
             shell.run(["tar", "-czf", str(tmp_tar), "-C", str(wp_dir), "."], check=False)
-            shell.run(["tar", "-xzf", str(tmp_tar), "-C", str(target_wp_dir)], check=False)
+            if tmp_tar.exists():
+                rel_stage = ".spanel-wp-clone-stage.tar.gz"
+                stage_dest = target_site_root / rel_stage
+                try:
+                    shell.privileged(
+                        "site-file-install",
+                        helper_args=[target_linux_user, str(target_site_root), rel_stage, str(tmp_tar)],
+                        fallback=["cp", "--", str(tmp_tar), str(stage_dest)],
+                        check=False,
+                    )
+                except Exception:
+                    pass
+                try:
+                    rel_dst_wp = str(target_wp_dir.relative_to(target_site_root)).replace("\\", "/")
+                except ValueError:
+                    rel_dst_wp = "public_html"
+                shell.privileged(
+                    "terminal-exec",
+                    helper_args=[
+                        target_linux_user,
+                        str(target_site_root),
+                        "tar",
+                        "-xzf",
+                        rel_stage,
+                        "-C",
+                        rel_dst_wp,
+                    ],
+                    fallback=["tar", "-xzf", str(stage_dest), "-C", str(target_wp_dir)],
+                    check=False,
+                )
+                delete_wp_path(target_linux_user, target_site_root, target_site_root, rel_stage)
             wordpress.fix_permissions(str(target_site_root), target_linux_user)
+        except Exception as exc:
+            logger.warning("Clone/Sync file copy warning: %s", exc)
         finally:
             try:
                 if tmp_tar.exists():
