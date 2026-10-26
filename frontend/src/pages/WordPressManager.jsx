@@ -162,6 +162,14 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       if (data) {
         const list = Array.isArray(data.instances) ? data.instances : [];
         setInstances(list);
+        const nextPlugins = {};
+        const nextThemes = {};
+        for (const inst of list) {
+          if (Array.isArray(inst.plugins)) nextPlugins[inst.id] = inst.plugins;
+          if (Array.isArray(inst.themes)) nextThemes[inst.id] = inst.themes;
+        }
+        setInstancePluginsMap(nextPlugins);
+        setInstanceThemesMap(nextThemes);
         if (Array.isArray(data.sets)) setPackageSets(data.sets);
         if (Array.isArray(data.websites) && data.websites.length > 0) {
           setAllWebsites(data.websites);
@@ -175,6 +183,15 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   function updateSingleInstanceState(updated) {
     if (!updated || !updated.id) return;
     setInstances(prev => prev.map(item => (item.id === updated.id ? updated : item)));
+    if (Array.isArray(updated.plugins)) {
+      setInstancePluginsMap(prev => ({ ...prev, [updated.id]: updated.plugins }));
+    }
+    if (Array.isArray(updated.themes)) {
+      setInstanceThemesMap(prev => ({ ...prev, [updated.id]: updated.themes }));
+    }
+    if (snapshotModalInst && snapshotModalInst.id === updated.id) {
+      setSnapshotModalInst(updated);
+    }
   }
 
   function getSubTab(instId) {
@@ -183,16 +200,43 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
 
   async function selectSubTab(inst, tabKey) {
     setInstanceTabMap(prev => ({ ...prev, [inst.id]: tabKey }));
-    if (tabKey === 'plugins' && !instancePluginsMap[inst.id]) {
+    if (tabKey === 'plugins') {
       const res = await request(`/wordpress-manager/instances/${inst.id}/plugins`, { silent: true });
-      if (res?.plugins) {
+      if (Array.isArray(res?.plugins)) {
         setInstancePluginsMap(prev => ({ ...prev, [inst.id]: res.plugins }));
+        setInstances(prev =>
+          prev.map(item =>
+            item.id === inst.id
+              ? {
+                  ...item,
+                  plugins: res.plugins,
+                  plugins_count: res.plugins.length,
+                  plugins_active_count: res.plugins.filter(p => p.status === 'active').length,
+                  plugins_updatable_count: res.plugins.filter(p => p.update_available).length,
+                }
+              : item
+          )
+        );
       }
     }
-    if (tabKey === 'themes' && !instanceThemesMap[inst.id]) {
+    if (tabKey === 'themes') {
       const res = await request(`/wordpress-manager/instances/${inst.id}/themes`, { silent: true });
-      if (res?.themes) {
+      if (Array.isArray(res?.themes)) {
         setInstanceThemesMap(prev => ({ ...prev, [inst.id]: res.themes }));
+        const activeTh = res.themes.find(th => th.status === 'active');
+        setInstances(prev =>
+          prev.map(item =>
+            item.id === inst.id
+              ? {
+                  ...item,
+                  themes: res.themes,
+                  themes_count: res.themes.length,
+                  themes_updatable_count: res.themes.filter(th => th.update_available).length,
+                  active_theme: activeTh ? activeTh.name : item.active_theme,
+                }
+              : item
+          )
+        );
       }
     }
     if (tabKey === 'security' && !securityCheckedMap[inst.id]) {
@@ -1262,8 +1306,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               {filteredInstances.map(inst => {
                 const isCollapsed = !!collapsedMap[inst.id];
                 const subTab = getSubTab(inst.id);
-                const instPlugins = instancePluginsMap[inst.id] || [];
-                const instThemes = instanceThemesMap[inst.id] || [];
+                const instPlugins = instancePluginsMap[inst.id] ?? inst.plugins ?? [];
+                const instThemes = instanceThemesMap[inst.id] ?? inst.themes ?? [];
                 const checkedSecIds =
                   securityCheckedMap[inst.id] || (inst.security_checks || []).map(c => c.id);
 
@@ -2153,6 +2197,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                     </tr>
                                   </thead>
                                   <tbody>
+                                    {instPlugins.length === 0 && (
+                                      <tr>
+                                        <td colSpan={4} style={{ padding: '22px 14px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                                          Không có Plugin nào đang được cài đặt trên website này.
+                                        </td>
+                                      </tr>
+                                    )}
                                     {instPlugins.map(pl => (
                                       <tr key={pl.slug} style={{ borderBottom: '1px solid var(--border)' }}>
                                         <td style={{ padding: '9px 14px' }}>
@@ -2254,6 +2305,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                     </tr>
                                   </thead>
                                   <tbody>
+                                    {instThemes.length === 0 && (
+                                      <tr>
+                                        <td colSpan={4} style={{ padding: '22px 14px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                                          Không có Theme nào đang được cài đặt trên website này.
+                                        </td>
+                                      </tr>
+                                    )}
                                     {instThemes.map(th => (
                                       <tr key={th.slug} style={{ borderBottom: '1px solid var(--border)' }}>
                                         <td style={{ padding: '9px 14px' }}>
@@ -2481,7 +2539,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   <code>{inst.table_prefix}</code>
                                   <span style={{ color: 'var(--text-muted)' }}>Tables / Size:</span>
                                   <span>
-                                    <strong>{inst.database?.table_count ?? 12}</strong> bảng ({inst.database?.size_mb ?? 2.4} MB)
+                                    <strong>{inst.database?.table_count ?? 0}</strong> bảng ({inst.database?.size_mb ?? inst.db_size_mb ?? 0} MB)
                                   </span>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>

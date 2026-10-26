@@ -2156,6 +2156,7 @@ id -u spanel >/dev/null 2>&1 && py_compile_as=(sudo -u spanel)
   app/services/waf.py \
   app/services/mariadb.py \
   app/services/wordpress.py \
+  app/services/wordpress_live.py \
   app/services/file_manager.py \
   app/services/backup.py \
   app/services/backup_scheduler.py \

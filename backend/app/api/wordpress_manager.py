@@ -21,7 +21,7 @@ from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, User, Website
-from app.services import mariadb, nginx, site_users, wordpress
+from app.services import mariadb, nginx, site_users, wordpress, wordpress_live
 from app.services.shell import shell
 
 router = APIRouter(prefix="/wordpress-manager", tags=["wordpress-manager"])
@@ -511,41 +511,41 @@ def _evaluate_security_checks(
     saved_inst: Dict[str, Any],
     linux_user: Optional[str] = None,
     site_root: Optional[Path] = None,
+    live_admin_user: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     sec_overrides = saved_inst.get("security_overrides") or {}
     uploads_ht = _read_wp_file_text(wp_dir, "wp-content/uploads/.htaccess", linux_user=linux_user, site_root=site_root)
     root_ht = _read_wp_file_text(wp_dir, ".htaccess", linux_user=linux_user, site_root=site_root)
+    effective_admin = (live_admin_user or saved_inst.get("admin_user") or "admin").strip()
 
     checks_map = {
         "disallow_file_edit": bool(config_info.get("disallow_file_edit")),
         "xmlrpc_blocked": bool(
-            sec_overrides.get("xmlrpc_blocked")
+            wordpress_live.wp_path_exists(wp_dir, "wp-content/mu-plugins/spanel-block-xmlrpc.php", linux_user, site_root)
             or ("xmlrpc.php" in root_ht)
-            or (wp_dir / ".spanel-block-xmlrpc").exists()
+            or wordpress_live.wp_path_exists(wp_dir, ".spanel-block-xmlrpc", linux_user, site_root)
         ),
         "uploads_php_blocked": bool(
-            sec_overrides.get("uploads_php_blocked")
-            or ("php" in uploads_ht.lower())
-            or (wp_dir / "wp-content/uploads/.spanel-no-php").exists()
+            ("php" in uploads_ht.lower())
+            or wordpress_live.wp_path_exists(wp_dir, "wp-content/uploads/.spanel-no-php", linux_user, site_root)
         ),
         "permissions_strict": bool(sec_overrides.get("permissions_strict", True)),
         "keys_salts_fresh": int(config_info.get("salts_count") or 0) >= 8 or bool(sec_overrides.get("keys_salts_fresh")),
         "sensitive_files_blocked": bool(
-            sec_overrides.get("sensitive_files_blocked")
-            or (not (wp_dir / "readme.html").exists() and not (wp_dir / "wp-config-sample.php").exists())
+            not wordpress_live.wp_path_exists(wp_dir, "readme.html", linux_user, site_root)
+            and not wordpress_live.wp_path_exists(wp_dir, "wp-config-sample.php", linux_user, site_root)
         ),
         "author_enum_blocked": bool(
-            sec_overrides.get("author_enum_blocked")
-            or (wp_dir / "wp-content/mu-plugins/spanel-block-author-scan.php").exists()
+            wordpress_live.wp_path_exists(wp_dir, "wp-content/mu-plugins/spanel-block-author-scan.php", linux_user, site_root)
         ),
         "custom_table_prefix": (config_info.get("table_prefix") or "wp_") != "wp_",
-        "no_default_admin_user": (saved_inst.get("admin_user") or "admin").lower() != "admin",
+        "no_default_admin_user": effective_admin.lower() != "admin",
     }
 
     results = []
     for item in SECURITY_CHECK_DEFINITIONS:
         cid = item["id"]
-        if cid in sec_overrides:
+        if settings.command_dry_run and cid in sec_overrides:
             passed = bool(sec_overrides[cid])
         else:
             passed = bool(checks_map.get(cid, False))
@@ -764,11 +764,15 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
 
     subpath = saved.get("subpath") or ""
     linux_user, site_root, wp_dir = _resolve_site_paths(site, db, subpath)
-    has_wp_files = (wp_dir / "wp-config.php").exists() or (wp_dir / "wp-includes/version.php").exists()
+    has_wp_files = (
+        wordpress_live.wp_path_exists(wp_dir, "wp-config.php", linux_user, site_root)
+        or wordpress_live.wp_path_exists(wp_dir, "wp-includes/version.php", linux_user, site_root)
+    )
 
     if site.app_type != "wordpress" and not has_wp_files and not saved.get("installed"):
         return None
 
+    php_ver = site.php_version or "8.4"
     config_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
     cfg = _parse_wp_config_details(config_text)
     detected_ver = _detect_wp_version(wp_dir, linux_user=linux_user, site_root=site_root) or saved.get("wp_version") or "6.7.2"
@@ -786,45 +790,77 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
     table_prefix = cfg["table_prefix"] if config_text else (saved.get("table_prefix") or "wp_")
 
     db_size_mb = 0.0
+    table_count = 0
     db_acc = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first() or linked_acc
-    if db_acc:
-        sz_bytes = int(getattr(db_acc, "size_bytes", 0) or 0)
-        if sz_bytes <= 0:
-            try:
-                tables = mariadb.get_database_tables_breakdown(db_acc.db_name)
-                sz_bytes = sum(int(t.get("total_bytes") or 0) for t in tables)
-                if sz_bytes > 0:
-                    db_acc.size_bytes = sz_bytes
-                    db.commit()
-            except Exception:
-                pass
+    try:
+        tables = mariadb.get_database_tables_breakdown(db_acc.db_name if db_acc else db_name)
+        table_count = len(tables)
+        sz_bytes = sum(int(t.get("total_bytes") or 0) for t in tables)
+        if db_acc and sz_bytes > 0 and getattr(db_acc, "size_bytes", 0) != sz_bytes:
+            db_acc.size_bytes = sz_bytes
+            db.commit()
         if sz_bytes > 0:
             db_size_mb = round(float(sz_bytes) / (1024 * 1024), 2)
-    elif saved.get("db_size_mb"):
-        db_size_mb = float(saved["db_size_mb"])
+    except Exception:
+        if db_acc and int(getattr(db_acc, "size_bytes", 0) or 0) > 0:
+            db_size_mb = round(float(db_acc.size_bytes) / (1024 * 1024), 2)
+
+    db_meta = wordpress_live.query_wp_db_live_meta(db_name, table_prefix)
+    live_site_title = db_meta.get("site_title") or saved.get("site_title") or site.domain
+    live_site_desc = (
+        db_meta.get("site_description")
+        if db_meta.get("site_description") != ""
+        else (saved.get("site_description") or "")
+    )
+    live_admin_user = db_meta.get("admin_user") or saved.get("admin_user") or "admin"
+    live_admin_email = db_meta.get("admin_email") or saved.get("admin_email") or f"admin@{site.domain}"
 
     toggles_saved = saved.get("toggles") or {}
-    maintenance_active = (wp_dir / ".maintenance").exists() or bool(toggles_saved.get("maintenance_mode", False))
+    maintenance_active = wordpress_live.wp_path_exists(wp_dir, ".maintenance", linux_user, site_root)
+    htpasswd_active = wordpress_live.wp_path_exists(wp_dir, ".htpasswd", linux_user, site_root)
+    search_indexing = (
+        bool(db_meta["blog_public"])
+        if db_meta.get("blog_public") is not None
+        else bool(toggles_saved.get("search_engine_indexing", True))
+    )
 
     toggles = {
-        "search_engine_indexing": bool(toggles_saved.get("search_engine_indexing", True)),
-        "caching_enabled": bool(toggles_saved.get("caching_enabled", cfg["wp_cache"])),
+        "search_engine_indexing": search_indexing,
+        "caching_enabled": bool(cfg["wp_cache"]) if config_text else bool(toggles_saved.get("caching_enabled", cfg["wp_cache"])),
         "maintenance_mode": maintenance_active,
-        "debugging": bool(toggles_saved.get("debugging", cfg["wp_debug"])),
-        "debug_log": bool(toggles_saved.get("debug_log", cfg["wp_debug_log"])),
-        "debug_display": bool(toggles_saved.get("debug_display", cfg["wp_debug_display"])),
-        "password_protection": bool(toggles_saved.get("password_protection", False)),
-        "disable_wp_cron": bool(toggles_saved.get("disable_wp_cron", cfg["disable_wp_cron"])),
+        "debugging": bool(cfg["wp_debug"]) if config_text else bool(toggles_saved.get("debugging", cfg["wp_debug"])),
+        "debug_log": bool(cfg["wp_debug_log"]) if config_text else bool(toggles_saved.get("debug_log", cfg["wp_debug_log"])),
+        "debug_display": bool(cfg["wp_debug_display"]) if config_text else bool(toggles_saved.get("debug_display", cfg["wp_debug_display"])),
+        "password_protection": htpasswd_active or bool(toggles_saved.get("password_protection", False)),
+        "disable_wp_cron": bool(cfg["disable_wp_cron"]) if config_text else bool(toggles_saved.get("disable_wp_cron", cfg["disable_wp_cron"])),
     }
 
-    sec_checks = _evaluate_security_checks(wp_dir, cfg, saved, linux_user=linux_user, site_root=site_root)
+    sec_checks = _evaluate_security_checks(
+        wp_dir, cfg, saved, linux_user=linux_user, site_root=site_root, live_admin_user=live_admin_user
+    )
     passed_count = sum(1 for c in sec_checks if c["passed"])
     critical_failed = any(c["critical"] and not c["passed"] for c in sec_checks)
     security_status = "ok" if passed_count == len(sec_checks) else ("warning" if not critical_failed or passed_count >= 5 else "critical")
 
-    plugins_list = saved.get("plugins") or _default_plugins_for_instance(wp_dir)
-    themes_list = saved.get("themes") or _default_themes_for_instance(wp_dir)
-    active_theme = next((th["name"] for th in themes_list if th.get("status") == "active"), "Twenty Twenty-Five")
+    if settings.command_dry_run and "plugins" in saved:
+        plugins_list = list(saved.get("plugins") or [])
+    else:
+        plugins_list = _default_plugins_for_instance(
+            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta
+        )
+    if settings.command_dry_run and "themes" in saved:
+        themes_list = list(saved.get("themes") or [])
+    else:
+        themes_list = _default_themes_for_instance(
+            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta
+        )
+    active_theme = next(
+        (th["name"] for th in themes_list if th.get("status") == "active"),
+        (themes_list[0]["name"] if themes_list else (db_meta.get("stylesheet") or "None")),
+    )
+    if inst_key in (state.get("instances") or {}):
+        saved["plugins"] = plugins_list
+        saved["themes"] = themes_list
 
     snapshots = _list_site_snapshots(site_root, saved)
 
@@ -844,26 +880,29 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
         "php_version": site.php_version or "8.4",
         "ssl_enabled": bool(site.ssl_enabled),
         "ssl_mode": site.ssl_mode or "none",
-        "site_title": saved.get("site_title") or site.domain,
-        "site_description": saved.get("site_description") or "Just another WordPress site",
+        "site_title": live_site_title,
+        "site_description": live_site_desc,
         "language": saved.get("language") or "vi",
         "wp_version": detected_ver,
         "latest_wp_version": latest_ver,
         "update_available": detected_ver != latest_ver,
-        "admin_user": saved.get("admin_user") or "admin",
-        "admin_email": saved.get("admin_email") or f"admin@{site.domain}",
+        "admin_user": live_admin_user,
+        "admin_email": live_admin_email,
         "db_name": db_name,
         "db_user": db_user,
         "db_host": cfg["db_host"] or "localhost",
         "table_prefix": table_prefix,
         "db_size_mb": db_size_mb,
-        "wp_memory_limit": saved.get("wp_memory_limit") or cfg["wp_memory_limit"] or "256M",
-        "wp_max_memory_limit": saved.get("wp_max_memory_limit") or cfg["wp_max_memory_limit"] or "512M",
-        "wp_post_revisions": str(saved.get("wp_post_revisions") or cfg["wp_post_revisions"] or "10"),
+        "database": {"table_count": table_count, "size_mb": db_size_mb},
+        "wp_memory_limit": cfg["wp_memory_limit"] if config_text else (saved.get("wp_memory_limit") or "256M"),
+        "wp_max_memory_limit": cfg["wp_max_memory_limit"] if config_text else (saved.get("wp_max_memory_limit") or "512M"),
+        "wp_post_revisions": str(cfg["wp_post_revisions"] if config_text else (saved.get("wp_post_revisions") or "10")),
         "toggles": toggles,
         "maintenance_message": saved.get("maintenance_message") or "Website đang được bảo trì và nâng cấp định kỳ. Vui lòng quay lại sau ít phút!",
         "basic_auth_user": saved.get("basic_auth_user") or "",
         "cron_interval_minutes": int(saved.get("cron_interval_minutes") or 15),
+        "plugins": plugins_list,
+        "themes": themes_list,
         "plugins_count": len(plugins_list),
         "plugins_active_count": sum(1 for p in plugins_list if p.get("status") == "active"),
         "plugins_updatable_count": sum(1 for p in plugins_list if p.get("update_available")),
@@ -879,7 +918,18 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
     }
 
 
-def _default_plugins_for_instance(wp_dir: Path) -> List[Dict[str, Any]]:
+def _default_plugins_for_instance(
+    wp_dir: Path,
+    linux_user: Optional[str] = None,
+    php_version: str = "8.4",
+    site_root: Optional[Path] = None,
+    db_meta: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    live = wordpress_live.discover_live_plugins(
+        wp_dir, linux_user=linux_user, php_version=php_version, site_root=site_root, db_meta=db_meta
+    )
+    if live or not settings.command_dry_run:
+        return live
     plugins_dir = wp_dir / "wp-content" / "plugins"
     found: List[Dict[str, Any]] = []
     if plugins_dir.exists() and plugins_dir.is_dir():
@@ -897,31 +947,21 @@ def _default_plugins_for_instance(wp_dir: Path) -> List[Dict[str, Any]]:
                     })
         except Exception:
             pass
-    if found:
-        return found
-    return [
-        {
-            "slug": "classic-editor",
-            "name": "Classic Editor",
-            "version": "1.6.7",
-            "latest_version": "1.6.7",
-            "update_available": False,
-            "status": "active",
-            "auto_update": True,
-        },
-        {
-            "slug": "akismet",
-            "name": "Akismet Anti-spam: Spam Protection",
-            "version": "5.3.5",
-            "latest_version": "5.3.7",
-            "update_available": True,
-            "status": "inactive",
-            "auto_update": False,
-        },
-    ]
+    return found
 
 
-def _default_themes_for_instance(wp_dir: Path) -> List[Dict[str, Any]]:
+def _default_themes_for_instance(
+    wp_dir: Path,
+    linux_user: Optional[str] = None,
+    php_version: str = "8.4",
+    site_root: Optional[Path] = None,
+    db_meta: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    live = wordpress_live.discover_live_themes(
+        wp_dir, linux_user=linux_user, php_version=php_version, site_root=site_root, db_meta=db_meta
+    )
+    if live or not settings.command_dry_run:
+        return live
     themes_dir = wp_dir / "wp-content" / "themes"
     found: List[Dict[str, Any]] = []
     if themes_dir.exists() and themes_dir.is_dir():
@@ -938,42 +978,25 @@ def _default_themes_for_instance(wp_dir: Path) -> List[Dict[str, Any]]:
                     })
         except Exception:
             pass
-    if found:
-        return found
-    return [
-        {
-            "slug": "twentytwentyfive",
-            "name": "Twenty Twenty-Five",
-            "version": "1.1",
-            "latest_version": "1.1",
-            "update_available": False,
-            "status": "active",
-        },
-        {
-            "slug": "twentytwentyfour",
-            "name": "Twenty Twenty-Four",
-            "version": "1.3",
-            "latest_version": "1.3",
-            "update_available": False,
-            "status": "inactive",
-        },
-    ]
+    return found
 
 
 def _list_site_snapshots(site_root: Path, saved: Dict[str, Any]) -> List[Dict[str, Any]]:
     snaps = list(saved.get("snapshots") or [])
     snap_dir = site_root / "wp-snapshots"
+    if not settings.command_dry_run:
+        snaps = [s for s in snaps if s.get("id") and (snap_dir / str(s["id"])).exists()]
     if snap_dir.exists() and snap_dir.is_dir():
         known_ids = {s.get("id") for s in snaps}
         try:
             for f in sorted(snap_dir.glob("*.tar.gz"), reverse=True):
-                if f.stem not in known_ids:
+                if f.name not in known_ids and f.stem not in known_ids:
                     sz_mb = round(f.stat().st_size / (1024 * 1024), 2)
                     snaps.append({
                         "id": f.name,
                         "label": "Automatic Snapshot",
                         "created_at": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
-                        "size_mb": max(0.1, sz_mb),
+                        "size_mb": max(0.01, sz_mb),
                     })
         except Exception:
             pass
@@ -1092,6 +1115,7 @@ def list_wp_instances(
         summary = _build_instance_summary(site, db, state)
         if summary:
             instances.append(summary)
+    _save_toolkit_state(state)
 
     custom_sets = state.get("custom_sets") or []
     return {
@@ -1365,15 +1389,17 @@ def install_wp_instance(
         logger.warning("Nginx rewrite on WP install warning: %s", exc)
 
     # 4. Starter Set plugins/themes
-    starter_plugins = list(_default_plugins_for_instance(wp_dir))
+    starter_plugins = list(
+        _default_plugins_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root)
+    )
     if payload.starter_set and payload.starter_set != "none":
         state_tmp = _load_toolkit_state()
         all_sets = [*DEFAULT_PACKAGE_SETS, *(state_tmp.get("custom_sets") or [])]
         chosen_set = next((s for s in all_sets if s["id"] == payload.starter_set), None)
         if chosen_set:
             for slug in chosen_set.get("plugins") or []:
-                _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "install", slug, "--activate"])
-                if not any(p["slug"].lower() == slug.lower() for p in starter_plugins):
+                _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "install", slug.lower(), "--activate", "--force"])
+                if settings.command_dry_run and not any(p["slug"].lower() == slug.lower() for p in starter_plugins):
                     starter_plugins.append({
                         "slug": slug,
                         "name": slug.replace("-", " ").title(),
@@ -1383,6 +1409,12 @@ def install_wp_instance(
                         "status": "active",
                         "auto_update": True,
                     })
+            for t_slug in chosen_set.get("themes") or []:
+                _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "install", t_slug.lower(), "--force"])
+            if not settings.command_dry_run:
+                starter_plugins = _default_plugins_for_instance(
+                    wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root
+                )
 
     # 5. Persist instance state
     detected_wp_ver = _detect_wp_version(wp_dir, linux_user=linux_user, site_root=site_root) or "6.7.2"
@@ -1406,7 +1438,7 @@ def install_wp_instance(
         "wp_max_memory_limit": "512M",
         "wp_post_revisions": "10",
         "plugins": starter_plugins,
-        "themes": _default_themes_for_instance(wp_dir),
+        "themes": _default_themes_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root),
         "security_overrides": {
             "disallow_file_edit": True,
             "permissions_strict": True,
@@ -1566,16 +1598,21 @@ def update_wp_general(
     inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
     linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
     php_ver = payload.php_version or site.php_version or "8.4"
+    cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+    db_name = cfg["db_name"] or inst.get("db_name") or ""
+    table_prefix = cfg["table_prefix"] or inst.get("table_prefix") or "wp_"
 
     if payload.site_title is not None:
         clean_title = payload.site_title.strip()
         inst["site_title"] = clean_title
         _run_wp_cli(linux_user, php_ver, wp_dir, ["option", "update", "blogname", clean_title])
+        wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "blogname", clean_title)
 
     if payload.site_description is not None:
         clean_desc = payload.site_description.strip()
         inst["site_description"] = clean_desc
         _run_wp_cli(linux_user, php_ver, wp_dir, ["option", "update", "blogdescription", clean_desc])
+        wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "blogdescription", clean_desc)
 
     if payload.php_version and payload.php_version != site.php_version:
         site.php_version = payload.php_version
@@ -1597,11 +1634,13 @@ def update_wp_general(
 
     if payload.admin_user:
         inst["admin_user"] = payload.admin_user.strip()
+        wordpress_live.rename_wp_admin_user_direct(db_name, table_prefix, inst["admin_user"])
         inst.setdefault("security_overrides", {})["no_default_admin_user"] = inst["admin_user"].lower() != "admin"
 
     if payload.admin_email:
         inst["admin_email"] = payload.admin_email.strip()
         _run_wp_cli(linux_user, php_ver, wp_dir, ["option", "update", "admin_email", inst["admin_email"]])
+        wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "admin_email", inst["admin_email"])
 
     if payload.admin_password:
         if len(payload.admin_password) < 10:
@@ -1639,16 +1678,21 @@ def update_wp_toggles(
     linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
     php_ver = site.php_version or "8.4"
     config_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
+    cfg = _parse_wp_config_details(config_text)
+    db_name = cfg["db_name"] or inst.get("db_name") or ""
+    table_prefix = cfg["table_prefix"] or inst.get("table_prefix") or "wp_"
     config_changed = False
 
     if payload.search_engine_indexing is not None:
         toggles["search_engine_indexing"] = payload.search_engine_indexing
+        val_str = "1" if payload.search_engine_indexing else "0"
         _run_wp_cli(
             linux_user,
             php_ver,
             wp_dir,
-            ["option", "update", "blog_public", "1" if payload.search_engine_indexing else "0"],
+            ["option", "update", "blog_public", val_str],
         )
+        wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "blog_public", val_str)
 
     if payload.caching_enabled is not None:
         toggles["caching_enabled"] = payload.caching_enabled
@@ -1680,6 +1724,7 @@ def update_wp_toggles(
                     (wp_dir / ".maintenance").unlink()
             except Exception:
                 pass
+            wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, ".maintenance")
             _run_wp_cli(linux_user, php_ver, wp_dir, ["maintenance-mode", "deactivate"])
 
     if payload.debugging is not None:
@@ -1706,6 +1751,12 @@ def update_wp_toggles(
         toggles["password_protection"] = payload.password_protection
         if payload.basic_auth_user:
             inst["basic_auth_user"] = payload.basic_auth_user.strip()
+        if payload.password_protection:
+            auth_u = (inst.get("basic_auth_user") or "preview").strip()
+            auth_p = (payload.basic_auth_password or "preview123").strip()
+            _write_wp_file_text(linux_user, site_root, wp_dir, ".htpasswd", f"{auth_u}:{auth_p}\n", "0640")
+        else:
+            wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, ".htpasswd")
 
     if payload.disable_wp_cron is not None:
         toggles["disable_wp_cron"] = payload.disable_wp_cron
@@ -1770,13 +1821,14 @@ def list_instance_plugins(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state()
     inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
-    linux_user, _, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
+    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
+    php_ver = site.php_version or "8.4"
 
     # Try live WP-CLI JSON output first
-    res = _run_wp_cli(linux_user, site.php_version or "8.4", wp_dir, ["plugin", "list", "--format=json"])
-    if res.returncode == 0 and res.stdout and res.stdout.strip().startswith("["):
+    res = _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "list", "--format=json", "--skip-plugins", "--skip-themes"])
+    raw_list = wordpress_live.extract_wp_cli_json(res.stdout) if res.returncode == 0 else None
+    if isinstance(raw_list, list):
         try:
-            raw_list = json.loads(res.stdout)
             plugins = [
                 {
                     "slug": item.get("name", ""),
@@ -1796,8 +1848,12 @@ def list_instance_plugins(
         except Exception:
             pass
 
-    if "plugins" not in inst:
-        inst["plugins"] = _default_plugins_for_instance(wp_dir)
+    if not settings.command_dry_run or "plugins" not in inst:
+        cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+        db_meta = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
+        inst["plugins"] = _default_plugins_for_instance(
+            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta
+        )
         _save_toolkit_state(state)
     return {"plugins": inst["plugins"]}
 
@@ -1812,9 +1868,15 @@ def manage_instance_plugins(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state()
     inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
-    linux_user, _, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
+    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
     php_ver = site.php_version or "8.4"
-    plugins: List[Dict[str, Any]] = list(inst.get("plugins") or _default_plugins_for_instance(wp_dir))
+    cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+    db_meta = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
+    plugins: List[Dict[str, Any]] = list(
+        inst.get("plugins")
+        if (settings.command_dry_run and "plugins" in inst)
+        else _default_plugins_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta)
+    )
 
     slug = (payload.slug or "").strip()
     if slug and not WP_SLUG_RE.fullmatch(slug):
@@ -1834,12 +1896,13 @@ def manage_instance_plugins(
                     else ("inactive" if p.get("status") == "active" else "active")
                 )
                 p["status"] = new_status
-                _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", new_status, slug])
+                wp_cmd = "activate" if new_status == "active" else "deactivate"
+                _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", wp_cmd, slug, "--skip-plugins", "--skip-themes"])
                 msg = f"Đã {'kích hoạt' if new_status == 'active' else 'vô hiệu hóa'} plugin {p['name']}."
                 break
 
     elif act == "update" and slug:
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", slug])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", slug, "--skip-plugins", "--skip-themes"])
         for p in plugins:
             if p["slug"].lower() == slug.lower():
                 p["version"] = p.get("latest_version") or p["version"]
@@ -1848,23 +1911,28 @@ def manage_instance_plugins(
                 break
 
     elif act == "update_all":
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", "--all"])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", "--all", "--skip-plugins", "--skip-themes"])
         for p in plugins:
             p["version"] = p.get("latest_version") or p["version"]
             p["update_available"] = False
         msg = "Đã cập nhật tất cả Plugins lên phiên bản mới nhất."
 
     elif act == "delete" and slug:
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "deactivate", slug])
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "delete", slug])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "deactivate", slug, "--skip-plugins", "--skip-themes"])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "delete", slug, "--skip-plugins", "--skip-themes"])
+        wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, f"wp-content/plugins/{slug}")
+        wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, f"wp-content/plugins/{slug}.php")
         plugins = [p for p in plugins if p["slug"].lower() != slug.lower()]
         msg = f"Đã gỡ bỏ hoàn toàn plugin {slug}."
 
     elif act == "install" and slug:
-        cli_args = ["plugin", "install", slug]
+        cli_args = ["plugin", "install", slug, "--force", "--skip-plugins", "--skip-themes"]
         if payload.activate_after_install:
             cli_args.append("--activate")
-        _run_wp_cli(linux_user, php_ver, wp_dir, cli_args)
+        res_inst = _run_wp_cli(linux_user, php_ver, wp_dir, cli_args)
+        if res_inst.returncode != 0 and not settings.command_dry_run:
+            err_detail = (res_inst.stderr or res_inst.stdout or "WP-CLI install failed").strip()
+            raise HTTPException(status_code=400, detail=f"Không thể cài đặt plugin '{slug}': {err_detail[:240]}")
         wporg_match = next((item for item in CURATED_WPORG_PLUGINS if item["slug"].lower() == slug.lower()), None)
         ver = wporg_match["version"] if wporg_match else "1.0.0"
         title = wporg_match["name"] if wporg_match else slug.replace("-", " ").title()
@@ -1887,6 +1955,11 @@ def manage_instance_plugins(
             )
         msg = f"Đã cài đặt{' và kích hoạt' if payload.activate_after_install else ''} plugin {title}!"
 
+    if not settings.command_dry_run:
+        db_meta_after = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
+        plugins = _default_plugins_for_instance(
+            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta_after
+        )
     inst["plugins"] = plugins
     _save_toolkit_state(state)
     return {
@@ -1907,12 +1980,13 @@ def list_instance_themes(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state()
     inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
-    linux_user, _, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
+    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
+    php_ver = site.php_version or "8.4"
 
-    res = _run_wp_cli(linux_user, site.php_version or "8.4", wp_dir, ["theme", "list", "--format=json"])
-    if res.returncode == 0 and res.stdout and res.stdout.strip().startswith("["):
+    res = _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "list", "--format=json", "--skip-plugins", "--skip-themes"])
+    raw_list = wordpress_live.extract_wp_cli_json(res.stdout) if res.returncode == 0 else None
+    if isinstance(raw_list, list):
         try:
-            raw_list = json.loads(res.stdout)
             themes = [
                 {
                     "slug": item.get("name", ""),
@@ -1930,8 +2004,12 @@ def list_instance_themes(
         except Exception:
             pass
 
-    if "themes" not in inst:
-        inst["themes"] = _default_themes_for_instance(wp_dir)
+    if not settings.command_dry_run or "themes" not in inst:
+        cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+        db_meta = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
+        inst["themes"] = _default_themes_for_instance(
+            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta
+        )
         _save_toolkit_state(state)
     return {"themes": inst["themes"]}
 
@@ -1946,9 +2024,17 @@ def manage_instance_themes(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state()
     inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
-    linux_user, _, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
+    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
     php_ver = site.php_version or "8.4"
-    themes: List[Dict[str, Any]] = list(inst.get("themes") or _default_themes_for_instance(wp_dir))
+    cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+    db_name = cfg["db_name"] or inst.get("db_name") or ""
+    table_prefix = cfg["table_prefix"] or inst.get("table_prefix") or "wp_"
+    db_meta = wordpress_live.query_wp_db_live_meta(db_name, table_prefix)
+    themes: List[Dict[str, Any]] = list(
+        inst.get("themes")
+        if (settings.command_dry_run and "themes" in inst)
+        else _default_themes_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta)
+    )
 
     slug = (payload.slug or "").strip()
     if slug and not WP_SLUG_RE.fullmatch(slug):
@@ -1958,13 +2044,15 @@ def manage_instance_themes(
     msg = "Đã cập nhật giao diện Theme."
 
     if act == "activate" and slug:
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "activate", slug])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "activate", slug, "--skip-plugins", "--skip-themes"])
+        wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "stylesheet", slug)
+        wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "template", slug)
         for th in themes:
             th["status"] = "active" if th["slug"].lower() == slug.lower() else "inactive"
         msg = f"Đã kích hoạt giao diện {slug}."
 
     elif act == "update" and slug:
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", slug])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", slug, "--skip-plugins", "--skip-themes"])
         for th in themes:
             if th["slug"].lower() == slug.lower():
                 th["version"] = th.get("latest_version") or th["version"]
@@ -1973,7 +2061,7 @@ def manage_instance_themes(
                 break
 
     elif act == "update_all":
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", "--all"])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", "--all", "--skip-plugins", "--skip-themes"])
         for th in themes:
             th["version"] = th.get("latest_version") or th["version"]
             th["update_available"] = False
@@ -1983,15 +2071,19 @@ def manage_instance_themes(
         target = next((th for th in themes if th["slug"].lower() == slug.lower()), None)
         if target and target.get("status") == "active":
             raise HTTPException(status_code=400, detail="Không thể xóa giao diện đang được kích hoạt (Active Theme).")
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "delete", slug])
+        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "delete", slug, "--skip-plugins", "--skip-themes"])
+        wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, f"wp-content/themes/{slug}")
         themes = [th for th in themes if th["slug"].lower() != slug.lower()]
         msg = f"Đã xóa giao diện {slug}."
 
     elif act == "install" and slug:
-        cli_args = ["theme", "install", slug]
+        cli_args = ["theme", "install", slug, "--force", "--skip-plugins", "--skip-themes"]
         if payload.activate_after_install:
             cli_args.append("--activate")
-        _run_wp_cli(linux_user, php_ver, wp_dir, cli_args)
+        res_inst = _run_wp_cli(linux_user, php_ver, wp_dir, cli_args)
+        if res_inst.returncode != 0 and not settings.command_dry_run:
+            err_detail = (res_inst.stderr or res_inst.stdout or "WP-CLI theme install failed").strip()
+            raise HTTPException(status_code=400, detail=f"Không thể cài đặt giao diện '{slug}': {err_detail[:240]}")
         wporg_match = next((item for item in CURATED_WPORG_THEMES if item["slug"].lower() == slug.lower()), None)
         ver = wporg_match["version"] if wporg_match else "1.0.0"
         title = wporg_match["name"] if wporg_match else slug.replace("-", " ").title()
@@ -2016,6 +2108,11 @@ def manage_instance_themes(
             )
         msg = f"Đã cài đặt{' và kích hoạt' if payload.activate_after_install else ''} giao diện {title}!"
 
+    if not settings.command_dry_run:
+        db_meta_after = wordpress_live.query_wp_db_live_meta(db_name, table_prefix)
+        themes = _default_themes_for_instance(
+            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta_after
+        )
     inst["themes"] = themes
     _save_toolkit_state(state)
     return {
@@ -2099,7 +2196,7 @@ def apply_wp_security(
         ok = res.returncode == 0
         return {
             "ok": True,
-            "verified": ok or True,
+            "verified": ok,
             "message": "Đã xác minh chữ ký SHA-256 mã nguồn gốc WordPress: Tất cả tệp hệ thống đều nguyên vẹn 100%!",
             "output": (res.stdout or "Success: WordPress installation verifies against checksums.").strip(),
         }
@@ -2116,6 +2213,9 @@ def apply_wp_security(
     turn_on = payload.action != "revert"
     sec_overrides = inst.setdefault("security_overrides", {})
     config_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
+    cfg = _parse_wp_config_details(config_text)
+    db_name = cfg["db_name"] or inst.get("db_name") or ""
+    table_prefix = cfg["table_prefix"] or inst.get("table_prefix") or "wp_"
     config_dirty = False
 
     for cid in target_ids:
@@ -2123,8 +2223,25 @@ def apply_wp_security(
         if cid == "disallow_file_edit" and config_text:
             config_text = _set_wp_config_constant(config_text, "DISALLOW_FILE_EDIT", "true" if turn_on else "false")
             config_dirty = True
+        elif cid == "xmlrpc_blocked":
+            if turn_on:
+                _write_wp_file_text(
+                    linux_user,
+                    site_root,
+                    wp_dir,
+                    "wp-content/mu-plugins/spanel-block-xmlrpc.php",
+                    "<?php\nadd_filter('xmlrpc_enabled', '__return_false');\n",
+                    "0644",
+                )
+                _write_wp_file_text(linux_user, site_root, wp_dir, ".spanel-block-xmlrpc", "1\n", "0644")
+            else:
+                wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/mu-plugins/spanel-block-xmlrpc.php")
+                wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, ".spanel-block-xmlrpc")
         elif cid == "keys_salts_fresh" and turn_on:
             _run_wp_cli(linux_user, php_ver, wp_dir, ["config", "shuffle-salts"])
+            refreshed = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
+            if refreshed:
+                config_text = refreshed
         elif cid == "permissions_strict" and turn_on:
             try:
                 wordpress.fix_permissions(str(site_root), linux_user)
@@ -2139,6 +2256,16 @@ def apply_wp_security(
                 "<Files *.php>\ndeny from all\n</Files>\n",
                 "0644",
             )
+            _write_wp_file_text(linux_user, site_root, wp_dir, "wp-content/uploads/.spanel-no-php", "1\n", "0644")
+        elif cid == "uploads_php_blocked" and not turn_on:
+            wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.htaccess")
+            wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.spanel-no-php")
+        elif cid == "sensitive_files_blocked":
+            if turn_on:
+                wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "readme.html")
+                wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-config-sample.php")
+            else:
+                _write_wp_file_text(linux_user, site_root, wp_dir, "readme.html", "WordPress\n", "0644")
         elif cid == "author_enum_blocked" and turn_on:
             _write_wp_file_text(
                 linux_user,
@@ -2148,10 +2275,24 @@ def apply_wp_security(
                 "<?php\nif (!is_admin() && isset($_REQUEST['author'])) { wp_safe_redirect(home_url(), 301); exit; }\n",
                 "0644",
             )
+        elif cid == "author_enum_blocked" and not turn_on:
+            wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/mu-plugins/spanel-block-author-scan.php")
+        elif cid == "custom_table_prefix":
+            new_pfx = "wp_sp_" if turn_on else "wp_"
+            if table_prefix != new_pfx and (wordpress_live.rename_wp_table_prefix_direct(db_name, table_prefix, new_pfx) or settings.command_dry_run):
+                table_prefix = new_pfx
+                inst["table_prefix"] = new_pfx
+                if config_text:
+                    config_text = re.sub(r"\$table_prefix\s*=\s*['\"][^'\"]+['\"]\s*;", f"$table_prefix = '{new_pfx}';", config_text)
+                    config_dirty = True
         elif cid == "no_default_admin_user" and turn_on:
             new_admin = (payload.new_admin_username or "wpadmin_sec").strip()
+            wordpress_live.rename_wp_admin_user_direct(db_name, table_prefix, new_admin)
             if inst.get("admin_user", "admin").lower() == "admin":
                 inst["admin_user"] = new_admin
+        elif cid == "no_default_admin_user" and not turn_on:
+            wordpress_live.rename_wp_admin_user_direct(db_name, table_prefix, "admin")
+            inst["admin_user"] = "admin"
 
     if config_dirty and config_text:
         _write_wp_file_text(linux_user, site_root, wp_dir, "wp-config.php", config_text, "0640")
@@ -2196,7 +2337,7 @@ def execute_wp_tool(
     if act == "update_core":
         _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "update"])
         _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "update-db"])
-        inst["wp_version"] = inst.get("latest_wp_version") or "6.7.2"
+        inst["wp_version"] = _detect_wp_version(wp_dir, linux_user=linux_user, site_root=site_root) or inst.get("latest_wp_version") or "6.7.2"
         _save_toolkit_state(state)
         return {
             "message": f"Đã nâng cấp WordPress Core trên {site.domain} lên phiên bản {inst['wp_version']}.",
@@ -2247,6 +2388,10 @@ def execute_wp_tool(
 
     if act == "create_snapshot":
         snap_id = f"wp-snap-{site.domain.replace('.', '-')}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.tar.gz"
+        cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+        real_size_mb = wordpress_live.create_live_snapshot_archive(
+            linux_user, site_root, wp_dir, cfg["db_name"] or inst.get("db_name") or "", snap_id
+        )
         snaps = list(inst.get("snapshots") or [])
         snaps.insert(
             0,
@@ -2254,7 +2399,7 @@ def execute_wp_tool(
                 "id": snap_id,
                 "label": (payload.snapshot_label or "Manual Recovery Point").strip(),
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "size_mb": 24.6,
+                "size_mb": real_size_mb,
                 "wp_version": inst.get("wp_version") or "6.7.2",
             },
         )
@@ -2269,6 +2414,8 @@ def execute_wp_tool(
         snap_id = (payload.snapshot_id or "").strip()
         if not snap_id:
             raise HTTPException(status_code=400, detail="Vui lòng chọn bản Snapshot cần khôi phục.")
+        cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+        wordpress_live.restore_live_snapshot(linux_user, site_root, wp_dir, cfg["db_name"] or inst.get("db_name") or "", snap_id)
         return {
             "message": f"Đã khôi phục thành công website {site.domain} về thời điểm Snapshot {snap_id}.",
             "instance": _build_instance_summary(site, db, state),
@@ -2276,6 +2423,7 @@ def execute_wp_tool(
 
     if act == "delete_snapshot":
         snap_id = (payload.snapshot_id or "").strip()
+        wordpress_live.delete_live_snapshot(linux_user, site_root, inst, snap_id)
         inst["snapshots"] = [s for s in (inst.get("snapshots") or []) if s.get("id") != snap_id]
         _save_toolkit_state(state)
         return {
@@ -2338,6 +2486,32 @@ def execute_wp_tool(
             cloned_state["db_password_enc"] = encrypt(clone_db_pass)
             cloned_state["installed_at"] = datetime.now(timezone.utc).isoformat()
         state.setdefault("instances", {})[target_key] = cloned_state
+        target_subpath = (payload.target_subpath or "").strip()
+        target_linux_user, target_site_root, target_wp_dir = _resolve_site_paths(target_site, db, target_subpath)
+        src_cfg_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
+        src_cfg = _parse_wp_config_details(src_cfg_text)
+        wordpress_live.execute_live_clone_or_sync(
+            act=act,
+            site=site,
+            target_site=target_site,
+            db=db,
+            inst=inst,
+            state=state,
+            linux_user=linux_user,
+            site_root=site_root,
+            wp_dir=wp_dir,
+            php_ver=php_ver,
+            target_linux_user=target_linux_user,
+            target_site_root=target_site_root,
+            target_wp_dir=target_wp_dir,
+            target_subpath=target_subpath,
+            sync_files=payload.sync_files,
+            sync_database=payload.sync_database,
+            src_cfg_text=src_cfg_text,
+            src_db_name=src_cfg["db_name"] or inst.get("db_name") or "",
+            src_prefix=src_cfg["table_prefix"] or inst.get("table_prefix") or "wp_",
+            set_wp_config_constant_fn=_set_wp_config_constant,
+        )
         _save_toolkit_state(state)
 
         return {
@@ -2412,14 +2586,14 @@ def apply_package_set(
     for wid in payload.website_ids:
         site = _get_accessible_website(wid, db, current_user)
         inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
-        linux_user, _, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
+        linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
         php_ver = site.php_version or "8.4"
-        plugins = list(inst.get("plugins") or _default_plugins_for_instance(wp_dir))
-        themes = list(inst.get("themes") or _default_themes_for_instance(wp_dir))
+        plugins = list(inst.get("plugins") or _default_plugins_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root))
+        themes = list(inst.get("themes") or _default_themes_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root))
 
         for p_slug in chosen.get("plugins") or []:
-            _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "install", p_slug, "--activate"])
-            if not any(p["slug"].lower() == p_slug.lower() for p in plugins):
+            _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "install", p_slug.lower(), "--activate", "--force"])
+            if settings.command_dry_run and not any(p["slug"].lower() == p_slug.lower() for p in plugins):
                 plugins.append({
                     "slug": p_slug,
                     "name": p_slug.replace("-", " ").title(),
@@ -2430,8 +2604,8 @@ def apply_package_set(
                     "auto_update": True,
                 })
         for t_slug in chosen.get("themes") or []:
-            _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "install", t_slug])
-            if not any(th["slug"].lower() == t_slug.lower() for th in themes):
+            _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "install", t_slug.lower(), "--force"])
+            if settings.command_dry_run and not any(th["slug"].lower() == t_slug.lower() for th in themes):
                 themes.append({
                     "slug": t_slug,
                     "name": t_slug.replace("-", " ").title(),
@@ -2440,6 +2614,9 @@ def apply_package_set(
                     "update_available": False,
                     "status": "inactive",
                 })
+        if not settings.command_dry_run:
+            plugins = _default_plugins_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root)
+            themes = _default_themes_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root)
         inst["plugins"] = plugins
         inst["themes"] = themes
         applied += 1

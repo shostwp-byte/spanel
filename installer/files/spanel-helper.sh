@@ -11710,7 +11710,7 @@ EOF
       shift
     fi
     [[ $# -ge 1 ]] || deny "usage: wp-site <site-user> [--php-version=<version>] <args...>"
-    wp_site_basedir="$(site_open_basedir "$user"):/usr/local/bin"
+    wp_site_basedir="$(site_open_basedir "$user"):/usr/local/bin:/run/mysqld:/var/run/mysqld:/etc/ssl/certs:/usr/share/ca-certificates:/dev"
     # Move into the tenant's home first. WP-CLI probes its working directory
     # during bootstrap even when --path is given, and the API unit's cwd is
     # /opt/spanel/backend - outside the basedir - so every call printed a row
@@ -11719,8 +11719,8 @@ EOF
     # and it did not matter until the confinement above made the cwd visible.
     cd "$HOME_ROOT/$user" 2>/dev/null || deny "no home for $user"
     exec runuser -u "$user" -- env HOME="$HOME_ROOT/$user" \
-      WP_CLI_PHP_ARGS="-d pcre.jit=0 -d open_basedir=$wp_site_basedir" \
-      "$wp_php" -d pcre.jit=0 -d open_basedir="$wp_site_basedir" /usr/local/bin/wp "$@"
+      WP_CLI_PHP_ARGS="-d pcre.jit=0 -d display_errors=0 -d log_errors=1 -d open_basedir=$wp_site_basedir" \
+      "$wp_php" -d pcre.jit=0 -d display_errors=0 -d log_errors=1 -d open_basedir="$wp_site_basedir" /usr/local/bin/wp "$@"
     ;;
 
   # ---- crontab managed via root-owned /etc/cron.d/spanel-user-<user> ---
