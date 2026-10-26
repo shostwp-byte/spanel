@@ -698,35 +698,45 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       <button
         type="button"
         role="switch"
+        className={`sp-switch${checked ? ' is-on' : ''}`}
         aria-checked={checked}
         disabled={disabled}
         onClick={onChange}
         style={{
           position: 'relative',
-          width: '44px',
+          display: 'inline-block',
+          width: '42px',
+          minWidth: '42px',
           height: '24px',
           minHeight: '24px',
           borderRadius: '999px',
           padding: 0,
-          border: checked ? '1px solid var(--primary)' : '1px solid var(--border)',
-          background: checked ? 'var(--primary)' : 'var(--surface-alt)',
+          margin: 0,
+          border: checked ? '1px solid var(--primary)' : '1px solid rgba(15, 23, 42, 0.14)',
+          background: checked ? 'var(--primary)' : '#cbd5e1',
           cursor: disabled ? 'not-allowed' : 'pointer',
-          transition: 'all 0.18s ease',
-          display: 'inline-flex',
-          alignItems: 'center',
+          transition: 'background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
           flexShrink: 0,
-          boxShadow: 'none',
+          verticalAlign: 'middle',
+          boxSizing: 'border-box',
+          boxShadow: checked ? 'none' : 'inset 0 1px 2px rgba(15, 23, 42, 0.08)',
         }}
       >
         <span
+          className="sp-switch-thumb"
           style={{
+            position: 'absolute',
+            top: '2px',
+            left: '2px',
             width: '18px',
             height: '18px',
             borderRadius: '50%',
             background: '#ffffff',
-            boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-            transform: checked ? 'translateX(21px)' : 'translateX(3px)',
-            transition: 'transform 0.18s ease',
+            boxShadow: '0 1px 3px rgba(15, 23, 42, 0.28), 0 1px 1px rgba(15, 23, 42, 0.14)',
+            transform: checked ? 'translateX(18px)' : 'translateX(0)',
+            transition: 'transform 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+            pointerEvents: 'none',
+            display: 'block',
           }}
         />
       </button>

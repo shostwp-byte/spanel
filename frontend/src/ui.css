@@ -2761,3 +2761,170 @@ table.table {
     padding: 0 !important;
   }
 }
+
+/* ==========================================================================
+   Unified Toggle Switch Component (.sp-switch, button[role="switch"], and
+   setting toggle checkboxes across the entire panel)
+   ========================================================================== */
+button.sp-switch,
+button[role="switch"],
+input[type="checkbox"].sp-switch-input,
+.check-line input[type="checkbox"],
+.schedule-toggle input[type="checkbox"],
+.waf-rule-toggle input[type="checkbox"],
+.malware-sched-toggle input[type="checkbox"],
+.switch-line input[type="checkbox"] {
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  position: relative !important;
+  display: inline-block !important;
+  width: 42px !important;
+  min-width: 42px !important;
+  max-width: 42px !important;
+  height: 24px !important;
+  min-height: 24px !important;
+  max-height: 24px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border-radius: 999px !important;
+  border: 1px solid rgba(15, 23, 42, 0.14) !important;
+  background: #cbd5e1 !important;
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.08) !important;
+  cursor: pointer !important;
+  flex-shrink: 0 !important;
+  vertical-align: middle !important;
+  box-sizing: border-box !important;
+  overflow: visible !important;
+  transition:
+    background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    box-shadow 0.2s ease !important;
+}
+
+[data-theme="dark"] button.sp-switch:not(.is-on):not([aria-checked="true"]),
+[data-theme="dark"] button[role="switch"]:not([aria-checked="true"]),
+[data-theme="dark"] input[type="checkbox"].sp-switch-input:not(:checked),
+[data-theme="dark"] .check-line input[type="checkbox"]:not(:checked),
+[data-theme="dark"] .schedule-toggle input[type="checkbox"]:not(:checked),
+[data-theme="dark"] .waf-rule-toggle input[type="checkbox"]:not(:checked),
+[data-theme="dark"] .malware-sched-toggle input[type="checkbox"]:not(:checked),
+[data-theme="dark"] .switch-line input[type="checkbox"]:not(:checked) {
+  background: #334155 !important;
+  border-color: rgba(255, 255, 255, 0.15) !important;
+}
+
+button.sp-switch > .sp-switch-thumb,
+button[role="switch"] > span,
+input[type="checkbox"].sp-switch-input::after,
+.check-line input[type="checkbox"]::after,
+.schedule-toggle input[type="checkbox"]::after,
+.waf-rule-toggle input[type="checkbox"]::after,
+.malware-sched-toggle input[type="checkbox"]::after,
+.switch-line input[type="checkbox"]::after {
+  content: "" !important;
+  position: absolute !important;
+  top: 2px !important;
+  left: 2px !important;
+  width: 18px !important;
+  height: 18px !important;
+  border-radius: 50% !important;
+  background: #ffffff !important;
+  box-shadow:
+    0 1px 3px rgba(15, 23, 42, 0.28),
+    0 1px 1px rgba(15, 23, 42, 0.14) !important;
+  transform: translateX(0) !important;
+  transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  pointer-events: none !important;
+  display: block !important;
+}
+
+button.sp-switch.is-on,
+button[role="switch"][aria-checked="true"],
+input[type="checkbox"].sp-switch-input:checked,
+.check-line input[type="checkbox"]:checked,
+.schedule-toggle input[type="checkbox"]:checked,
+.waf-rule-toggle input[type="checkbox"]:checked,
+.malware-sched-toggle input[type="checkbox"]:checked,
+.switch-line input[type="checkbox"]:checked {
+  background: var(--primary, #2563eb) !important;
+  border-color: var(--primary, #2563eb) !important;
+  box-shadow: none !important;
+}
+
+button.sp-switch.is-on > .sp-switch-thumb,
+button[role="switch"][aria-checked="true"] > span,
+input[type="checkbox"].sp-switch-input:checked::after,
+.check-line input[type="checkbox"]:checked::after,
+.schedule-toggle input[type="checkbox"]:checked::after,
+.waf-rule-toggle input[type="checkbox"]:checked::after,
+.malware-sched-toggle input[type="checkbox"]:checked::after,
+.switch-line input[type="checkbox"]:checked::after {
+  transform: translateX(18px) !important;
+}
+
+button.sp-switch:hover:not(:disabled),
+button[role="switch"]:hover:not(:disabled),
+input[type="checkbox"].sp-switch-input:hover:not(:disabled),
+.check-line input[type="checkbox"]:hover:not(:disabled),
+.schedule-toggle input[type="checkbox"]:hover:not(:disabled),
+.waf-rule-toggle input[type="checkbox"]:hover:not(:disabled),
+.malware-sched-toggle input[type="checkbox"]:hover:not(:disabled),
+.switch-line input[type="checkbox"]:hover:not(:disabled) {
+  transform: none !important;
+  background: #94a3b8 !important;
+  border-color: rgba(15, 23, 42, 0.22) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary, #2563eb) 14%, transparent) !important;
+}
+
+[data-theme="dark"] button.sp-switch:not(.is-on):not([aria-checked="true"]):hover:not(:disabled),
+[data-theme="dark"] button[role="switch"]:not([aria-checked="true"]):hover:not(:disabled),
+[data-theme="dark"] input[type="checkbox"].sp-switch-input:not(:checked):hover:not(:disabled),
+[data-theme="dark"] .check-line input[type="checkbox"]:not(:checked):hover:not(:disabled),
+[data-theme="dark"] .schedule-toggle input[type="checkbox"]:not(:checked):hover:not(:disabled),
+[data-theme="dark"] .waf-rule-toggle input[type="checkbox"]:not(:checked):hover:not(:disabled),
+[data-theme="dark"] .malware-sched-toggle input[type="checkbox"]:not(:checked):hover:not(:disabled),
+[data-theme="dark"] .switch-line input[type="checkbox"]:not(:checked):hover:not(:disabled) {
+  background: #475569 !important;
+}
+
+button.sp-switch.is-on:hover:not(:disabled),
+button[role="switch"][aria-checked="true"]:hover:not(:disabled),
+input[type="checkbox"].sp-switch-input:checked:hover:not(:disabled),
+.check-line input[type="checkbox"]:checked:hover:not(:disabled),
+.schedule-toggle input[type="checkbox"]:checked:hover:not(:disabled),
+.waf-rule-toggle input[type="checkbox"]:checked:hover:not(:disabled),
+.malware-sched-toggle input[type="checkbox"]:checked:hover:not(:disabled),
+.switch-line input[type="checkbox"]:checked:hover:not(:disabled) {
+  background: var(--primary-hover, var(--primary, #1d4ed8)) !important;
+  border-color: var(--primary-hover, var(--primary, #1d4ed8)) !important;
+}
+
+button.sp-switch:disabled,
+button[role="switch"]:disabled,
+input[type="checkbox"].sp-switch-input:disabled,
+.check-line input[type="checkbox"]:disabled,
+.schedule-toggle input[type="checkbox"]:disabled,
+.waf-rule-toggle input[type="checkbox"]:disabled,
+.malware-sched-toggle input[type="checkbox"]:disabled,
+.switch-line input[type="checkbox"]:disabled {
+  opacity: 0.55 !important;
+  cursor: not-allowed !important;
+}
+
+.check-line,
+.schedule-toggle,
+.malware-sched-toggle,
+.switch-line {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+  cursor: pointer;
+}
+
+.waf-rule-toggle {
+  display: grid !important;
+  grid-template-columns: 42px minmax(0, 1fr) !important;
+  gap: 12px !important;
+  align-items: center !important;
+}
+
