@@ -1981,7 +1981,12 @@ function AppContent() {
       setDomain('');
       setCreateFormOpen(false);
       setNotice(t('Added domain {domain}. Root folder: /domains/{domain}/public_html', { domain: cleanDomain }));
-      refreshAll();
+      setWebsites(prev => {
+        const list = Array.isArray(prev) ? prev : [];
+        const exists = list.some(s => s.id === data.id);
+        return exists ? list.map(s => (s.id === data.id ? data : s)) : [data, ...list];
+      });
+      await refreshAll();
     }
   }
 
