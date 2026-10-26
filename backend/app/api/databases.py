@@ -56,6 +56,14 @@ def list_databases(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    try:
+        from app.api.websites import reconcile_websites_from_disk
+        from app.api.wordpress_manager import reconcile_wordpress_databases
+        reconcile_websites_from_disk(db)
+        reconcile_wordpress_databases(db)
+    except Exception as exc:
+        logger.debug("reconcile_wordpress_databases skipped in list_databases: %s", exc)
+
     query = db.query(DatabaseAccount)
     if not is_admin_role(current_user.role):
         query = query.filter(DatabaseAccount.owner_id == current_user.id)
@@ -67,10 +75,27 @@ def list_databases(
             DatabaseAccount.db_user.ilike(like),
         ))
     rows = query.order_by(DatabaseAccount.id.desc()).all()
+    dirty_sizes = False
     for row in rows:
         cached_sz = resource_monitor.cached_db_size_bytes(row.db_name)
         if cached_sz > 0 and getattr(row, "size_bytes", 0) != cached_sz:
             row.size_bytes = cached_sz
+            dirty_sizes = True
+        elif int(getattr(row, "size_bytes", 0) or 0) == 0:
+            try:
+                live_tables = mariadb.get_database_tables_breakdown(row.db_name)
+                if live_tables:
+                    live_sz = sum(int(t.get("size_bytes", 0) or 0) for t in live_tables)
+                    if live_sz > 0:
+                        row.size_bytes = live_sz
+                        dirty_sizes = True
+            except Exception:
+                pass
+    if dirty_sizes:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
     return rows
 
 

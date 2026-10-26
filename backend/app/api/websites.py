@@ -615,6 +615,9 @@ def reconcile_websites_from_disk(db: Session) -> None:
                 site_counts[w.owner_id] -= 1
             w.owner_id = matched_user.id
             site_counts[matched_user.id] = site_counts.get(matched_user.id, 0) + 1
+            for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == w.id).all():
+                if db_acc.owner_id != matched_user.id:
+                    db_acc.owner_id = matched_user.id
             if DnsZone is not None:
                 z = db.query(DnsZone).filter(DnsZone.name == w.domain).first()
                 if z and z.owner_id != matched_user.id:
