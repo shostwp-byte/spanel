@@ -124,6 +124,34 @@ def configured_panel_url() -> str:
     return (_read_raw_lenient().get("panel_url") or settings.panel_url or "").strip()
 
 
+def get_brand(db=None, reseller_id: int | None = None):
+    """Return a lightweight brand descriptor with ``panel_domain``, ``panel_url``, and ``app_name``."""
+    from types import SimpleNamespace
+
+    raw = _read_raw_lenient()
+    app_name = (raw.get("app_name") or settings.app_name or "spanel").strip() or "spanel"
+    panel_url = (raw.get("panel_url") or settings.panel_url or "").strip()
+    panel_domain = ""
+    if panel_url:
+        try:
+            _scheme, panel_domain, _port = parse_panel_url(panel_url)
+        except ValueError:
+            panel_domain = ""
+    if db is not None and reseller_id:
+        try:
+            from app.models.entities import ResellerBranding
+            rb = db.query(ResellerBranding).filter(ResellerBranding.reseller_id == reseller_id).first()
+            if rb:
+                if getattr(rb, "brand_name", None):
+                    app_name = rb.brand_name
+                if getattr(rb, "custom_domain", None):
+                    panel_domain = rb.custom_domain
+                    panel_url = f"https://{rb.custom_domain}"
+        except Exception:
+            pass
+    return SimpleNamespace(app_name=app_name, panel_url=panel_url, panel_domain=panel_domain)
+
+
 def global_blocked_bots() -> list[str]:
     """The server-wide bad-bot list.
 

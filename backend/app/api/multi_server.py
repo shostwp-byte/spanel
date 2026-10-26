@@ -17,7 +17,7 @@ from app.core.permissions import Role, ensure_role
 from app.models.entities import ApiToken, User
 from app.services import backup, cluster_dns, cluster_peer, cluster_placement, cluster_transfer, cluster_worker, multi_server
 from app.services.audit import log_action
-from app.services.provisioning import create_api_token
+from app.services.provisioning import create_api_token, normalize_allowed_ips
 
 router = APIRouter(prefix="/multi-server", tags=["multi-server"])
 logger = logging.getLogger("spanel.cluster")
@@ -204,6 +204,10 @@ def generate_local_cluster_token(
 ):
     """Generate a ready-to-use Cluster Peer API Token on this server."""
     ensure_role(current_user.role, Role.admin)
+    try:
+        allowed_ips = normalize_allowed_ips(payload.allowed_ips or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Cluster scopes only: the token a peer holds can sync DNS, check for
     # conflicts and (if allowed) move accounts here, but it is not a billing
     # token and cannot create or terminate accounts through provisioning.
@@ -211,7 +215,8 @@ def generate_local_cluster_token(
         db,
         name=(payload.name or "SPanel Cluster Peer").strip(),
         scopes=cluster_peer.node_token_scopes(payload.allow_transfer),
-        allowed_ips=(payload.allowed_ips or "").strip(),
+        allowed_ips=allowed_ips,
+        created_by_id=current_user.id,
     )
     log_action(db, current_user.id, "create_cluster_token", token_row.name, request=request)
     return {

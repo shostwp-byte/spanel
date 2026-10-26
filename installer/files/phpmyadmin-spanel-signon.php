@@ -12,11 +12,15 @@ declare(strict_types=1);
 
 session_save_path('/var/lib/php/sessions');
 ini_set('session.use_cookies', 'true');
+$isHttpsRequest = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https')
+    || ((string)($_SERVER['SERVER_PORT'] ?? '') === '443');
+$cookieSecure = __SPANEL_PMA_COOKIE_SECURE__ ? $isHttpsRequest : $isHttpsRequest;
 session_set_cookie_params([
     'lifetime' => 0,
     'path' => '/',
     'domain' => '',
-    'secure' => __SPANEL_PMA_COOKIE_SECURE__,
+    'secure' => $cookieSecure,
     'httponly' => true,
     'samesite' => 'Lax',
 ]);
@@ -32,34 +36,23 @@ if (!is_string($token) || !preg_match('/^[A-Za-z0-9_-]{20,}$/', $token)) {
     exit('Invalid token');
 }
 
-if (
-    isset($_SESSION['SPANEL_LAST_SSO_TOKEN'], $_SESSION['PMA_single_signon_user'])
-    && $_SESSION['SPANEL_LAST_SSO_TOKEN'] === $token
-    && is_string($_SESSION['PMA_single_signon_user'])
-    && $_SESSION['PMA_single_signon_user'] !== ''
-) {
-    $cachedServer = isset($_SESSION['SPANEL_LAST_SSO_SERVER']) && is_int($_SESSION['SPANEL_LAST_SSO_SERVER'])
-        ? $_SESSION['SPANEL_LAST_SSO_SERVER']
-        : 1;
-    session_write_close();
-    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-    header('Pragma: no-cache');
-    header('Location: /phpmyadmin/index.php?server=' . $cachedServer);
-    exit;
+$configuredBase = '__SPANEL_API_BASE__';
+$candidateBases = [$configuredBase];
+if (strpos($configuredBase, 'http://') === 0) {
+    $candidateBases[] = 'https://' . substr($configuredBase, 7);
+} elseif (strpos($configuredBase, 'https://') === 0) {
+    $candidateBases[] = 'http://' . substr($configuredBase, 8);
 }
-
-$apiUrl = '__SPANEL_API_BASE__' . rawurlencode($token);
-$candidateUrls = [$apiUrl];
-if (strpos($apiUrl, 'https://') === 0) {
-    $candidateUrls[] = 'http://' . substr($apiUrl, 8);
-} elseif (strpos($apiUrl, 'http://') === 0) {
-    $candidateUrls[] = 'https://' . substr($apiUrl, 7);
-}
+$candidateBases[] = 'https://127.0.0.1:2222/api/databases/phpmyadmin-sso/';
+$candidateBases[] = 'http://127.0.0.1:2222/api/databases/phpmyadmin-sso/';
+$candidateBases[] = 'http://127.0.0.1:8000/api/databases/phpmyadmin-sso/';
+$candidateBases = array_values(array_unique($candidateBases));
 
 $response = false;
 $status = 0;
-foreach ($candidateUrls as $candidateUrl) {
-    $ch = curl_init($candidateUrl);
+foreach ($candidateBases as $baseUrl) {
+    $apiUrl = $baseUrl . rawurlencode($token);
+    $ch = curl_init($apiUrl);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 5,
@@ -67,11 +60,16 @@ foreach ($candidateUrls as $candidateUrl) {
         CURLOPT_SSL_VERIFYHOST => false,
         CURLOPT_HTTPHEADER => ['Accept: application/json'],
     ]);
-    $response = curl_exec($ch);
-    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $res = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
-    if ($status === 200 && $response) {
+    if ($code === 200 && $res) {
+        $response = $res;
+        $status = 200;
         break;
+    }
+    if ($code === 404) {
+        $status = 404;
     }
 }
 
@@ -99,8 +97,6 @@ $_SESSION['PMA_single_signon_cfgupdate'] = [
     'only_db' => $data['db_name'] ?? '',
 ];
 $_SESSION['PMA_single_signon_HMAC_secret'] = bin2hex(random_bytes(16));
-$_SESSION['SPANEL_LAST_SSO_TOKEN'] = $token;
-$_SESSION['SPANEL_LAST_SSO_SERVER'] = $server;
 session_write_close();
 
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');

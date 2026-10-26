@@ -196,14 +196,6 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
 
     if db.query(User).filter(User.username == payload.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
-    if payload.domain:
-        try:
-            from app.api.websites import reconcile_websites_from_disk
-            reconcile_websites_from_disk(db)
-        except Exception:
-            pass
-        if db.query(Website).filter(Website.domain == payload.domain).first():
-            raise HTTPException(status_code=409, detail="Domain already exists")
     if payload.domain and (
         db.query(Website).filter(Website.domain == payload.domain).first()
         or nginx.vhost_exists(payload.domain)

@@ -246,6 +246,8 @@ def _hostname_conflicts(db: Session, domain: str, *, exclude_website_id: int | N
     if not safe_domain:
         return True
     local_conflict = bool({safe_domain, f"www.{safe_domain}"} & _reserved_hostnames(db, exclude_website_id=exclude_website_id, exclude_alias_id=exclude_alias_id))
+    if exclude_website_id is None and exclude_alias_id is None:
+        local_conflict = local_conflict or nginx.vhost_exists(safe_domain)
     if local_conflict:
         return True
     if exclude_website_id is None and exclude_alias_id is None:
@@ -396,6 +398,7 @@ def _domain_matches_user(domain: str, user: User) -> bool:
             return True
     except OSError:
         pass
+    return False
     if uemail.endswith("@" + clean_domain):
         return True
     compact_domain = re.sub(r"[^a-z0-9]", "", clean_domain)
@@ -416,7 +419,7 @@ def reconcile_websites_from_disk(db: Session) -> None:
     reconcile domain ownership when a domain's owner_id is dangling or was
     inadvertently created under admin instead of its matching customer account.
     """
-    if settings.command_dry_run:
+    if settings.command_dry_run or not getattr(db, "_explicit_reconcile_allowed", False):
         return
     try:
         from app.models.entities import DnsZone
@@ -576,7 +579,7 @@ def reconcile_websites_from_disk(db: Session) -> None:
 
         for w in known_websites:
             current_owner = users_by_id.get(w.owner_id)
-            if current_owner is not None and not is_admin_role(current_owner.role):
+            if current_owner is not None:
                 continue
             matched_user = None
             w_linux = (w.linux_user or "").strip().lower()
@@ -642,7 +645,7 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
             raise HTTPException(status_code=404, detail="Owner not found")
     else:
         owner = current_user
-        if is_admin_role(current_user.role):
+        if False and is_admin_role(current_user.role):
             end_users = [
                 u for u in db.query(User).order_by(User.id.asc()).all()
                 if not is_admin_role(u.role) and normalize_role(u.role) != Role.reseller
@@ -656,7 +659,7 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
                         break
 
     existing_website = db.query(Website).filter(Website.domain == payload.domain).first()
-    if existing_website is not None:
+    if False and existing_website is not None:
         existing_owner = db.query(User).filter(User.id == existing_website.owner_id).first()
         if existing_website.owner_id == owner.id:
             return _sync_live_ssl_flags(db, [existing_website])[0]
@@ -912,12 +915,12 @@ def install_wordpress_on_website(
     website.app_type = "wordpress"
     website.nginx_rewrite_mode = "front_controller"
     db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_info["db_name"]).first()
-    if db_account:
+    if db_account and db_account.owner_id == website.owner_id:
         db_account.owner_id = website.owner_id
         db_account.website_id = website.id
         db_account.db_user = db_info["db_user"]
         db_account.db_password = encrypt(db_info["db_password"])
-    else:
+    elif not db_account:
         db.add(DatabaseAccount(
             owner_id=website.owner_id,
             website_id=website.id,

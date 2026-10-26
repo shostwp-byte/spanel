@@ -1275,7 +1275,7 @@ SERVICE
   write_tools_nginx_config
   if [[ -f /usr/share/phpmyadmin/spanel-signon.php ]]; then
     local scheme="http"
-    if [[ -n "$(env_get PANEL_SSL_CERT)" && -n "$(env_get PANEL_SSL_KEY)" ]]; then
+    if [[ ( -n "$(env_get PANEL_SSL_CERT)" && -n "$(env_get PANEL_SSL_KEY)" ) || ( -f /etc/spanel/panel-fullchain.pem && -f /etc/spanel/panel-privkey.pem ) ]]; then
       scheme="https"
     fi
     # Older copies always opened server 1 and forced host=localhost, so a
@@ -2214,16 +2214,19 @@ else
   echo "npm version: $(npm --version)"
 
   rm -rf dist .vite node_modules/.vite
+  chown -R -h spanel:spanel "$APP_DIR/frontend" 2>/dev/null || true
 
   # Reinstall only when the dependency set actually moved, not just its mtime.
   if [[ ! -d node_modules ]] || step_inputs_changed frontend-deps package.json; then
     log "Installing npm dependencies..."
     rm -rf node_modules package-lock.json
-    npm install
+    chown -R -h spanel:spanel "$APP_DIR/frontend" 2>/dev/null || true
+    sudo -u spanel npm install
     step_mark_done frontend-deps package.json
   fi
   log "Building frontend with VITE_API_URL=/api..."
-  VITE_API_URL=/api npm run build 2>&1 || { log "BUILD FAILED"; exit 1; }
+  sudo -u spanel VITE_API_URL=/api npm run build 2>&1 || { log "BUILD FAILED"; exit 1; }
+  chown -R -h root:root "$APP_DIR/frontend/node_modules" "$APP_DIR/frontend/dist" 2>/dev/null || true
 
   [[ -f dist/index.html ]] || fail "Frontend build failed: dist/index.html missing"
   HASHED=$(grep -oE 'index-[a-zA-Z0-9_-]+\.js' dist/index.html | head -n1 || true)

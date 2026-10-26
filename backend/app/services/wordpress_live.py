@@ -1,15 +1,21 @@
+import hashlib
 import json
 import logging
+import os
 import re
 import secrets
+import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import HTTPException
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import SessionLocal, engine
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, Website
 from app.services import mariadb, nginx, site_users, wordpress
@@ -17,9 +23,266 @@ from app.services.shell import CommandResult, shell
 
 logger = logging.getLogger("spanel.wordpress_live")
 
-WP_SLUG_RE = re.compile(r"^[a-zA-Z0-9._-]{1,120}$")
+WP_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,99}$")
 WP_PREFIX_RE = re.compile(r"^[a-zA-Z0-9_]{2,24}$")
-DB_IDENT_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
+DB_IDENT_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+WP_MEMORY_LIMIT_RE = re.compile(r"^\d{1,5}[MG]$")
+WP_POST_REVISIONS_RE = re.compile(r"^(true|false|\d{1,4})$")
+_TOOLKIT_STATE_LOCK = threading.RLock()
+
+
+def toolkit_state_path() -> Path:
+    """Return a panel-owned state file path (never in /tmp)."""
+    candidates = [
+        Path("/var/lib/spanel/wordpress_toolkit_state.json"),
+        Path(__file__).resolve().parents[2] / "data" / "wordpress_toolkit_state.json",
+    ]
+    for p in candidates:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if os.access(p.parent, os.W_OK):
+                return p
+        except Exception:
+            continue
+    fallback = Path(__file__).resolve().parents[2] / "wordpress_toolkit_state.json"
+    return fallback
+
+
+def _ensure_toolkit_state_table() -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS wordpress_toolkit_state ("
+                "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                "payload TEXT NOT NULL, "
+                "updated_at TEXT"
+                ")"
+            )
+        )
+
+
+def load_toolkit_state_safe() -> Dict[str, Any]:
+    with _TOOLKIT_STATE_LOCK:
+        try:
+            _ensure_toolkit_state_table()
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT payload FROM wordpress_toolkit_state WHERE id = 1")
+                ).fetchone()
+                if row and row[0]:
+                    data = json.loads(row[0])
+                    if isinstance(data, dict):
+                        data.setdefault("instances", {})
+                        data.setdefault("custom_sets", [])
+                        return data
+        except Exception as exc:
+            logger.debug("load_toolkit_state_safe db read warning: %s", exc)
+
+        path = toolkit_state_path()
+        if path.exists() and not path.is_symlink():
+            try:
+                raw = path.read_text(encoding="utf-8")
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    data.setdefault("instances", {})
+                    data.setdefault("custom_sets", [])
+                    save_toolkit_state_safe(data)
+                    return data
+            except Exception as exc:
+                logger.warning("Failed to load WP toolkit state file: %s", exc)
+        return {"instances": {}, "custom_sets": []}
+
+
+def save_toolkit_state_safe(state: Dict[str, Any]) -> None:
+    payload = json.dumps(state, ensure_ascii=False, indent=2)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _TOOLKIT_STATE_LOCK:
+        try:
+            _ensure_toolkit_state_table()
+            with engine.begin() as conn:
+                existing = conn.execute(
+                    text("SELECT 1 FROM wordpress_toolkit_state WHERE id = 1")
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        text(
+                            "UPDATE wordpress_toolkit_state SET payload = :payload, updated_at = :updated_at WHERE id = 1"
+                        ),
+                        {"payload": payload, "updated_at": now_iso},
+                    )
+                else:
+                    conn.execute(
+                        text(
+                            "INSERT INTO wordpress_toolkit_state (id, payload, updated_at) VALUES (1, :payload, :updated_at)"
+                        ),
+                        {"payload": payload, "updated_at": now_iso},
+                    )
+        except Exception as exc:
+            logger.warning("Failed to save WP toolkit state to DB: %s", exc)
+
+        path = toolkit_state_path()
+        try:
+            if path.is_symlink():
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".wp_toolkit_state.", dir=str(path.parent), text=True
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                os.chmod(tmp_name, 0o600)
+                os.replace(tmp_name, path)
+            finally:
+                if os.path.exists(tmp_name):
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
+        except Exception as exc:
+            logger.debug("save_toolkit_state_safe file mirror warning: %s", exc)
+
+
+def is_authorized_wp_database(
+    db_name: Optional[str],
+    *,
+    owner_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> bool:
+    """Verify db_name is a valid, non-reserved customer database registered in DatabaseAccount
+    and owned by owner_id (when provided). Never allow panel-level SQL on unregistered or
+    other-tenant databases named in wp-config.php."""
+    clean_db = (db_name or "").strip()
+    if not clean_db or not DB_IDENT_RE.fullmatch(clean_db):
+        return False
+    if clean_db.lower() in mariadb.RESERVED_DATABASES:
+        return False
+    close_session = False
+    session = db
+    try:
+        if session is None:
+            session = SessionLocal()
+            close_session = True
+        acc = (
+            session.query(DatabaseAccount)
+            .filter(DatabaseAccount.db_name == clean_db)
+            .first()
+        )
+        if acc is None:
+            return False
+        if owner_id is not None and acc.owner_id != owner_id:
+            return False
+        if site_id is not None and acc.website_id is not None and acc.website_id != site_id:
+            if owner_id is None:
+                site = session.query(Website).filter(Website.id == site_id).first()
+                if site is not None and acc.owner_id != site.owner_id:
+                    return False
+        return True
+    except Exception as exc:
+        logger.debug("is_authorized_wp_database check failed for %s: %s", clean_db, exc)
+        return False
+    finally:
+        if close_session and session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def resolve_owned_wp_database(
+    db: Session,
+    site: Website,
+    candidate_db_or_cfg: Any = None,
+) -> Optional[DatabaseAccount]:
+    """Return DatabaseAccount ONLY if owned by site.owner_id.
+    Never returns a database owned by another user or an unregistered system database."""
+    db_acc = (
+        db.query(DatabaseAccount)
+        .filter(
+            DatabaseAccount.website_id == site.id,
+            DatabaseAccount.owner_id == site.owner_id,
+        )
+        .first()
+    )
+    if db_acc is not None and db_acc.db_name.lower() not in mariadb.RESERVED_DATABASES:
+        return db_acc
+
+    if isinstance(candidate_db_or_cfg, dict):
+        clean_candidate = str(candidate_db_or_cfg.get("db_name") or "").strip()
+    else:
+        clean_candidate = str(candidate_db_or_cfg or "").strip()
+    if (
+        clean_candidate
+        and DB_IDENT_RE.fullmatch(clean_candidate)
+        and clean_candidate.lower() not in mariadb.RESERVED_DATABASES
+    ):
+        cand_acc = (
+            db.query(DatabaseAccount)
+            .filter(
+                DatabaseAccount.db_name == clean_candidate,
+                DatabaseAccount.owner_id == site.owner_id,
+            )
+            .first()
+        )
+        if cand_acc is not None:
+            if cand_acc.website_id is None:
+                cand_acc.website_id = site.id
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+            return cand_acc
+
+    return None
+
+
+def safe_reconcile_wordpress_databases(
+    db: Session,
+    *,
+    website_id: Optional[int] = None,
+    provision_missing: bool = False,
+) -> int:
+    """Safely link already-owned DatabaseAccount records (owner_id == site.owner_id,
+    website_id IS NULL) to their Website if recorded in toolkit state.
+    Never reads wp-config.php to create/alter MariaDB credentials, never changes
+    DatabaseAccount.owner_id, and never runs wp core install."""
+    _ = provision_missing
+    reconciled = 0
+    try:
+        state = load_toolkit_state_safe()
+        instances = state.get("instances", {})
+        q = db.query(Website)
+        if website_id is not None:
+            q = q.filter(Website.id == website_id)
+        sites = q.all()
+        for site in sites:
+            inst = instances.get(str(site.id))
+            if not isinstance(inst, dict):
+                continue
+            cand_db = (inst.get("db_name") or "").strip()
+            if not cand_db or not DB_IDENT_RE.fullmatch(cand_db) or cand_db.lower() in mariadb.RESERVED_DATABASES:
+                continue
+            existing = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.db_name == cand_db,
+                    DatabaseAccount.owner_id == site.owner_id,
+                )
+                .first()
+            )
+            if existing is not None and existing.website_id is None:
+                existing.website_id = site.id
+                reconciled += 1
+        if reconciled > 0:
+            db.commit()
+    except Exception as exc:
+        logger.debug("safe_reconcile_wordpress_databases warning: %s", exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    return reconciled
 
 
 def run_wp_cli(
@@ -214,7 +477,14 @@ def _run_mariadb_sql(sql: str, batch: bool = True) -> CommandResult:
         return CommandResult(command="mysql", returncode=1, stdout="", stderr=str(exc))
 
 
-def query_wp_db_live_meta(db_name: str, table_prefix: str = "wp_") -> Dict[str, Any]:
+def query_wp_db_live_meta(
+    db_name: str,
+    table_prefix: str = "wp_",
+    *,
+    owner_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
     """Query live WordPress options and primary administrator directly from MariaDB."""
     meta: Dict[str, Any] = {
         "site_title": "",
@@ -233,6 +503,8 @@ def query_wp_db_live_meta(db_name: str, table_prefix: str = "wp_") -> Dict[str, 
         if not clean_db or settings.command_dry_run:
             return meta
         if not DB_IDENT_RE.fullmatch(clean_db) or not WP_PREFIX_RE.fullmatch(clean_prefix):
+            return meta
+        if not is_authorized_wp_database(clean_db, owner_id=owner_id, site_id=site_id, db=db):
             return meta
 
         options_table = f"{clean_prefix}options"
@@ -305,13 +577,24 @@ def query_wp_db_live_meta(db_name: str, table_prefix: str = "wp_") -> Dict[str, 
     return meta
 
 
-def update_wp_db_option_direct(db_name: str, table_prefix: str, option_name: str, option_value: str) -> None:
+def update_wp_db_option_direct(
+    db_name: str,
+    table_prefix: str,
+    option_name: str,
+    option_value: str,
+    *,
+    owner_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> None:
     try:
         clean_db = (db_name or "").strip()
         clean_prefix = (table_prefix or "wp_").strip()
         if not clean_db or settings.command_dry_run:
             return
         if not DB_IDENT_RE.fullmatch(clean_db) or not WP_PREFIX_RE.fullmatch(clean_prefix):
+            return
+        if not is_authorized_wp_database(clean_db, owner_id=owner_id, site_id=site_id, db=db):
             return
         safe_opt = option_name.replace("'", "''")
         safe_val = option_value.replace("\\", "\\\\").replace("'", "''")
@@ -324,7 +607,15 @@ def update_wp_db_option_direct(db_name: str, table_prefix: str, option_name: str
         logger.debug("update_wp_db_option_direct warning: %s", exc)
 
 
-def rename_wp_admin_user_direct(db_name: str, table_prefix: str, new_login: str) -> None:
+def rename_wp_admin_user_direct(
+    db_name: str,
+    table_prefix: str,
+    new_login: str,
+    *,
+    owner_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> None:
     try:
         clean_db = (db_name or "").strip()
         clean_prefix = (table_prefix or "wp_").strip()
@@ -333,6 +624,8 @@ def rename_wp_admin_user_direct(db_name: str, table_prefix: str, new_login: str)
         if not DB_IDENT_RE.fullmatch(clean_db) or not WP_PREFIX_RE.fullmatch(clean_prefix):
             return
         if not wordpress.WP_USER_RE.fullmatch(new_login):
+            return
+        if not is_authorized_wp_database(clean_db, owner_id=owner_id, site_id=site_id, db=db):
             return
         safe_login = new_login.replace("'", "''")
         sql = (
@@ -345,7 +638,15 @@ def rename_wp_admin_user_direct(db_name: str, table_prefix: str, new_login: str)
         logger.debug("rename_wp_admin_user_direct warning: %s", exc)
 
 
-def rename_wp_table_prefix_direct(db_name: str, old_prefix: str, new_prefix: str) -> bool:
+def rename_wp_table_prefix_direct(
+    db_name: str,
+    old_prefix: str,
+    new_prefix: str,
+    *,
+    owner_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> bool:
     try:
         clean_db = (db_name or "").strip()
         if not clean_db or old_prefix == new_prefix or settings.command_dry_run:
@@ -353,6 +654,8 @@ def rename_wp_table_prefix_direct(db_name: str, old_prefix: str, new_prefix: str
         if not DB_IDENT_RE.fullmatch(clean_db):
             return False
         if not WP_PREFIX_RE.fullmatch(old_prefix) or not WP_PREFIX_RE.fullmatch(new_prefix):
+            return False
+        if not is_authorized_wp_database(clean_db, owner_id=owner_id, site_id=site_id, db=db):
             return False
         tables = mariadb.get_database_tables_breakdown(clean_db)
         matching = [
@@ -622,30 +925,56 @@ def create_live_snapshot_archive(
     wp_dir: Path,
     db_name: str,
     snap_id: str,
+    *,
+    owner_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    php_ver: str = "8.4",
+    db: Optional[Session] = None,
 ) -> float:
+    snap_id = Path((snap_id or "").strip()).name
     snap_dir = site_root / "wp-snapshots"
     snap_file = snap_dir / snap_id
     real_size_mb = 0.1
-    if settings.command_dry_run:
+    if settings.command_dry_run or not snap_id:
         return real_size_mb
     try:
-        snap_dir.mkdir(parents=True, exist_ok=True)
+        shell.privileged(
+            "terminal-exec",
+            helper_args=[linux_user, str(site_root), "mkdir", "-p", "wp-snapshots"],
+            fallback=["mkdir", "-p", str(snap_dir)],
+            check=False,
+        )
     except Exception:
         try:
-            shell.privileged(
-                "terminal-exec",
-                helper_args=[linux_user, str(site_root), "mkdir", "-p", "wp-snapshots"],
-                fallback=["mkdir", "-p", str(snap_dir)],
-                check=False,
-            )
+            snap_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-    sql_dump = wp_dir / ".spanel-db-snapshot.sql"
-    if db_name:
+
+    if db_name and is_authorized_wp_database(db_name, owner_id=owner_id, site_id=site_id, db=db):
+        rel_sql = f"wp-snapshots/{snap_id}.sql"
         try:
-            mariadb.export_database(db_name, str(sql_dump))
+            res = run_wp_cli(
+                linux_user,
+                php_ver,
+                wp_dir,
+                ["db", "export", str(site_root / rel_sql), "--add-drop-table"],
+                check=False,
+                sensitive=True,
+            )
+            if res.returncode != 0:
+                with tempfile.TemporaryDirectory(prefix="spanel-wpsnap-") as tmp_dir:
+                    tmp_sql = Path(tmp_dir) / "dump.sql"
+                    mariadb.export_database(db_name, str(tmp_sql))
+                    if tmp_sql.exists():
+                        shell.privileged(
+                            "site-file-install",
+                            helper_args=[linux_user, str(site_root), rel_sql, str(tmp_sql)],
+                            fallback=["cp", "--", str(tmp_sql), str(site_root / rel_sql)],
+                            check=False,
+                        )
         except Exception as exc:
             logger.warning("Snapshot DB dump warning: %s", exc)
+
     try:
         rel_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
     except ValueError:
@@ -659,9 +988,8 @@ def create_live_snapshot_archive(
         )
     except Exception as exc:
         logger.warning("Snapshot tar warning: %s", exc)
-    delete_wp_path(linux_user, site_root, wp_dir, ".spanel-db-snapshot.sql")
     try:
-        if snap_file.exists():
+        if snap_file.exists() and not snap_file.is_symlink():
             real_size_mb = max(0.01, round(snap_file.stat().st_size / (1024 * 1024), 2))
     except Exception:
         pass
@@ -674,6 +1002,11 @@ def restore_live_snapshot(
     wp_dir: Path,
     db_name: str,
     snapshot_id: Optional[str],
+    *,
+    owner_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    php_ver: str = "8.4",
+    db: Optional[Session] = None,
 ) -> str:
     snap_id = Path((snapshot_id or "").strip()).name
     if not snap_id:
@@ -692,13 +1025,27 @@ def restore_live_snapshot(
             fallback=["tar", "-xzf", str(snap_file), "-C", str(wp_dir)],
             check=False,
         )
-        sql_dump = wp_dir / ".spanel-db-snapshot.sql"
-        if db_name and wp_path_exists(wp_dir, ".spanel-db-snapshot.sql", linux_user, site_root):
+        # Ensure any legacy in-docroot SQL dump extracted from older archives is removed immediately
+        delete_wp_path(linux_user, site_root, wp_dir, ".spanel-db-snapshot.sql")
+        sql_dump = site_root / "wp-snapshots" / f"{snap_id}.sql"
+        if (
+            db_name
+            and is_authorized_wp_database(db_name, owner_id=owner_id, site_id=site_id, db=db)
+            and wp_path_exists(site_root, f"wp-snapshots/{snap_id}.sql", linux_user, site_root)
+        ):
             try:
-                mariadb.import_database(db_name, str(sql_dump))
+                res = run_wp_cli(
+                    linux_user,
+                    php_ver,
+                    wp_dir,
+                    ["db", "import", str(sql_dump)],
+                    check=False,
+                    sensitive=True,
+                )
+                if res.returncode != 0 and sql_dump.exists() and not sql_dump.is_symlink():
+                    mariadb.import_database(db_name, str(sql_dump))
             except Exception as exc:
                 logger.warning("Snapshot DB restore warning: %s", exc)
-            delete_wp_path(linux_user, site_root, wp_dir, ".spanel-db-snapshot.sql")
     return snap_id
 
 
@@ -710,21 +1057,22 @@ def delete_live_snapshot(
 ) -> str:
     snap_id = Path((snapshot_id or "").strip()).name
     if snap_id and not settings.command_dry_run:
-        snap_file = site_root / "wp-snapshots" / snap_id
-        try:
-            if snap_file.exists():
-                snap_file.unlink()
-        except Exception:
-            pass
-        try:
-            shell.privileged(
-                "rm-site",
-                helper_args=[linux_user, str(site_root), str(snap_file)],
-                fallback=["rm", "-f", "--", str(snap_file)],
-                check=False,
-            )
-        except Exception:
-            pass
+        for fname in (snap_id, f"{snap_id}.sql"):
+            snap_file = site_root / "wp-snapshots" / fname
+            try:
+                if snap_file.exists() and not snap_file.is_symlink():
+                    snap_file.unlink()
+            except Exception:
+                pass
+            try:
+                shell.privileged(
+                    "rm-site",
+                    helper_args=[linux_user, str(site_root), str(snap_file)],
+                    fallback=["rm", "-f", "--", str(snap_file)],
+                    check=False,
+                )
+            except Exception:
+                pass
     inst["snapshots"] = [s for s in (inst.get("snapshots") or []) if s.get("id") != snap_id]
     return snap_id
 
@@ -773,8 +1121,21 @@ def execute_live_clone_or_sync(
     cloned_state["detached"] = False
     cloned_state["subpath"] = target_subpath
 
-    target_db_acc = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == target_site.id).first()
+    target_db_acc = (
+        db.query(DatabaseAccount)
+        .filter(
+            DatabaseAccount.website_id == target_site.id,
+            DatabaseAccount.owner_id == target_site.owner_id,
+        )
+        .first()
+    )
     if not target_db_acc:
+        from app.api.databases import enforce_user_database_limit
+        from app.models.entities import User
+
+        target_owner = db.query(User).filter(User.id == target_site.owner_id).first()
+        if target_owner is not None:
+            enforce_user_database_limit(db, target_owner, action_label="nhân bản/đồng bộ WordPress")
         if act == "clone":
             cloned_state["site_title"] = f"{inst.get('site_title') or site.domain} (Clone)"
         seed = f"{target_site.domain}_{secrets.token_hex(2)}"
@@ -789,7 +1150,7 @@ def execute_live_clone_or_sync(
             clone_db_pass = mariadb.random_password(20)
             try:
                 mariadb.create_database_credentials(
-                    clone_db_name, clone_db_user, clone_db_pass, allow_existing_user=True
+                    clone_db_name, clone_db_user, clone_db_pass, allow_existing_user=False
                 )
             except Exception:
                 pass
@@ -803,12 +1164,13 @@ def execute_live_clone_or_sync(
                 db_password=encrypt(clone_db_pass),
             )
             db.add(target_db_acc)
-        else:
-            existing_clone_db.owner_id = target_site.owner_id
+        elif existing_clone_db.owner_id == target_site.owner_id:
             existing_clone_db.website_id = target_site.id
             existing_clone_db.db_user = clone_db_user
             existing_clone_db.db_password = encrypt(clone_db_pass)
             target_db_acc = existing_clone_db
+        else:
+            raise HTTPException(status_code=409, detail="Xung đột tên cơ sở dữ liệu khi nhân bản.")
         db.commit()
     else:
         clone_db_name = target_db_acc.db_name
@@ -820,17 +1182,33 @@ def execute_live_clone_or_sync(
 
     if sync_files and not settings.command_dry_run and str(wp_dir) != str(target_wp_dir):
         delete_wp_path(target_linux_user, target_site_root, target_wp_dir, "index.html")
-        tmp_tar = Path(f"/tmp/spanel-upload-wpclone-{secrets.token_hex(6)}.tar.gz")
+        src_stage_rel = f"wp-snapshots/.clone-src-{secrets.token_hex(6)}.tar.gz"
+        src_stage_abs = site_root / src_stage_rel
+        rel_stage = ".spanel-wp-clone-stage.tar.gz"
+        stage_dest = target_site_root / rel_stage
         try:
-            shell.run(["tar", "-czf", str(tmp_tar), "-C", str(wp_dir), "."], check=False)
-            if tmp_tar.exists():
-                rel_stage = ".spanel-wp-clone-stage.tar.gz"
-                stage_dest = target_site_root / rel_stage
+            shell.privileged(
+                "terminal-exec",
+                helper_args=[linux_user, str(site_root), "mkdir", "-p", "wp-snapshots"],
+                fallback=["mkdir", "-p", str(site_root / "wp-snapshots")],
+                check=False,
+            )
+            try:
+                rel_src_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
+            except ValueError:
+                rel_src_wp = "public_html"
+            shell.privileged(
+                "terminal-exec",
+                helper_args=[linux_user, str(site_root), "tar", "-czf", src_stage_rel, "-C", rel_src_wp, "."],
+                fallback=["tar", "-czf", str(src_stage_abs), "-C", str(wp_dir), "."],
+                check=False,
+            )
+            if src_stage_abs.exists() and not src_stage_abs.is_symlink():
                 try:
                     shell.privileged(
                         "site-file-install",
-                        helper_args=[target_linux_user, str(target_site_root), rel_stage, str(tmp_tar)],
-                        fallback=["cp", "--", str(tmp_tar), str(stage_dest)],
+                        helper_args=[target_linux_user, str(target_site_root), rel_stage, str(src_stage_abs)],
+                        fallback=["cp", "--", str(src_stage_abs), str(stage_dest)],
                         check=False,
                     )
                 except Exception:
@@ -858,25 +1236,23 @@ def execute_live_clone_or_sync(
         except Exception as exc:
             logger.warning("Clone/Sync file copy warning: %s", exc)
         finally:
-            try:
-                if tmp_tar.exists():
-                    tmp_tar.unlink()
-            except Exception:
-                pass
+            delete_wp_path(linux_user, site_root, site_root, src_stage_rel)
 
-    if sync_database and src_db_name and clone_db_name and not settings.command_dry_run:
-        tmp_sql = Path(f"/tmp/spanel-wp-db-{secrets.token_hex(6)}.sql")
+    if (
+        sync_database
+        and src_db_name
+        and clone_db_name
+        and not settings.command_dry_run
+        and is_authorized_wp_database(src_db_name, owner_id=site.owner_id, db=db)
+        and is_authorized_wp_database(clone_db_name, owner_id=target_site.owner_id, db=db)
+    ):
         try:
-            mariadb.export_database(src_db_name, str(tmp_sql))
-            mariadb.import_database(clone_db_name, str(tmp_sql))
+            with tempfile.TemporaryDirectory(prefix="spanel-wpdb-") as tmp_dir:
+                tmp_sql = Path(tmp_dir) / "clone.sql"
+                mariadb.export_database(src_db_name, str(tmp_sql))
+                mariadb.import_database(clone_db_name, str(tmp_sql))
         except Exception as exc:
             logger.warning("Clone/Sync database copy warning: %s", exc)
-        finally:
-            try:
-                if tmp_sql.exists():
-                    tmp_sql.unlink()
-            except Exception:
-                pass
 
     target_cfg = src_cfg_text or wordpress._render_wp_config(
         clone_db_name, clone_db_user, clone_db_pass, table_prefix=src_prefix
@@ -893,14 +1269,18 @@ def execute_live_clone_or_sync(
     src_url = f"{src_scheme}://{site.domain}{src_sub}"
     dst_url = f"{dst_scheme}://{target_site.domain}{dst_sub}"
 
-    update_wp_db_option_direct(clone_db_name, src_prefix, "siteurl", dst_url)
-    update_wp_db_option_direct(clone_db_name, src_prefix, "home", dst_url)
+    update_wp_db_option_direct(
+        clone_db_name, src_prefix, "siteurl", dst_url, owner_id=target_site.owner_id, db=db
+    )
+    update_wp_db_option_direct(
+        clone_db_name, src_prefix, "home", dst_url, owner_id=target_site.owner_id, db=db
+    )
     if src_url != dst_url:
         run_wp_cli(
             target_linux_user,
             target_php_ver,
             target_wp_dir,
-            ["search-replace", src_url, dst_url, "--all-tables", "--precise", "--skip-plugins", "--skip-themes"],
+            ["search-replace", "--all-tables", "--precise", "--skip-plugins", "--skip-themes", "--", src_url, dst_url],
         )
 
     try:
@@ -922,3 +1302,84 @@ def execute_live_clone_or_sync(
     cloned_state["table_prefix"] = src_prefix
     cloned_state["installed_at"] = datetime.now(timezone.utc).isoformat()
     state.setdefault("instances", {})[target_key] = cloned_state
+
+
+def apply_wp_password_protection(
+    linux_user: str,
+    site_root: Path,
+    wp_dir: Path,
+    inst: Dict[str, Any],
+    *,
+    enabled: Optional[bool] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> None:
+    """Enforce HTTP Basic Auth via an MU-plugin with PBKDF2-HMAC-SHA256 instead of
+    writing plaintext .htpasswd into public_html."""
+    if enabled is not None:
+        inst["password_protection_enabled"] = bool(enabled)
+    if username is not None and username.strip():
+        clean_u = re.sub(r"[^a-zA-Z0-9._@-]", "", username.strip())[:64]
+        if clean_u:
+            inst["password_protection_user"] = clean_u
+    if password is not None and password.strip():
+        raw_pw = password.strip()
+        if len(raw_pw) < 6:
+            raise HTTPException(
+                status_code=400,
+                detail="Mật khẩu bảo vệ trang phải có ít nhất 6 ký tự.",
+            )
+        salt = secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac("sha256", raw_pw.encode("utf-8"), salt.encode("ascii"), 100_000).hex()
+        inst["password_protection_hash"] = f"pbkdf2_sha256$100000${salt}${digest}"
+        inst.pop("password_protection_password", None)
+
+    # Always remove any legacy plaintext .htpasswd from docroot
+    delete_wp_path(linux_user, site_root, wp_dir, ".htpasswd")
+
+    if inst.get("password_protection_enabled"):
+        pw_hash = inst.get("password_protection_hash") or ""
+        if not pw_hash.startswith("pbkdf2_sha256$"):
+            raise HTTPException(
+                status_code=400,
+                detail="Vui lòng thiết lập mật khẩu bảo vệ trang (tối thiểu 6 ký tự) trước khi bật khóa HTTP Basic Auth.",
+            )
+        _, iter_str, salt, digest = pw_hash.split("$", 3)
+        user_str = re.sub(r"[^a-zA-Z0-9._@-]", "", (inst.get("password_protection_user") or "preview")) or "preview"
+        mu_php = (
+            "<?php\n"
+            "/**\n"
+            " * Plugin Name: SPanel HTTP Basic Auth Guard\n"
+            " * Description: Enforces HTTP Basic Auth across Nginx + PHP-FPM without exposing .htpasswd.\n"
+            " */\n"
+            "if (defined('WP_CLI') && WP_CLI) { return; }\n"
+            "if (defined('DOING_CRON') && DOING_CRON) { return; }\n"
+            "add_action('init', function() {\n"
+            f"    $expected_user = '{user_str}';\n"
+            f"    $salt = '{salt}';\n"
+            f"    $expected_digest = '{digest}';\n"
+            "    $u = isset($_SERVER['PHP_AUTH_USER']) ? (string)$_SERVER['PHP_AUTH_USER'] : '';\n"
+            "    $p = isset($_SERVER['PHP_AUTH_PW']) ? (string)$_SERVER['PHP_AUTH_PW'] : '';\n"
+            f"    $calc = hash_pbkdf2('sha256', $p, $salt, {int(iter_str)}, 64, false);\n"
+            "    if (!hash_equals($expected_user, $u) || !hash_equals($expected_digest, $calc)) {\n"
+            "        header('WWW-Authenticate: Basic realm=\"Protected WordPress Site\"');\n"
+            "        header('HTTP/1.0 401 Unauthorized');\n"
+            "        exit('401 Unauthorized - Protected by SPanel');\n"
+            "    }\n"
+            "}, 1);\n"
+        )
+        write_wp_file_text(
+            linux_user,
+            site_root,
+            wp_dir,
+            "wp-content/mu-plugins/spanel-password-protect.php",
+            mu_php,
+            "0640",
+        )
+    else:
+        delete_wp_path(
+            linux_user,
+            site_root,
+            wp_dir,
+            "wp-content/mu-plugins/spanel-password-protect.php",
+        )

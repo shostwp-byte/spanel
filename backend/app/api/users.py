@@ -335,7 +335,12 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
                 body = template.body
 
             brand = panel_settings.get_brand(db, reseller_id)
-            login_url = f"https://{brand.panel_domain}" if brand and brand.panel_domain else "https://your-server-ip:2222"
+            login_url = (
+                getattr(brand, "panel_url", "")
+                or (f"https://{brand.panel_domain}" if brand and getattr(brand, "panel_domain", "") else "")
+                or panel_settings.configured_panel_url()
+                or "https://your-server-ip:2222"
+            )
 
             subject = subject.replace("{username}", user.username)
             body = body.replace("{username}", user.username).replace("{password}", payload.password).replace("{login_url}", login_url)
@@ -526,6 +531,17 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, db: Session
     db.commit()
     db.refresh(user)
     if active_changed:
+        try:
+            if user.is_active:
+                site_users.unlock_linux_user(user.username)
+            else:
+                site_users.lock_linux_user(user.username)
+        except Exception:
+            pass
+        try:
+            teardown.set_owner_databases_locked(db, user.id, not user.is_active)
+        except Exception:
+            pass
         # A suspended account's mailboxes keep receiving but cannot sign in.
         mail.sync_quietly(db)
     log_action(db, current_user.id, "update_user", user.username, request=request)

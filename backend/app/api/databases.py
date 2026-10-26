@@ -29,24 +29,14 @@ logger = logging.getLogger("spanel.databases")
 def _is_loopback_peer(request: Request) -> bool:
     """Return True if the immediate TCP peer is loopback.
 
-    On a dual-stack AF_INET6 socket (see app.serve.dual_stack_socket), an IPv4
-    connection from 127.0.0.1 arrives with peer address ``::ffff:127.0.0.1``.
-    Python's ``IPv6Address.is_loopback`` only checks ``::1`` and returns False
-    for IPv4-mapped loopback addresses unless ``addr.ipv4_mapped`` is inspected.
+    With ``--forwarded-allow-ips 127.0.0.1`` (see installer/install.sh) any
+    X-Forwarded-For from a non-trusted peer is dropped, so request.client.host
+    is the real connecting address.
     """
-    if not request.client or not request.client.host:
+    if not request.client:
         return False
-    host = request.client.host.strip()
-    if host.lower() in {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}:
-        return True
     try:
-        addr = ipaddress.ip_address(host)
-        if addr.is_loopback:
-            return True
-        mapped = getattr(addr, "ipv4_mapped", None)
-        if mapped is not None and mapped.is_loopback:
-            return True
-        return False
+        return ipaddress.ip_address(request.client.host).is_loopback
     except ValueError:
         return False
 
@@ -82,12 +72,6 @@ def enforce_user_database_limit(db: Session, owner: User | None, *, creating_cou
     """Enforce package database count quota, reseller database pool quota, and storage quotas."""
     if owner is None or is_admin_role(getattr(owner, "role", None)):
         return
-
-    try:
-        from app.api.wordpress_manager import reconcile_wordpress_databases
-        reconcile_wordpress_databases(db, provision_missing=False)
-    except Exception as exc:
-        logger.debug("reconcile_wordpress_databases skipped in enforce_user_database_limit: %s", exc)
 
     db_limit = effective_database_limit(owner)
     if getattr(owner, "package", None) is not None and getattr(owner, "database_limit", None) != db_limit:
@@ -155,14 +139,6 @@ def list_databases(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    try:
-        from app.api.websites import reconcile_websites_from_disk
-        from app.api.wordpress_manager import reconcile_wordpress_databases
-        reconcile_websites_from_disk(db)
-        reconcile_wordpress_databases(db)
-    except Exception as exc:
-        logger.debug("reconcile_wordpress_databases skipped in list_databases: %s", exc)
-
     query = db.query(DatabaseAccount)
     if not is_admin_role(current_user.role):
         query = query.filter(DatabaseAccount.owner_id == current_user.id)
@@ -344,16 +320,6 @@ def create_phpmyadmin_sso(database_id: int, request: Request, db: Session = Depe
             status_code=500,
             detail="Failed to access stored database password; please re-save the password in panel settings",
         )
-    if item.db_host_id is None:
-        try:
-            mariadb.create_database_credentials(
-                item.db_name,
-                item.db_user,
-                db_password,
-                allow_existing_user=True,
-            )
-        except Exception as exc:
-            logger.debug("Could not refresh local MariaDB credentials before phpMyAdmin SSO: %s", exc)
     token = create_phpmyadmin_token(
         item.db_user, db_password, item.db_name,
         server=remote_mysql.phpmyadmin_server_index(db, item.db_host),

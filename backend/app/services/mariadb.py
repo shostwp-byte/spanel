@@ -39,10 +39,32 @@ RESERVED_DB_USERS = frozenset({
     "spanel",
 })
 
+RESERVED_DATABASES = frozenset({
+    "mysql",
+    "information_schema",
+    "performance_schema",
+    "sys",
+    "spanel",
+    "spanel_mail",
+    "phpmyadmin",
+    "roundcube",
+    "roundcubemail",
+    "pdns",
+    "powerdns",
+    "test",
+})
+
 
 def _reject_reserved_user(db_user: str) -> None:
     if db_user.strip().lower() in RESERVED_DB_USERS:
         raise ValueError(f"'{db_user}' is a reserved MariaDB account and cannot be used for a website database")
+
+
+def _reject_reserved_database(db_name: str) -> str:
+    safe = _validate_identifier(db_name)
+    if safe.strip().lower() in RESERVED_DATABASES:
+        raise ValueError(f"'{db_name}' is a reserved MariaDB database and cannot be used for a website database")
+    return safe
 
 
 def user_exists(db_user: str) -> bool:
@@ -102,7 +124,7 @@ def _run_sql(sql: str, *, check: bool = True):
 
 
 def create_database(seed: str, prefix: str = "wp", db_name: str | None = None, if_not_exists: bool = True) -> Dict[str, str]:
-    db_name = _validate_identifier(db_name or safe_db_identifier(seed, prefix))
+    db_name = _reject_reserved_database(db_name or safe_db_identifier(seed, prefix))
     db_user = _validate_identifier(safe_db_identifier(db_name, "u"))
     _reject_reserved_user(db_user)
     db_password = random_password()
@@ -139,7 +161,7 @@ def create_database_credentials(
     recreates the account that archive already owned - and even those cannot
     touch a reserved account.
     """
-    db_name = _validate_identifier(db_name)
+    db_name = _reject_reserved_database(db_name)
     db_user = _validate_identifier(db_user)
     _reject_reserved_user(db_user)
 
@@ -166,9 +188,10 @@ def create_database_credentials(
 
 
 def drop_database(db_name: str, db_user: str):
+    safe_db = _reject_reserved_database(db_name)
     _reject_reserved_user(_validate_identifier(db_user))
     sql = (
-        f"DROP DATABASE IF EXISTS {_quote_identifier(db_name)};\n"
+        f"DROP DATABASE IF EXISTS {_quote_identifier(safe_db)};\n"
         f"DROP USER IF EXISTS {_quote_sql_string(_validate_identifier(db_user))}@'localhost';\n"
         "FLUSH PRIVILEGES;\n"
     )
@@ -190,12 +213,12 @@ def export_database(db_name: str, output_file: str):
     home_cnf = Path.home() / ".my.cnf"
     if home_cnf.exists():
         args.append(f"--defaults-file={home_cnf}")
-    args.extend([_validate_identifier(db_name), "--result-file", output_file])
+    args.extend([_reject_reserved_database(db_name), "--result-file", output_file])
     return shell.run(args, sensitive=True)
 
 
 def import_database(db_name: str, input_file: str):
-    safe_name = _validate_identifier(db_name)
+    safe_name = _reject_reserved_database(db_name)
     sql_path = Path(input_file).resolve()
     if not sql_path.exists() or not sql_path.is_file():
         raise FileNotFoundError("SQL file not found")
@@ -211,7 +234,7 @@ def import_database(db_name: str, input_file: str):
 
 
 def dump_database_file(db_name: str, output_dir: Path) -> Path:
-    safe_name = _validate_identifier(db_name)
+    safe_name = _reject_reserved_database(db_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{safe_name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.sql"
     export_database(safe_name, str(target))
@@ -228,7 +251,7 @@ def set_database_write_lock(db_name: str, db_user: str, locked: bool) -> None:
     SELECT, DELETE, DROP, and SHOW VIEW remain granted so the website stays online
     and the customer can still DELETE/TRUNCATE/DROP bloated tables via phpMyAdmin.
     """
-    safe_db = _validate_identifier(db_name)
+    safe_db = _reject_reserved_database(db_name)
     safe_user = _validate_identifier(db_user)
     _reject_reserved_user(safe_user)
     q_db = _quote_identifier(safe_db)
@@ -282,7 +305,7 @@ def set_account_locked(db_user: str, locked: bool) -> None:
 
 def get_database_tables_breakdown(db_name: str) -> list[dict]:
     """Return top tables by size (data + index bytes) inside a specific database."""
-    safe_db = _validate_identifier(db_name)
+    safe_db = _reject_reserved_database(db_name)
     if settings.command_dry_run:
         return []
     sql = (
@@ -319,7 +342,7 @@ def get_database_tables_breakdown(db_name: str) -> list[dict]:
 
 def optimize_database(db_name: str) -> dict:
     """Run OPTIMIZE TABLE on tables in db_name to reclaim fragmented InnoDB/MyISAM space."""
-    safe_db = _validate_identifier(db_name)
+    safe_db = _reject_reserved_database(db_name)
     tables = get_database_tables_breakdown(safe_db)
     if not tables:
         return {"optimized_tables": 0, "db_name": safe_db}

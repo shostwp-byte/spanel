@@ -461,12 +461,21 @@ def suspend_account(db: Session, account: ProvisioningAccount, reason: str = "")
 
     # Include reseller's children
     owner_ids = [user.id]
+    affected_users = [user]
     if user.role == "reseller":
         children = db.query(User).filter(User.reseller_id == user.id).all()
         for child in children:
             child.is_active = False
             child.token_version = (child.token_version or 0) + 1
             owner_ids.append(child.id)
+            affected_users.append(child)
+
+    for u in affected_users:
+        if u.username:
+            try:
+                site_users.lock_linux_user(u.username)
+            except Exception:
+                pass
 
     websites = db.query(Website).filter(Website.owner_id.in_(owner_ids)).all()
     for website in websites:
@@ -504,12 +513,21 @@ def unsuspend_account(db: Session, account: ProvisioningAccount) -> None:
 
     # Include reseller's children
     owner_ids = [user.id]
+    affected_users = [user]
     if user.role == "reseller":
         children = db.query(User).filter(User.reseller_id == user.id).all()
         for child in children:
             child.is_active = True
             child.token_version = (child.token_version or 0) + 1
             owner_ids.append(child.id)
+            affected_users.append(child)
+
+    for u in affected_users:
+        if u.username:
+            try:
+                site_users.unlock_linux_user(u.username)
+            except Exception:
+                pass
 
     websites = db.query(Website).filter(Website.owner_id.in_(owner_ids)).all()
     for website in websites:

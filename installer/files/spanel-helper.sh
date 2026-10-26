@@ -11593,16 +11593,11 @@ EOF
     old_user="${old_user%%/*}"
     ensure_panel_user_home "$user"
     if [[ "$old_target" != "$new_target" ]]; then
+      [[ ! -e "$new_target" && ! -L "$new_target" ]] || deny "target path already exists: $new_target"
       delete_site_php_pools "$old_user" "$old_target"
       mkdir -p "$(dirname "$new_target")"
-      if [[ -d "$old_target" && -d "$new_target" ]]; then
-        cp -a "$old_target"/. "$new_target"/ 2>/dev/null || true
-        rm -rf "$old_target"
-      elif [[ -e "$old_target" && ! -e "$new_target" ]]; then
-        mv "$old_target" "$new_target"
-      elif [[ -e "$old_target" ]]; then
-        rm -rf "$new_target"
-        mv "$old_target" "$new_target"
+      if [[ -e "$old_target" ]]; then
+        mv -- "$old_target" "$new_target"
       else
         mkdir -p "$new_target"
       fi
