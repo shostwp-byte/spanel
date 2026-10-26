@@ -32,6 +32,7 @@ import { Migration } from './pages/Migration.jsx';
 import { Packages } from './pages/Packages.jsx';
 import { IpManager } from './pages/IpManager.jsx';
 import { AppInstallerPage } from './pages/AppInstaller.jsx';
+import { WordPressManagerPage } from './pages/WordPressManager.jsx';
 import { ResellerSettingsPage } from './pages/ResellerSettings.jsx';
 import { UsersPage } from './pages/Users.jsx';
 import { MoveUsersPage } from './pages/MoveUsers.jsx';
@@ -207,6 +208,7 @@ const PAGE_ROUTES = {
   mail_forwarders: '/mail-forwarders',
   mail_auto: '/mail-autoresponders',
   app_installer: '/app-installer',
+  wordpress_manager: '/wordpress-manager',
   reseller_settings: '/reseller-settings',
   ipmanager: '/ipmanager',
   packages: '/packages',
@@ -2993,6 +2995,7 @@ function AppContent() {
       ]}] : []),
       { key: 'advanced_features', title: 'Advanced Features', items: [
         ...(appsFeatureEnabled ? [['applications', 'Applications (Node/Python/Docker)', Cpu]] : []),
+        ['wordpress_manager', 'WordPress Manager', WordPressIcon],
         ['app_installer', 'Install Applications', Boxes],
         ['waf', 'Web Application Firewall', ShieldAlert],
         ['cron', 'Cron Jobs', Clock],
@@ -4187,7 +4190,8 @@ function AppContent() {
     if (page === 'mail') return mailAddonInstalled ? <MailPage request={request} API={API} isAdmin={isAdmin} users={users} isReseller={isReseller} renderCopyBlock={renderCopyBlock} renderDnsRecordEditor={renderDnsRecordEditor} dnsTtlLabel={dnsTtlLabel} setPanelSettingsTab={setPanelSettingsTab} setPage={setPage} /> : renderAddonMissing('mail');
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
-    if (page === 'app_installer') return <AppInstallerPage request={request} websites={websites} />;
+    if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={websites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
+    if (page === 'app_installer') return <AppInstallerPage request={request} websites={websites} navigateToPage={navigateToPage} />;
     if (page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;
     if (page === 'databases') return <DatabasesPage request={request} API={API} navigateToPage={navigateToPage} refreshAll={refreshAll} />;
