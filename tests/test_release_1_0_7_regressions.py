@@ -153,6 +153,22 @@ def test_panel_settings_get_brand_returns_expected_fields():
     assert hasattr(brand, "panel_domain")
 
 
+def test_phpmyadmin_sso_loopback_and_signon_script():
+    from app.api.databases import _is_loopback_peer
+
+    for host in ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1", "127.0.0.42"):
+        req = SimpleNamespace(client=SimpleNamespace(host=host))
+        assert _is_loopback_peer(req) is True, f"Expected loopback True for {host}"
+
+    for host in ("8.8.8.8", "::ffff:8.8.8.8", "192.168.1.10", ""):
+        req = SimpleNamespace(client=SimpleNamespace(host=host))
+        assert _is_loopback_peer(req) is False, f"Expected loopback False for {host}"
+
+    signon_php = (REPO_ROOT / "installer" / "files" / "phpmyadmin-spanel-signon.php").read_text(encoding="utf-8")
+    assert "SPANEL_LAST_SSO_TOKEN" in signon_php
+    assert "__SPANEL_API_BASE__" in signon_php
+
+
 class Release107RegressionTests(unittest.TestCase):
     def test_1_heredocs(self):
         test_installer_and_updater_python_heredocs_compile_cleanly()
@@ -171,4 +187,8 @@ class Release107RegressionTests(unittest.TestCase):
 
     def test_6_panel_settings_brand(self):
         test_panel_settings_get_brand_returns_expected_fields()
+
+    def test_7_phpmyadmin_sso(self):
+        test_phpmyadmin_sso_loopback_and_signon_script()
+
 

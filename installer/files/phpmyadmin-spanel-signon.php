@@ -36,23 +36,39 @@ if (!is_string($token) || !preg_match('/^[A-Za-z0-9_-]{20,}$/', $token)) {
     exit('Invalid token');
 }
 
-$configuredBase = '__SPANEL_API_BASE__';
-$candidateBases = [$configuredBase];
-if (strpos($configuredBase, 'http://') === 0) {
-    $candidateBases[] = 'https://' . substr($configuredBase, 7);
-} elseif (strpos($configuredBase, 'https://') === 0) {
-    $candidateBases[] = 'http://' . substr($configuredBase, 8);
+if (
+    isset($_SESSION['SPANEL_LAST_SSO_TOKEN'], $_SESSION['PMA_single_signon_user'])
+    && $_SESSION['SPANEL_LAST_SSO_TOKEN'] === $token
+    && is_string($_SESSION['PMA_single_signon_user'])
+    && $_SESSION['PMA_single_signon_user'] !== ''
+) {
+    $cachedServer = isset($_SESSION['SPANEL_LAST_SSO_SERVER']) && is_int($_SESSION['SPANEL_LAST_SSO_SERVER'])
+        ? $_SESSION['SPANEL_LAST_SSO_SERVER']
+        : 1;
+    session_write_close();
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+    header('Location: /phpmyadmin/index.php?server=' . $cachedServer);
+    exit;
 }
-$candidateBases[] = 'https://127.0.0.1:2222/api/databases/phpmyadmin-sso/';
-$candidateBases[] = 'http://127.0.0.1:2222/api/databases/phpmyadmin-sso/';
-$candidateBases[] = 'http://127.0.0.1:8000/api/databases/phpmyadmin-sso/';
-$candidateBases = array_values(array_unique($candidateBases));
+
+$apiUrl = '__SPANEL_API_BASE__' . rawurlencode($token);
+$candidateUrls = [$apiUrl];
+if (strpos($apiUrl, 'https://') === 0) {
+    $candidateUrls[] = 'http://' . substr($apiUrl, 8);
+} elseif (strpos($apiUrl, 'http://') === 0) {
+    $candidateUrls[] = 'https://' . substr($apiUrl, 7);
+}
+$ssoPath = '/api/databases/' . 'phpmyadmin-sso/' . rawurlencode($token);
+$candidateUrls[] = 'https://127.0.0.1:2222' . $ssoPath;
+$candidateUrls[] = 'http://127.0.0.1:2222' . $ssoPath;
+$candidateUrls[] = 'http://127.0.0.1:8000' . $ssoPath;
+$candidateUrls = array_values(array_unique($candidateUrls));
 
 $response = false;
 $status = 0;
-foreach ($candidateBases as $baseUrl) {
-    $apiUrl = $baseUrl . rawurlencode($token);
-    $ch = curl_init($apiUrl);
+foreach ($candidateUrls as $candidateUrl) {
+    $ch = curl_init($candidateUrl);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_TIMEOUT => 5,
@@ -97,6 +113,8 @@ $_SESSION['PMA_single_signon_cfgupdate'] = [
     'only_db' => $data['db_name'] ?? '',
 ];
 $_SESSION['PMA_single_signon_HMAC_secret'] = bin2hex(random_bytes(16));
+$_SESSION['SPANEL_LAST_SSO_TOKEN'] = $token;
+$_SESSION['SPANEL_LAST_SSO_SERVER'] = $server;
 session_write_close();
 
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
