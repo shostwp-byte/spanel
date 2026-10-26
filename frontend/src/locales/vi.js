@@ -2866,6 +2866,7 @@ export const vi = {
   "Snapshots & Rollback": "Snapshots & Rollback",
   "Updates navigation tabs": "Các tab quản lý cập nhật",
   "new": "mới",
+  "WordPress Manager": "Quản lý WordPress",
 };
 
 /* Said in English by the people who run these servers. Translating them

@@ -3,7 +3,7 @@ import { PackageOpen, ExternalLink, Box, Code2, Search, Download, RefreshCw } fr
 import { useAppContext, WordPressIcon } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
-export function AppInstallerPage({ request, websites }) {
+export function AppInstallerPage({ request, websites, navigateToPage }) {
   const { loading, setLoading, setError, setNotice, phpVersions, loadPhpVersions, appsFeatureEnabled } = useAppContext();
   const installedPhpList = phpVersions?.installed?.length ? phpVersions.installed : ['8.4'];
   useEffect(() => { if (loadPhpVersions) loadPhpVersions({ silent: true }); }, []);
@@ -50,6 +50,10 @@ export function AppInstallerPage({ request, websites }) {
 
   const handleInstallClick = (app) => {
     if (isBusy) return;
+    if (app.id === 'wordpress' && navigateToPage) {
+      navigateToPage('wordpress_manager');
+      return;
+    }
     setSelectedApp(app);
     setInstallForm({ domain: websites?.[0]?.domain || '', php_version: installedPhpList[0] || '8.4' });
     setShowInstallModal(true);
