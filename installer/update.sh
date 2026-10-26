@@ -1588,14 +1588,8 @@ mkdir -p "$APP_DIR"
 # during the update could leave behind. As spanel: a root connection would
 # create spanel.db-wal/-shm owned by root if they were missing, and the API
 # could no longer open its own database.
-if [[ -f "$APP_DIR/backend/spanel.db" ]] && id -u spanel >/dev/null 2>&1; then
-  sudo -u spanel python3 -I - "$APP_DIR/backend/spanel.db" <<'PY' || true
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1], timeout=15)
-try:
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-if [[ -f "$APP_DIR/backend/spanel.db" ]] && command -v python3 >/dev/null 2>&1; then
-  python3 -c '
+if [[ -f "$APP_DIR/backend/spanel.db" ]] && id -u spanel >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  sudo -u spanel python3 -I -c '
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1], timeout=15)
 try:
@@ -2134,6 +2128,7 @@ for php_ini_dir in /etc/php/*/; do
 done
 
 log "Compiling backend modules"
+cd "$APP_DIR/backend"
 # As spanel: the .pyc files land in backend/__pycache__, the account's
 # directory, and root writing there follows whatever links it holds.
 py_compile_as=()
