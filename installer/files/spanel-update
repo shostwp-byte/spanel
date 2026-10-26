@@ -7,7 +7,7 @@ set -euo pipefail
 STATE_FILE="${UPDATE_STATE_FILE:-/var/lib/spanel/update-status.json}"
 SOURCE_CONFIG_FILE="${UPDATE_SOURCE_FILE:-/var/lib/spanel/update-source.json}"
 APP_DIR="${APP_DIR:-/opt/spanel}"
-SNAPSHOT_DIR="${BACKUP_ROOT:-/var/backups/spanel}/panel-snapshots"
+SNAPSHOT_DIR="/var/backups/spanel-panel-snapshots"
 HELPER_BIN="/usr/local/sbin/spanel-helper"
 ROLLBACK_SNAPSHOT_ID=""
 # Set once update.sh starts changing the server. A failure before that

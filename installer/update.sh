@@ -14,6 +14,14 @@
 
 set -euo pipefail
 
+# Much of this script runs as root with the working directory inside
+# $APP_DIR, which the panel account owns. `python3 -`, `-c` and `-m` put that
+# directory first on sys.path, so a json.py, venv.py or py_compile.py the
+# account dropped there would run as root. Python 3.11+ leaves it off with
+# this set; sudo's env_reset keeps it away from the `sudo -u spanel` steps,
+# which do import the panel from their cwd.
+export PYTHONSAFEPATH=1
+
 log()  { echo ""; echo "==> $1"; }
 fail() { echo "ERROR: $1" >&2; exit 1; }
 
@@ -340,15 +348,40 @@ write_update_state() {
   latest="${ref#v}"
   [[ "$latest" == "$ref" ]] && latest=""
   install -d -m 0750 "$(dirname "$UPDATE_STATE_FILE")"
-  python3 - "$UPDATE_STATE_FILE" "$status" "$ref" "$latest" "$current" "$message" "$now" <<'PY'
+  /usr/bin/python3 -I - "$UPDATE_STATE_FILE" "$status" "$ref" "$latest" "$current" "$message" "$now" <<'PY'
 import json
 import sys
 from pathlib import Path
 
+
+def save_state(path, state):
+    # A fresh file renamed over the old name, owner and mode set on the
+    # descriptor: a chown by name afterwards follows whatever link the panel
+    # account put there, and handed that file to spanel.
+    import os, pwd, tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".update-status.")
+    try:
+        try:
+            account = pwd.getpwnam("spanel")
+            os.fchown(fd, account.pw_uid, account.pw_gid)
+        except KeyError:
+            pass
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 path = Path(sys.argv[1])
 status, ref, latest, current, message, now = sys.argv[2:8]
 try:
-    state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    state = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and not path.is_symlink() else {}
 except Exception:
     state = {}
 
@@ -366,12 +399,8 @@ if status in {"checking", "updating"}:
     state["last_update_started_at"] = now
 elif status in {"completed", "failed"}:
     state["last_update_finished_at"] = now
-path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+save_state(path, state)
 PY
-  if id -u spanel >/dev/null 2>&1; then
-    chown spanel:spanel "$UPDATE_STATE_FILE" 2>/dev/null || true
-  fi
-  chmod 0640 "$UPDATE_STATE_FILE" 2>/dev/null || true
 }
 
 # Write progress markers (percent / phase / message) into the update state file
@@ -379,15 +408,40 @@ PY
 update_progress() {
   local percent="$1" phase="$2" message="${3:-}"
   install -d -m 0750 "$(dirname "$UPDATE_STATE_FILE")"
-  python3 - "$UPDATE_STATE_FILE" "$percent" "$phase" "$message" <<'PY'
+  /usr/bin/python3 -I - "$UPDATE_STATE_FILE" "$percent" "$phase" "$message" <<'PY'
 import json
 import sys
 from pathlib import Path
 
+
+def save_state(path, state):
+    # A fresh file renamed over the old name, owner and mode set on the
+    # descriptor: a chown by name afterwards follows whatever link the panel
+    # account put there, and handed that file to spanel.
+    import os, pwd, tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".update-status.")
+    try:
+        try:
+            account = pwd.getpwnam("spanel")
+            os.fchown(fd, account.pw_uid, account.pw_gid)
+        except KeyError:
+            pass
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 path = Path(sys.argv[1])
 percent, phase, message = sys.argv[2:5]
 try:
-    state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    state = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and not path.is_symlink() else {}
 except Exception:
     state = {}
 try:
@@ -398,12 +452,8 @@ if phase:
     state["progress_phase"] = phase
 if message:
     state["progress_message"] = message
-path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+save_state(path, state)
 PY
-  if id -u spanel >/dev/null 2>&1; then
-    chown spanel:spanel "$UPDATE_STATE_FILE" 2>/dev/null || true
-  fi
-  chmod 0640 "$UPDATE_STATE_FILE" 2>/dev/null || true
 }
 
 UPDATE_REF=""
@@ -750,11 +800,16 @@ PY_DUMP
 
   # Stage 2 (unprivileged spanel account via sudo -u spanel + SPANEL_USE_HELPER=true):
   # Migrate legacy spool lines and enforce spanel-cron-jail across all sites.
+  #
+  # From backend/, like the panel's own units (WorkingDirectory=): the app
+  # reads .env, and with it DATABASE_URL, relative to the working directory.
+  # This runs after the frontend build has cd'd into frontend/, where it used
+  # to open a fresh empty frontend/spanel.db, find no websites table, and
+  # migrate nothing on every update.
   local mig_out
-  mig_out="$(sudo -u spanel env \
+  mig_out="$(cd "$APP_DIR/backend" && sudo -u spanel env \
     HOME="$APP_DIR" \
     PYTHONPATH="$APP_DIR/backend" \
-    SPANEL_DB_PATH="$db_path" \
     SPANEL_USE_HELPER=true \
     "$py_bin" - "$spool_json" <<'PY_MIGRATE'
 import json
@@ -1300,8 +1355,11 @@ ensure_panel_runtime_ownership() {
   # bypasses every argv check in spanel-helper, which is the whole point of the
   # sudo trampoline. Root keeps the venv; the service only reads and executes it.
   if [[ -d "$APP_DIR/backend" ]]; then
+    # -h: find hands chown every symlink in the tree as a command-line
+    # argument, and without -h chown follows it - a link to /etc/shadow
+    # planted here gave the file to spanel on the next update.
     find "$APP_DIR/backend" -path "$APP_DIR/backend/.venv" -prune \
-      -o -exec chown spanel:spanel {} + 2>/dev/null || true
+      -o -exec chown -h spanel:spanel {} + 2>/dev/null || true
     # Reclaim it on an upgrade from a build that handed it to spanel.
     [[ -d "$APP_DIR/backend/.venv" ]] && chown -R root:root "$APP_DIR/backend/.venv" 2>/dev/null || true
   fi
@@ -1315,7 +1373,7 @@ ensure_panel_runtime_ownership() {
   # script ever creates node_modules; spanel just needs to read it.
   if [[ -d "$APP_DIR/frontend" ]]; then
     find "$APP_DIR/frontend" -path "$APP_DIR/frontend/node_modules" -prune \
-      -o -exec chown spanel:spanel {} + 2>/dev/null || true
+      -o -exec chown -h spanel:spanel {} + 2>/dev/null || true
     # Reclaim it on an upgrade from a build that handed it to spanel.
     [[ -d "$APP_DIR/frontend/node_modules" ]] && chown -R root:root "$APP_DIR/frontend/node_modules" 2>/dev/null || true
   fi
@@ -1335,20 +1393,37 @@ backup_db() {
   fi
   local snap_dir="${BACKUP_ROOT:-/var/backups/spanel}/db-snapshots"
   install -d -m 0750 "$snap_dir"
+  local -a as_owner=()
   if id -u spanel >/dev/null 2>&1; then
     chown spanel:spanel "$snap_dir" 2>/dev/null || true
+    # The directory is spanel's, so spanel writes into it: root following a
+    # name spanel planted there would write wherever that name points.
+    as_owner=(sudo -u spanel)
   fi
   local stamp
   stamp=$(date -u +%Y%m%d-%H%M%S)
   local snap="$snap_dir/spanel-$stamp.db"
-  if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$db_path" ".backup '$snap'"
-  else
-    cp -a "$db_path" "$snap"
+  # SQLite's backup API, never cp: the API runs in WAL mode, so rows written
+  # since the last checkpoint live only in spanel.db-wal and a copy of the
+  # main file alone is missing them (the sqlite3 CLI is not installed on a
+  # stock Ubuntu either, which is how every snapshot became a cp).
+  if ! "${as_owner[@]}" python3 -I - "$db_path" "$snap" <<'PY'; then
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()
+PY
+    echo "ERROR: could not snapshot $db_path; nothing was changed." >&2
+    exit 1
   fi
   echo "DB snapshot saved: $snap"
   # Keep the 10 most recent snapshots.
-  ls -1t "$snap_dir"/spanel-*.db 2>/dev/null | tail -n +11 | xargs -r rm -f
+  "${as_owner[@]}" find "$snap_dir" -maxdepth 1 -type f -name 'spanel-*.db' -printf '%T@ %p\0' \
+    | sort -z -rn | tail -z -n +11 | cut -z -d' ' -f2- \
+    | "${as_owner[@]}" xargs -0 -r rm -f -- || true
 }
 
 if [[ -n "${SPANEL_UPDATE_STAGE2:-}" ]]; then
@@ -1508,6 +1583,17 @@ fi
 log "Syncing source to $APP_DIR"
 mkdir -p "$APP_DIR"
 
+# Fold the WAL into spanel.db while the API is still running. The protect
+# filters below are what keeps the WAL alive; this only shrinks what a crash
+# during the update could leave behind. As spanel: a root connection would
+# create spanel.db-wal/-shm owned by root if they were missing, and the API
+# could no longer open its own database.
+if [[ -f "$APP_DIR/backend/spanel.db" ]] && id -u spanel >/dev/null 2>&1; then
+  sudo -u spanel python3 -I - "$APP_DIR/backend/spanel.db" <<'PY' || true
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=15)
+try:
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 if [[ -f "$APP_DIR/backend/spanel.db" ]] && command -v python3 >/dev/null 2>&1; then
   python3 - "$APP_DIR/backend/spanel.db" <<'PY' 2>/dev/null || true
 import sqlite3, sys
@@ -1524,6 +1610,12 @@ if command -v rsync >/dev/null 2>&1; then
   # --filter='protect ...' keeps the destination file even when --delete
   # would otherwise remove it because the source side doesn't have it. We use
   # this for runtime artefacts that the installer creates: .env, .venv,
+  # spanel.db, .my.cnf.
+  #
+  # spanel.db-wal, -shm and -journal belong to the database as much as
+  # spanel.db does. Deleting the WAL under a running API dropped every row
+  # written since the last checkpoint: on a test server a website created ten
+  # minutes before the update was gone from the panel afterwards.
   # spanel.db (including WAL/SHM files), .my.cnf.
   rsync -a --delete \
     --filter='protect /.env' \
@@ -1786,10 +1878,15 @@ fi
 source .venv/bin/activate
 # pip resolves the whole requirements file on every run even when nothing moved;
 # skip it unless requirements.txt changed or the venv was just rebuilt.
-if [[ "$venv_needs_recreate" == "true" ]] || step_inputs_changed backend-deps requirements.txt; then
+# requirements.txt from the release source, not from backend/: root installs
+# whatever it names, and backend/ is the panel account's. rsync's quick check
+# skips a file whose size and mtime already match, so a copy the account
+# rewrote there could survive the sync.
+release_requirements="$SOURCE_DIR/backend/requirements.txt"
+if [[ "$venv_needs_recreate" == "true" ]] || step_inputs_changed backend-deps "$release_requirements"; then
   pip install --upgrade pip
-  pip install -r requirements.txt
-  step_mark_done backend-deps requirements.txt
+  pip install -r "$release_requirements"
+  step_mark_done backend-deps "$release_requirements"
 else
   log "Backend dependencies unchanged since last update; skipping pip install"
 fi
@@ -1804,7 +1901,7 @@ if id -u spanel >/dev/null 2>&1; then
   sudo -u spanel env HOME="$APP_DIR" SPANEL_USE_HELPER=true "$APP_DIR/backend/.venv/bin/python" -c \
     "from app.core.database import run_migrations; run_migrations()"
 else
-  python -c "from app.core.database import run_migrations; run_migrations()"
+  PYTHONPATH="$APP_DIR/backend" python -c "from app.core.database import run_migrations; run_migrations()"
 fi
 # Remote MySQL hosts now live in the panel database (moved out of
 # multi-server.json by the migration above); give phpMyAdmin the list.
@@ -2029,7 +2126,11 @@ for php_ini_dir in /etc/php/*/; do
 done
 
 log "Compiling backend modules"
-python -m py_compile \
+# As spanel: the .pyc files land in backend/__pycache__, the account's
+# directory, and root writing there follows whatever links it holds.
+py_compile_as=()
+id -u spanel >/dev/null 2>&1 && py_compile_as=(sudo -u spanel)
+"${py_compile_as[@]}" "$APP_DIR/backend/.venv/bin/python" -m py_compile \
   app/main.py \
   app/api/auth.py \
   app/api/users.py \
@@ -2144,6 +2245,12 @@ migrate_nginx_wordpress_csp_worker_src
 migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
+# The empty database earlier updates left behind when the cron migration ran
+# from frontend/ (see migrate_site_cron_php_binary). As spanel: frontend/ is
+# spanel's directory.
+if [[ -f "$APP_DIR/frontend/spanel.db" && ! -L "$APP_DIR/frontend/spanel.db" ]]; then
+  sudo -u spanel rm -f -- "$APP_DIR/frontend/spanel.db" || true
+fi
 nginx -t
 systemctl reload nginx
 

@@ -738,7 +738,7 @@ validate_privileged_helper() {
 chown_backend_except_venv() {
   local dir="$1"
   [[ -d "$dir" ]] || return 0
-  find "$dir" -path "$dir/.venv" -prune -o -exec chown spanel:spanel {} + 2>/dev/null || true
+  find "$dir" -path "$dir/.venv" -prune -o -exec chown -h spanel:spanel {} + 2>/dev/null || true
   # Reclaim the venv on an upgrade from a build that gave it away.
   [[ -d "$dir/.venv" ]] && chown -R root:root "$dir/.venv" 2>/dev/null || true
   return 0
@@ -756,7 +756,7 @@ chown_backend_except_venv() {
 chown_frontend_except_node_modules() {
   local dir="$1"
   [[ -d "$dir" ]] || return 0
-  find "$dir" -path "$dir/node_modules" -prune -o -exec chown spanel:spanel {} + 2>/dev/null || true
+  find "$dir" -path "$dir/node_modules" -prune -o -exec chown -h spanel:spanel {} + 2>/dev/null || true
   # Reclaim it on an upgrade from a build that handed it to spanel.
   [[ -d "$dir/node_modules" ]] && chown -R root:root "$dir/node_modules" 2>/dev/null || true
   return 0

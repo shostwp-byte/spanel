@@ -24,7 +24,9 @@ from app.services.shell import shell
 DATA_DIR = Path(os.environ.get("SPANEL_DATA_DIR") or os.environ.get("spanel_DATA_DIR") or "/var/lib/spanel")
 UPDATE_STATE_FILE = Path(os.environ.get("SPANEL_UPDATE_STATE_FILE") or os.environ.get("spanel_UPDATE_STATE_FILE") or str(DATA_DIR / "update-status.json"))
 UPDATE_SOURCE_FILE = Path(os.environ.get("SPANEL_UPDATE_SOURCE_FILE") or str(DATA_DIR / "update-source.json"))
-SNAPSHOT_DIR = Path(os.environ.get("BACKUP_ROOT") or "/var/backups/spanel") / "panel-snapshots"
+# Root's directory, not under BACKUP_ROOT (which this account owns): a
+# rollback installs what it finds here as root. See spanel-helper.
+SNAPSHOT_DIR = Path("/var/backups/spanel-panel-snapshots")
 
 DEFAULT_REPO_URL = os.environ.get("SPANEL_REPO_URL") or os.environ.get("spanel_REPO_URL") or "https://github.com/shostwp-byte/spanel.git"
 DEFAULT_MANIFEST_URL = os.environ.get("SPANEL_UPDATE_MANIFEST_URL") or ""
