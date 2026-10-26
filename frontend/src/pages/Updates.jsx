@@ -89,6 +89,7 @@ export function UpdatesPage({ request, isAdmin }) {
   const [phpPatchingBranch, setPhpPatchingBranch] = useState('');
   const [phpSavingConfig, setPhpSavingConfig] = useState(false);
   const [corePatchingPkg, setCorePatchingPkg] = useState('');
+  const [activeTab, setActiveTab] = useState('panel');
 
   useEffect(() => {
     if (isAdmin) loadUpdates(false);
@@ -527,7 +528,11 @@ export function UpdatesPage({ request, isAdmin }) {
           marginBottom: '16px',
         }}
       >
-        <div className="cb-stat-box" style={{ padding: '14px 16px' }}>
+        <div
+          className="cb-stat-box"
+          style={{ padding: '14px 16px', cursor: 'pointer' }}
+          onClick={() => setActiveTab('panel')}
+        >
           <div className="cb-stat-icon blue">
             <Server size={18} />
           </div>
@@ -542,7 +547,11 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         </div>
 
-        <div className="cb-stat-box" style={{ padding: '14px 16px' }}>
+        <div
+          className="cb-stat-box"
+          style={{ padding: '14px 16px', cursor: 'pointer' }}
+          onClick={() => setActiveTab('panel')}
+        >
           <div className={`cb-stat-icon ${updateAvailable ? 'amber' : 'emerald'}`}>
             {updateAvailable ? <Download size={18} /> : <CheckCircle size={18} />}
           </div>
@@ -564,7 +573,11 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         </div>
 
-        <div className="cb-stat-box" style={{ padding: '14px 16px' }}>
+        <div
+          className="cb-stat-box"
+          style={{ padding: '14px 16px', cursor: 'pointer' }}
+          onClick={() => setShowSourceModal(true)}
+        >
           <div className="cb-stat-icon indigo">
             <Lock size={18} />
           </div>
@@ -590,7 +603,11 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         </div>
 
-        <div className="cb-stat-box" style={{ padding: '14px 16px' }}>
+        <div
+          className="cb-stat-box"
+          style={{ padding: '14px 16px', cursor: 'pointer' }}
+          onClick={() => setActiveTab('snapshots')}
+        >
           <div className="cb-stat-icon emerald">
             <ArchiveRestore size={18} />
           </div>
@@ -606,7 +623,108 @@ export function UpdatesPage({ request, isAdmin }) {
         </div>
       </div>
 
+      {/* 2B. Clean Tab Navigation Bar */}
+      <div
+        role="tablist"
+        aria-label={t('Updates navigation tabs')}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '4px',
+          flexWrap: 'wrap',
+          borderBottom: '1px solid var(--border)',
+          marginBottom: '18px',
+        }}
+      >
+        {[
+          {
+            id: 'panel',
+            label: t('SPanel & OS Updates'),
+            icon: ShieldCheck,
+            badge: fmtVer(currentPanelVersion),
+            badgeTone: updateAvailable ? 'warn' : 'ok',
+          },
+          {
+            id: 'php',
+            label: t('Smart PHP Auto-Patch'),
+            icon: Zap,
+            badge: phpUpdatableCount > 0 ? `${phpUpdatableCount} ${t('new')}` : String(phpVersions.length || 0),
+            badgeTone: phpUpdatableCount > 0 ? 'warn' : 'ok',
+          },
+          {
+            id: 'core',
+            label: t('Core Infrastructure'),
+            icon: Server,
+            badge:
+              coreUpdatableCount > 0
+                ? `${coreUpdatableCount} ${t('new')}`
+                : `${coreServices.length}/${coreServices.length || 9}`,
+            badgeTone: coreUpdatableCount > 0 ? 'warn' : 'ok',
+          },
+          {
+            id: 'schedule',
+            label: t('Maintenance Window'),
+            icon: Clock,
+          },
+          {
+            id: 'snapshots',
+            label: t('Snapshots & Rollback'),
+            icon: ArchiveRestore,
+            badge: String(snapshots.length),
+            badgeTone: '',
+          },
+        ].map(tab => {
+          const Icon = tab.icon;
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={isActive}
+              onClick={() => setActiveTab(tab.id)}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '8px',
+                height: '42px',
+                minHeight: '42px',
+                padding: '0 16px',
+                marginBottom: '-1px',
+                border: '0',
+                borderBottom: isActive ? '2px solid var(--primary)' : '2px solid transparent',
+                borderRadius: '8px 8px 0 0',
+                background: isActive ? 'color-mix(in srgb, var(--primary) 8%, transparent)' : 'transparent',
+                color: isActive ? 'var(--primary)' : 'var(--text-secondary)',
+                fontWeight: isActive ? 600 : 500,
+                fontSize: '13.5px',
+                cursor: 'pointer',
+                boxShadow: 'none',
+                transform: 'none',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              <Icon size={15} style={{ color: isActive ? 'var(--primary)' : 'var(--text-muted)', flexShrink: 0 }} />
+              <span>{tab.label}</span>
+              {tab.badge !== undefined && (
+                <span
+                  className={`badge ${tab.badgeTone || ''}`}
+                  style={{
+                    padding: '1px 7px',
+                    fontSize: '11px',
+                    lineHeight: 1.35,
+                  }}
+                >
+                  {tab.badge}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
       {/* 3. Hero Release & Transactional Update Banner */}
+      {activeTab === 'panel' && (
       <div
         style={{
           border: updateAvailable ? '1px solid rgba(245, 158, 11, 0.45)' : '1px solid var(--border)',
@@ -862,6 +980,7 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         )}
       </div>
+      )}
 
       {/* 4. Sanitized Update Logs Box (Collapsible) */}
       {showUpdateLog && (
@@ -931,6 +1050,7 @@ export function UpdatesPage({ request, isAdmin }) {
       )}
 
       {/* 4C. Smart PHP Auto-Patching & Anti-PHP2SHELL Security Guard Card */}
+      {activeTab === 'php' && (
       <div
         style={{
           border: phpUpdatableCount > 0 ? '1px solid rgba(245, 158, 11, 0.45)' : '1px solid var(--border)',
@@ -1200,11 +1320,14 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         )}
       </div>
+      )}
 
-      <MaintenanceWindowCard request={request} setNotice={setNotice} loading={loading} />
+      <div style={{ display: activeTab === 'schedule' ? 'block' : 'none' }}>
+        <MaintenanceWindowCard request={request} setNotice={setNotice} loading={loading} />
+      </div>
 
       {/* 4D. Smart Core Infrastructure Auto-Patch Card */}
-      {coreServices.length > 0 && (
+      {activeTab === 'core' && (coreServices.length > 0 || true) && (
         <div
           style={{
             border: coreUpdatableCount > 0 ? '1px solid rgba(245, 158, 11, 0.45)' : '1px solid var(--border)',
@@ -1369,6 +1492,7 @@ export function UpdatesPage({ request, isAdmin }) {
       )}
 
       {/* 5. Recovery Snapshots & 1-Click Rollback Card */}
+      {activeTab === 'snapshots' && (
       <div
         style={{
           border: '1px solid var(--border)',
@@ -1518,8 +1642,10 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         )}
       </div>
+      )}
 
       {/* 6. Symmetrical Two-Column Automation & OS Security Cards */}
+      {activeTab === 'panel' && (
       <div
         style={{
           display: 'grid',
@@ -1731,6 +1857,7 @@ export function UpdatesPage({ request, isAdmin }) {
           </div>
         </div>
       </div>
+      )}
 
       {/* 7. Centered Protected Designated Update Server Configuration Modal */}
       {showSourceModal && (

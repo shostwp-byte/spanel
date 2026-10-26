@@ -80,7 +80,7 @@ export function WebsitesPage({
 
   const installedPhpList = (phpVersions?.installed?.length ? phpVersions.installed : ctxPhpVersions?.installed?.length ? ctxPhpVersions.installed : ['8.4']);
   useEffect(() => { if (loadPhpVersions) loadPhpVersions({ silent: true }); }, []);
-  useEffect(() => { loadWebsiteList(); }, [websiteSearch]);
+  useEffect(() => { loadWebsiteList(); }, [websiteSearch, currentUser?.id]);
   useEffect(() => {
     if (websiteList.length === 0) {
       const id = setInterval(() => loadWebsiteList(websiteSearch, false), 5000);
@@ -112,7 +112,10 @@ export function WebsitesPage({
   async function deleteWebsite(id) {
     if (!confirm(t('Delete this website including files, vhost, database, and its SSL certificate?'))) return;
     const data = await request(`/websites/${id}?delete_files=true&delete_database=true`, { method: 'DELETE' }, t('Deleting website...'));
-    if (data) refreshAll();
+    if (data) {
+      await loadWebsiteList(websiteSearch, false);
+      if (refreshAll) await refreshAll();
+    }
   }
 
   async function addWebsiteAlias(site) {
@@ -624,7 +627,7 @@ export function WebsitesPage({
   }, [rootDomains, defaultDomainId, selectedWebsiteId]);
 
   useEffect(() => {
-    if (!websiteSearch.trim() && Array.isArray(websites) && websites.length > 0) {
+    if (!websiteSearch.trim() && Array.isArray(websites)) {
       setWebsiteList(websites);
     }
   }, [websites, websiteSearch]);

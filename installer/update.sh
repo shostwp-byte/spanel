@@ -1594,6 +1594,13 @@ import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1], timeout=15)
 try:
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+if [[ -f "$APP_DIR/backend/spanel.db" ]] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$APP_DIR/backend/spanel.db" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=15)
+try:
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    conn.commit()
 finally:
     conn.close()
 PY
@@ -1609,6 +1616,7 @@ if command -v rsync >/dev/null 2>&1; then
   # spanel.db does. Deleting the WAL under a running API dropped every row
   # written since the last checkpoint: on a test server a website created ten
   # minutes before the update was gone from the panel afterwards.
+  # spanel.db (including WAL/SHM files), .my.cnf.
   rsync -a --delete \
     --filter='protect /.env' \
     --filter='protect /.venv' \
@@ -1617,6 +1625,7 @@ if command -v rsync >/dev/null 2>&1; then
     --filter='protect /spanel.db-wal' \
     --filter='protect /spanel.db-shm' \
     --filter='protect /spanel.db-journal' \
+    --filter='protect /spanel.db*' \
     --filter='protect /.my.cnf' \
     --exclude '__pycache__/' \
     --exclude '*.pyc' \
@@ -1889,7 +1898,7 @@ log "Running database migrations"
 update_progress 65 "backend" "Running database migrations"
 if id -u spanel >/dev/null 2>&1; then
   # Run migrations as the spanel user so the SQLite file ownership stays correct.
-  sudo -u spanel "$APP_DIR/backend/.venv/bin/python" -c \
+  sudo -u spanel env HOME="$APP_DIR" SPANEL_USE_HELPER=true "$APP_DIR/backend/.venv/bin/python" -c \
     "from app.core.database import run_migrations; run_migrations()"
 else
   PYTHONPATH="$APP_DIR/backend" python -c "from app.core.database import run_migrations; run_migrations()"

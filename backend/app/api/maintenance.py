@@ -1871,6 +1871,27 @@ def rename_entry(payload: FileRename, db: Session = Depends(get_db), current_use
     return {"target": target}
 
 
+@router.post("/files/duplicate")
+def duplicate_entry(payload: FileRename, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ensure_role(current_user.role, Role.end_user)
+    website = get_file_target(db, current_user, payload.website_id, payload.app_id)
+    try:
+        target = file_manager.duplicate_entry(
+            website,
+            payload.path,
+            payload.new_name,
+            allow_executable=is_admin_role(current_user.role),
+            allow_sensitive=is_admin_role(current_user.role),
+            quota_check=_quota_check_for_website(db, website),
+        )
+    except storage_quota.StorageQuotaExceeded as exc:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log_action(db, current_user.id, "duplicate_file", website.domain, target)
+    return {"target": target}
+
+
 @router.post("/files/chmod")
 def chmod_entry(payload: FileChmod, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.end_user)
