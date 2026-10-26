@@ -32,18 +32,48 @@ if (!is_string($token) || !preg_match('/^[A-Za-z0-9_-]{20,}$/', $token)) {
     exit('Invalid token');
 }
 
+if (
+    isset($_SESSION['SPANEL_LAST_SSO_TOKEN'], $_SESSION['PMA_single_signon_user'])
+    && $_SESSION['SPANEL_LAST_SSO_TOKEN'] === $token
+    && is_string($_SESSION['PMA_single_signon_user'])
+    && $_SESSION['PMA_single_signon_user'] !== ''
+) {
+    $cachedServer = isset($_SESSION['SPANEL_LAST_SSO_SERVER']) && is_int($_SESSION['SPANEL_LAST_SSO_SERVER'])
+        ? $_SESSION['SPANEL_LAST_SSO_SERVER']
+        : 1;
+    session_write_close();
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
+    header('Location: /phpmyadmin/index.php?server=' . $cachedServer);
+    exit;
+}
+
 $apiUrl = '__SPANEL_API_BASE__' . rawurlencode($token);
-$ch = curl_init($apiUrl);
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => 5,
-    CURLOPT_SSL_VERIFYPEER => false,
-    CURLOPT_SSL_VERIFYHOST => false,
-    CURLOPT_HTTPHEADER => ['Accept: application/json'],
-]);
-$response = curl_exec($ch);
-$status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-curl_close($ch);
+$candidateUrls = [$apiUrl];
+if (strpos($apiUrl, 'https://') === 0) {
+    $candidateUrls[] = 'http://' . substr($apiUrl, 8);
+} elseif (strpos($apiUrl, 'http://') === 0) {
+    $candidateUrls[] = 'https://' . substr($apiUrl, 7);
+}
+
+$response = false;
+$status = 0;
+foreach ($candidateUrls as $candidateUrl) {
+    $ch = curl_init($candidateUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+    ]);
+    $response = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($status === 200 && $response) {
+        break;
+    }
+}
 
 if ($status !== 200 || !$response) {
     http_response_code(403);
@@ -69,6 +99,8 @@ $_SESSION['PMA_single_signon_cfgupdate'] = [
     'only_db' => $data['db_name'] ?? '',
 ];
 $_SESSION['PMA_single_signon_HMAC_secret'] = bin2hex(random_bytes(16));
+$_SESSION['SPANEL_LAST_SSO_TOKEN'] = $token;
+$_SESSION['SPANEL_LAST_SSO_SERVER'] = $server;
 session_write_close();
 
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
