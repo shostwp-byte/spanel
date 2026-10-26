@@ -857,11 +857,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            <label
+            <div
+              onClick={toggleSelectAll}
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: '6px',
+                gap: '7px',
                 fontSize: '13px',
                 cursor: 'pointer',
                 marginRight: '4px',
@@ -872,12 +873,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 type="checkbox"
                 checked={allSelected}
                 onChange={toggleSelectAll}
-                style={{ width: '15px', height: '15px' }}
+                onClick={e => e.stopPropagation()}
+                style={{ width: '15px', height: '15px', margin: 0, flexShrink: 0, cursor: 'pointer' }}
               />
-              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>
+              <span style={{ color: 'var(--text-secondary)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                 {selectedIds.length > 0 ? `Đã chọn (${selectedIds.length})` : 'Chọn tất cả'}
               </span>
-            </label>
+            </div>
 
             <button
               type="button"
@@ -1072,7 +1074,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 <thead>
                   <tr style={{ background: 'var(--surface-alt)', borderBottom: '1px solid var(--border)' }}>
                     <th style={{ padding: '11px 16px', width: '36px' }}>
-                      <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
+                      <input
+                        type="checkbox"
+                        checked={allSelected}
+                        onChange={toggleSelectAll}
+                        style={{ width: '15px', height: '15px', margin: 0, cursor: 'pointer' }}
+                      />
                     </th>
                     <th style={{ padding: '11px 14px' }}>Website / Domain</th>
                     <th style={{ padding: '11px 14px' }}>Tiêu đề Site</th>
@@ -1091,6 +1098,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                           type="checkbox"
                           checked={selectedIds.includes(inst.id)}
                           onChange={() => toggleSelectOne(inst.id)}
+                          style={{ width: '15px', height: '15px', margin: 0, cursor: 'pointer' }}
                         />
                       </td>
                       <td style={{ padding: '11px 14px', fontWeight: 600 }}>
@@ -2293,12 +2301,31 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
 
                           {/* SUB-TAB 4: SECURITY HARDENING & CHECKSUMS */}
                           {subTab === 'security' && (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  alignItems: 'center',
+                                  flexWrap: 'wrap',
+                                  gap: '10px',
+                                  padding: '10px 14px',
+                                  background: 'var(--surface-alt)',
+                                  border: '1px solid var(--border)',
+                                  borderRadius: '10px',
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                   <button
                                     type="button"
-                                    onClick={() => handleSecurityAction(inst, 'secure', checkedSecIds)}
+                                    disabled={!!busyAction}
+                                    onClick={() =>
+                                      handleSecurityAction(
+                                        inst,
+                                        'secure',
+                                        (inst.security_checks || []).map(c => c.id)
+                                      )
+                                    }
                                     style={{
                                       height: '32px',
                                       minHeight: '32px',
@@ -2311,19 +2338,27 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                       borderRadius: '7px',
                                     }}
                                   >
-                                    <ShieldCheck size={14} /> Secure Selected ({checkedSecIds.length})
+                                    <ShieldCheck size={14} /> Bật tất cả ({inst.security_passed}/{inst.security_total})
                                   </button>
                                   <button
                                     type="button"
                                     className="secondary-light"
-                                    onClick={() => handleSecurityAction(inst, 'revert', checkedSecIds)}
+                                    disabled={!!busyAction}
+                                    onClick={() =>
+                                      handleSecurityAction(
+                                        inst,
+                                        'revert',
+                                        (inst.security_checks || []).map(c => c.id)
+                                      )
+                                    }
                                     style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12.5px' }}
                                   >
-                                    Revert
+                                    Tắt tất cả (Revert)
                                   </button>
                                   <button
                                     type="button"
                                     className="secondary-light"
+                                    disabled={!!busyAction}
                                     onClick={() => handleSecurityAction(inst, 'verify_checksums')}
                                     style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12.5px' }}
                                   >
@@ -2332,60 +2367,89 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   <button
                                     type="button"
                                     className="secondary-light"
+                                    disabled={!!busyAction}
                                     onClick={() => handleSecurityAction(inst, 'reinstall_core')}
                                     style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12.5px' }}
                                   >
                                     <RotateCcw size={13} /> Reinstall Clean Core
                                   </button>
                                 </div>
+                                <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                                  Gạt công tắc từng mục để bật/tắt trực tiếp lớp bảo vệ tương ứng
+                                </span>
                               </div>
 
-                              <div style={{ border: '1px solid var(--border)', borderRadius: '10px', overflow: 'hidden' }}>
-                                {(inst.security_checks || []).map(chk => {
-                                  const isChecked = checkedSecIds.includes(chk.id);
+                              <div
+                                style={{
+                                  border: '1px solid var(--border)',
+                                  borderRadius: '10px',
+                                  overflow: 'hidden',
+                                  background: 'var(--surface)',
+                                }}
+                              >
+                                {(inst.security_checks || []).map((chk, idx, arr) => {
+                                  const isSecured = !!chk.passed;
                                   return (
-                                    <label
+                                    <div
                                       key={chk.id}
+                                      onClick={() => {
+                                        if (!busyAction) {
+                                          handleSecurityAction(inst, isSecured ? 'revert' : 'secure', [chk.id]);
+                                        }
+                                      }}
                                       style={{
-                                        display: 'flex',
-                                        justifyContent: 'space-between',
+                                        display: 'grid',
+                                        gridTemplateColumns: '52px minmax(0, 1fr) auto',
                                         alignItems: 'center',
-                                        padding: '10px 14px',
-                                        borderBottom: '1px solid var(--border)',
-                                        cursor: 'pointer',
-                                        gap: '12px',
+                                        padding: '13px 18px',
+                                        borderBottom: idx < arr.length - 1 ? '1px solid var(--border)' : 'none',
+                                        background: isSecured
+                                          ? 'color-mix(in srgb, var(--primary) 3%, var(--surface))'
+                                          : 'var(--surface)',
+                                        cursor: busyAction ? 'wait' : 'pointer',
+                                        gap: '14px',
+                                        transition: 'background 0.15s ease',
                                       }}
                                     >
-                                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
-                                        <input
-                                          type="checkbox"
-                                          checked={isChecked}
-                                          onChange={() => {
-                                            setSecurityCheckedMap(prev => {
-                                              const cur = prev[inst.id] || [];
-                                              return {
-                                                ...prev,
-                                                [inst.id]: cur.includes(chk.id)
-                                                  ? cur.filter(x => x !== chk.id)
-                                                  : [...cur, chk.id],
-                                              };
-                                            });
+                                      <div
+                                        onClick={e => e.stopPropagation()}
+                                        style={{ display: 'flex', alignItems: 'center' }}
+                                      >
+                                        {renderSwitch(
+                                          isSecured,
+                                          () => handleSecurityAction(inst, isSecured ? 'revert' : 'secure', [chk.id]),
+                                          !!busyAction
+                                        )}
+                                      </div>
+
+                                      <div style={{ minWidth: 0 }}>
+                                        <div
+                                          style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '8px',
+                                            flexWrap: 'wrap',
+                                            marginBottom: '3px',
                                           }}
-                                          style={{ marginTop: '3px' }}
-                                        />
-                                        <div>
-                                          <strong style={{ fontSize: '13px', color: 'var(--text)', display: 'block' }}>
+                                        >
+                                          <strong style={{ fontSize: '13.5px', color: 'var(--text)', lineHeight: 1.35 }}>
                                             {chk.title}
                                           </strong>
-                                          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                                            {chk.description}
-                                          </span>
+                                        </div>
+                                        <div style={{ fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+                                          {chk.description}
                                         </div>
                                       </div>
-                                      <span className={`badge ${chk.passed ? 'ok' : chk.critical ? 'bad' : 'warn'}`}>
-                                        {chk.passed ? 'Secured' : chk.critical ? 'Critical' : 'Warning'}
-                                      </span>
-                                    </label>
+
+                                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
+                                        <span
+                                          className={`badge ${chk.passed ? 'ok' : chk.critical ? 'bad' : 'warn'}`}
+                                          style={{ minWidth: '74px', justifyContent: 'center', textAlign: 'center' }}
+                                        >
+                                          {chk.passed ? 'Secured' : chk.critical ? 'Critical' : 'Warning'}
+                                        </span>
+                                      </div>
+                                    </div>
                                   );
                                 })}
                               </div>
@@ -2454,8 +2518,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   Hiệu năng wp-config.php
                                 </strong>
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '13px' }}>
-                                  <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <span>WP_MEMORY_LIMIT</span>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                                    <code>WP_MEMORY_LIMIT</code>
                                     <select
                                       value={inst.wp_memory_limit || '256M'}
                                       onChange={e =>
@@ -2464,17 +2528,17 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                           wp_memory_limit: e.target.value,
                                         })
                                       }
-                                      style={{ width: '130px', height: '32px' }}
+                                      style={{ width: '155px', height: '32px' }}
                                     >
                                       <option value="128M">128M</option>
                                       <option value="256M">256M (Khuyên dùng)</option>
                                       <option value="512M">512M</option>
                                       <option value="1024M">1024M</option>
                                     </select>
-                                  </label>
+                                  </div>
 
-                                  <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <span>WP_MAX_MEMORY_LIMIT</span>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                                    <code>WP_MAX_MEMORY_LIMIT</code>
                                     <select
                                       value={inst.wp_max_memory_limit || '512M'}
                                       onChange={e =>
@@ -2483,16 +2547,16 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                           wp_max_memory_limit: e.target.value,
                                         })
                                       }
-                                      style={{ width: '130px', height: '32px' }}
+                                      style={{ width: '155px', height: '32px' }}
                                     >
                                       <option value="256M">256M</option>
                                       <option value="512M">512M</option>
                                       <option value="1024M">1024M</option>
                                     </select>
-                                  </label>
+                                  </div>
 
-                                  <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <span>WP_POST_REVISIONS</span>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                                    <code>WP_POST_REVISIONS</code>
                                     <select
                                       value={String(inst.wp_post_revisions || '10')}
                                       onChange={e =>
@@ -2501,14 +2565,14 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                           wp_post_revisions: e.target.value,
                                         })
                                       }
-                                      style={{ width: '130px', height: '32px' }}
+                                      style={{ width: '155px', height: '32px' }}
                                     >
                                       <option value="false">Tắt lưu bản nháp</option>
                                       <option value="5">Tối đa 5 bản</option>
                                       <option value="10">Tối đa 10 bản</option>
                                       <option value="25">Tối đa 25 bản</option>
                                     </select>
-                                  </label>
+                                  </div>
                                 </div>
                               </div>
                             </div>
@@ -3256,40 +3320,32 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               </button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', fontSize: '13px' }}>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
-                  <input
-                    type="checkbox"
-                    checked={!!debugModalInst.toggles?.debugging}
-                    onChange={e => {
-                      const v = e.target.checked;
-                      handleToggleSwitch(debugModalInst, 'debugging', v);
-                      setDebugModalInst(prev => ({
-                        ...prev,
-                        toggles: { ...prev.toggles, debugging: v },
-                      }));
-                    }}
-                  />
-                  <span>WP_DEBUG (Bật chế độ gỡ lỗi)</span>
-                </label>
+              <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', fontSize: '13px' }}>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '10px' }}>
+                  {renderSwitch(!!debugModalInst.toggles?.debugging, () => {
+                    const v = !debugModalInst.toggles?.debugging;
+                    handleToggleSwitch(debugModalInst, 'debugging', v);
+                    setDebugModalInst(prev => ({
+                      ...prev,
+                      toggles: { ...prev.toggles, debugging: v },
+                    }));
+                  })}
+                  <span style={{ fontWeight: 500 }}>WP_DEBUG (Bật chế độ gỡ lỗi)</span>
+                </div>
 
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
-                  <input
-                    type="checkbox"
-                    checked={!!debugModalInst.toggles?.debug_log}
-                    onChange={e => {
-                      const v = e.target.checked;
-                      handleToggleSwitch(debugModalInst, 'debug_log', v, {
-                        debugging: debugModalInst.toggles?.debugging,
-                      });
-                      setDebugModalInst(prev => ({
-                        ...prev,
-                        toggles: { ...prev.toggles, debug_log: v },
-                      }));
-                    }}
-                  />
-                  <span>WP_DEBUG_LOG (Ghi vào wp-content/debug.log)</span>
-                </label>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '10px' }}>
+                  {renderSwitch(!!debugModalInst.toggles?.debug_log, () => {
+                    const v = !debugModalInst.toggles?.debug_log;
+                    handleToggleSwitch(debugModalInst, 'debug_log', v, {
+                      debugging: debugModalInst.toggles?.debugging,
+                    });
+                    setDebugModalInst(prev => ({
+                      ...prev,
+                      toggles: { ...prev.toggles, debug_log: v },
+                    }));
+                  })}
+                  <span style={{ fontWeight: 500 }}>WP_DEBUG_LOG (Ghi vào wp-content/debug.log)</span>
+                </div>
               </div>
 
               <div>
@@ -3654,14 +3710,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                   onChange={e => setSearchReplaceForm(prev => ({ ...prev, replace_to: e.target.value }))}
                 />
               </label>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
-                <input
-                  type="checkbox"
-                  checked={searchReplaceForm.dry_run}
-                  onChange={e => setSearchReplaceForm(prev => ({ ...prev, dry_run: e.target.checked }))}
-                />
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '10px', fontSize: '13px', marginTop: '4px' }}>
+                {renderSwitch(searchReplaceForm.dry_run, () =>
+                  setSearchReplaceForm(prev => ({ ...prev, dry_run: !prev.dry_run }))
+                )}
                 <span>Chạy thử (Dry-run) kiểm tra trước khi ghi vào Database</span>
-              </label>
+              </div>
             </div>
             <div className="modal-footer">
               <button type="button" className="secondary-light" onClick={() => setSearchReplaceModalInst(null)}>
