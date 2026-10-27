@@ -888,7 +888,14 @@ function AppContent() {
 
   const rawRole = currentUser?.role || 'user';
   const actualRole = rawRole === 'end_user' ? 'user' : rawRole;
-  const effectiveRole = actualRole;
+  const canSwitchToAdmin = actualRole === 'admin';
+  const canSwitchToReseller = actualRole === 'admin' || actualRole === 'reseller';
+  const validViewLevel = (
+    actualRole === 'admin' ? ['admin', 'reseller', 'user'].includes(viewLevel) :
+    actualRole === 'reseller' ? ['reseller', 'user'].includes(viewLevel) :
+    false
+  ) ? viewLevel : null;
+  const effectiveRole = validViewLevel || actualRole;
   const isAdmin = effectiveRole === 'admin';
   const isReseller = effectiveRole === 'reseller';
   const isUser = effectiveRole === 'user' || effectiveRole === 'end_user';
@@ -1319,7 +1326,13 @@ function AppContent() {
   // installed at all, and the customer's package has to include it. Admins skip
   // the second one, never the first.
   const appsFeatureEnabled = applicationAddonInstalled && (actualRole === 'admin' || siteApps.limit > 0);
-  const currentSite = websites.find(site => String(site.id) === String(selectedWebsiteId));
+  const roleScopedWebsites = React.useMemo(() => {
+    if (isUser && currentUser) {
+      return (websites || []).filter(site => site.owner_id === currentUser.id);
+    }
+    return websites || [];
+  }, [websites, isUser, currentUser]);
+  const currentSite = roleScopedWebsites.find(site => String(site.id) === String(selectedWebsiteId));
   const accountLabel = currentUser?.package_name
     ? `${currentUser?.username || username} - ${currentUser.package_name}`
     : (currentUser?.username || username);
@@ -1468,6 +1481,9 @@ function AppContent() {
         'Content-Type': 'application/json',
         ...(fetchOptions.headers || {}),
       };
+      if (effectiveRole && !headers['X-Access-Role']) {
+        headers['X-Access-Role'] = effectiveRole;
+      }
       // CSRF: echo the spanel_csrf cookie back in a header for mutating
       // requests. The backend rejects mismatches when the request was
       // authenticated via cookie.
@@ -1533,6 +1549,7 @@ function AppContent() {
         // Don't keep the token anywhere: the HttpOnly cookie just got set by
         // the response. JS code MUST NOT touch the JWT.
         signedOutRef.current = false;
+        setViewLevel(null);
         setIsAuthenticated(true);
         setNeedsTwoFactor(false);
         setPasskeyPrompt(null);
@@ -2851,7 +2868,7 @@ function AppContent() {
     if (isAuthenticated) {
       refreshAll();
     }
-  }, [isAuthenticated]);
+  }, [isAuthenticated, effectiveRole]);
 
   useEffect(() => {
     if (standaloneEditor) return undefined;
@@ -4242,10 +4259,11 @@ function AppContent() {
 
   const sharedContextValue = {
     ...baseContext,
+    websites: roleScopedWebsites,
     request, API, clearSession, handleAuthExpired, formatApiError, readCookie,
     copyText, copiedField, setCopiedField, generateRandomPassword,
     loadCurrentUser, loadUsers, loadPackages, loadDatabases, loadPanelSettings, loadSiteApps, loadSiteRuntimes, loadPhpVersions, loadAddons, loadDemoSettings, loadCfZone, refreshAll,
-    navigateToPage, page, setPage, isAdmin, isReseller, isUser, effectiveRole, actualRole,
+    navigateToPage, page, setPage, isAdmin, isReseller, isUser, effectiveRole, actualRole, viewLevel, setViewLevel,
     storageUsageText, formatFileTime, dnsTtlLabel, splitAddresses, normalizeHttpFloodConfig, isProxiedAppType, composeWebPorts,
     openWebsiteTerminal, openWebsiteFileManager, websiteUrl, websiteConfigForm, enableSsl, assignDomainToUser, submitPasswordChange,
     validateCompose, installDockerEngine, pruneDocker, installNodeMajor,
@@ -4314,8 +4332,8 @@ function AppContent() {
     if (page === 'mail') return mailAddonInstalled ? <MailPage request={request} API={API} isAdmin={isAdmin} users={users} isReseller={isReseller} renderCopyBlock={renderCopyBlock} renderDnsRecordEditor={renderDnsRecordEditor} dnsTtlLabel={dnsTtlLabel} setPanelSettingsTab={setPanelSettingsTab} setPage={setPage} /> : renderAddonMissing('mail');
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
-    if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={websites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
-    if (page === 'app_installer') return <AppInstallerPage request={request} websites={websites} navigateToPage={navigateToPage} />;
+    if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
+    if (page === 'app_installer') return <AppInstallerPage request={request} websites={roleScopedWebsites} navigateToPage={navigateToPage} />;
     if (page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;
     if (page === 'databases') return <DatabasesPage request={request} API={API} navigateToPage={navigateToPage} refreshAll={refreshAll} />;
@@ -4524,13 +4542,21 @@ function AppContent() {
         </div>
       </aside>
       <div className="content">
-        {currentUser?.impersonated && currentUser?.impersonated_by && (
+        {currentUser?.impersonated && currentUser?.impersonated_by ? (
           <div className="impersonation-banner">
             <div className="banner-text">
               <span className="banner-icon">⚠️</span>
               <span>{t('You are currently logged in as')} <strong>{currentUser.username}</strong> ({t(roleLabel(actualRole))}).</span>
             </div>
             <button type="button" onClick={() => exitImpersonation()}>{t('Return to')} {currentUser.impersonated_by}</button>
+          </div>
+        ) : effectiveRole !== actualRole && (
+          <div className="impersonation-banner">
+            <div className="banner-text">
+              <span className="banner-icon">⚠️</span>
+              <span>You are currently viewing the panel as <strong>{effectiveRole.toUpperCase()}</strong>.</span>
+            </div>
+            <button type="button" onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>Return to {actualRole.toUpperCase()}</button>
           </div>
         )}
         <section className="topbar">
@@ -4545,20 +4571,13 @@ function AppContent() {
           {/* The page title, then one account menu - profile, account security
               and sign out live in it, as they do in OPanel. */}
           <div className="top-actions">
-            <div className="segmented role-switcher-seg" aria-label="Access Role">
-              <button type="button" className="active" style={{ cursor: 'default' }} title={t('Current Access Role')}>
-                {isAdmin ? t('Admin') : isReseller ? t('Reseller') : t('End User')}
-              </button>
-              {currentUser?.impersonated && currentUser?.impersonated_by && (
-                <button
-                  type="button"
-                  onClick={() => exitImpersonation()}
-                  title={`${t('Return to')} ${currentUser.impersonated_by}`}
-                >
-                  {t('Return to')} {currentUser.impersonated_by}
-                </button>
-              )}
-            </div>
+            {(canSwitchToAdmin || canSwitchToReseller) && (
+              <div className="segmented role-switcher-seg" aria-label="Access Level">
+                {canSwitchToAdmin && <button className={effectiveRole === 'admin' ? 'active' : ''} onClick={() => { setViewLevel('admin'); navigateToPage('dashboard'); }}>Admin</button>}
+                {canSwitchToReseller && <button className={effectiveRole === 'reseller' ? 'active' : ''} onClick={() => { setViewLevel('reseller'); navigateToPage('dashboard'); }}>Reseller</button>}
+                <button className={effectiveRole === 'user' ? 'active' : ''} onClick={() => { setViewLevel('user'); navigateToPage('dashboard'); }}>User</button>
+              </div>
+            )}
 
             <div className="top-utility-group">
               <button

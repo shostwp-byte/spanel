@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -24,7 +25,22 @@ from app.models.entities import DatabaseAccount, User, Website
 from app.services import mariadb, nginx, site_users, wordpress, wordpress_live
 from app.services.shell import shell
 
-router = APIRouter(prefix="/wordpress-manager", tags=["wordpress-manager"])
+_WP_ACCESS_ROLE_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("wp_access_role", default="")
+
+
+def _capture_wp_access_role(request: Request):
+    token = _WP_ACCESS_ROLE_CTX.set((request.headers.get("x-access-role") or "").strip().lower())
+    try:
+        yield
+    finally:
+        _WP_ACCESS_ROLE_CTX.reset(token)
+
+
+router = APIRouter(
+    prefix="/wordpress-manager",
+    tags=["wordpress-manager"],
+    dependencies=[Depends(_capture_wp_access_role)],
+)
 logger = logging.getLogger("spanel.wordpress_manager")
 
 WP_SLUG_RE = re.compile(r"^[a-zA-Z0-9._-]{1,120}$")
@@ -295,13 +311,19 @@ def _visible_custom_sets(state: Dict[str, Any], current_user: User) -> List[Dict
 
 # ── Helpers for Website Access & WP-CLI Execution ────────────────────────────
 
-def _require_end_user_wp_access(current_user: User) -> None:
+def _require_end_user_wp_access(current_user: User, request: Optional[Request] = None) -> None:
     role = normalize_role(getattr(current_user, "role", None))
+    access_role = (
+        (request.headers.get("x-access-role") or "").strip().lower()
+        if (request is not None and getattr(request, "headers", None))
+        else _WP_ACCESS_ROLE_CTX.get()
+    )
     if is_admin_role(getattr(current_user, "role", None)) or role == Role.reseller:
-        raise HTTPException(
-            status_code=403,
-            detail="WordPress Manager is only available for End User accounts. Please use 'Login as' to manage a user's WordPress instances.",
-        )
+        if access_role not in {"user", "end_user"}:
+            raise HTTPException(
+                status_code=403,
+                detail="WordPress Manager is only available in User Access Role. Please switch Access Role to User or use 'Login as' on an End User account.",
+            )
 
 
 def _get_accessible_website(website_id: int, db: Session, current_user: User) -> Website:

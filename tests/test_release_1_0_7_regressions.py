@@ -858,6 +858,23 @@ def test_strict_role_isolation_between_admin_reseller_and_end_user():
     assert databases.list_databases(q="", db=db, current_user=admin) == []
     assert len(databases.list_databases(q="", db=db, current_user=customer)) == 1
 
+    # 5. When Admin switches Access Role Switch to 'User' (X-Access-Role: user), only Admin's own websites/WP instances are visible
+    user_role_req = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={"x-access-role": "user"})
+    with patch.object(websites, "reconcile_websites_from_disk"):
+        assert websites.list_websites(q="", scope="", request=user_role_req, db=db, current_user=admin) == []
+    tok = wordpress_manager._WP_ACCESS_ROLE_CTX.set("user")
+    try:
+        admin_wp_in_user_role = wordpress_manager.list_wp_instances(db=db, current_user=admin)
+        assert admin_wp_in_user_role["websites"] == []
+        # Even in User Access Role, Admin cannot access customer's WordPress site without "Login as"
+        try:
+            wordpress_manager._get_accessible_website(site.id, db, admin)
+            raise AssertionError("Expected 403 when Admin in User Access Role tries to access customer's website")
+        except HTTPException as exc:
+            assert exc.status_code == 403
+    finally:
+        wordpress_manager._WP_ACCESS_ROLE_CTX.reset(tok)
+
 
 class Release107RegressionTests(unittest.TestCase):
     def test_1_heredocs(self):

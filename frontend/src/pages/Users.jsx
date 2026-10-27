@@ -21,7 +21,7 @@ export function UsersPage({
 }) {
   const {
     loading, setError, setNotice, currentUser, setCurrentUser, packages, users,
-    storageUsageText, loadCurrentUser, navigateToPage, submitPasswordChange, editingUserForm, setEditingUserForm,
+    storageUsageText, loadCurrentUser, navigateToPage, submitPasswordChange, editingUserForm, setEditingUserForm, setViewLevel,
   } = useAppContext();
 
   const isResellerMode = mode === 'resellers' || mode === 'create_reseller';
@@ -345,6 +345,7 @@ export function UsersPage({
       );
       if (retryData?.access_token) {
         setNotice(`Logged in as ${user.username}.`);
+        setViewLevel?.(null);
         const nextUser = await loadCurrentUser();
         const nextRole = nextUser?.role || user.role;
         navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');
@@ -354,6 +355,7 @@ export function UsersPage({
     }
     if (data?.access_token) {
       setNotice(`Logged in as ${user.username}.`);
+      setViewLevel?.(null);
       const nextUser = await loadCurrentUser();
       const nextRole = nextUser?.role || user.role;
       navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');

@@ -636,16 +636,13 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
     folder + Nginx vhost (no DB, no WordPress files)."""
     reconcile_websites_from_disk(db)
     requested_owner_id = payload.owner_id
-    if normalize_role(current_user.role) == Role.reseller:
-        raise HTTPException(
-            status_code=403,
-            detail="Reseller accounts cannot create websites directly. Please use 'Login as' on an End User account.",
-        )
-    if is_admin_role(current_user.role) and requested_owner_id is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Admin accounts cannot create websites without an End User owner. Please use 'Login as' on an End User account.",
-        )
+    access_role = (request.headers.get("x-access-role") or "").strip().lower() if (request is not None and getattr(request, "headers", None)) else ""
+    if (is_admin_role(current_user.role) or normalize_role(current_user.role) == Role.reseller) and requested_owner_id is None:
+        if access_role not in {"user", "end_user"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Switch Access Role to User or use 'Login as' on an End User account to create websites.",
+            )
     if requested_owner_id is not None and requested_owner_id != current_user.id:
         ensure_role(current_user.role, Role.admin)
 
@@ -653,13 +650,13 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
         owner = db.query(User).filter(User.id == requested_owner_id).first()
         if not owner:
             raise HTTPException(status_code=404, detail="Owner not found")
+        if is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller:
+            raise HTTPException(
+                status_code=403,
+                detail="Websites can only be assigned to End User accounts.",
+            )
     else:
         owner = current_user
-    if is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller:
-        raise HTTPException(
-            status_code=403,
-            detail="Websites can only belong to End User accounts.",
-        )
 
     existing_website = db.query(Website).filter(Website.domain == payload.domain).first()
     if False and existing_website is not None:
@@ -939,12 +936,21 @@ def install_wordpress_on_website(
 
 
 @router.get("", response_model=List[WebsiteOut])
-def list_websites(q: str = Query(default="", max_length=255), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def list_websites(
+    q: str = Query(default="", max_length=255),
+    scope: str = Query(default="", max_length=32),
+    request: Request = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     reconcile_websites_from_disk(db)
     search = (q or "").strip().lower()
-    if is_admin_role(current_user.role):
+    access_role = (request.headers.get("x-access-role") or "").strip().lower() if (request is not None and getattr(request, "headers", None)) else ""
+    if scope == "own" or access_role in {"user", "end_user"}:
+        query = db.query(Website).filter(Website.owner_id == current_user.id)
+    elif is_admin_role(current_user.role) and access_role != "reseller":
         query = db.query(Website)
-    elif normalize_role(current_user.role) == Role.reseller:
+    elif normalize_role(current_user.role) == Role.reseller or (is_admin_role(current_user.role) and access_role == "reseller"):
         sub_ids = db.query(User.id).filter(User.reseller_id == current_user.id)
         query = db.query(Website).filter(or_(Website.owner_id == current_user.id, Website.owner_id.in_(sub_ids)))
     else:
