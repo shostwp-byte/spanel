@@ -1433,7 +1433,7 @@ backup_db() {
   # since the last checkpoint live only in spanel.db-wal and a copy of the
   # main file alone is missing them (the sqlite3 CLI is not installed on a
   # stock Ubuntu either, which is how every snapshot became a cp).
-  if ! "${as_owner[@]}" python3 -I - "$db_path" "$snap" <<'PY'; then
+  if ! (cd "$snap_dir" && "${as_owner[@]}" python3 -I - "$db_path" "$snap" <<'PY'
 import sqlite3, sys
 src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
 dst = sqlite3.connect(sys.argv[2])
@@ -1442,14 +1442,19 @@ with dst:
 dst.close()
 src.close()
 PY
+  ); then
     echo "ERROR: could not snapshot $db_path; nothing was changed." >&2
     exit 1
   fi
   echo "DB snapshot saved: $snap"
-  # Keep the 10 most recent snapshots.
-  "${as_owner[@]}" find "$snap_dir" -maxdepth 1 -type f -name 'spanel-*.db' -printf '%T@ %p\0' \
-    | sort -z -rn | tail -z -n +11 | cut -z -d' ' -f2- \
-    | "${as_owner[@]}" xargs -0 -r rm -f -- || true
+  # Keep the 10 most recent snapshots. Run from $snap_dir so GNU find's
+  # restore_cwd never tries to chdir back into /root (0700) as user spanel.
+  (
+    cd "$snap_dir" \
+      && "${as_owner[@]}" find "$snap_dir" -maxdepth 1 -type f -name 'spanel-*.db' -printf '%T@ %p\0' \
+        | sort -z -rn | tail -z -n +11 | cut -z -d' ' -f2- \
+        | "${as_owner[@]}" xargs -0 -r rm -f --
+  ) || true
 }
 
 if [[ -n "${SPANEL_UPDATE_STAGE2:-}" ]]; then
