@@ -700,6 +700,11 @@ install_privileged_helper() {
     install -d -m 0755 -o root -g root /usr/local/lib/spanel
     install -m 0644 -o root -g root "${SCRIPT_DIR}/files/spanel_mailtool.py" /usr/local/lib/spanel/spanel_mailtool.py
   fi
+  if [[ -f "${SCRIPT_DIR}/files/webmail/backend/main.py" && -f "${SCRIPT_DIR}/files/webmail/backend/requirements.txt" ]]; then
+    install -d -m 0755 -o root -g root /usr/local/lib/spanel/webmail /usr/local/lib/spanel/webmail/backend
+    install -m 0755 -o root -g root "${SCRIPT_DIR}/files/webmail/backend/main.py" /usr/local/lib/spanel/webmail/backend/main.py
+    install -m 0644 -o root -g root "${SCRIPT_DIR}/files/webmail/backend/requirements.txt" /usr/local/lib/spanel/webmail/backend/requirements.txt
+  fi
   if [[ -f "${SCRIPT_DIR}/files/spanel_webshells.yar" ]]; then
     install -d -m 0755 -o root -g spanel /etc/spanel/yara
     install -m 0644 -o root -g spanel "${SCRIPT_DIR}/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar

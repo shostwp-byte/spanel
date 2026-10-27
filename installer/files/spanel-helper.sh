@@ -2637,6 +2637,7 @@ MAIL_INSTALL_LOG="/var/log/spanel-mail-install.log"
 MAIL_MARKER="# Managed by SPanel (Email addon)."
 WEBMAIL_HOME="/opt/SPanel-webmail"
 WEBMAIL_REPO="https://github.com/shostwp-byte/spanel.git"
+WEBMAIL_BUNDLED_DIR="/usr/local/lib/spanel/webmail"
 WEBMAIL_ENV="/etc/SPanel-webmail.env"
 WEBMAIL_UNIT="/etc/systemd/system/spanel-webmail.service"
 WEBMAIL_PORT="8096"
@@ -2682,7 +2683,7 @@ mail_port_taken() {
 
 mail_install_packages() {
   local missing=() pkg
-  for pkg in exim4-daemon-heavy dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-sieve rspamd unbound dns-root-data git python3-venv; do
+  for pkg in exim4-daemon-heavy dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-sieve rspamd unbound dns-root-data git python3-venv python3-pip; do
     pkg_installed "$pkg" || missing+=("$pkg")
   done
   [[ ${#missing[@]} -gt 0 ]] || return 0
@@ -3461,10 +3462,11 @@ mail_env_value() {
 }
 
 mail_install_webmail() {
-  local ref auth_secret sso_secret master_password
+  local ref custom_repo bundled_src="" candidate auth_secret sso_secret master_password
   ref="$(env_get WEBMAIL_REF)"
   ref="${ref:-main}"
   [[ "$ref" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || deny "invalid WEBMAIL_REF: $ref"
+  custom_repo="$(env_get WEBMAIL_REPO)"
   if [[ -d "$WEBMAIL_HOME" && ! -f "$WEBMAIL_HOME/.spanel" ]]; then
     deny "${WEBMAIL_HOME} already exists and was not set up by SPanel - the Email addon will not take it over"
   fi
@@ -3472,21 +3474,45 @@ mail_install_webmail() {
     || useradd --system --home-dir "$WEBMAIL_HOME" --no-create-home --shell /usr/sbin/nologin --user-group SPanel-webmail
   install -d -o root -g root -m 0755 "$WEBMAIL_HOME"
   touch "$WEBMAIL_HOME/.spanel"
-  if [[ -d "$WEBMAIL_HOME/src/.git" ]]; then
-    git -C "$WEBMAIL_HOME/src" fetch --quiet --depth 1 origin "$ref" >>"$MAIL_INSTALL_LOG" 2>&1 \
-      || deny "could not fetch the webmail from ${WEBMAIL_REPO} (see ${MAIL_INSTALL_LOG})"
-    git -C "$WEBMAIL_HOME/src" reset --quiet --hard FETCH_HEAD >>"$MAIL_INSTALL_LOG" 2>&1 \
-      || deny "could not update the webmail checkout (see ${MAIL_INSTALL_LOG})"
-  else
-    rm -rf "$WEBMAIL_HOME/src"
-    git clone --quiet --depth 1 --branch "$ref" "$WEBMAIL_REPO" "$WEBMAIL_HOME/src" >>"$MAIL_INSTALL_LOG" 2>&1 \
-      || deny "could not download the webmail from ${WEBMAIL_REPO} (see ${MAIL_INSTALL_LOG})"
+
+  for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "${APP_DIR}/installer/files/webmail/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
+    if [[ -f "${candidate}/main.py" && -f "${candidate}/requirements.txt" ]]; then
+      bundled_src="$candidate"
+      break
+    fi
+  done
+
+  if [[ -n "$custom_repo" && "$custom_repo" != *"shostwp-byte/spanel"* ]]; then
+    if [[ -d "$WEBMAIL_HOME/src/.git" ]]; then
+      git -C "$WEBMAIL_HOME/src" fetch --quiet --depth 1 origin "$ref" >>"$MAIL_INSTALL_LOG" 2>&1 \
+        || deny "could not fetch the webmail from ${custom_repo} (see ${MAIL_INSTALL_LOG})"
+      git -C "$WEBMAIL_HOME/src" reset --quiet --hard FETCH_HEAD >>"$MAIL_INSTALL_LOG" 2>&1 \
+        || deny "could not update the webmail checkout (see ${MAIL_INSTALL_LOG})"
+    else
+      rm -rf "$WEBMAIL_HOME/src"
+      git clone --quiet --depth 1 --branch "$ref" "$custom_repo" "$WEBMAIL_HOME/src" >>"$MAIL_INSTALL_LOG" 2>&1 \
+        || deny "could not download the webmail from ${custom_repo} (see ${MAIL_INSTALL_LOG})"
+    fi
+  elif [[ -n "$bundled_src" ]]; then
+    # Remove any previous broken git checkout (e.g. spanel.git) before installing bundled webmail
+    [[ -d "$WEBMAIL_HOME/src/.git" ]] && rm -rf "$WEBMAIL_HOME/src"
+    install -d -o root -g root -m 0755 "$WEBMAIL_HOME/src" "$WEBMAIL_HOME/src/backend"
+    install -m 0755 -o root -g root "${bundled_src}/main.py" "$WEBMAIL_HOME/src/backend/main.py"
+    install -m 0644 -o root -g root "${bundled_src}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
+  elif [[ ! -f "$WEBMAIL_HOME/src/backend/main.py" ]]; then
+    deny "bundled SPanel Webmail files not found in ${WEBMAIL_BUNDLED_DIR} - run spanel-update first"
   fi
-  if [[ ! -x "$WEBMAIL_HOME/venv/bin/python" ]]; then
+
+  if [[ ! -x "$WEBMAIL_HOME/venv/bin/python" || ! -x "$WEBMAIL_HOME/venv/bin/pip" ]] \
+     || ! "$WEBMAIL_HOME/venv/bin/python" -m pip --version >/dev/null 2>&1; then
+    rm -rf "$WEBMAIL_HOME/venv"
     python3 -m venv "$WEBMAIL_HOME/venv" >>"$MAIL_INSTALL_LOG" 2>&1 \
       || deny "could not create the webmail's Python environment (see ${MAIL_INSTALL_LOG})"
   fi
-  "$WEBMAIL_HOME/venv/bin/pip" install --quiet --disable-pip-version-check \
+  if ! "$WEBMAIL_HOME/venv/bin/python" -m pip --version >/dev/null 2>&1; then
+    "$WEBMAIL_HOME/venv/bin/python" -m ensurepip --upgrade >>"$MAIL_INSTALL_LOG" 2>&1 || true
+  fi
+  "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
     -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 \
     || deny "could not install the webmail's Python packages (see ${MAIL_INSTALL_LOG})"
   install -d -o SPanel-webmail -g SPanel-webmail -m 0750 "$WEBMAIL_HOME/data"
@@ -3620,6 +3646,12 @@ mail_first_line() {
 install_mail() {
   local hostname="$1" other taken greeting waited
   require_domain "$hostname"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/spanel-mail-install.lock
+    if ! flock -w 300 9; then
+      deny "another Email addon installation is already running - wait for it to finish"
+    fi
+  fi
   for other in postfix sendmail opensmtpd; do
     if systemctl is-active --quiet "$other" 2>/dev/null; then
       deny "${other} is already running here - stop it before installing the Email addon"
@@ -3687,6 +3719,10 @@ install_mail() {
 
 remove_mail() {
   local conf
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/spanel-mail-install.lock
+    flock -w 120 9 || deny "another Email addon operation is currently running - wait for it to finish"
+  fi
   systemctl disable --now rspamd >/dev/null 2>&1 || true
   systemctl disable --now unbound >/dev/null 2>&1 || true
   systemctl disable --now spanel-webmail >/dev/null 2>&1 || true
@@ -4695,6 +4731,20 @@ mail_reconfigure() {
   mail_write_quota_warning
   mail_write_dovecot_conf
   mail_write_learn_service
+  if [[ -f "$WEBMAIL_HOME/.spanel" ]]; then
+    local candidate
+    for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "${APP_DIR}/installer/files/webmail/backend"; do
+      if [[ -f "${candidate}/main.py" && -f "${candidate}/requirements.txt" ]]; then
+        install -d -o root -g root -m 0755 "$WEBMAIL_HOME/src" "$WEBMAIL_HOME/src/backend"
+        if ! cmp -s "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py" 2>/dev/null; then
+          install -m 0755 -o root -g root "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py"
+          install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
+          systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
+        fi
+        break
+      fi
+    done
+  fi
   if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
   if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
   echo "Mail configuration rewritten."
