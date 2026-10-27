@@ -257,10 +257,73 @@ def export_database(db_name: str, output_file: str):
     return shell.run(args, sensitive=True)
 
 
-def import_database(
+_SQL_DEFINER_RE = re.compile(
+    rb"DEFINER\s*=\s*(?:`[^`]+`|'[^']+'|\"[^\"]+\"|[A-Za-z0-9_.$]+)\s*@\s*(?:`[^`]+`|'[^']+'|\"[^\"]+\"|[A-Za-z0-9_.%$-]+)\s*",
+    re.IGNORECASE,
+)
+
+
+@contextmanager
+def _strip_sql_definers(sql_path: Path) -> Iterator[Path]:
+    """Copy sql_path line-by-line to a 0600 temporary file with DEFINER clauses removed."""
+    fd, raw_tmp = tempfile.mkstemp(prefix="spanel-sql-import-", suffix=".sql")
+    tmp_path = Path(raw_tmp)
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "wb") as dst, sql_path.open("rb") as src:
+            for raw_line in src:
+                cleaned = _SQL_DEFINER_RE.sub(b"", raw_line)
+                if cleaned != raw_line:
+                    cleaned = re.sub(rb"/\*![0-9]{5}\s*\*/\s*", b"", cleaned)
+                dst.write(cleaned)
+        yield tmp_path
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _resolve_tenant_import_credentials(
+    safe_name: str,
+    db_user: Optional[str] = None,
+    db_password: Optional[str] = None,
+) -> tuple[str, str]:
+    eff_user = (db_user or "").strip()
+    eff_pass = db_password
+    if not (eff_user and eff_pass):
+        ctx_creds = _IMPORT_CREDS_CTX.get()
+        if ctx_creds:
+            eff_user, eff_pass = (ctx_creds[0] or "").strip(), ctx_creds[1]
+    if not (eff_user and eff_pass):
+        acc = None
+        try:
+            from app.core.database import SessionLocal
+            from app.models.entities import DatabaseAccount
+
+            with SessionLocal() as session:
+                acc = session.query(DatabaseAccount).filter(DatabaseAccount.db_name == safe_name).first()
+                if acc is not None:
+                    session.expunge(acc)
+        except Exception:
+            acc = None
+        if acc and acc.db_user and acc.db_password:
+            from app.core.secrets import decrypt
+
+            eff_user = acc.db_user.strip()
+            eff_pass = decrypt(acc.db_password)
+    if not (eff_user and eff_pass):
+        raise RuntimeError(
+            f"Database import refused: missing tenant database credentials for '{safe_name}'"
+        )
+    safe_user = _validate_identifier(eff_user)
+    _reject_reserved_user(safe_user)
+    return safe_user, eff_pass
+
+
+def import_database_as_tenant(
     db_name: str,
     input_file: str,
-    *,
     db_user: Optional[str] = None,
     db_password: Optional[str] = None,
 ):
@@ -271,38 +334,59 @@ def import_database(
     if settings.command_dry_run:
         return shell.run(["mysql", safe_name], sensitive=True)
 
-    eff_user = (db_user or "").strip()
-    eff_pass = db_password
-    if not (eff_user and eff_pass):
-        ctx_creds = _IMPORT_CREDS_CTX.get()
-        if ctx_creds:
-            eff_user, eff_pass = ctx_creds
-    if not (eff_user and eff_pass):
-        try:
-            from app.core.database import SessionLocal
-            from app.core.secrets import decrypt
-            from app.models.entities import DatabaseAccount
-
-            with SessionLocal() as session:
-                acc = session.query(DatabaseAccount).filter(DatabaseAccount.db_name == safe_name).first()
-                if acc and acc.db_user and acc.db_password:
-                    eff_user = acc.db_user.strip()
-                    eff_pass = decrypt(acc.db_password)
-        except Exception:
-            pass
-
-    if eff_user and eff_pass:
-        with _tenant_client_defaults_file(eff_user, eff_pass) as cnf_path, sql_path.open("rb") as source:
+    eff_user, eff_pass = _resolve_tenant_import_credentials(
+        safe_name, db_user=db_user, db_password=db_password
+    )
+    with _tenant_client_defaults_file(eff_user, eff_pass) as cnf_path, _strip_sql_definers(sql_path) as clean_sql_path:
+        with clean_sql_path.open("rb") as source:
             args = ["mysql", f"--defaults-file={cnf_path}", "--binary-mode", safe_name]
-            completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
-    else:
-        args = _mysql_args(["--binary-mode", safe_name])
-        with sql_path.open("rb") as source:
             completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
     if completed.returncode != 0:
         stderr = completed.stderr.decode("utf-8", errors="replace")
         raise RuntimeError(f"Database import failed: {stderr.strip()}")
     return completed
+
+
+def import_database_as_panel(db_name: str, input_file: str):
+    """Import a SQL dump using the panel's global MariaDB credentials.
+
+    Restricted to ephemeral panel-owned databases (such as backup_verify's
+    throwaway spanel_verify_* databases) that have no tenant DatabaseAccount.
+    """
+    if import_database is not _default_import_database:
+        return import_database(db_name, input_file)
+    safe_name = _reject_reserved_database(db_name)
+    sql_path = Path(input_file).resolve()
+    if not sql_path.exists() or not sql_path.is_file():
+        raise FileNotFoundError("SQL file not found")
+    if settings.command_dry_run:
+        return shell.run(["mysql", safe_name], sensitive=True)
+
+    args = _mysql_args(["--binary-mode", safe_name])
+    with _strip_sql_definers(sql_path) as clean_sql_path, clean_sql_path.open("rb") as source:
+        completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"Database import failed: {stderr.strip()}")
+    return completed
+
+
+def import_database(
+    db_name: str,
+    input_file: str,
+    *,
+    db_user: Optional[str] = None,
+    db_password: Optional[str] = None,
+):
+    return import_database_as_tenant(
+        db_name,
+        input_file,
+        db_user=db_user,
+        db_password=db_password,
+    )
+
+
+_default_import_database = import_database
 
 
 def dump_database_file(db_name: str, output_dir: Path) -> Path:

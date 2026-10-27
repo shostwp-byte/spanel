@@ -1454,8 +1454,12 @@ def execute_live_clone_or_sync(
                 with tempfile.TemporaryDirectory(prefix="spanel-wpdb-") as tmp_dir:
                     tmp_sql = Path(tmp_dir) / "clone.sql"
                     mariadb.export_database(src_db_name, str(tmp_sql))
-                    with mariadb.tenant_import_credentials(clone_db_user, clone_db_pass):
-                        mariadb.import_database(clone_db_name, str(tmp_sql))
+                    mariadb.import_database_as_tenant(
+                        clone_db_name,
+                        str(tmp_sql),
+                        db_user=clone_db_user,
+                        db_password=clone_db_pass,
+                    )
             except HTTPException:
                 raise
             except Exception as exc:

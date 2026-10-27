@@ -1144,6 +1144,120 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
         settings.command_dry_run = orig_dry
 
 
+def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
+    from app.core.config import settings
+    from app.models.entities import RemoteDbHost
+    from app.services import mariadb, remote_mysql
+
+    orig_dry = settings.command_dry_run
+    settings.command_dry_run = False
+    try:
+        sql_file = tmp_path / "dump_with_definer.sql"
+        sql_file.write_text(
+            "CREATE TABLE `wp_posts` (`id` int PRIMARY KEY);\n"
+            "/*!50003 CREATE*/ /*!50017 DEFINER=`u_src_site`@`localhost`*/ /*!50003 TRIGGER `wp_trg` BEFORE INSERT ON `wp_posts` FOR EACH ROW BEGIN END */;\n"
+            "CREATE DEFINER=`other_user`@`%` TRIGGER `wp_trg2` AFTER INSERT ON `wp_posts` FOR EACH ROW BEGIN END;\n"
+            "CREATE DEFINER=`admin`@`localhost` VIEW `v_posts` AS SELECT * FROM `wp_posts`;\n",
+            encoding="utf-8",
+        )
+
+        # P1-3: Calling import_database_as_tenant (or import_database) without credentials or DatabaseAccount MUST raise RuntimeError
+        # and MUST NOT invoke subprocess.run with ~/.my.cnf
+        subproc_calls = []
+
+        class _Done:
+            returncode = 0
+            stderr = b""
+
+        def fake_subproc(args, stdin=None, **kwargs):
+            data = stdin.read() if stdin is not None else b""
+            cnf_arg = next((a for a in args if a.startswith("--defaults-file=")), "")
+            cnf_text = Path(cnf_arg.split("=", 1)[1]).read_text(encoding="utf-8") if cnf_arg else ""
+            subproc_calls.append({"args": args, "stdin": data, "cnf": cnf_text})
+            return _Done()
+
+        with patch.object(mariadb.subprocess, "run", side_effect=fake_subproc):
+            try:
+                mariadb.import_database_as_tenant("wp_missing_creds_db", str(sql_file))
+                raise AssertionError("Expected RuntimeError when tenant DB credentials are missing")
+            except RuntimeError as exc:
+                assert "missing tenant database credentials" in str(exc)
+            assert subproc_calls == [], "subprocess.run must never be called with ~/.my.cnf when tenant creds are missing"
+
+            # P1-2: With tenant credentials, DEFINER clauses are stripped before piping to mysql
+            mariadb.import_database_as_tenant(
+                "wp_target_db",
+                str(sql_file),
+                db_user="u_target_db",
+                db_password="TargetSecret123!",
+            )
+            assert len(subproc_calls) == 1
+            call = subproc_calls[0]
+            assert call["args"][0] == "mysql"
+            assert "--binary-mode" in call["args"]
+            assert call["args"][-1] == "wp_target_db"
+            assert 'user="u_target_db"' in call["cnf"]
+            assert b"DEFINER" not in call["stdin"]
+            assert b"TRIGGER `wp_trg`" in call["stdin"]
+            assert b"TRIGGER `wp_trg2`" in call["stdin"]
+
+        # P1-3 remote backend: RemoteMySQLBackend.import_database_as_tenant uses tenant user/password and strips DEFINER
+        remote_calls = []
+
+        def fake_remote_subproc(args, stdin=None, **kwargs):
+            data = stdin.read() if stdin is not None else b""
+            cnf_arg = next((a for a in args if a.startswith("--defaults-file=")), "")
+            cnf_text = Path(cnf_arg.split("=", 1)[1]).read_text(encoding="utf-8") if cnf_arg else ""
+            remote_calls.append({"args": args, "stdin": data, "cnf": cnf_text})
+            return _Done()
+
+        host = RemoteDbHost(
+            id=1,
+            name="rdb1",
+            host="10.10.0.15",
+            port=3306,
+            admin_user="rdb_admin",
+            admin_password="",
+            use_tls=False,
+            enabled=True,
+        )
+        r_backend = remote_mysql.RemoteMySQLBackend(host)
+        with patch.object(remote_mysql.subprocess, "run", side_effect=fake_remote_subproc):
+            try:
+                r_backend.import_database_as_tenant("wp_missing_remote", str(sql_file))
+                raise AssertionError("Expected RuntimeError when remote tenant DB credentials are missing")
+            except RuntimeError as exc:
+                assert "missing tenant database credentials" in str(exc)
+            assert remote_calls == []
+
+            r_backend.import_database_as_tenant(
+                "wp_remote_db",
+                str(sql_file),
+                db_user="u_remote_tenant",
+                db_password="RemoteTenantPass!",
+            )
+            assert len(remote_calls) == 1
+            rcall = remote_calls[0]
+            assert 'user="u_remote_tenant"' in rcall["cnf"]
+            assert 'password="RemoteTenantPass!"' in rcall["cnf"]
+            assert 'user="rdb_admin"' not in rcall["cnf"]
+            assert b"DEFINER" not in rcall["stdin"]
+
+        # Verify backup_verify.trial_restore_sql uses import_database_as_panel
+        from app.services import backup_verify
+        from app.services.shell import CommandResult
+
+        panel_imports = []
+        with patch.object(mariadb, "_run_sql", return_value=CommandResult("sql", 0, "", "")), \
+             patch.object(mariadb, "import_database_as_panel", side_effect=lambda n, p: panel_imports.append((n, p))), \
+             patch.object(mariadb.shell, "run", return_value=CommandResult("cnt", 0, "4\n", "")):
+            res = backup_verify.trial_restore_sql(sql_file)
+            assert res["ok"] is True and res["tables"] == 4
+            assert len(panel_imports) == 1 and panel_imports[0][0].startswith("spanel_verify_")
+    finally:
+        settings.command_dry_run = orig_dry
+
+
 if __name__ == "__main__":
     import tempfile as _tf
 
@@ -1161,6 +1275,8 @@ if __name__ == "__main__":
         test_p0_1_clone_rejects_symlink_and_mismatched_uid_and_cleans_orphan_db(Path(_td))
     with _tf.TemporaryDirectory() as _td2:
         test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(Path(_td2))
+    with _tf.TemporaryDirectory() as _td3:
+        test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(Path(_td3))
     print("ALL TESTS PASSED")
 
 

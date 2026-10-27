@@ -1170,15 +1170,33 @@ def _create_panel_database(
         db_password, db_password_hash, reused = mariadb.random_password(), "", False
 
     # An import recreates the account the DirectAdmin backup already owned.
+    import_pw = db_password or mariadb.random_password()
+    use_temp_pw = bool(sql_file is not None and not db_password and db_password_hash)
     mariadb.create_database_credentials(
-        db_name, db_user, db_password, password_hash=db_password_hash or None,
+        db_name,
+        db_user,
+        import_pw,
+        password_hash=None if use_temp_pw else (db_password_hash or None),
         allow_existing_user=True,
     )
     temp_sql: Optional[Path] = None
     try:
         if sql_file is not None:
             temp_sql = _temporary_sql_file(sql_file)
-            mariadb.import_database(db_name, str(temp_sql))
+            mariadb.import_database_as_tenant(
+                db_name,
+                str(temp_sql),
+                db_user=db_user,
+                db_password=import_pw,
+            )
+            if use_temp_pw:
+                mariadb.create_database_credentials(
+                    db_name,
+                    db_user,
+                    "",
+                    password_hash=db_password_hash,
+                    allow_existing_user=True,
+                )
     except Exception:
         mariadb.drop_database(db_name, db_user)
         raise

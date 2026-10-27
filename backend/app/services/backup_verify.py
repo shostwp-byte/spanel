@@ -190,7 +190,7 @@ def trial_restore_sql(sql_path: Path) -> dict:
     quoted = mariadb._quote_identifier(name)
     try:
         mariadb._run_sql(f"CREATE DATABASE {quoted} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n")
-        mariadb.import_database(name, str(sql_path))
+        mariadb.import_database_as_panel(name, str(sql_path))
         res = mariadb.shell.run(mariadb._mysql_args(["-N"]), check=False, sensitive=True,
                                 input=f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = "
                                       f"{mariadb._quote_sql_string(name)};\n")
