@@ -886,6 +886,32 @@ PY_MIGRATE
   fi
 }
 
+warn_legacy_privileged_owned_resources() {
+  local db_path="$APP_DIR/backend/spanel.db"
+  [[ -f "$db_path" ]] || return 0
+  local py_bin="$APP_DIR/backend/.venv/bin/python"
+  [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
+
+  (cd "$APP_DIR/backend" && sudo -u spanel env \
+    HOME="$APP_DIR" \
+    PYTHONPATH="$APP_DIR/backend" \
+    "$py_bin" - <<'PY_WARN_ROLES'
+import sys
+
+try:
+    from app.api.websites import audit_privileged_role_owned_resources
+    from app.core.database import SessionLocal
+
+    with SessionLocal() as db:
+        report = audit_privileged_role_owned_resources(db)
+        for line in report.get("warnings") or []:
+            print(line)
+except Exception as exc:
+    print(f"WARNING: role ownership audit skipped: {exc}", file=sys.stderr)
+PY_WARN_ROLES
+  ) || true
+}
+
 ensure_terminal_tools() {
   local missing=()
   command -v composer >/dev/null 2>&1 || missing+=(composer)
@@ -2253,6 +2279,7 @@ migrate_nginx_wordpress_csp_worker_src
 migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
+warn_legacy_privileged_owned_resources
 # The empty database earlier updates left behind when the cron migration ran
 # from frontend/ (see migrate_site_cron_php_binary).
 if [[ -f "$APP_DIR/frontend/spanel.db" && ! -L "$APP_DIR/frontend/spanel.db" ]]; then

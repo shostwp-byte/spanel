@@ -1258,6 +1258,79 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
         settings.command_dry_run = orig_dry
 
 
+def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
+    from fastapi import HTTPException
+    from app.api import websites
+
+    db = _make_db()
+    admin = User(username="admin", email="admin@example.com", hashed_password="x", role="admin", is_active=True)
+    reseller = User(username="res1", email="res1@example.com", hashed_password="x", role="reseller", is_active=True)
+    end_user = User(username="alice", email="alice@example.com", hashed_password="x", role="user", is_active=True)
+    db.add_all([admin, reseller, end_user])
+    db.commit()
+
+    legacy_site = Website(
+        domain="legacy-admin.example.com",
+        owner_id=admin.id,
+        root_path="/home/admin/legacy-admin.example.com",
+        php_version="8.4",
+        linux_user="admin",
+        app_type="wordpress",
+    )
+    db.add(legacy_site)
+    db.commit()
+
+    legacy_db = DatabaseAccount(
+        owner_id=admin.id,
+        website_id=legacy_site.id,
+        db_name="wp_legacy_admin",
+        db_user="u_legacy_admin",
+        db_password="secret",
+    )
+    db.add(legacy_db)
+    db.commit()
+
+    report = websites.audit_privileged_role_owned_resources(db)
+    assert len(report["websites"]) == 1 and report["websites"][0]["domain"] == "legacy-admin.example.com"
+    assert len(report["databases"]) == 1 and report["databases"][0]["db_name"] == "wp_legacy_admin"
+    assert any("legacy-admin.example.com" in w for w in report["warnings"])
+    assert any("wp_legacy_admin" in w for w in report["warnings"])
+
+    # Cannot transfer ownership to another privileged role (reseller)
+    try:
+        websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=reseller.id),
+            request=None,
+            db=db,
+            current_user=admin,
+        )
+        raise AssertionError("Expected 403 when transferring website to Reseller")
+    except HTTPException as exc:
+        assert exc.status_code == 403
+
+    # Transferring ownership to End User moves site + linked DB and clears warning
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"):
+        updated = websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
+            request=None,
+            db=db,
+            current_user=admin,
+        )
+    assert updated.owner_id == end_user.id
+    assert updated.linux_user == "alice"
+    db.refresh(legacy_db)
+    assert legacy_db.owner_id == end_user.id
+
+    report_after = websites.audit_privileged_role_owned_resources(db)
+    assert report_after["websites"] == []
+    assert report_after["databases"] == []
+    assert report_after["warnings"] == []
+
+
 if __name__ == "__main__":
     import tempfile as _tf
 
@@ -1277,6 +1350,7 @@ if __name__ == "__main__":
         test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(Path(_td2))
     with _tf.TemporaryDirectory() as _td3:
         test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(Path(_td3))
+    test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer()
     print("ALL TESTS PASSED")
 
 

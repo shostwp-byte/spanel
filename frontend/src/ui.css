@@ -2305,6 +2305,12 @@ table.table {
   animation: donateHeartPulse 1.5s infinite cubic-bezier(0.25, 0.46, 0.45, 0.94);
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .donate-heart-icon {
+    animation: none !important;
+  }
+}
+
 :root[data-theme="dark"] .donate-heart-icon {
   color: #fb7185 !important;
 }

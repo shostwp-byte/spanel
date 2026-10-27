@@ -1758,3 +1758,123 @@ def install_shared_ssl(
     db.refresh(website)
     log_action(db, current_user.id, "install_shared_ssl", website.domain, detail=cert_name, request=request)
     return website
+
+
+from pydantic import BaseModel as _PydanticBaseModel
+
+
+class WebsiteTransferOwnerPayload(_PydanticBaseModel):
+    target_owner_id: int
+
+
+def audit_privileged_role_owned_resources(db: Session) -> dict:
+    """List existing Website and DatabaseAccount rows whose owner has role Admin or Reseller."""
+    users_by_id = {u.id: u for u in db.query(User).all()}
+    privileged_websites = []
+    privileged_databases = []
+    warnings: list[str] = []
+
+    for site in db.query(Website).order_by(Website.id.asc()).all():
+        owner = users_by_id.get(site.owner_id)
+        if owner and (is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller):
+            entry = {
+                "id": site.id,
+                "domain": site.domain,
+                "owner_id": site.owner_id,
+                "owner_username": owner.username,
+                "owner_role": owner.role,
+            }
+            privileged_websites.append(entry)
+            warnings.append(
+                f"WARNING: Website '{site.domain}' (id={site.id}) is owned by {owner.role} account '{owner.username}'. "
+                "Switch Access Role to 'User' or transfer ownership to an End User account via POST /api/websites/{id}/transfer-owner."
+            )
+
+    for acc in db.query(DatabaseAccount).order_by(DatabaseAccount.id.asc()).all():
+        owner = users_by_id.get(acc.owner_id)
+        if owner and (is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller):
+            entry = {
+                "id": acc.id,
+                "db_name": acc.db_name,
+                "website_id": acc.website_id,
+                "owner_id": acc.owner_id,
+                "owner_username": owner.username,
+                "owner_role": owner.role,
+            }
+            privileged_databases.append(entry)
+            warnings.append(
+                f"WARNING: Database '{acc.db_name}' (id={acc.id}) is owned by {owner.role} account '{owner.username}'. "
+                "Switch Access Role to 'User' or transfer ownership to an End User account."
+            )
+
+    return {
+        "websites": privileged_websites,
+        "databases": privileged_databases,
+        "warnings": warnings,
+    }
+
+
+@router.get("/legacy-privileged-owned")
+def list_legacy_privileged_owned_resources(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    return audit_privileged_role_owned_resources(db)
+
+
+@router.post("/{website_id}/transfer-owner", response_model=WebsiteOut)
+def transfer_website_owner(
+    website_id: int,
+    payload: WebsiteTransferOwnerPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    website = db.query(Website).filter(Website.id == website_id).first()
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    target_owner = db.query(User).filter(User.id == payload.target_owner_id).first()
+    if not target_owner:
+        raise HTTPException(status_code=404, detail="Target owner not found")
+    if is_admin_role(target_owner.role) or normalize_role(target_owner.role) == Role.reseller:
+        raise HTTPException(
+            status_code=403,
+            detail="Websites can only be assigned to End User accounts.",
+        )
+
+    new_linux_user = site_users.linux_user_for_panel_username(target_owner.username)
+    new_root_path = site_users.site_root_for_panel_user(target_owner.username, website.domain)
+    runtime_php = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
+    if website.root_path != new_root_path or website.linux_user != new_linux_user:
+        site_users.move_site_runtime(website.root_path, new_root_path, new_linux_user, runtime_php)
+        website.root_path = new_root_path
+        website.linux_user = new_linux_user
+        _ensure_default_waf_file(website.domain)
+        _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
+
+    website.owner_id = target_owner.id
+    for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).all():
+        db_acc.owner_id = target_owner.id
+    try:
+        from app.models.entities import DnsZone
+
+        z = db.query(DnsZone).filter(DnsZone.name == website.domain).first()
+        if z:
+            z.owner_id = target_owner.id
+    except Exception:
+        pass
+
+    db.commit()
+    db.refresh(website)
+    log_action(
+        db,
+        current_user.id,
+        "transfer_website_owner",
+        website.domain,
+        detail=f"new_owner={target_owner.username}",
+        request=request,
+    )
+    return website
