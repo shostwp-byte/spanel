@@ -1137,6 +1137,7 @@ function AppContent() {
   const [telegramChats, setTelegramChats] = useState(null);
   const [myChatInput, setMyChatInput] = useState('');
   const [notifyLimits, setNotifyLimits] = useState({ disk_percent: 90, ssl_days: 7, language: 'vi' });
+  const [notifyTab, setNotifyTab] = useState('general');
   // An old /api-tokens link opens the tab the tokens now live on.
   const [panelSettingsTab, setPanelSettingsTab] = useState(() => (/^\/api-tokens?\/?$/i.test(window.location.pathname) ? 'api' : 'general'));
   // The restore catalogue: local archives and whatever is in each S3 bucket,
@@ -3039,7 +3040,7 @@ function AppContent() {
         ['multi_server', 'Multi Server Setup', Server],
         ['php', 'PHP Settings', Code2],
         ['server_tls', 'Server TLS Certificate', Lock],
-        ...(notificationsAddonInstalled ? [['notifications', 'Alerting & Webhooks', Bell]] : []),
+        ...(notificationsAddonInstalled ? [['notifications', 'System Notifications', Bell]] : []),
         ['custombuild', 'CustomBuild', Wrench],
       ]},
       { key: 'admin_tools', title: 'Admin Tools', items: [
@@ -3630,153 +3631,186 @@ function AppContent() {
       <span><strong>{t(ev.label)}</strong><small>{t(ev.hint)}</small></span>
     </label>;
     const fmtTime = value => { const d = new Date(value.endsWith('Z') ? value : `${value}Z`); return Number.isNaN(d.getTime()) ? value : d.toLocaleString('vi-VN', { hour12: false }); };
-    return <>
+    const tabs = [
+      ['general', 'General', Bell],
+      ['channels', 'Channels', Send],
+      ['log', 'Delivery log', FileText],
+    ];
+    const activeTab = tabs.some(([id]) => id === notifyTab) ? notifyTab : 'general';
+    return (
       <section className="section">
-        <div className="section-title">
-          <div>
-            <h2>{t('My notifications')}</h2>
-            <p className="hint">{t('Where the panel reaches you, and about what.')}</p>
-          </div>
+        <div className="segmented-control backup-tabs" role="tablist" aria-label={t('System Notifications')} style={{ marginBottom: '16px' }}>
+          {tabs.map(([id, label, Icon]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              id={`notify-tab-button-${id}`}
+              aria-controls={`notify-tab-${id}`}
+              aria-selected={activeTab === id}
+              className={activeTab === id ? 'active' : ''}
+              onClick={() => setNotifyTab(id)}
+            >
+              <Icon size={14} />
+              {t(label)}
+            </button>
+          ))}
         </div>
-        {!me ? <p className="hint">{t('Loading...')}</p> : <>
-          <div className="notify-channels">
-            <div className="notify-channel">
-              <div className="notify-channel-head"><Mail size={16} /><strong>Email</strong>
-                <span className={me.channels.email && me.email_enabled ? 'badge ok' : 'badge'}>{me.channels.email ? (me.email_enabled ? t('On') : t('Off')) : t('Not set up')}</span>
+
+        {activeTab === 'general' && (
+          <div className="backup-tab-panel" id="notify-tab-general" role="tabpanel" aria-labelledby="notify-tab-button-general">
+            <div className="section-title">
+              <div>
+                <h2>{t('My notifications')}</h2>
+                <p className="hint">{t('Where the panel reaches you, and about what.')}</p>
               </div>
-              <p className="hint">{me.channels.email
-                ? t('Sent to {email}, the address on your account.', { email: me.email || '—' })
-                : t('Email is not set up on this server yet.')}</p>
-              {me.channels.email && <label className="switch-line"><input type="checkbox" checked={me.email_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ email_enabled: e.target.checked })} />{t('Send me email')}</label>}
             </div>
-            <div className="notify-channel">
-              <div className="notify-channel-head"><Send size={16} /><strong>Telegram</strong>
-                <span className={me.telegram_linked && me.telegram_enabled ? 'badge ok' : 'badge'}>{!me.channels.telegram ? t('Not set up') : me.telegram_linked ? (me.telegram_enabled ? t('On') : t('Off')) : t('Not connected')}</span>
-              </div>
-              {!me.channels.telegram && <p className="hint">{t('Telegram is not set up on this server yet.')}</p>}
-              {me.channels.telegram && me.telegram_linked && <>
-                <p className="hint">Chat ID: <code>{me.telegram_chat_id}</code></p>
-                <label className="switch-line"><input type="checkbox" checked={me.telegram_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ telegram_enabled: e.target.checked })} />{t('Send me Telegram messages')}</label>
-                <div className="notify-actions">
-                  <button type="button" className="secondary" disabled={!!loading} onClick={() => sendNotifyTest('telegram')}><Send size={14} />{t('Send a test')}</button>
-                  <button type="button" className="secondary-light" disabled={!!loading} onClick={unlinkTelegram}>{t('Disconnect')}</button>
+            {!me ? <p className="hint">{t('Loading...')}</p> : <>
+              <div className="notify-channels">
+                <div className="notify-channel">
+                  <div className="notify-channel-head"><Mail size={16} /><strong>Email</strong>
+                    <span className={me.channels.email && me.email_enabled ? 'badge ok' : 'badge'}>{me.channels.email ? (me.email_enabled ? t('On') : t('Off')) : t('Not set up')}</span>
+                  </div>
+                  <p className="hint">{me.channels.email
+                    ? t('Sent to {email}, the address on your account.', { email: me.email || '—' })
+                    : t('Email is not set up on this server yet.')}</p>
+                  {me.channels.email && <label className="switch-line"><input type="checkbox" checked={me.email_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ email_enabled: e.target.checked })} />{t('Send me email')}</label>}
                 </div>
-              </>}
-              {me.channels.telegram && !me.telegram_linked && me.telegram_admin_chat && <p className="hint">{t('You hear in the admin chat ({chat}). Connect a chat of your own to hear there instead.', { chat: me.telegram_admin_chat })}</p>}
-              {me.channels.telegram && !me.telegram_linked && <div className="notify-own-chat">
-                <input value={myChatInput} placeholder={t('Your chat ID')} aria-label={t('Your chat ID')} onChange={e => setMyChatInput(e.target.value)} />
-                <button type="button" className="secondary" disabled={!!loading || !myChatInput.trim()} onClick={() => saveNotifyMe({ telegram_chat_id: myChatInput.trim() })}>{t('Save')}</button>
-              </div>}
-              {me.channels.telegram && !me.telegram_linked && (telegramLink
-                ? <div className="notify-link">
-                  <ol>
-                    <li>{t('Open the bot and press Start:')}{' '}{telegramLink.link ? <a href={telegramLink.link} target="_blank" rel="noreferrer">@{telegramLink.bot_username}</a> : <code>@{telegramLink.bot_username}</code>}</li>
-                    <li>{t('Or send the bot this message:')}{' '}<code>/start {telegramLink.code}</code></li>
-                    <li>{t('Then press Check. The code works for {n} minutes.', { n: telegramLink.expires_minutes })}</li>
-                  </ol>
-                  <div className="notify-actions"><button type="button" disabled={!!loading} onClick={verifyTelegramLink}><Check size={14} />{t('Check')}</button></div>
+                <div className="notify-channel">
+                  <div className="notify-channel-head"><Send size={16} /><strong>Telegram</strong>
+                    <span className={me.telegram_linked && me.telegram_enabled ? 'badge ok' : 'badge'}>{!me.channels.telegram ? t('Not set up') : me.telegram_linked ? (me.telegram_enabled ? t('On') : t('Off')) : t('Not connected')}</span>
+                  </div>
+                  {!me.channels.telegram && <p className="hint">{t('Telegram is not set up on this server yet.')}</p>}
+                  {me.channels.telegram && me.telegram_linked && <>
+                    <p className="hint">Chat ID: <code>{me.telegram_chat_id}</code></p>
+                    <label className="switch-line"><input type="checkbox" checked={me.telegram_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ telegram_enabled: e.target.checked })} />{t('Send me Telegram messages')}</label>
+                    <div className="notify-actions">
+                      <button type="button" className="secondary" disabled={!!loading} onClick={() => sendNotifyTest('telegram')}><Send size={14} />{t('Send a test')}</button>
+                      <button type="button" className="secondary-light" disabled={!!loading} onClick={unlinkTelegram}>{t('Disconnect')}</button>
+                    </div>
+                  </>}
+                  {me.channels.telegram && !me.telegram_linked && me.telegram_admin_chat && <p className="hint">{t('You hear in the admin chat ({chat}). Connect a chat of your own to hear there instead.', { chat: me.telegram_admin_chat })}</p>}
+                  {me.channels.telegram && !me.telegram_linked && <div className="notify-own-chat">
+                    <input value={myChatInput} placeholder={t('Your chat ID')} aria-label={t('Your chat ID')} onChange={e => setMyChatInput(e.target.value)} />
+                    <button type="button" className="secondary" disabled={!!loading || !myChatInput.trim()} onClick={() => saveNotifyMe({ telegram_chat_id: myChatInput.trim() })}>{t('Save')}</button>
+                  </div>}
+                  {me.channels.telegram && !me.telegram_linked && (telegramLink
+                    ? <div className="notify-link">
+                      <ol>
+                        <li>{t('Open the bot and press Start:')}{' '}{telegramLink.link ? <a href={telegramLink.link} target="_blank" rel="noreferrer">@{telegramLink.bot_username}</a> : <code>@{telegramLink.bot_username}</code>}</li>
+                        <li>{t('Or send the bot this message:')}{' '}<code>/start {telegramLink.code}</code></li>
+                        <li>{t('Then press Check. The code works for {n} minutes.', { n: telegramLink.expires_minutes })}</li>
+                      </ol>
+                      <div className="notify-actions"><button type="button" disabled={!!loading} onClick={verifyTelegramLink}><Check size={14} />{t('Check')}</button></div>
+                    </div>
+                    : <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading} onClick={startTelegramLink}><Send size={14} />{t('Find my chat ID for me')}</button></div>)}
                 </div>
-                : <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading} onClick={startTelegramLink}><Send size={14} />{t('Find my chat ID for me')}</button></div>)}
-            </div>
-          </div>
-          <div className="notify-events">
-            <h3>{t('About the server')}</h3>
-            <div className="notify-event-list">{events.filter(ev => ev.audience === 'admin').map(eventRow)}</div>
-            <h3>{t('About your account')}</h3>
-            <div className="notify-event-list">{events.filter(ev => ev.audience === 'user').map(eventRow)}</div>
-          </div>
-        </>}
-      </section>
-
-      {s && <section className="section">
-        <div className="section-title">
-          <div>
-            <h2>{t('Server channels')}</h2>
-            <p className="hint">{t('What every notification on this server goes out through.')}</p>
-          </div>
-        </div>
-        <div className="notify-settings">
-          <div className="notify-card">
-            <h3><Mail size={16} />{t('Email (SMTP)')}</h3>
-            <div className="notify-form">
-              <label><span>{t('SMTP server')}</span><input value={smtpForm.host} placeholder="smtp.example.com" onChange={e => setSmtpForm(f => ({ ...f, host: e.target.value }))} /></label>
-              <div className="notify-form-pair">
-                <label><span>{t('Encryption')}</span><select value={smtpForm.security} onChange={e => setSmtpForm(f => ({ ...f, security: e.target.value, port: { starttls: 587, ssl: 465, none: 25 }[e.target.value] }))}>
-                  <option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">{t('None')}</option>
-                </select></label>
-                <label><span>{t('Port')}</span><input type="number" value={smtpForm.port} onChange={e => setSmtpForm(f => ({ ...f, port: e.target.value }))} /></label>
               </div>
-              <label><span>{t('Username')}</span><input value={smtpForm.username} autoComplete="off" onChange={e => setSmtpForm(f => ({ ...f, username: e.target.value }))} /></label>
-              <label><span>{t('Password')}</span><input type="password" value={smtpForm.password} autoComplete="new-password" placeholder={s.smtp.password_set ? t('Saved - leave empty to keep it') : ''} onChange={e => setSmtpForm(f => ({ ...f, password: e.target.value }))} /></label>
-              <label><span>{t('Sender address')}</span><input value={smtpForm.from_email} placeholder="noreply@example.com" onChange={e => setSmtpForm(f => ({ ...f, from_email: e.target.value }))} /></label>
-              <label><span>{t('Sender name')}</span><input value={smtpForm.from_name} onChange={e => setSmtpForm(f => ({ ...f, from_name: e.target.value }))} /></label>
-            </div>
-            <div className="notify-actions">
-              <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({ smtp: { ...smtpForm, port: Number(smtpForm.port) || 587, password: smtpForm.password || null } }, t('Email settings saved.'))}>{t('Save')}</button>
-              <button type="button" className="secondary" disabled={!!loading || !s.smtp_ready} onClick={() => sendNotifyTest('email')}><Mail size={14} />{t('Send me a test email')}</button>
-            </div>
+              <div className="notify-events">
+                <h3>{t('About the server')}</h3>
+                <div className="notify-event-list">{events.filter(ev => ev.audience === 'admin').map(eventRow)}</div>
+                <h3>{t('About your account')}</h3>
+                <div className="notify-event-list">{events.filter(ev => ev.audience === 'user').map(eventRow)}</div>
+              </div>
+            </>}
           </div>
-          <div className="notify-card">
-            <h3><Send size={16} />{t('Telegram bot')}</h3>
-            <p className="hint">{t('Create a bot with @BotFather (/newbot) and paste its token. Then send the bot any message - or add it to a group - press Find chat ID and pick the chat.')}</p>
-            {s.telegram.token_set && <p className="notify-bot"><span className="badge ok">@{s.telegram.bot_username}</span></p>}
-            <label className="notify-form"><span>{t('Bot token')}</span><input type="password" value={botTokenInput} autoComplete="off" placeholder={s.telegram.token_set ? t('Saved - paste a new one to replace it') : '123456789:AA...'} onChange={e => setBotTokenInput(e.target.value)} /></label>
-            <div className="notify-form">
-              <label><span>Chat ID</span><input value={adminChatInput} placeholder="-1001234567890" onChange={e => setAdminChatInput(e.target.value)} /></label>
-              <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set} onClick={findTelegramChats}><Search size={14} />{t('Find chat ID')}</button></div>
-              {telegramChats && (telegramChats.length > 0
-                ? <div className="notify-chats">{telegramChats.map(chat => <button type="button" key={chat.id} className={adminChatInput === chat.id ? 'mini' : 'mini secondary'} onClick={() => setAdminChatInput(chat.id)}>{chat.name || chat.type}<code>{chat.id}</code></button>)}</div>
-                : <p className="hint">{t('No messages yet. Send the bot a message first, then press Find chat ID again.')}</p>)}
-            </div>
-            <p className="hint">{t('Server events go to this chat once. An administrator with no chat of their own hears about their account here too.')}</p>
-            <div className="notify-actions">
-              <button type="button" disabled={!!loading || (!s.telegram.token_set && !botTokenInput.trim())} onClick={() => saveNotifySettings({ telegram: { bot_token: botTokenInput.trim() || null, chat_id: adminChatInput.trim() } }, t('Telegram bot saved.'))}>{t('Save')}</button>
-              <button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set || !s.telegram.chat_id} onClick={() => sendNotifyTest('telegram_admin')}><Send size={14} />{t('Send a test')}</button>
-              {s.telegram.token_set && <button type="button" className="secondary-light" disabled={!!loading} onClick={() => saveNotifySettings({ telegram: { clear_bot_token: true } }, t('Telegram bot removed.'))}>{t('Remove the bot')}</button>}
-            </div>
-          </div>
-          <div className="notify-card">
-            <h3><AlertCircle size={16} />{t('When to warn')}</h3>
-            <div className="notify-form">
-              <label><span>{t('Disk usage (%)')}</span><input type="number" min="50" max="99" value={notifyLimits.disk_percent} onChange={e => setNotifyLimits(v => ({ ...v, disk_percent: e.target.value }))} /></label>
-              <label><span>{t('Certificate expiry (days)')}</span><input type="number" min="1" max="60" value={notifyLimits.ssl_days} onChange={e => setNotifyLimits(v => ({ ...v, ssl_days: e.target.value }))} /></label>
-              <label><span>{t('Language of the messages')}</span><select value={notifyLimits.language} onChange={e => setNotifyLimits(v => ({ ...v, language: e.target.value }))}>
-                <option value="vi">Tiếng Việt</option><option value="en">English</option>
-              </select></label>
-            </div>
-            <div className="notify-actions">
-              <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({
-                language: notifyLimits.language, thresholds: {
-                  disk_percent: Number(notifyLimits.disk_percent), ssl_days: Number(notifyLimits.ssl_days),
-                }
-              }, t('Saved.'))}>{t('Save')}</button>
-            </div>
-          </div>
-        </div>
-      </section>}
+        )}
 
-
-      <section className="section">
-        <div className="section-title">
-          <div><h2>{t('Delivery log')}</h2><p className="hint">{t('The last 100 messages sent, and the ones that failed.')}</p></div>
-          <div className="actions"><button type="button" className="secondary" disabled={!!loading} onClick={loadNotifyLog}><RefreshCw size={14} />{t('Refresh')}</button></div>
-        </div>
-
-        {notifyLog.length === 0
-          ? <EmptyState icon={Bell} message="Nothing sent yet." />
-          : <div className="notify-log">
-            {notifyLog.map(row => <div className="notify-log-row" key={row.id}>
-              <span className="notify-log-time">{fmtTime(row.created_at)}</span>
-              <span className="notify-log-user">{row.username || '—'}</span>
-              <span className="notify-log-title">{row.title}</span>
-              <span className="notify-log-channel">{row.channel === 'email' ? 'Email' : 'Telegram'}</span>
-              <span className={row.status === 'sent' ? 'badge ok' : 'badge danger'}>{row.status === 'sent' ? t('Sent') : t('Failed')}</span>
-              {row.status !== 'sent' && row.detail && <small className="notify-log-detail">{row.detail}</small>}
-            </div>)}
+        {activeTab === 'channels' && (
+          <div className="backup-tab-panel" id="notify-tab-channels" role="tabpanel" aria-labelledby="notify-tab-button-channels">
+            <div className="section-title">
+              <div>
+                <h2>{t('Server channels')}</h2>
+                <p className="hint">{t('What every notification on this server goes out through.')}</p>
+              </div>
+            </div>
+            {!s ? <p className="hint">{t('Loading...')}</p> : (
+              <div className="notify-settings">
+                <div className="notify-card">
+                  <h3><Mail size={16} />{t('Email (SMTP)')}</h3>
+                  <div className="notify-form">
+                    <label><span>{t('SMTP server')}</span><input value={smtpForm.host} placeholder="smtp.example.com" onChange={e => setSmtpForm(f => ({ ...f, host: e.target.value }))} /></label>
+                    <div className="notify-form-pair">
+                      <label><span>{t('Encryption')}</span><select value={smtpForm.security} onChange={e => setSmtpForm(f => ({ ...f, security: e.target.value, port: { starttls: 587, ssl: 465, none: 25 }[e.target.value] }))}>
+                        <option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">{t('None')}</option>
+                      </select></label>
+                      <label><span>{t('Port')}</span><input type="number" value={smtpForm.port} onChange={e => setSmtpForm(f => ({ ...f, port: e.target.value }))} /></label>
+                    </div>
+                    <label><span>{t('Username')}</span><input value={smtpForm.username} autoComplete="off" onChange={e => setSmtpForm(f => ({ ...f, username: e.target.value }))} /></label>
+                    <label><span>{t('Password')}</span><input type="password" value={smtpForm.password} autoComplete="new-password" placeholder={s.smtp.password_set ? t('Saved - leave empty to keep it') : ''} onChange={e => setSmtpForm(f => ({ ...f, password: e.target.value }))} /></label>
+                    <label><span>{t('Sender address')}</span><input value={smtpForm.from_email} placeholder="noreply@example.com" onChange={e => setSmtpForm(f => ({ ...f, from_email: e.target.value }))} /></label>
+                    <label><span>{t('Sender name')}</span><input value={smtpForm.from_name} onChange={e => setSmtpForm(f => ({ ...f, from_name: e.target.value }))} /></label>
+                  </div>
+                  <div className="notify-actions">
+                    <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({ smtp: { ...smtpForm, port: Number(smtpForm.port) || 587, password: smtpForm.password || null } }, t('Email settings saved.'))}>{t('Save')}</button>
+                    <button type="button" className="secondary" disabled={!!loading || !s.smtp_ready} onClick={() => sendNotifyTest('email')}><Mail size={14} />{t('Send me a test email')}</button>
+                  </div>
+                </div>
+                <div className="notify-card">
+                  <h3><Send size={16} />{t('Telegram bot')}</h3>
+                  <p className="hint">{t('Create a bot with @BotFather (/newbot) and paste its token. Then send the bot any message - or add it to a group - press Find chat ID and pick the chat.')}</p>
+                  {s.telegram.token_set && <p className="notify-bot"><span className="badge ok">@{s.telegram.bot_username}</span></p>}
+                  <label className="notify-form"><span>{t('Bot token')}</span><input type="password" value={botTokenInput} autoComplete="off" placeholder={s.telegram.token_set ? t('Saved - paste a new one to replace it') : '123456789:AA...'} onChange={e => setBotTokenInput(e.target.value)} /></label>
+                  <div className="notify-form">
+                    <label><span>Chat ID</span><input value={adminChatInput} placeholder="-1001234567890" onChange={e => setAdminChatInput(e.target.value)} /></label>
+                    <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set} onClick={findTelegramChats}><Search size={14} />{t('Find chat ID')}</button></div>
+                    {telegramChats && (telegramChats.length > 0
+                      ? <div className="notify-chats">{telegramChats.map(chat => <button type="button" key={chat.id} className={adminChatInput === chat.id ? 'mini' : 'mini secondary'} onClick={() => setAdminChatInput(chat.id)}>{chat.name || chat.type}<code>{chat.id}</code></button>)}</div>
+                      : <p className="hint">{t('No messages yet. Send the bot a message first, then press Find chat ID again.')}</p>)}
+                  </div>
+                  <p className="hint">{t('Server events go to this chat once. An administrator with no chat of their own hears about their account here too.')}</p>
+                  <div className="notify-actions">
+                    <button type="button" disabled={!!loading || (!s.telegram.token_set && !botTokenInput.trim())} onClick={() => saveNotifySettings({ telegram: { bot_token: botTokenInput.trim() || null, chat_id: adminChatInput.trim() } }, t('Telegram bot saved.'))}>{t('Save')}</button>
+                    <button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set || !s.telegram.chat_id} onClick={() => sendNotifyTest('telegram_admin')}><Send size={14} />{t('Send a test')}</button>
+                    {s.telegram.token_set && <button type="button" className="secondary-light" disabled={!!loading} onClick={() => saveNotifySettings({ telegram: { clear_bot_token: true } }, t('Telegram bot removed.'))}>{t('Remove the bot')}</button>}
+                  </div>
+                </div>
+                <div className="notify-card">
+                  <h3><AlertCircle size={16} />{t('When to warn')}</h3>
+                  <div className="notify-form">
+                    <label><span>{t('Disk usage (%)')}</span><input type="number" min="50" max="99" value={notifyLimits.disk_percent} onChange={e => setNotifyLimits(v => ({ ...v, disk_percent: e.target.value }))} /></label>
+                    <label><span>{t('Certificate expiry (days)')}</span><input type="number" min="1" max="60" value={notifyLimits.ssl_days} onChange={e => setNotifyLimits(v => ({ ...v, ssl_days: e.target.value }))} /></label>
+                    <label><span>{t('Language of the messages')}</span><select value={notifyLimits.language} onChange={e => setNotifyLimits(v => ({ ...v, language: e.target.value }))}>
+                      <option value="vi">Tiếng Việt</option><option value="en">English</option>
+                    </select></label>
+                  </div>
+                  <div className="notify-actions">
+                    <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({
+                      language: notifyLimits.language, thresholds: {
+                        disk_percent: Number(notifyLimits.disk_percent), ssl_days: Number(notifyLimits.ssl_days),
+                      }
+                    }, t('Saved.'))}>{t('Save')}</button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
-        }
+        )}
+
+        {activeTab === 'log' && (
+          <div className="backup-tab-panel" id="notify-tab-log" role="tabpanel" aria-labelledby="notify-tab-button-log">
+            <div className="section-title">
+              <div><h2>{t('Delivery log')}</h2><p className="hint">{t('The last 100 messages sent, and the ones that failed.')}</p></div>
+              <div className="actions"><button type="button" className="secondary" disabled={!!loading} onClick={loadNotifyLog}><RefreshCw size={14} />{t('Refresh')}</button></div>
+            </div>
+
+            {notifyLog.length === 0
+              ? <EmptyState icon={Bell} message="Nothing sent yet." />
+              : <div className="notify-log">
+                {notifyLog.map(row => <div className="notify-log-row" key={row.id}>
+                  <span className="notify-log-time">{fmtTime(row.created_at)}</span>
+                  <span className="notify-log-user">{row.username || '—'}</span>
+                  <span className="notify-log-title">{row.title}</span>
+                  <span className="notify-log-channel">{row.channel === 'email' ? 'Email' : 'Telegram'}</span>
+                  <span className={row.status === 'sent' ? 'badge ok' : 'badge danger'}>{row.status === 'sent' ? t('Sent') : t('Failed')}</span>
+                  {row.status !== 'sent' && row.detail && <small className="notify-log-detail">{row.detail}</small>}
+                </div>)}
+              </div>
+            }
+          </div>
+        )}
       </section>
-    </>;
+    );
   }
 
   function renderSettingsHub() {
