@@ -302,7 +302,6 @@ const USER_ALLOWED_PAGES = new Set([
   'mail_auto',
   'applications',
   'wordpress_manager',
-  'app_installer',
   'waf',
   'waf-site',
   'waf-logs',
@@ -3111,7 +3110,6 @@ function AppContent() {
         ['ssl', 'SSL Certificates', Lock],
         ['sftp', 'FTP Management', Upload],
         ['databases', 'MySQL Management', Database],
-        ['php_select', 'PHP Version Selection', Code2],
         ['redirects', 'Site Redirection', MoveRight],
       ]},
       ...(mailAddonInstalled ? [{ key: 'email_manager', title: 'Email Manager', items: [
@@ -3123,7 +3121,6 @@ function AppContent() {
       { key: 'advanced_features', title: 'Advanced Features', items: [
         ...(appsFeatureEnabled ? [['applications', 'Applications (Node/Python/Docker)', Cpu]] : []),
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
-        ['app_installer', 'Install Applications', Boxes],
         ['waf', 'Web Application Firewall', ShieldAlert],
         ['cron', 'Cron Jobs', Clock],
         ['backups', 'Create/Restore Backups', Archive],
@@ -3152,12 +3149,6 @@ function AppContent() {
     }
     if (key === 'subdomains') {
       navigateToPage('subdomains');
-      return;
-    }
-    if (key === 'php_select') {
-      loadPhpVersions({ silent: true });
-      navigateToPage('websites');
-      setNotice(t('Select a website below to configure its PHP version.'));
       return;
     }
     if (key === 'mail_spam') {
