@@ -2166,6 +2166,7 @@ function AppContent() {
   async function loadAddons() {
     const data = await request('/addons', { silent: true });
     if (data) setAddons({ ...data, loaded: true });
+    return data;
   }
 
   async function loadCfZone(id) {
