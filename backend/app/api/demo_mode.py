@@ -42,7 +42,7 @@ def public_accounts():
     return demo_mode.public_view()
 
 
-@router.get("", dependencies=[Depends(addons.require_demo)])
+@router.get("")
 def read_settings(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.admin)
     return demo_mode.admin_view(db)
