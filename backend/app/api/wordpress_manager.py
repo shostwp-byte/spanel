@@ -270,35 +270,14 @@ SECURITY_CHECK_DEFINITIONS: List[Dict[str, Any]] = [
 
 def _toolkit_state_path() -> Path:
     return wordpress_live.toolkit_state_path()
-    base = Path("/etc/spanel") if Path("/etc/spanel").exists() else Path("./data")
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        base = Path("/tmp")
-    return base / "wordpress_toolkit_state.json"
 
 
 def _load_toolkit_state() -> Dict[str, Any]:
     return wordpress_live.load_toolkit_state_safe()
-    path = _toolkit_state_path()
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-    return {"instances": {}, "custom_sets": []}
 
 
 def _save_toolkit_state(state: Dict[str, Any]) -> None:
     wordpress_live.save_toolkit_state_safe(state)
-    return
-    path = _toolkit_state_path()
-    try:
-        path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Could not persist wordpress toolkit state: %s", exc)
 
 
 def _visible_custom_sets(state: Dict[str, Any], current_user: User) -> List[Dict[str, Any]]:
@@ -607,212 +586,6 @@ def reconcile_wordpress_databases(db: Session, website_id: Optional[int] = None,
     and ensure the MariaDB database, user credentials, and WordPress core tables
     are created and synchronized with wp-config.php."""
     return wordpress_live.safe_reconcile_wordpress_databases(db, website_id=website_id, provision_missing=False)
-    reconciled = 0
-    try:
-        from app.api.databases import effective_database_limit
-
-        websites = db.query(Website).all()
-        if not websites:
-            return 0
-        state = _load_toolkit_state()
-        instances_state = state.setdefault("instances", {})
-        state_dirty = False
-        db_dirty = False
-
-        for site in websites:
-            inst_key = str(site.id)
-            saved = instances_state.get(inst_key) or {}
-            if saved.get("detached"):
-                continue
-
-            # 1. Keep any existing DatabaseAccount linked to this website owned by site.owner_id
-            linked_acc = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == site.id).first()
-            if linked_acc and linked_acc.owner_id != site.owner_id:
-                linked_acc.owner_id = site.owner_id
-                db_dirty = True
-
-            subpath = saved.get("subpath") or ""
-            linux_user, site_root, wp_dir = _resolve_site_paths(site, db, subpath)
-            has_wp_files = (
-                (wp_dir / "wp-config.php").exists()
-                or (wp_dir / "wp-includes/version.php").exists()
-                or (wp_dir / "wp-admin").is_dir()
-            )
-            if site.app_type != "wordpress" and not has_wp_files and not saved.get("installed"):
-                continue
-
-            config_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
-            cfg = _parse_wp_config_details(config_text)
-
-            db_name = (cfg.get("db_name") or saved.get("db_name") or (linked_acc.db_name if linked_acc else "")).strip()
-            db_user = (cfg.get("db_user") or saved.get("db_user") or (linked_acc.db_user if linked_acc else "") or db_name).strip()
-            db_password = cfg.get("db_password") or ""
-            table_prefix = cfg.get("table_prefix") if config_text else (saved.get("table_prefix") or "wp_")
-
-            # If WordPress site has no wp-config.php or no DB_NAME yet, provision one now
-            if not db_name:
-                if not provision_missing or not has_wp_files:
-                    continue
-                site_owner = db.query(User).filter(User.id == site.owner_id).first()
-                owner_db_limit = effective_database_limit(site_owner)
-                if owner_db_limit == 0:
-                    continue
-                if owner_db_limit > 0:
-                    owner_db_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == site.owner_id).count()
-                    if owner_db_count >= owner_db_limit:
-                        continue
-                seed = f"{site.domain}_{secrets.token_hex(2)}"
-                try:
-                    db_info = mariadb.create_database(seed, prefix="wp")
-                except Exception:
-                    fallback_name = mariadb.safe_db_identifier(seed, "wp")
-                    db_info = {
-                        "db_name": fallback_name,
-                        "db_user": mariadb.safe_db_identifier(fallback_name, "u"),
-                        "db_password": mariadb.random_password(20),
-                    }
-                db_name = db_info["db_name"]
-                db_user = db_info["db_user"]
-                db_password = db_info["db_password"]
-                new_cfg = wordpress._render_wp_config(db_name, db_user, db_password, table_prefix=table_prefix)
-                new_cfg = _set_wp_config_constant(new_cfg, "DISALLOW_FILE_EDIT", "true")
-                new_cfg = _set_wp_config_constant(new_cfg, "WP_MEMORY_LIMIT", "'256M'")
-                _write_wp_file_text(linux_user, site_root, wp_dir, "wp-config.php", new_cfg, "0640")
-                config_text = new_cfg
-
-            db_acc = (
-                db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
-                or linked_acc
-            )
-
-            if not db_acc:
-                if not db_password:
-                    db_password = mariadb.random_password(20)
-                    if config_text:
-                        updated_cfg = _set_wp_config_constant(config_text, "DB_PASSWORD", f"'{db_password}'")
-                        _write_wp_file_text(linux_user, site_root, wp_dir, "wp-config.php", updated_cfg, "0640")
-                try:
-                    mariadb.create_database_credentials(
-                        db_name,
-                        db_user,
-                        db_password,
-                        allow_existing_user=True,
-                    )
-                except Exception as exc:
-                    logger.warning("Could not ensure MariaDB credentials for %s: %s", db_name, exc)
-
-                tables = []
-                try:
-                    tables = mariadb.get_database_tables_breakdown(db_name)
-                except Exception:
-                    tables = []
-
-                if not tables and (wp_dir / "wp-includes/version.php").exists():
-                    scheme = "https" if site.ssl_enabled else "http"
-                    admin_u = saved.get("admin_user") or "admin"
-                    admin_e = saved.get("admin_email") or f"admin@{site.domain}"
-                    site_t = saved.get("site_title") or site.domain
-                    admin_p = mariadb.random_password(16)
-                    _run_wp_cli(
-                        linux_user,
-                        site.php_version or "8.4",
-                        wp_dir,
-                        [
-                            "core", "install",
-                            f"--url={scheme}://{site.domain}",
-                            f"--title={site_t}",
-                            f"--admin_user={admin_u}",
-                            f"--admin_password={admin_p}",
-                            f"--admin_email={admin_e}",
-                            "--skip-email",
-                        ],
-                    )
-                    try:
-                        tables = mariadb.get_database_tables_breakdown(db_name)
-                    except Exception:
-                        tables = []
-
-                total_bytes = sum(int(t.get("total_bytes") or 0) for t in tables)
-                db_acc = DatabaseAccount(
-                    owner_id=site.owner_id,
-                    website_id=site.id,
-                    db_name=db_name,
-                    db_user=db_user,
-                    db_password=encrypt(db_password),
-                    size_bytes=total_bytes,
-                )
-                db.add(db_acc)
-                db_dirty = True
-                reconciled += 1
-            else:
-                if db_acc.owner_id != site.owner_id:
-                    db_acc.owner_id = site.owner_id
-                    db_dirty = True
-                    reconciled += 1
-                if db_acc.website_id != site.id:
-                    db_acc.website_id = site.id
-                    db_dirty = True
-                try:
-                    tables = mariadb.get_database_tables_breakdown(db_acc.db_name)
-                except Exception:
-                    tables = []
-                if not tables and (wp_dir / "wp-includes/version.php").exists():
-                    if db_password:
-                        try:
-                            mariadb.create_database_credentials(
-                                db_acc.db_name,
-                                db_acc.db_user,
-                                db_password,
-                                allow_existing_user=True,
-                            )
-                            db_acc.db_password = encrypt(db_password)
-                            db_dirty = True
-                        except Exception:
-                            pass
-                    scheme = "https" if site.ssl_enabled else "http"
-                    admin_u = saved.get("admin_user") or "admin"
-                    admin_e = saved.get("admin_email") or f"admin@{site.domain}"
-                    site_t = saved.get("site_title") or site.domain
-                    admin_p = mariadb.random_password(16)
-                    _run_wp_cli(
-                        linux_user,
-                        site.php_version or "8.4",
-                        wp_dir,
-                        [
-                            "core", "install",
-                            f"--url={scheme}://{site.domain}",
-                            f"--title={site_t}",
-                            f"--admin_user={admin_u}",
-                            f"--admin_password={admin_p}",
-                            f"--admin_email={admin_e}",
-                            "--skip-email",
-                        ],
-                    )
-                    try:
-                        tables = mariadb.get_database_tables_breakdown(db_acc.db_name)
-                    except Exception:
-                        tables = []
-                total_bytes = sum(int(t.get("total_bytes") or 0) for t in tables)
-                if total_bytes > 0 and getattr(db_acc, "size_bytes", 0) != total_bytes:
-                    db_acc.size_bytes = total_bytes
-                    db_dirty = True
-
-            if saved.get("db_name") != db_acc.db_name or saved.get("db_user") != db_acc.db_user:
-                saved["installed"] = True
-                saved["db_name"] = db_acc.db_name
-                saved["db_user"] = db_acc.db_user
-                saved["table_prefix"] = table_prefix
-                instances_state[inst_key] = saved
-                state_dirty = True
-
-        if db_dirty:
-            db.commit()
-        if state_dirty:
-            _save_toolkit_state(state)
-    except Exception as exc:
-        db.rollback()
-        logger.warning("reconcile_wordpress_databases warning: %s", exc)
-    return reconciled
 
 
 def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1057,21 +830,6 @@ def _list_site_snapshots(site_root: Path, saved: Dict[str, Any]) -> List[Dict[st
     if not settings.command_dry_run:
         snaps = [s for s in snaps if s.get("id") and (snap_dir / str(s["id"])).exists()]
     return [dict(s) for s in snaps if isinstance(s, dict) and s.get("id")]
-    if snap_dir.exists() and snap_dir.is_dir():
-        known_ids = {s.get("id") for s in snaps}
-        try:
-            for f in sorted(snap_dir.glob("*.tar.gz"), reverse=True):
-                if f.stem not in known_ids:
-                    sz_mb = round(f.stat().st_size / (1024 * 1024), 2)
-                    snaps.append({
-                        "id": f.name,
-                        "label": "Automatic Snapshot",
-                        "created_at": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
-                        "size_mb": max(0.1, sz_mb),
-                    })
-        except Exception:
-            pass
-    return snaps
 
 
 # ── Pydantic Request Models ──────────────────────────────────────────────────
@@ -1336,49 +1094,6 @@ def install_wp_instance(
         }
         existing_check.website_id = site.id
         db_acc = existing_check
-    elif False and payload.db_mode == "existing" and payload.db_name and payload.db_user:
-        clean_db_name = payload.db_name.strip()
-        clean_db_user = payload.db_user.strip()
-        existing_acc = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == clean_db_name).first()
-        clean_db_pass = (payload.db_password or "").strip()
-        if not clean_db_pass and existing_acc:
-            try:
-                clean_db_pass = decrypt(existing_acc.db_password)
-            except Exception:
-                clean_db_pass = mariadb.random_password(20)
-        elif not clean_db_pass:
-            clean_db_pass = mariadb.random_password(20)
-
-        db_info = {
-            "db_name": clean_db_name,
-            "db_user": clean_db_user,
-            "db_password": clean_db_pass,
-        }
-        try:
-            mariadb.create_database_credentials(
-                clean_db_name,
-                clean_db_user,
-                clean_db_pass,
-                allow_existing_user=True,
-            )
-        except Exception as exc:
-            logger.warning("Existing database credential sync warning: %s", exc)
-
-        if existing_acc:
-            existing_acc.owner_id = site.owner_id
-            existing_acc.website_id = site.id
-            existing_acc.db_user = clean_db_user
-            existing_acc.db_password = encrypt(clean_db_pass)
-            db_acc = existing_acc
-        else:
-            db_acc = DatabaseAccount(
-                owner_id=site.owner_id,
-                website_id=site.id,
-                db_name=clean_db_name,
-                db_user=clean_db_user,
-                db_password=encrypt(clean_db_pass),
-            )
-            db.add(db_acc)
     else:
         seed = f"{site.domain}_{secrets.token_hex(2)}"
         try:
@@ -1908,12 +1623,6 @@ def update_wp_toggles(
         toggles["password_protection"] = payload.password_protection
         if payload.basic_auth_user:
             inst["basic_auth_user"] = payload.basic_auth_user.strip()
-        if False and payload.password_protection:
-            auth_u = (inst.get("basic_auth_user") or "preview").strip()
-            auth_p = (payload.basic_auth_password or "preview123").strip()
-            _write_wp_file_text(linux_user, site_root, wp_dir, ".htpasswd", f"{auth_u}:{auth_p}\n", "0640")
-        elif False:
-            wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, ".htpasswd")
 
     if payload.disable_wp_cron is not None:
         toggles["disable_wp_cron"] = payload.disable_wp_cron
@@ -2677,52 +2386,6 @@ def execute_wp_tool(
                 target_owner = db.query(User).filter(User.id == target_site.owner_id).first() or current_user
                 enforce_user_database_limit(db, target_owner)
 
-        target_site.app_type = "wordpress"
-        db.commit()
-        target_key = str(target_site.id)
-        cloned_state = json.loads(json.dumps(inst))
-        cloned_state["installed"] = True
-        cloned_state["detached"] = False
-        cloned_state["subpath"] = (payload.target_subpath or "").strip()
-        if act == "clone":
-            cloned_state["site_title"] = f"{inst.get('site_title') or site.domain} (Clone)"
-            clone_db_name = f"wp_{target_site.domain.replace('.', '_')[:22]}"
-            clone_db_user = f"{clone_db_name[:18]}_u"
-            clone_db_pass = mariadb.random_password(18)
-            try:
-                raise RuntimeError("delegated to wordpress_live.execute_live_clone_or_sync")
-                db_info = mariadb.create_database(target_site.domain)
-                clone_db_name = db_info["db_name"]
-                clone_db_user = db_info["db_user"]
-                clone_db_pass = db_info["db_password"]
-            except Exception:
-                try:
-                    raise RuntimeError("delegated to wordpress_live.execute_live_clone_or_sync")
-                    mariadb.create_database_credentials(
-                        clone_db_name, clone_db_user, clone_db_pass, allow_existing_user=True
-                    )
-                except Exception:
-                    pass
-            existing_clone_db = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == clone_db_name).first()
-            if not existing_clone_db and False:
-                db.add(
-                    DatabaseAccount(
-                        owner_id=target_site.owner_id,
-                        website_id=target_site.id,
-                        db_name=clone_db_name,
-                        db_user=clone_db_user,
-                        db_password=encrypt(clone_db_pass),
-                    )
-                )
-            elif False:
-                existing_clone_db.owner_id = target_site.owner_id
-                existing_clone_db.website_id = target_site.id
-            db.commit()
-            cloned_state["db_name"] = clone_db_name
-            cloned_state["db_user"] = clone_db_user
-            cloned_state["db_password_enc"] = encrypt(clone_db_pass)
-            cloned_state["installed_at"] = datetime.now(timezone.utc).isoformat()
-        state.setdefault("instances", {})[target_key] = cloned_state
         target_subpath = (payload.target_subpath or "").strip()
         target_linux_user, target_site_root, target_wp_dir = _resolve_site_paths(target_site, db, target_subpath)
         src_cfg_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)

@@ -1243,11 +1243,12 @@ def execute_live_clone_or_sync(
     except Exception:
         pass
 
-    target_site.app_type = "wordpress"
+    if not target_subpath.strip("/"):
+        target_site.app_type = "wordpress"
+        target_site.nginx_rewrite_mode = "front_controller"
     target_site.php_version = target_php_ver
     target_site.linux_user = target_linux_user
     target_site.root_path = str(target_site_root)
-    target_site.nginx_rewrite_mode = "front_controller"
     db.commit()
 
     target_key = str(target_site.id)
@@ -1494,15 +1495,20 @@ def execute_live_clone_or_sync(
         )
 
     try:
+        from app.api.websites import _rewrite_website_vhost
+
         php_socket = site_users.site_php_fpm_socket(target_linux_user, str(target_site_root), target_php_ver)
-        nginx.rewrite_vhost(
-            target_site.domain,
-            str(target_site_root),
-            app_type="wordpress",
+        eff_app_type = target_site.app_type if target_subpath.strip("/") else "wordpress"
+        eff_rewrite_mode = (target_site.nginx_rewrite_mode or "front_controller") if target_subpath.strip("/") else "front_controller"
+        _rewrite_website_vhost(
+            target_site,
+            root_path=str(target_site_root),
+            linux_user=target_linux_user,
+            app_type=eff_app_type,
             php_version=target_php_ver,
             php_fpm_socket_override=php_socket,
             document_root=target_site.document_root or "public_html",
-            rewrite_mode="front_controller",
+            rewrite_mode=eff_rewrite_mode,
         )
     except Exception:
         pass

@@ -658,30 +658,6 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
     else:
         owner = current_user
 
-    existing_website = db.query(Website).filter(Website.domain == payload.domain).first()
-    if False and existing_website is not None:
-        existing_owner = db.query(User).filter(User.id == existing_website.owner_id).first()
-        if existing_website.owner_id == owner.id:
-            return _sync_live_ssl_flags(db, [existing_website])[0]
-        if existing_owner is None or (is_admin_role(existing_owner.role) and not is_admin_role(owner.role)):
-            new_linux_user = site_users.linux_user_for_panel_username(owner.username)
-            new_root_path = site_users.site_root_for_panel_user(owner.username, existing_website.domain)
-            runtime_php = existing_website.php_version if (existing_website.app_type or "wordpress") in {"wordpress", "php"} else None
-            try:
-                if existing_website.root_path != new_root_path or existing_website.linux_user != new_linux_user:
-                    site_users.move_site_runtime(existing_website.root_path, new_root_path, new_linux_user, runtime_php)
-                    existing_website.root_path = new_root_path
-                    existing_website.linux_user = new_linux_user
-                    _ensure_default_waf_file(existing_website.domain)
-                    _rewrite_website_vhost(existing_website, root_path=new_root_path, linux_user=new_linux_user)
-            except Exception:
-                existing_website.root_path = new_root_path
-                existing_website.linux_user = new_linux_user
-            existing_website.owner_id = owner.id
-            db.commit()
-            db.refresh(existing_website)
-            return _sync_live_ssl_flags(db, [existing_website])[0]
-
     if _hostname_conflicts(db, payload.domain):
         raise HTTPException(status_code=409, detail="Domain already exists")
     from app.services import mail
