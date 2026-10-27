@@ -2244,30 +2244,45 @@ table.table {
 
 /* Donate Button in Header & Sidebar */
 @keyframes donateHeartPulse {
-  0%, 100% { transform: scale(1); }
-  50% { transform: scale(1.14); }
+  0%, 100% {
+    transform: scale(1);
+    filter: drop-shadow(0 0 0 rgba(225, 29, 72, 0));
+  }
+  14% {
+    transform: scale(1.25);
+    filter: drop-shadow(0 0 4px rgba(225, 29, 72, 0.45));
+  }
+  28% {
+    transform: scale(0.95);
+    filter: drop-shadow(0 0 0 rgba(225, 29, 72, 0));
+  }
+  42% {
+    transform: scale(1.18);
+    filter: drop-shadow(0 0 3px rgba(225, 29, 72, 0.35));
+  }
+  70% {
+    transform: scale(1);
+    filter: drop-shadow(0 0 0 rgba(225, 29, 72, 0));
+  }
 }
 
 .donate-trigger-btn {
   display: inline-flex !important;
   align-items: center !important;
   justify-content: center !important;
-  gap: 6px !important;
-  width: auto !important;
-  min-width: max-content !important;
+  width: 36px !important;
+  min-width: 36px !important;
   height: 36px !important;
   min-height: 36px !important;
-  padding: 0 12px !important;
+  padding: 0 !important;
   border-radius: 999px !important;
-  font-size: 12.5px !important;
-  font-weight: 700 !important;
   color: #e11d48 !important;
   background: linear-gradient(135deg, #fff1f2 0%, #ffe4e6 100%) !important;
   border: 1px solid rgba(244, 63, 94, 0.34) !important;
   box-shadow: 0 2px 8px rgba(225, 29, 72, 0.08) !important;
   cursor: pointer !important;
   transition: all 0.2s ease !important;
-  white-space: nowrap !important;
+  flex-shrink: 0 !important;
 }
 
 :root[data-theme="dark"] .donate-trigger-btn {
@@ -2286,7 +2301,8 @@ table.table {
 .donate-heart-icon {
   color: #e11d48 !important;
   flex-shrink: 0 !important;
-  animation: donateHeartPulse 2.4s infinite ease-in-out;
+  transform-origin: center center !important;
+  animation: donateHeartPulse 1.5s infinite cubic-bezier(0.25, 0.46, 0.45, 0.94);
 }
 
 :root[data-theme="dark"] .donate-heart-icon {
@@ -2312,18 +2328,18 @@ table.table {
   display: inline-flex !important;
   align-items: center !important;
   justify-content: center !important;
-  gap: 5px !important;
-  width: auto !important;
-  height: 26px !important;
-  min-height: 26px !important;
-  padding: 0 10px !important;
+  width: 28px !important;
+  min-width: 28px !important;
+  height: 28px !important;
+  min-height: 28px !important;
+  padding: 0 !important;
   border-radius: 999px !important;
-  font-size: 11.5px !important;
-  font-weight: 700 !important;
   color: #fb7185 !important;
   background: rgba(244, 63, 94, 0.14) !important;
   border: 1px solid rgba(244, 63, 94, 0.3) !important;
   cursor: pointer !important;
+  flex-shrink: 0 !important;
+  transition: all 0.2s ease !important;
 }
 
 .sidebar-donate-btn:hover:not(:disabled) {
@@ -2421,12 +2437,11 @@ table.table {
   }
 
   .top-utility-group .donate-trigger-btn {
-    width: auto !important;
-    min-width: max-content !important;
+    width: 34px !important;
+    min-width: 34px !important;
     height: 34px !important;
     min-height: 34px !important;
-    padding: 0 10px !important;
-    font-size: 12px !important;
+    padding: 0 !important;
     border-radius: 999px !important;
   }
 
@@ -2720,9 +2735,11 @@ table.table {
     gap: 4px !important;
   }
   .top-utility-group .donate-trigger-btn {
-    padding: 0 8px !important;
-    font-size: 11.5px !important;
-    gap: 4px !important;
+    width: 34px !important;
+    min-width: 34px !important;
+    height: 34px !important;
+    min-height: 34px !important;
+    padding: 0 !important;
   }
   .aapanel-resources-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr)) !important;

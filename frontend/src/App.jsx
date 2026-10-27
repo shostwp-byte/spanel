@@ -4393,9 +4393,9 @@ function AppContent() {
               setDonateModalOpen(true);
             }}
             title={t('Donate to SPanel')}
+            aria-label={t('Donate to SPanel')}
           >
-            <Heart size={13} fill="currentColor" />
-            <span>{t('Donate')}</span>
+            <Heart size={14} fill="currentColor" className="donate-heart-icon" />
           </button>
         </div>
       </aside>
@@ -4475,8 +4475,7 @@ function AppContent() {
                 title={t('Donate to SPanel')}
                 aria-label={t('Donate to SPanel')}
               >
-                <Heart size={14} fill="currentColor" className="donate-heart-icon" />
-                <span className="donate-trigger-label">{t('Donate')}</span>
+                <Heart size={16} fill="currentColor" className="donate-heart-icon" />
               </button>
 
               <div className="user-menu" ref={notificationsRef}>
