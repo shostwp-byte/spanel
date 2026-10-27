@@ -1,5 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ace from 'ace-builds/src-noconflict/ace';
+import 'ace-builds/src-noconflict/ext-language_tools';
+import 'ace-builds/src-noconflict/ext-searchbox';
+import 'ace-builds/src-noconflict/mode-css';
+import 'ace-builds/src-noconflict/mode-html';
+import 'ace-builds/src-noconflict/mode-ini';
+import 'ace-builds/src-noconflict/mode-javascript';
+import 'ace-builds/src-noconflict/mode-json';
+import 'ace-builds/src-noconflict/mode-php';
+import 'ace-builds/src-noconflict/mode-text';
+import 'ace-builds/src-noconflict/mode-yaml';
+import 'ace-builds/src-noconflict/theme-textmate';
+import 'ace-builds/src-noconflict/theme-tomorrow_night';
 import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, ChevronRight, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FilePlus, Files, FileText, FolderOpen, FolderPlus, Globe, HardDrive, Home, Image, KeyRound, Link2, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoreVertical, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';

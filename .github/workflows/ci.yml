@@ -90,9 +90,9 @@ jobs:
           node-version: "22"
       - name: Install dependencies
         working-directory: frontend
-        # Same command install.sh uses. `npm ci` is not used because
+        # Same command update.sh / install.sh uses. `npm ci` is not used because
         # package-lock.json is currently out of sync with package.json.
-        run: npm install --no-audit --no-fund --legacy-peer-deps
+        run: npm install --no-audit --no-fund --legacy-peer-deps --ignore-scripts
       - name: Build
         working-directory: frontend
         run: npm run build

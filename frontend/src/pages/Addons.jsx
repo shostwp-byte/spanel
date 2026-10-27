@@ -32,8 +32,9 @@ export function AddonsPage({ request, isAdmin, addons, setAddons, loadAddons: lo
 
   async function loadAddons() {
     if (loadAddonsProp) {
-      await loadAddonsProp();
-      if (isAdmin && loadDemoSettings) {
+      const data = await loadAddonsProp();
+      const items = data?.items || addons?.items || [];
+      if (isAdmin && loadDemoSettings && items.some(item => item.slug === 'demo' && item.installed)) {
         await loadDemoSettings();
       }
       return;

@@ -246,6 +246,8 @@ def _hostname_conflicts(db: Session, domain: str, *, exclude_website_id: int | N
     if not safe_domain:
         return True
     local_conflict = bool({safe_domain, f"www.{safe_domain}"} & _reserved_hostnames(db, exclude_website_id=exclude_website_id, exclude_alias_id=exclude_alias_id))
+    if exclude_website_id is None and exclude_alias_id is None:
+        local_conflict = local_conflict or nginx.vhost_exists(safe_domain)
     if local_conflict:
         return True
     if exclude_website_id is None and exclude_alias_id is None:
@@ -396,6 +398,7 @@ def _domain_matches_user(domain: str, user: User) -> bool:
             return True
     except OSError:
         pass
+    return False
     if uemail.endswith("@" + clean_domain):
         return True
     compact_domain = re.sub(r"[^a-z0-9]", "", clean_domain)
@@ -416,7 +419,7 @@ def reconcile_websites_from_disk(db: Session) -> None:
     reconcile domain ownership when a domain's owner_id is dangling or was
     inadvertently created under admin instead of its matching customer account.
     """
-    if settings.command_dry_run:
+    if settings.command_dry_run or not getattr(db, "_explicit_reconcile_allowed", False):
         return
     try:
         from app.models.entities import DnsZone
@@ -576,7 +579,7 @@ def reconcile_websites_from_disk(db: Session) -> None:
 
         for w in known_websites:
             current_owner = users_by_id.get(w.owner_id)
-            if current_owner is not None and not is_admin_role(current_owner.role):
+            if current_owner is not None:
                 continue
             matched_user = None
             w_linux = (w.linux_user or "").strip().lower()
@@ -633,6 +636,13 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
     folder + Nginx vhost (no DB, no WordPress files)."""
     reconcile_websites_from_disk(db)
     requested_owner_id = payload.owner_id
+    access_role = (request.headers.get("x-access-role") or "").strip().lower() if (request is not None and getattr(request, "headers", None)) else ""
+    if (is_admin_role(current_user.role) or normalize_role(current_user.role) == Role.reseller) and requested_owner_id is None:
+        if access_role not in {"user", "end_user"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Switch Access Role to User or use 'Login as' on an End User account to create websites.",
+            )
     if requested_owner_id is not None and requested_owner_id != current_user.id:
         ensure_role(current_user.role, Role.admin)
 
@@ -640,44 +650,13 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
         owner = db.query(User).filter(User.id == requested_owner_id).first()
         if not owner:
             raise HTTPException(status_code=404, detail="Owner not found")
+        if is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller:
+            raise HTTPException(
+                status_code=403,
+                detail="Websites can only be assigned to End User accounts.",
+            )
     else:
         owner = current_user
-        if is_admin_role(current_user.role):
-            end_users = [
-                u for u in db.query(User).order_by(User.id.asc()).all()
-                if not is_admin_role(u.role) and normalize_role(u.role) != Role.reseller
-            ]
-            for u in end_users:
-                if _domain_matches_user(payload.domain, u):
-                    u_count = db.query(Website).filter(Website.owner_id == u.id).count()
-                    eff_limit = int(u.website_limit if u.website_limit is not None else (u.package.website_limit if getattr(u, "package", None) else 0) or 0)
-                    if eff_limit == 0 or u_count < eff_limit:
-                        owner = u
-                        break
-
-    existing_website = db.query(Website).filter(Website.domain == payload.domain).first()
-    if existing_website is not None:
-        existing_owner = db.query(User).filter(User.id == existing_website.owner_id).first()
-        if existing_website.owner_id == owner.id:
-            return _sync_live_ssl_flags(db, [existing_website])[0]
-        if existing_owner is None or (is_admin_role(existing_owner.role) and not is_admin_role(owner.role)):
-            new_linux_user = site_users.linux_user_for_panel_username(owner.username)
-            new_root_path = site_users.site_root_for_panel_user(owner.username, existing_website.domain)
-            runtime_php = existing_website.php_version if (existing_website.app_type or "wordpress") in {"wordpress", "php"} else None
-            try:
-                if existing_website.root_path != new_root_path or existing_website.linux_user != new_linux_user:
-                    site_users.move_site_runtime(existing_website.root_path, new_root_path, new_linux_user, runtime_php)
-                    existing_website.root_path = new_root_path
-                    existing_website.linux_user = new_linux_user
-                    _ensure_default_waf_file(existing_website.domain)
-                    _rewrite_website_vhost(existing_website, root_path=new_root_path, linux_user=new_linux_user)
-            except Exception:
-                existing_website.root_path = new_root_path
-                existing_website.linux_user = new_linux_user
-            existing_website.owner_id = owner.id
-            db.commit()
-            db.refresh(existing_website)
-            return _sync_live_ssl_flags(db, [existing_website])[0]
 
     if _hostname_conflicts(db, payload.domain):
         raise HTTPException(status_code=409, detail="Domain already exists")
@@ -702,10 +681,13 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
             raise HTTPException(status_code=403, detail="Subdomain limit reached")
     else:
         eff_site_limit = int(owner.website_limit if owner.website_limit is not None else (owner.package.website_limit if getattr(owner, "package", None) else 0) or 0)
-        if not is_admin_role(owner.role) and eff_site_limit != 0 and existing_root_domains_count >= eff_site_limit:
+        if not is_admin_role(owner.role) and eff_site_limit > 0 and existing_root_domains_count >= eff_site_limit:
             raise HTTPException(status_code=403, detail="Website limit reached")
 
     install_wp = payload.install_wordpress and payload.app_type == "wordpress"
+    if install_wp:
+        from app.api.databases import enforce_user_database_limit
+        enforce_user_database_limit(db, owner)
     create_estimate_bytes = storage_quota.WORDPRESS_SITE_ESTIMATE_BYTES if install_wp else storage_quota.STATIC_SITE_ESTIMATE_BYTES
     try:
         storage_quota.enforce_user_storage_quota(db, owner, incoming_bytes=create_estimate_bytes)
@@ -873,6 +855,9 @@ def install_wordpress_on_website(
     except storage_quota.StorageQuotaExceeded as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
 
+    from app.api.databases import enforce_user_database_limit
+    enforce_user_database_limit(db, owner)
+
     try:
         db_info = mariadb.create_database(website.domain, if_not_exists=False)
     except (RuntimeError, ValueError) as exc:
@@ -906,12 +891,12 @@ def install_wordpress_on_website(
     website.app_type = "wordpress"
     website.nginx_rewrite_mode = "front_controller"
     db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_info["db_name"]).first()
-    if db_account:
+    if db_account and db_account.owner_id == website.owner_id:
         db_account.owner_id = website.owner_id
         db_account.website_id = website.id
         db_account.db_user = db_info["db_user"]
         db_account.db_password = encrypt(db_info["db_password"])
-    else:
+    elif not db_account:
         db.add(DatabaseAccount(
             owner_id=website.owner_id,
             website_id=website.id,
@@ -927,12 +912,21 @@ def install_wordpress_on_website(
 
 
 @router.get("", response_model=List[WebsiteOut])
-def list_websites(q: str = Query(default="", max_length=255), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def list_websites(
+    q: str = Query(default="", max_length=255),
+    scope: str = Query(default="", max_length=32),
+    request: Request = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     reconcile_websites_from_disk(db)
     search = (q or "").strip().lower()
-    if is_admin_role(current_user.role):
+    access_role = (request.headers.get("x-access-role") or "").strip().lower() if (request is not None and getattr(request, "headers", None)) else ""
+    if scope == "own" or access_role in {"user", "end_user"}:
+        query = db.query(Website).filter(Website.owner_id == current_user.id)
+    elif is_admin_role(current_user.role) and access_role != "reseller":
         query = db.query(Website)
-    elif normalize_role(current_user.role) == Role.reseller:
+    elif normalize_role(current_user.role) == Role.reseller or (is_admin_role(current_user.role) and access_role == "reseller"):
         sub_ids = db.query(User.id).filter(User.reseller_id == current_user.id)
         query = db.query(Website).filter(or_(Website.owner_id == current_user.id, Website.owner_id.in_(sub_ids)))
     else:
@@ -1148,7 +1142,9 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
         owner = db.query(User).filter(User.id == payload.owner_id).first()
         if not owner:
             raise HTTPException(status_code=404, detail="Owner not found")
-        if not is_admin_role(current_user.role) and owner.id != current_user.id and owner.reseller_id != current_user.id:
+        if is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller:
+            raise HTTPException(status_code=403, detail="Domains can only be assigned to End User accounts")
+        if not is_admin_role(current_user.role) and owner.reseller_id != current_user.id:
             raise HTTPException(status_code=403, detail="Cannot assign domain to a user outside your reseller pool")
         assigned_count = db.query(Website).filter(Website.owner_id == owner.id, Website.id != website.id).count()
         if not is_admin_role(owner.role) and owner.website_limit != 0 and assigned_count >= owner.website_limit:
@@ -1761,4 +1757,124 @@ def install_shared_ssl(
     db.commit()
     db.refresh(website)
     log_action(db, current_user.id, "install_shared_ssl", website.domain, detail=cert_name, request=request)
+    return website
+
+
+from pydantic import BaseModel as _PydanticBaseModel
+
+
+class WebsiteTransferOwnerPayload(_PydanticBaseModel):
+    target_owner_id: int
+
+
+def audit_privileged_role_owned_resources(db: Session) -> dict:
+    """List existing Website and DatabaseAccount rows whose owner has role Admin or Reseller."""
+    users_by_id = {u.id: u for u in db.query(User).all()}
+    privileged_websites = []
+    privileged_databases = []
+    warnings: list[str] = []
+
+    for site in db.query(Website).order_by(Website.id.asc()).all():
+        owner = users_by_id.get(site.owner_id)
+        if owner and (is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller):
+            entry = {
+                "id": site.id,
+                "domain": site.domain,
+                "owner_id": site.owner_id,
+                "owner_username": owner.username,
+                "owner_role": owner.role,
+            }
+            privileged_websites.append(entry)
+            warnings.append(
+                f"WARNING: Website '{site.domain}' (id={site.id}) is owned by {owner.role} account '{owner.username}'. "
+                "Switch Access Role to 'User' or transfer ownership to an End User account via POST /api/websites/{id}/transfer-owner."
+            )
+
+    for acc in db.query(DatabaseAccount).order_by(DatabaseAccount.id.asc()).all():
+        owner = users_by_id.get(acc.owner_id)
+        if owner and (is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller):
+            entry = {
+                "id": acc.id,
+                "db_name": acc.db_name,
+                "website_id": acc.website_id,
+                "owner_id": acc.owner_id,
+                "owner_username": owner.username,
+                "owner_role": owner.role,
+            }
+            privileged_databases.append(entry)
+            warnings.append(
+                f"WARNING: Database '{acc.db_name}' (id={acc.id}) is owned by {owner.role} account '{owner.username}'. "
+                "Switch Access Role to 'User' or transfer ownership to an End User account."
+            )
+
+    return {
+        "websites": privileged_websites,
+        "databases": privileged_databases,
+        "warnings": warnings,
+    }
+
+
+@router.get("/legacy-privileged-owned")
+def list_legacy_privileged_owned_resources(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    return audit_privileged_role_owned_resources(db)
+
+
+@router.post("/{website_id}/transfer-owner", response_model=WebsiteOut)
+def transfer_website_owner(
+    website_id: int,
+    payload: WebsiteTransferOwnerPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ensure_role(current_user.role, Role.admin)
+    website = db.query(Website).filter(Website.id == website_id).first()
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    target_owner = db.query(User).filter(User.id == payload.target_owner_id).first()
+    if not target_owner:
+        raise HTTPException(status_code=404, detail="Target owner not found")
+    if is_admin_role(target_owner.role) or normalize_role(target_owner.role) == Role.reseller:
+        raise HTTPException(
+            status_code=403,
+            detail="Websites can only be assigned to End User accounts.",
+        )
+
+    new_linux_user = site_users.linux_user_for_panel_username(target_owner.username)
+    new_root_path = site_users.site_root_for_panel_user(target_owner.username, website.domain)
+    runtime_php = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
+    if website.root_path != new_root_path or website.linux_user != new_linux_user:
+        site_users.move_site_runtime(website.root_path, new_root_path, new_linux_user, runtime_php)
+        website.root_path = new_root_path
+        website.linux_user = new_linux_user
+        _ensure_default_waf_file(website.domain)
+        _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
+
+    website.owner_id = target_owner.id
+    for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).all():
+        db_acc.owner_id = target_owner.id
+    try:
+        from app.models.entities import DnsZone
+
+        z = db.query(DnsZone).filter(DnsZone.name == website.domain).first()
+        if z:
+            z.owner_id = target_owner.id
+    except Exception:
+        pass
+
+    db.commit()
+    db.refresh(website)
+    log_action(
+        db,
+        current_user.id,
+        "transfer_website_owner",
+        website.domain,
+        detail=f"new_owner={target_owner.username}",
+        request=request,
+    )
     return website

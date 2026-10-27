@@ -21,7 +21,7 @@ export function UsersPage({
 }) {
   const {
     loading, setError, setNotice, currentUser, setCurrentUser, packages, users,
-    storageUsageText, loadCurrentUser, navigateToPage, submitPasswordChange, editingUserForm, setEditingUserForm,
+    storageUsageText, loadCurrentUser, navigateToPage, submitPasswordChange, editingUserForm, setEditingUserForm, setViewLevel,
   } = useAppContext();
 
   const isResellerMode = mode === 'resellers' || mode === 'create_reseller';
@@ -345,16 +345,20 @@ export function UsersPage({
       );
       if (retryData?.access_token) {
         setNotice(`Logged in as ${user.username}.`);
-        await loadCurrentUser();
-        navigateToPage('websites');
+        setViewLevel?.(null);
+        const nextUser = await loadCurrentUser();
+        const nextRole = nextUser?.role || user.role;
+        navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');
         await refreshAll();
       }
       return;
     }
     if (data?.access_token) {
       setNotice(`Logged in as ${user.username}.`);
-      await loadCurrentUser();
-      navigateToPage('websites');
+      setViewLevel?.(null);
+      const nextUser = await loadCurrentUser();
+      const nextRole = nextUser?.role || user.role;
+      navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');
       await refreshAll();
     }
   }
@@ -703,7 +707,7 @@ export function UsersPage({
                 </select>
                 <select value={assignUserId} onChange={e => setAssignUserId(e.target.value)}>
                   <option value="">{t('Select user')}</option>
-                  {users.map(user => (
+                  {users.filter(user => user.role !== 'admin' && user.role !== 'reseller').map(user => (
                     <option key={user.id} value={user.id}>
                       {user.username} ({roleLabel(user.role)})
                     </option>

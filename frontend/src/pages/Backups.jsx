@@ -1078,7 +1078,7 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
             </div>
 
             <div className="pkg-table-wrap">
-              <table className="pkg-clean-table">
+              <table className="pkg-clean-table backup-user-table">
                 <thead>
                   <tr>
                     <th>Tài khoản (User)</th>
@@ -1102,18 +1102,49 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         <td>
                           <strong style={{ color: 'var(--text-main)' }}>{item.username || '-'}</strong>
                         </td>
-                        <td>
+                        <td style={{ maxWidth: 'clamp(180px, 22vw, 300px)' }}>
                           {isManager ? (
                             <>
-                              <div style={{ fontWeight: 600, fontSize: '0.84rem', color: 'var(--accent-primary)', fontFamily: 'monospace' }}>
+                              <div
+                                title={standardizedPath}
+                                style={{
+                                  fontWeight: 600,
+                                  fontSize: '0.82rem',
+                                  color: 'var(--accent-primary)',
+                                  fontFamily: 'monospace',
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
                                 {standardizedPath}
                               </div>
-                              <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+                              <div
+                                title={item.backup_file}
+                                style={{
+                                  fontSize: '0.73rem',
+                                  color: 'var(--text-muted)',
+                                  fontFamily: 'monospace',
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
                                 {item.backup_file}
                               </div>
                             </>
                           ) : (
-                            <div style={{ fontWeight: 600, fontSize: '0.84rem', color: 'var(--text-main)' }}>
+                            <div
+                              title={item.filename}
+                              style={{
+                                fontWeight: 600,
+                                fontSize: '0.83rem',
+                                color: 'var(--text-main)',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
                               {item.filename}
                             </div>
                           )}
@@ -1121,14 +1152,14 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         <td>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', alignItems: 'flex-start' }}>
                             <span style={{
-                              padding: '2px 8px', borderRadius: '999px', fontSize: '0.73rem', fontWeight: 700,
+                              padding: '2px 8px', borderRadius: '999px', fontSize: '0.72rem', fontWeight: 700,
                               background: isInc ? 'rgba(13, 148, 136, 0.14)' : 'rgba(99, 102, 241, 0.14)',
                               color: isInc ? 'var(--accent-primary)' : '#6366f1',
                             }}>
                               {isInc ? `INCREMENTAL (#${item.chain_length || 2})` : 'FULL BASE'}
                             </span>
                             {isInc && item.saved_bytes > 0 && (
-                              <span style={{ fontSize: '0.72rem', color: '#10b981', fontWeight: 600 }}>
+                              <span style={{ fontSize: '0.71rem', color: '#10b981', fontWeight: 600 }}>
                                 Tiết kiệm {formatBytes(item.saved_bytes)}
                               </span>
                             )}
@@ -1136,21 +1167,21 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                         </td>
                         <td>
                           <span style={{
-                            padding: '2px 8px', borderRadius: '999px', fontSize: '0.78rem', fontWeight: 600,
+                            padding: '2px 8px', borderRadius: '999px', fontSize: '0.76rem', fontWeight: 600,
                             background: 'var(--surface-2)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)',
                           }}>
                             {item.websites ?? 0} site
                           </span>
                         </td>
-                        <td style={{ fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                        <td style={{ fontSize: '0.81rem', color: 'var(--text-muted)' }}>
                           {item.generated_at ? new Date(item.generated_at).toLocaleString() : '-'}
                         </td>
-                        <td style={{ fontWeight: 600, fontSize: '0.84rem' }}>{formatBytes(item.size)}</td>
+                        <td style={{ fontWeight: 600, fontSize: '0.83rem' }}>{formatBytes(item.size)}</td>
                         <td>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', alignItems: 'flex-start' }}>
                             <span style={{
                               display: 'inline-flex', alignItems: 'center', gap: '5px',
-                              padding: '3px 9px', borderRadius: '999px', fontSize: '0.75rem', fontWeight: 600,
+                              padding: '3px 8px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 600,
                               background: item.valid ? 'rgba(16, 185, 129, 0.12)' : 'rgba(239, 68, 68, 0.12)',
                               color: item.valid ? '#10b981' : '#ef4444',
                             }}>
@@ -1158,22 +1189,23 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                               {item.valid ? 'Hợp lệ' : (item.error || 'Lỗi')}
                             </span>
                             {item.sha256 && (
-                              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontFamily: 'monospace' }} title={`SHA-256: ${item.sha256}`}>
+                              <span style={{ fontSize: '0.69rem', color: 'var(--text-muted)', fontFamily: 'monospace' }} title={`SHA-256: ${item.sha256}`}>
                                 SHA256: {item.sha256.slice(0, 10)}…
                               </span>
                             )}
                           </div>
                         </td>
                         <td style={{ textAlign: 'right' }}>
-                          <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
+                          <div style={{ display: 'inline-flex', gap: '5px', justifyContent: 'flex-end', alignItems: 'center' }}>
                             <button
                               type="button"
                               className="secondary-light"
                               onClick={() => verifyBackupArchive(item.backup_file, null)}
                               disabled={loading}
                               title="Kiểm tra toàn vẹn SHA-256 & cấu trúc gói .tar.gz"
+                              style={{ padding: '5px 9px', fontSize: '0.78rem' }}
                             >
-                              <ShieldCheck size={14} /> SHA-256
+                              <ShieldCheck size={13} /> SHA-256
                             </button>
                             {isAdmin && (
                               <button
@@ -1182,8 +1214,9 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                                 onClick={() => restoreUserBackupItem(item)}
                                 disabled={loading || !item.valid}
                                 title="Khôi phục tài khoản này theo chế độ Granular đã chọn"
+                                style={{ padding: '5px 9px', fontSize: '0.78rem' }}
                               >
-                                <RotateCcw size={14} /> Khôi phục
+                                <RotateCcw size={13} /> Khôi phục
                               </button>
                             )}
                             <button
@@ -1192,8 +1225,9 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                               onClick={() => downloadUserBackup(item)}
                               disabled={loading}
                               title="Tải file .tar.gz về máy"
+                              style={{ padding: '5px 9px', fontSize: '0.78rem' }}
                             >
-                              <Download size={14} /> Tải về
+                              <Download size={13} /> Tải về
                             </button>
                             <button
                               type="button"
@@ -1201,9 +1235,9 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                               onClick={() => deleteUserBackupItem(item)}
                               disabled={loading}
                               title="Xóa bản sao lưu"
-                              style={{ padding: '6px 10px' }}
+                              style={{ padding: '5px 8px' }}
                             >
-                              <Trash2 size={14} />
+                              <Trash2 size={13} />
                             </button>
                           </div>
                         </td>

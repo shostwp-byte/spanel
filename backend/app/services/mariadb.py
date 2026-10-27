@@ -1,13 +1,53 @@
+from contextlib import contextmanager
+import contextvars
 from datetime import datetime
+import os
 from pathlib import Path
 import re
 import secrets
 import string
 import subprocess
-from typing import Dict
+import tempfile
+from typing import Dict, Iterator, Optional
 
 from app.core.config import settings
 from app.services.shell import shell
+
+_IMPORT_CREDS_CTX: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
+    "spanel_mariadb_import_creds", default=None
+)
+
+
+@contextmanager
+def tenant_import_credentials(db_user: Optional[str], db_password: Optional[str]) -> Iterator[None]:
+    """Scope a database import to a tenant's own MySQL account instead of the panel's global ~/.my.cnf."""
+    if db_user and db_password:
+        token = _IMPORT_CREDS_CTX.set((db_user.strip(), db_password))
+        try:
+            yield
+        finally:
+            _IMPORT_CREDS_CTX.reset(token)
+    else:
+        yield
+
+
+@contextmanager
+def _tenant_client_defaults_file(db_user: str, db_password: str) -> Iterator[Path]:
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    escaped_pw = (db_password or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    fd, raw_path = tempfile.mkstemp(prefix="spanel-mysql-import-", suffix=".cnf")
+    path = Path(raw_path)
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f'[client]\nhost=localhost\nuser="{safe_user}"\npassword="{escaped_pw}"\n')
+        yield path
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 IDENTIFIER_CHARS = set(string.ascii_lowercase + string.digits + "_")
@@ -39,10 +79,32 @@ RESERVED_DB_USERS = frozenset({
     "spanel",
 })
 
+RESERVED_DATABASES = frozenset({
+    "mysql",
+    "information_schema",
+    "performance_schema",
+    "sys",
+    "spanel",
+    "spanel_mail",
+    "phpmyadmin",
+    "roundcube",
+    "roundcubemail",
+    "pdns",
+    "powerdns",
+    "test",
+})
+
 
 def _reject_reserved_user(db_user: str) -> None:
     if db_user.strip().lower() in RESERVED_DB_USERS:
         raise ValueError(f"'{db_user}' is a reserved MariaDB account and cannot be used for a website database")
+
+
+def _reject_reserved_database(db_name: str) -> str:
+    safe = _validate_identifier(db_name)
+    if safe.strip().lower() in RESERVED_DATABASES:
+        raise ValueError(f"'{db_name}' is a reserved MariaDB database and cannot be used for a website database")
+    return safe
 
 
 def user_exists(db_user: str) -> bool:
@@ -102,7 +164,7 @@ def _run_sql(sql: str, *, check: bool = True):
 
 
 def create_database(seed: str, prefix: str = "wp", db_name: str | None = None, if_not_exists: bool = True) -> Dict[str, str]:
-    db_name = _validate_identifier(db_name or safe_db_identifier(seed, prefix))
+    db_name = _reject_reserved_database(db_name or safe_db_identifier(seed, prefix))
     db_user = _validate_identifier(safe_db_identifier(db_name, "u"))
     _reject_reserved_user(db_user)
     db_password = random_password()
@@ -139,7 +201,7 @@ def create_database_credentials(
     recreates the account that archive already owned - and even those cannot
     touch a reserved account.
     """
-    db_name = _validate_identifier(db_name)
+    db_name = _reject_reserved_database(db_name)
     db_user = _validate_identifier(db_user)
     _reject_reserved_user(db_user)
 
@@ -166,9 +228,10 @@ def create_database_credentials(
 
 
 def drop_database(db_name: str, db_user: str):
+    safe_db = _reject_reserved_database(db_name)
     _reject_reserved_user(_validate_identifier(db_user))
     sql = (
-        f"DROP DATABASE IF EXISTS {_quote_identifier(db_name)};\n"
+        f"DROP DATABASE IF EXISTS {_quote_identifier(safe_db)};\n"
         f"DROP USER IF EXISTS {_quote_sql_string(_validate_identifier(db_user))}@'localhost';\n"
         "FLUSH PRIVILEGES;\n"
     )
@@ -190,19 +253,117 @@ def export_database(db_name: str, output_file: str):
     home_cnf = Path.home() / ".my.cnf"
     if home_cnf.exists():
         args.append(f"--defaults-file={home_cnf}")
-    args.extend([_validate_identifier(db_name), "--result-file", output_file])
+    args.extend([_reject_reserved_database(db_name), "--result-file", output_file])
     return shell.run(args, sensitive=True)
 
 
-def import_database(db_name: str, input_file: str):
-    safe_name = _validate_identifier(db_name)
+_SQL_DEFINER_RE = re.compile(
+    rb"DEFINER\s*=\s*(?:`[^`]+`|'[^']+'|\"[^\"]+\"|[A-Za-z0-9_.$]+)\s*@\s*(?:`[^`]+`|'[^']+'|\"[^\"]+\"|[A-Za-z0-9_.%$-]+)\s*",
+    re.IGNORECASE,
+)
+
+
+@contextmanager
+def _strip_sql_definers(sql_path: Path) -> Iterator[Path]:
+    """Copy sql_path line-by-line to a 0600 temporary file with DEFINER clauses removed."""
+    fd, raw_tmp = tempfile.mkstemp(prefix="spanel-sql-import-", suffix=".sql")
+    tmp_path = Path(raw_tmp)
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "wb") as dst, sql_path.open("rb") as src:
+            for raw_line in src:
+                cleaned = _SQL_DEFINER_RE.sub(b"", raw_line)
+                if cleaned != raw_line:
+                    cleaned = re.sub(rb"/\*![0-9]{5}\s*\*/\s*", b"", cleaned)
+                dst.write(cleaned)
+        yield tmp_path
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _resolve_tenant_import_credentials(
+    safe_name: str,
+    db_user: Optional[str] = None,
+    db_password: Optional[str] = None,
+) -> tuple[str, str]:
+    eff_user = (db_user or "").strip()
+    eff_pass = db_password
+    if not (eff_user and eff_pass):
+        ctx_creds = _IMPORT_CREDS_CTX.get()
+        if ctx_creds:
+            eff_user, eff_pass = (ctx_creds[0] or "").strip(), ctx_creds[1]
+    if not (eff_user and eff_pass):
+        acc = None
+        try:
+            from app.core.database import SessionLocal
+            from app.models.entities import DatabaseAccount
+
+            with SessionLocal() as session:
+                acc = session.query(DatabaseAccount).filter(DatabaseAccount.db_name == safe_name).first()
+                if acc is not None:
+                    session.expunge(acc)
+        except Exception:
+            acc = None
+        if acc and acc.db_user and acc.db_password:
+            from app.core.secrets import decrypt
+
+            eff_user = acc.db_user.strip()
+            eff_pass = decrypt(acc.db_password)
+    if not (eff_user and eff_pass):
+        raise RuntimeError(
+            f"Database import refused: missing tenant database credentials for '{safe_name}'"
+        )
+    safe_user = _validate_identifier(eff_user)
+    _reject_reserved_user(safe_user)
+    return safe_user, eff_pass
+
+
+def import_database_as_tenant(
+    db_name: str,
+    input_file: str,
+    db_user: Optional[str] = None,
+    db_password: Optional[str] = None,
+):
+    safe_name = _reject_reserved_database(db_name)
     sql_path = Path(input_file).resolve()
     if not sql_path.exists() or not sql_path.is_file():
         raise FileNotFoundError("SQL file not found")
     if settings.command_dry_run:
         return shell.run(["mysql", safe_name], sensitive=True)
-    args = _mysql_args([safe_name])
-    with sql_path.open("rb") as source:
+
+    eff_user, eff_pass = _resolve_tenant_import_credentials(
+        safe_name, db_user=db_user, db_password=db_password
+    )
+    with _tenant_client_defaults_file(eff_user, eff_pass) as cnf_path, _strip_sql_definers(sql_path) as clean_sql_path:
+        with clean_sql_path.open("rb") as source:
+            args = ["mysql", f"--defaults-file={cnf_path}", "--binary-mode", safe_name]
+            completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"Database import failed: {stderr.strip()}")
+    return completed
+
+
+def import_database_as_panel(db_name: str, input_file: str):
+    """Import a SQL dump using the panel's global MariaDB credentials.
+
+    Restricted to ephemeral panel-owned databases (such as backup_verify's
+    throwaway spanel_verify_* databases) that have no tenant DatabaseAccount.
+    """
+    if import_database is not _default_import_database:
+        return import_database(db_name, input_file)
+    safe_name = _reject_reserved_database(db_name)
+    sql_path = Path(input_file).resolve()
+    if not sql_path.exists() or not sql_path.is_file():
+        raise FileNotFoundError("SQL file not found")
+    if settings.command_dry_run:
+        return shell.run(["mysql", safe_name], sensitive=True)
+
+    args = _mysql_args(["--binary-mode", safe_name])
+    with _strip_sql_definers(sql_path) as clean_sql_path, clean_sql_path.open("rb") as source:
         completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
     if completed.returncode != 0:
         stderr = completed.stderr.decode("utf-8", errors="replace")
@@ -210,8 +371,26 @@ def import_database(db_name: str, input_file: str):
     return completed
 
 
+def import_database(
+    db_name: str,
+    input_file: str,
+    *,
+    db_user: Optional[str] = None,
+    db_password: Optional[str] = None,
+):
+    return import_database_as_tenant(
+        db_name,
+        input_file,
+        db_user=db_user,
+        db_password=db_password,
+    )
+
+
+_default_import_database = import_database
+
+
 def dump_database_file(db_name: str, output_dir: Path) -> Path:
-    safe_name = _validate_identifier(db_name)
+    safe_name = _reject_reserved_database(db_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / f"{safe_name}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.sql"
     export_database(safe_name, str(target))
@@ -228,7 +407,7 @@ def set_database_write_lock(db_name: str, db_user: str, locked: bool) -> None:
     SELECT, DELETE, DROP, and SHOW VIEW remain granted so the website stays online
     and the customer can still DELETE/TRUNCATE/DROP bloated tables via phpMyAdmin.
     """
-    safe_db = _validate_identifier(db_name)
+    safe_db = _reject_reserved_database(db_name)
     safe_user = _validate_identifier(db_user)
     _reject_reserved_user(safe_user)
     q_db = _quote_identifier(safe_db)
@@ -282,7 +461,7 @@ def set_account_locked(db_user: str, locked: bool) -> None:
 
 def get_database_tables_breakdown(db_name: str) -> list[dict]:
     """Return top tables by size (data + index bytes) inside a specific database."""
-    safe_db = _validate_identifier(db_name)
+    safe_db = _reject_reserved_database(db_name)
     if settings.command_dry_run:
         return []
     sql = (
@@ -319,7 +498,7 @@ def get_database_tables_breakdown(db_name: str) -> list[dict]:
 
 def optimize_database(db_name: str) -> dict:
     """Run OPTIMIZE TABLE on tables in db_name to reclaim fragmented InnoDB/MyISAM space."""
-    safe_db = _validate_identifier(db_name)
+    safe_db = _reject_reserved_database(db_name)
     tables = get_database_tables_breakdown(safe_db)
     if not tables:
         return {"optimized_tables": 0, "db_name": safe_db}

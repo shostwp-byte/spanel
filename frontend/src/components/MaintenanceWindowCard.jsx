@@ -113,8 +113,8 @@ export function MaintenanceWindowCard({ request, setNotice, loading }) {
           />
         </label>
         <strong>{t('Scheduled core stack security patching')}</strong>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <input type="checkbox" checked={!!core.enabled} onChange={e => setCore({ enabled: e.target.checked })} />
+        <label className="check-line" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <input type="checkbox" className="sp-switch-input" checked={!!core.enabled} onChange={e => setCore({ enabled: e.target.checked })} />
           {t('Patch the selected packages in the window (nginx -t before and after; unattended-upgrades is told to leave them alone)')}
         </label>
         <label style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>

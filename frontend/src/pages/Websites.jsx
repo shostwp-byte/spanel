@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
-import { Terminal } from '../components/Terminal';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { NoAutofillInput } from '../components/NoAutofillInput.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
+
+const Terminal = React.lazy(() => import('../components/Terminal').then(m => ({ default: m.Terminal || m.default })));
 
 export function WebsitesPage({ 
   mode = 'domains',
@@ -542,7 +543,9 @@ export function WebsitesPage({
         <button className="secondary-light" onClick={() => setTerminalViewer(null)}><X size={14}/>{t('Close')}</button>
       </div>
       <div style={{ height: '500px', marginTop: '8px' }}>
-        <Terminal websiteId={terminalViewer.id} apiBase={API} />
+        <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
+          <Terminal websiteId={terminalViewer.id} apiBase={API} />
+        </React.Suspense>
       </div>
     </div>;
   }

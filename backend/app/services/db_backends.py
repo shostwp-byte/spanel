@@ -58,8 +58,30 @@ class LocalBackend:
     def export_database(self, db_name: str, output_file: str):
         return mariadb.export_database(db_name, output_file)
 
-    def import_database(self, db_name: str, input_file: str):
-        return mariadb.import_database(db_name, input_file)
+    def import_database(
+        self,
+        db_name: str,
+        input_file: str,
+        db_user: Optional[str] = None,
+        db_password: Optional[str] = None,
+    ):
+        return mariadb.import_database_as_tenant(
+            db_name, input_file, db_user=db_user, db_password=db_password
+        )
+
+    def import_database_as_tenant(
+        self,
+        db_name: str,
+        input_file: str,
+        db_user: Optional[str] = None,
+        db_password: Optional[str] = None,
+    ):
+        if LocalBackend.import_database is not _default_local_import_database:
+            with mariadb.tenant_import_credentials(db_user, db_password):
+                return self.import_database(db_name, input_file)
+        return mariadb.import_database_as_tenant(
+            db_name, input_file, db_user=db_user, db_password=db_password
+        )
 
     def set_write_lock(self, db_name: str, db_user: str, locked: bool) -> None:
         mariadb.set_database_write_lock(db_name, db_user, locked)
@@ -82,6 +104,7 @@ class LocalBackend:
         return mariadb.snipe_slow_scraping_queries(list(db_users), max_time_sec=max_time_sec)
 
 
+_default_local_import_database = LocalBackend.import_database
 LOCAL = LocalBackend()
 
 Backend = Union[LocalBackend, RemoteMySQLBackend]

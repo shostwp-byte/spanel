@@ -29,14 +29,24 @@ logger = logging.getLogger("spanel.databases")
 def _is_loopback_peer(request: Request) -> bool:
     """Return True if the immediate TCP peer is loopback.
 
-    With ``--forwarded-allow-ips 127.0.0.1`` (see installer/install.sh) any
-    X-Forwarded-For from a non-trusted peer is dropped, so request.client.host
-    is the real connecting address.
+    On a dual-stack AF_INET6 socket (see app.serve.dual_stack_socket), an IPv4
+    connection from 127.0.0.1 arrives with peer address ``::ffff:127.0.0.1``.
+    Python's ``IPv6Address.is_loopback`` only checks ``::1`` and returns False
+    for IPv4-mapped loopback addresses unless ``addr.ipv4_mapped`` is inspected.
     """
-    if not request.client:
+    if not request.client or not request.client.host:
         return False
+    host = request.client.host.strip()
+    if host.lower() in {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}:
+        return True
     try:
-        return ipaddress.ip_address(request.client.host).is_loopback
+        addr = ipaddress.ip_address(host)
+        if addr.is_loopback:
+            return True
+        mapped = getattr(addr, "ipv4_mapped", None)
+        if mapped is not None and mapped.is_loopback:
+            return True
+        return False
     except ValueError:
         return False
 
@@ -50,23 +60,96 @@ def get_accessible_database(database_id: int, db: Session, current_user: User) -
     return item
 
 
+def effective_database_limit(user: User | None) -> int:
+    """Return the effective database quota for ``user`` (-1 = unlimited, 0 = disabled, >0 = max DBs).
+
+    When the user belongs to a hosting package, the package's ``database_limit``
+    is authoritative so legacy accounts whose ``users.database_limit`` column
+    defaulted to 5 in SQLite cannot bypass their package limit.
+    """
+    if user is None or is_admin_role(getattr(user, "role", None)):
+        return -1
+    pkg = getattr(user, "package", None)
+    if pkg is not None:
+        pkg_lim = getattr(pkg, "database_limit", None)
+        if pkg_lim is not None:
+            return int(pkg_lim)
+    raw_db_lim = getattr(user, "database_limit", None)
+    return int(-1 if raw_db_lim is None else raw_db_lim)
+
+
+def enforce_user_database_limit(db: Session, owner: User | None, *, creating_count: int = 1) -> None:
+    """Enforce package database count quota, reseller database pool quota, and storage quotas."""
+    if owner is None or is_admin_role(getattr(owner, "role", None)):
+        return
+
+    db_limit = effective_database_limit(owner)
+    if getattr(owner, "package", None) is not None and getattr(owner, "database_limit", None) != db_limit:
+        owner.database_limit = db_limit
+
+    if db_limit == 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Database creation is disabled for your hosting package (limit: 0).",
+        )
+    if db_limit > 0:
+        current_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == owner.id).count()
+        if current_count + max(1, creating_count) > db_limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Database limit reached ({current_count}/{db_limit}). Upgrade your package to add more databases.",
+            )
+
+    reseller_id = getattr(owner, "reseller_id", None)
+    if reseller_id:
+        reseller = db.query(User).filter(User.id == reseller_id).first()
+        if reseller and not is_admin_role(getattr(reseller, "role", None)):
+            rp = getattr(reseller, "reseller_package", None)
+            up = getattr(reseller, "package", None)
+            total_db_limit = 0
+            if rp is not None:
+                total_db_limit = int(getattr(rp, "total_database_limit", 0) or 0)
+            elif up is not None and getattr(up, "is_reseller_package", False):
+                total_db_limit = int(getattr(up, "database_limit", 0) or 0)
+            if total_db_limit > 0:
+                reseller_db_count = (
+                    db.query(DatabaseAccount)
+                    .join(User, DatabaseAccount.owner_id == User.id)
+                    .filter(User.reseller_id == reseller.id)
+                    .count()
+                )
+                if reseller_db_count + max(1, creating_count) > total_db_limit:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Reseller database quota exceeded ({reseller_db_count}/{total_db_limit}).",
+                    )
+
+    pkg = getattr(owner, "package", None)
+    mysql_limit_mb = int(
+        (getattr(pkg, "mysql_storage_limit_mb", 0) if pkg is not None else getattr(owner, "mysql_storage_limit_mb", 0))
+        or getattr(owner, "mysql_storage_limit_mb", 0)
+        or 0
+    )
+    if mysql_limit_mb > 0:
+        used_mysql = storage_quota.mysql_storage_used_bytes(db, owner)
+        if used_mysql >= mysql_limit_mb * storage_quota.BYTES_PER_MB:
+            raise HTTPException(
+                status_code=403,
+                detail=f"MySQL storage quota exceeded ({used_mysql // storage_quota.BYTES_PER_MB} MB / {mysql_limit_mb} MB).",
+            )
+    try:
+        storage_quota.enforce_user_storage_quota(db, owner, incoming_bytes=1024)
+    except storage_quota.StorageQuotaExceeded as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 @router.get("", response_model=List[DatabaseOut])
 def list_databases(
     q: str = Query(default="", max_length=255),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    try:
-        from app.api.websites import reconcile_websites_from_disk
-        from app.api.wordpress_manager import reconcile_wordpress_databases
-        reconcile_websites_from_disk(db)
-        reconcile_wordpress_databases(db)
-    except Exception as exc:
-        logger.debug("reconcile_wordpress_databases skipped in list_databases: %s", exc)
-
-    query = db.query(DatabaseAccount)
-    if not is_admin_role(current_user.role):
-        query = query.filter(DatabaseAccount.owner_id == current_user.id)
+    query = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == current_user.id)
     search = (q or "").strip().lower()
     if search:
         like = f"%{search}%"
@@ -109,26 +192,7 @@ def list_database_hosts(db: Session = Depends(get_db), current_user: User = Depe
 
 @router.post("", response_model=DatabaseCreatedOut)
 def create_database(payload: DatabaseCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    if not is_admin_role(current_user.role):
-        raw_db_lim = getattr(current_user, "database_limit", None)
-        if raw_db_lim is None and current_user.package is not None:
-            raw_db_lim = getattr(current_user.package, "database_limit", None)
-        db_limit = int(-1 if raw_db_lim is None else raw_db_lim)
-        if db_limit == 0:
-            raise HTTPException(status_code=403, detail="Database creation is disabled for your hosting package (limit: 0).")
-        if db_limit > 0:
-            current_count = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == current_user.id).count()
-            if current_count >= db_limit:
-                raise HTTPException(status_code=403, detail=f"Database limit reached ({current_count}/{db_limit}). Upgrade your package to add more databases.")
-        mysql_limit_mb = int(getattr(current_user, "mysql_storage_limit_mb", 0) or 0)
-        if mysql_limit_mb > 0:
-            used_mysql = storage_quota.mysql_storage_used_bytes(db, current_user)
-            if used_mysql >= mysql_limit_mb * storage_quota.BYTES_PER_MB:
-                raise HTTPException(status_code=403, detail=f"MySQL storage quota exceeded ({used_mysql // storage_quota.BYTES_PER_MB} MB / {mysql_limit_mb} MB).")
-        try:
-            storage_quota.enforce_user_storage_quota(db, current_user, incoming_bytes=1024)
-        except storage_quota.StorageQuotaExceeded as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
+    enforce_user_database_limit(db, current_user)
 
     db_name = payload.db_name
     db_user = payload.db_user or db_name
@@ -264,6 +328,16 @@ def create_phpmyadmin_sso(database_id: int, request: Request, db: Session = Depe
             status_code=500,
             detail="Failed to access stored database password; please re-save the password in panel settings",
         )
+    if item.db_host_id is None:
+        try:
+            mariadb.create_database_credentials(
+                item.db_name,
+                item.db_user,
+                db_password,
+                allow_existing_user=True,
+            )
+        except Exception as exc:
+            logger.debug("Could not refresh local MariaDB credentials before phpMyAdmin SSO: %s", exc)
     token = create_phpmyadmin_token(
         item.db_user, db_password, item.db_name,
         server=remote_mysql.phpmyadmin_server_index(db, item.db_host),

@@ -848,6 +848,7 @@ def exit_impersonation(
     actor_id = actor.id
     _revoke_request_token(db, request, current_user)
     token = _issue_login_session(response, request, actor)
+    db.commit()
     log_action(
         db,
         actor_id,
@@ -856,50 +857,6 @@ def exit_impersonation(
         detail=f"from_user_id={from_user_id} to_user_id={actor_id}",
         request=request,
     )
-    token = _issue_login_session(
-        response,
-        request,
-        target_user,
-        extra_claims={
-            "imp": True,
-            "imp_by": current_user.id,
-            "imp_user": current_user.username,
-            "imp_tv": int(current_user.token_version or 0),
-        },
-    )
-    return LoginResponse(access_token=token)
-
-
-@router.post("/impersonate-exit", response_model=LoginResponse)
-def exit_impersonation(
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Return from an impersonated session back to the original admin/reseller account."""
-    jwt_payload = getattr(request.state, "jwt_payload", None) or {}
-    imp_by = jwt_payload.get("imp_by")
-    if not jwt_payload.get("imp") or not imp_by:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not in an impersonated session")
-    actor = db.query(User).filter(User.id == int(imp_by)).first()
-    if (
-        actor is None
-        or not actor.is_active
-        or normalize_role(actor.role) not in {Role.admin, Role.reseller}
-        or int(actor.token_version or 0) != int(jwt_payload.get("imp_tv", 0))
-    ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Original session is no longer valid")
-    _revoke_request_token(db, request, current_user)
-    log_action(
-        db,
-        actor.id,
-        "auth.impersonate_exit",
-        current_user.username,
-        detail=f"from_user_id={current_user.id} to_user_id={actor.id}",
-        request=request,
-    )
-    token = _issue_login_session(response, request, actor)
     return LoginResponse(access_token=token)
 
 

@@ -886,6 +886,32 @@ PY_MIGRATE
   fi
 }
 
+warn_legacy_privileged_owned_resources() {
+  local db_path="$APP_DIR/backend/spanel.db"
+  [[ -f "$db_path" ]] || return 0
+  local py_bin="$APP_DIR/backend/.venv/bin/python"
+  [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
+
+  (cd "$APP_DIR/backend" && sudo -u spanel env \
+    HOME="$APP_DIR" \
+    PYTHONPATH="$APP_DIR/backend" \
+    "$py_bin" - <<'PY_WARN_ROLES'
+import sys
+
+try:
+    from app.api.websites import audit_privileged_role_owned_resources
+    from app.core.database import SessionLocal
+
+    with SessionLocal() as db:
+        report = audit_privileged_role_owned_resources(db)
+        for line in report.get("warnings") or []:
+            print(line)
+except Exception as exc:
+    print(f"WARNING: role ownership audit skipped: {exc}", file=sys.stderr)
+PY_WARN_ROLES
+  ) || true
+}
+
 ensure_terminal_tools() {
   local missing=()
   command -v composer >/dev/null 2>&1 || missing+=(composer)
@@ -1275,7 +1301,7 @@ SERVICE
   write_tools_nginx_config
   if [[ -f /usr/share/phpmyadmin/spanel-signon.php ]]; then
     local scheme="http"
-    if [[ -n "$(env_get PANEL_SSL_CERT)" && -n "$(env_get PANEL_SSL_KEY)" ]]; then
+    if [[ ( -n "$(env_get PANEL_SSL_CERT)" && -n "$(env_get PANEL_SSL_KEY)" ) || ( -f /etc/spanel/panel-fullchain.pem && -f /etc/spanel/panel-privkey.pem ) ]]; then
       scheme="https"
     fi
     # Older copies always opened server 1 and forced host=localhost, so a
@@ -1407,7 +1433,7 @@ backup_db() {
   # since the last checkpoint live only in spanel.db-wal and a copy of the
   # main file alone is missing them (the sqlite3 CLI is not installed on a
   # stock Ubuntu either, which is how every snapshot became a cp).
-  if ! "${as_owner[@]}" python3 -I - "$db_path" "$snap" <<'PY'; then
+  if ! (cd "$snap_dir" && "${as_owner[@]}" python3 -I - "$db_path" "$snap" <<'PY'
 import sqlite3, sys
 src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=30)
 dst = sqlite3.connect(sys.argv[2])
@@ -1416,14 +1442,19 @@ with dst:
 dst.close()
 src.close()
 PY
+  ); then
     echo "ERROR: could not snapshot $db_path; nothing was changed." >&2
     exit 1
   fi
   echo "DB snapshot saved: $snap"
-  # Keep the 10 most recent snapshots.
-  "${as_owner[@]}" find "$snap_dir" -maxdepth 1 -type f -name 'spanel-*.db' -printf '%T@ %p\0' \
-    | sort -z -rn | tail -z -n +11 | cut -z -d' ' -f2- \
-    | "${as_owner[@]}" xargs -0 -r rm -f -- || true
+  # Keep the 10 most recent snapshots. Run from $snap_dir so GNU find's
+  # restore_cwd never tries to chdir back into /root (0700) as user spanel.
+  (
+    cd "$snap_dir" \
+      && "${as_owner[@]}" find "$snap_dir" -maxdepth 1 -type f -name 'spanel-*.db' -printf '%T@ %p\0' \
+        | sort -z -rn | tail -z -n +11 | cut -z -d' ' -f2- \
+        | "${as_owner[@]}" xargs -0 -r rm -f --
+  ) || true
 }
 
 if [[ -n "${SPANEL_UPDATE_STAGE2:-}" ]]; then
@@ -1588,14 +1619,8 @@ mkdir -p "$APP_DIR"
 # during the update could leave behind. As spanel: a root connection would
 # create spanel.db-wal/-shm owned by root if they were missing, and the API
 # could no longer open its own database.
-if [[ -f "$APP_DIR/backend/spanel.db" ]] && id -u spanel >/dev/null 2>&1; then
-  sudo -u spanel python3 -I - "$APP_DIR/backend/spanel.db" <<'PY' || true
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1], timeout=15)
-try:
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-if [[ -f "$APP_DIR/backend/spanel.db" ]] && command -v python3 >/dev/null 2>&1; then
-  python3 -c '
+if [[ -f "$APP_DIR/backend/spanel.db" ]] && id -u spanel >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  sudo -u spanel python3 -I -c '
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1], timeout=15)
 try:
@@ -1696,6 +1721,11 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
     if [[ -f "$SOURCE_DIR/installer/files/spanel_mailtool.py" ]]; then
       install -d -m 0755 -o root -g root /usr/local/lib/spanel
       install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel_mailtool.py" /usr/local/lib/spanel/spanel_mailtool.py
+    fi
+    if [[ -f "$SOURCE_DIR/installer/files/webmail/backend/main.py" && -f "$SOURCE_DIR/installer/files/webmail/backend/requirements.txt" ]]; then
+      install -d -m 0755 -o root -g root /usr/local/lib/spanel/webmail /usr/local/lib/spanel/webmail/backend
+      install -m 0755 -o root -g root "$SOURCE_DIR/installer/files/webmail/backend/main.py" /usr/local/lib/spanel/webmail/backend/main.py
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/webmail/backend/requirements.txt" /usr/local/lib/spanel/webmail/backend/requirements.txt
     fi
     if [[ -f "$SOURCE_DIR/installer/files/spanel_webshells.yar" ]]; then
       install -d -m 0755 -o root -g spanel /etc/spanel/yara
@@ -2134,6 +2164,7 @@ for php_ini_dir in /etc/php/*/; do
 done
 
 log "Compiling backend modules"
+cd "$APP_DIR/backend"
 # As spanel: the .pyc files land in backend/__pycache__, the account's
 # directory, and root writing there follows whatever links it holds.
 py_compile_as=()
@@ -2161,6 +2192,7 @@ id -u spanel >/dev/null 2>&1 && py_compile_as=(sudo -u spanel)
   app/services/waf.py \
   app/services/mariadb.py \
   app/services/wordpress.py \
+  app/services/wordpress_live.py \
   app/services/file_manager.py \
   app/services/backup.py \
   app/services/backup_scheduler.py \
@@ -2201,7 +2233,7 @@ systemctl restart spanel-api
 update_progress 80 "frontend" "Building frontend"
 cd "$APP_DIR/frontend"
 
-FRONTEND_INPUTS=(src public index.html package.json package-lock.json)
+FRONTEND_INPUTS=(src public index.html package.json package-lock.json vite.config.js)
 FRONTEND_FP="$(fingerprint "${FRONTEND_INPUTS[@]}" || true)"
 FRONTEND_REBUILT=0
 if [[ -f dist/index.html && -f dist/.build-fingerprint && -n "$FRONTEND_FP" && "$(cat dist/.build-fingerprint 2>/dev/null)" == "$FRONTEND_FP" ]] && ! step_inputs_changed frontend "${FRONTEND_INPUTS[@]}"; then
@@ -2218,16 +2250,19 @@ else
   echo "npm version: $(npm --version)"
 
   rm -rf dist .vite node_modules/.vite
+  chown -R -h spanel:spanel "$APP_DIR/frontend" 2>/dev/null || true
 
   # Reinstall only when the dependency set actually moved, not just its mtime.
   if [[ ! -d node_modules ]] || step_inputs_changed frontend-deps package.json; then
     log "Installing npm dependencies..."
     rm -rf node_modules package-lock.json
-    npm install
+    chown -R -h spanel:spanel "$APP_DIR/frontend" 2>/dev/null || true
+    sudo -u spanel npm install --ignore-scripts
     step_mark_done frontend-deps package.json
   fi
   log "Building frontend with VITE_API_URL=/api..."
-  VITE_API_URL=/api npm run build 2>&1 || { log "BUILD FAILED"; exit 1; }
+  sudo -u spanel VITE_API_URL=/api npm run build 2>&1 || { log "BUILD FAILED"; exit 1; }
+  chown -R -h root:root "$APP_DIR/frontend" 2>/dev/null || true
 
   [[ -f dist/index.html ]] || fail "Frontend build failed: dist/index.html missing"
   HASHED=$(grep -oE 'index-[a-zA-Z0-9_-]+\.js' dist/index.html | head -n1 || true)
@@ -2254,11 +2289,11 @@ migrate_nginx_wordpress_csp_worker_src
 migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
+warn_legacy_privileged_owned_resources
 # The empty database earlier updates left behind when the cron migration ran
-# from frontend/ (see migrate_site_cron_php_binary). As spanel: frontend/ is
-# spanel's directory.
+# from frontend/ (see migrate_site_cron_php_binary).
 if [[ -f "$APP_DIR/frontend/spanel.db" && ! -L "$APP_DIR/frontend/spanel.db" ]]; then
-  sudo -u spanel rm -f -- "$APP_DIR/frontend/spanel.db" || true
+  rm -f -- "$APP_DIR/frontend/spanel.db" || true
 fi
 nginx -t
 systemctl reload nginx

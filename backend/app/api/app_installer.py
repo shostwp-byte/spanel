@@ -1,12 +1,12 @@
 import shlex
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role
+from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.models.entities import User, Website
 from app.services.shell import shell
 from app.services import site_users, nginx
@@ -44,13 +44,20 @@ def _run_install_task(app_type: str, domain: str, linux_user: str, root_path: st
         )
 
 @router.post("/install")
-def install_app(payload: AppInstallRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def install_app(payload: AppInstallRequest, background_tasks: BackgroundTasks, request: Request = None, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    access_role = (request.headers.get("x-access-role") or "").strip().lower() if (request is not None and getattr(request, "headers", None)) else ""
+    if is_admin_role(getattr(current_user, "role", None)) or normalize_role(getattr(current_user, "role", None)) == Role.reseller:
+        if access_role not in {"user", "end_user"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Application Installer is only available in User Access Role. Please switch Access Role to User or use 'Login as' on an End User account.",
+            )
     # Find the website
     website = db.query(Website).filter(Website.domain == payload.domain).first()
     if not website:
         raise HTTPException(status_code=404, detail="Website not found")
     
-    if website.owner_id != current_user.id and current_user.role != Role.admin.value:
+    if website.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not allowed")
 
     # Update website configuration based on app type

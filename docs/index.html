@@ -1,9 +1,10 @@
 <!DOCTYPE html>
-<html lang="vi" data-theme="dark">
+<html lang="vi" data-theme="light">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SPanel v1.0.6 — Tài liệu & Hướng dẫn Chính thức</title>
+  <title>SPanel v1.0.7 — Tài liệu & Hướng dẫn Chính thức</title>
   <link rel="icon" type="image/png" href="favicon.png" />
   <style>
     :root {
@@ -18,6 +19,7 @@
       --accent: #10b981;
       --code-bg: #090d16;
     }
+
     [data-theme="light"] {
       --bg: #f8fafc;
       --bg-surface: #ffffff;
@@ -30,15 +32,38 @@
       --accent: #059669;
       --code-bg: #0f172a;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
       background: var(--bg);
       color: var(--text);
       line-height: 1.65;
     }
-    a { color: var(--primary); text-decoration: none; }
-    a:hover { text-decoration: underline; }
+
+    a {
+      color: var(--primary);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.9em;
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+    }
+
     header {
       position: sticky;
       top: 0;
@@ -52,6 +77,7 @@
       gap: 16px;
       flex-wrap: wrap;
     }
+
     .brand {
       display: flex;
       align-items: center;
@@ -60,7 +86,13 @@
       font-size: 20px;
       color: var(--text);
     }
-    .brand img { width: 32px; height: 32px; border-radius: 8px; }
+
+    .brand img {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+    }
+
     .badge {
       font-size: 12px;
       font-weight: 700;
@@ -70,14 +102,34 @@
       color: var(--primary);
       border: 1px solid rgba(59, 130, 246, 0.35);
     }
+
+    .pill-row {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+
+    .pill {
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 4px 12px;
+      border-radius: 999px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+    }
+
     .nav-links {
       display: flex;
       align-items: center;
-      gap: 18px;
+      gap: 16px;
       flex-wrap: wrap;
       font-size: 14px;
       font-weight: 600;
     }
+
     .btn {
       display: inline-flex;
       align-items: center;
@@ -91,40 +143,51 @@
       background: var(--bg-card);
       color: var(--text);
       transition: all 0.15s ease;
+      white-space: nowrap;
     }
+
     .btn-primary {
       background: var(--primary);
       border-color: var(--primary);
       color: #fff;
     }
-    .btn-primary:hover { background: var(--primary-hover); text-decoration: none; }
+
+    .btn-primary:hover {
+      background: var(--primary-hover);
+      text-decoration: none;
+    }
+
     .container {
-      max-width: 1160px;
+      max-width: 1200px;
       margin: 0 auto;
       padding: 40px 20px 80px;
     }
+
     .hero {
       text-align: center;
-      padding: 48px 20px;
+      padding: 48px 24px;
       background: var(--bg-surface);
       border: 1px solid var(--border);
       border-radius: 18px;
       margin-bottom: 40px;
     }
+
     .hero h1 {
-      font-size: clamp(28px, 4vw, 44px);
+      font-size: clamp(28px, 4vw, 42px);
       font-weight: 800;
       margin-bottom: 16px;
       letter-spacing: -0.02em;
     }
+
     .hero p {
-      max-width: 780px;
+      max-width: 860px;
       margin: 0 auto 28px;
       color: var(--text-muted);
-      font-size: 17px;
+      font-size: 16.5px;
     }
+
     .install-box {
-      max-width: 840px;
+      max-width: 880px;
       margin: 0 auto;
       background: var(--code-bg);
       color: #e2e8f0;
@@ -140,53 +203,103 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 13.5px;
     }
+
+    .install-box code {
+      background: transparent;
+      border: none;
+      padding: 0;
+      color: #e2e8f0;
+    }
+
     .section-title {
       font-size: 24px;
       font-weight: 800;
-      margin: 44px 0 20px;
+      margin: 48px 0 20px;
       padding-bottom: 10px;
       border-bottom: 1px solid var(--border);
     }
+
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
       gap: 20px;
     }
+
     .card {
       background: var(--bg-surface);
       border: 1px solid var(--border);
       border-radius: 14px;
       padding: 24px;
     }
+
     .card h3 {
-      font-size: 18px;
+      font-size: 17.5px;
       margin-bottom: 10px;
       display: flex;
       align-items: center;
       gap: 8px;
     }
-    .card p, .card li {
+
+    .card p,
+    .card li {
       color: var(--text-muted);
       font-size: 14.5px;
     }
-    .card ul { padding-left: 18px; margin-top: 8px; }
-    .card li { margin-bottom: 6px; }
+
+    .card ul {
+      padding-left: 18px;
+      margin-top: 8px;
+    }
+
+    .card li {
+      margin-bottom: 7px;
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--bg-surface);
+      margin-top: 12px;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      overflow: hidden;
-      margin-top: 12px;
     }
-    th, td {
+
+    th,
+    td {
       padding: 12px 16px;
       border-bottom: 1px solid var(--border);
       text-align: left;
       font-size: 14px;
+      vertical-align: top;
     }
-    th { background: var(--bg-card); font-weight: 700; }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    th {
+      background: var(--bg-card);
+      font-weight: 700;
+    }
+
+    pre.code-block {
+      margin-top: 10px;
+      padding: 14px;
+      background: var(--code-bg);
+      color: #e2e8f0;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.55;
+    }
+
     footer {
       text-align: center;
       padding: 32px 20px;
@@ -194,186 +307,473 @@
       color: var(--text-muted);
       font-size: 14px;
     }
+
     @media (max-width: 640px) {
-      .install-box { flex-direction: column; align-items: stretch; }
-      header { padding: 12px 16px; }
+      .install-box {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      header {
+        padding: 12px 16px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
+
 <body>
   <header>
     <div class="brand">
       <img src="favicon.png" alt="SPanel Logo" />
       <span>SPanel Docs</span>
-      <span class="badge">v1.0.6</span>
+      <span class="badge">v1.0.7</span>
     </div>
     <nav class="nav-links">
-      <a href="#features">Tính năng</a>
-      <a href="#roles">Phân quyền 3 cấp</a>
-      <a href="#install">Cài đặt & Cập nhật</a>
-      <a href="#cli">Lệnh CLI</a>
-      <a href="https://github.com/shostwp-byte/spanel" target="_blank" rel="noopener noreferrer" class="btn btn-primary">GitHub Repository</a>
+      <a href="#highlights">Điểm khác biệt</a>
+      <a href="#features">10 Nhóm Tính năng</a>
+      <a href="#rbac">Phân quyền 3 Cấp</a>
+      <a href="#docs">Tài liệu</a>
+      <a href="#install">Cài đặt &amp; CLI</a>
+      <a href="#limitations">Giới hạn đã biết</a>
+      <a href="https://github.com/shostwp-byte/spanel" target="_blank" rel="noopener noreferrer"
+        class="btn btn-primary">GitHub Repository</a>
       <button class="btn" id="themeBtn" type="button">Sáng / Tối</button>
     </nav>
   </header>
 
   <main class="container">
     <section class="hero">
-      <h1>Bảng điều khiển Web Hosting Đa tầng cho Ubuntu 24.04 LTS</h1>
+      <div class="pill-row">
+        <span class="pill">Ubuntu 24.04 LTS</span>
+        <span class="pill">FastAPI + Python 3.12</span>
+        <span class="pill">React 19 + Vite 8 Code-Splitting</span>
+        <span class="pill">Privilege Separated (spanel-helper)</span>
+        <span class="pill">Linux Cgroups v2 + MySQL Governor</span>
+        <span class="pill">WordPress Manager + WHMCS + MCP AI</span>
+      </div>
+      <h1>Nền tảng Quản trị Web Hosting &amp; Máy chủ Đa tầng Thế hệ mới</h1>
       <p>
-        Quản trị toàn diện máy chủ với kiến trúc 3 cấp độ (<strong>Admin / Reseller / End User</strong>),
-        giao diện quản lý Tên miền &amp; Subdomain chuẩn DirectAdmin, bảo mật cô lập đặc quyền
-        <code>spanel-helper</code>, tích hợp WHMCS và tối ưu hoàn hảo trên di động.
+        <strong>SPanel (<code>v1.0.7</code>)</strong> mang đến trải nghiệm quản trị máy chủ hiện đại, siêu nhẹ
+        (~<code>115 KB</code> GZip tải khởi động),
+        phân quyền <strong>3 cấp độ (Admin / Reseller / End User)</strong> kèm thanh chuyển đổi góc nhìn
+        <code>Access Role Switch</code>,
+        cô lập tài nguyên <strong>Linux Cgroups v2 &amp; MySQL Governor</strong>, trình quản trị chuyên sâu
+        <strong>WordPress Manager</strong>,
+        sao lưu 5 phân khu hỗ trợ <strong>Granular Restore</strong> và bảo mật đa lớp <code>spanel-helper</code>.
       </p>
       <div class="install-box">
-        <code id="installCmd">curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" -o /tmp/spanel-install.sh &amp;&amp; sudo env npm_config_legacy_peer_deps=true bash /tmp/spanel-install.sh</code>
-        <button class="btn btn-primary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('installCmd').innerText); this.innerText='Đã sao chép!'; setTimeout(()=>this.innerText='Sao chép lệnh', 2000);">Sao chép lệnh</button>
+        <code
+          id="installCmd">curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" -o /tmp/spanel-install.sh &amp;&amp; sudo env npm_config_legacy_peer_deps=true bash /tmp/spanel-install.sh</code>
+        <button class="btn btn-primary" type="button"
+          onclick="navigator.clipboard.writeText(document.getElementById('installCmd').innerText); this.innerText='Đã sao chép!'; setTimeout(()=>this.innerText='Sao chép lệnh', 2000);">Sao
+          chép lệnh</button>
       </div>
     </section>
 
-    <h2 class="section-title" id="features">1. Các Nhóm Tính năng Cốt lõi</h2>
+    <h2 class="section-title" id="highlights">1. Tổng quan &amp; Điểm khác biệt của SPanel (<code>v1.0.7</code>)</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Tiêu chí Kỹ thuật</th>
+            <th>Giải pháp Truyền thống</th>
+            <th>SPanel (<code>v1.0.7</code>)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Đặc quyền tiến trình Web Panel</strong></td>
+            <td>Thường chạy trực tiếp dưới quyền <code>root</code> hoặc wrapper rộng</td>
+            <td>Tiến trình <code>spanel-api</code> chạy dưới user không đặc quyền <code>spanel</code> (systemd sandbox
+              <code>RestrictNamespaces=mnt</code>); mọi tác vụ hệ thống đi qua cổng kiểm duyệt
+              <code>/usr/local/sbin/spanel-helper</code>.</td>
+          </tr>
+          <tr>
+            <td><strong>Cô lập Người dùng &amp; Website</strong></td>
+            <td>Dùng chung pool PHP hoặc quyền thư mục lỏng lẻo</td>
+            <td>Mỗi khách hàng có <strong>Linux user riêng</strong>, mỗi website chạy <strong>PHP-FPM Unix socket
+                riêng</strong>, Web Terminal cô lập mount namespace (<code>unshare --mount</code>) chỉ nhìn thấy thư mục
+              của chính mình.</td>
+          </tr>
+          <tr>
+            <td><strong>Kiểm soát Tài nguyên (Noisy Neighbor)</strong></td>
+            <td>Phải mua thêm bản quyền CloudLinux / LVE trả phí</td>
+            <td>Tích hợp sẵn <strong>Linux Cgroups v2</strong> (<code>CPU</code>, <code>RAM</code>,
+              <code>Disk I/O</code>, <code>IOPS</code>, <code>Tasks</code>) và <strong>MySQL Governor</strong> miễn phí
+              ngay trên nhân Ubuntu 24.04 LTS.</td>
+          </tr>
+          <tr>
+            <td><strong>Quản trị WordPress Chuyên sâu</strong></td>
+            <td>Phải cài plugin quản lý rời hoặc thao tác thủ công</td>
+            <td>Tích hợp <strong>WordPress Manager</strong>: 1-Click WP-Admin SSO, quản lý Core/Plugin/Theme/User, khóa
+              thực thi PHP trong <code>uploads</code>, tắt XML-RPC, Redis Object Cache, Snapshot &amp; Clone WordPress
+              an toàn.</td>
+          </tr>
+          <tr>
+            <td><strong>Tốc độ Tải Giao diện</strong></td>
+            <td>Gói JS nguyên khối nặng nhiều MB, tải chậm</td>
+            <td>Kiến trúc <strong>React 19 + Vite Code-Splitting (<code>React.lazy</code>) + GZipMiddleware + Immutable
+                Cache</strong>, dung lượng tải khởi động chỉ <strong>~115 KB</strong>.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="section-title" id="features">2. Danh mục 10 Nhóm Tính năng Toàn diện</h2>
     <div class="grid">
       <div class="card">
-        <h3>🌐 Quản lý Domains &amp; Subdomains chuẩn DirectAdmin</h3>
+        <h3>👥 1. Phân quyền 3 Cấp độ &amp; Access Role Switch</h3>
         <ul>
-          <li><strong>Domain Setup (<code>/website</code>):</strong> Thêm tên miền mới, đổi tên miền (Rename Domain), bật/tắt Force SSL, chọn phiên bản PHP (5.6 – 8.5), bật/tắt <code>Open_basedir</code> và tuỳ chỉnh cột hiển thị (<code>Columns ⌄</code>).</li>
-          <li><strong>Subdomain Management (<code>/subdomains</code>):</strong> Thanh chọn tên miền nhanh ở đầu trang, tạo Subdomain tự động chuẩn hoá tiền tố và tuỳ chỉnh Document Root.</li>
+          <li><strong>3 Vai trò độc lập:</strong> <code>Admin</code> (Quản trị máy chủ), <code>Reseller</code> (Đại lý
+            hosting kèm White-Label Branding), <code>End User</code> (Khách hàng cuối).</li>
+          <li><strong>Access Role Switch &amp; Impersonation:</strong> Chuyển đổi nhanh góc nhìn
+            <code>Admin / Reseller / User</code> ngay trên thanh Topbar hoặc đăng nhập thay thế 1-Click
+            (<code>Login as</code> / <code>Return to</code>).</li>
+          <li><strong>Kiểm toán &amp; Chuyển quyền sở hữu (<code>Owner Transfer</code>):</strong> Tự động cảnh báo và hỗ
+            trợ chuyển giao Website/Database tạo nhầm dưới tài khoản Admin/Reseller sang đúng tài khoản End User.</li>
         </ul>
       </div>
+
       <div class="card">
-        <h3>👥 Kiến trúc Đa tầng Admin / Reseller / User</h3>
+        <h3>🌐 2. Quản trị Tên miền, Subdomain, Redirects &amp; SSL/TLS</h3>
         <ul>
-          <li><strong>Admin:</strong> Quản trị toàn máy chủ, Resource &amp; Process Monitor, IP Manager, Name Servers, Custom HTTPD, Server TLS, Packages, Add-ons &amp; Panel Updates.</li>
-          <li><strong>Reseller:</strong> Tạo &amp; quản lý khách hàng thuộc đại lý, gói hosting riêng, White-Label Branding (Logo, Favicon, Tên Panel) và đổi mật khẩu hàng loạt.</li>
-          <li><strong>End User:</strong> Giao diện quản trị trực quan, tự động ẩn các menu nếu Add-on chưa được Admin kích hoạt.</li>
+          <li><strong>Domain Setup (<code>/website</code>):</strong> Thêm tên miền, đổi tên miền
+            (<code>Rename Domain</code>), chọn phiên bản PHP riêng (<code>5.6</code> – <code>8.5</code>), bật/tắt
+            <code>Force SSL</code>, <code>Open_basedir</code>, <code>FastCGI Cache</code>, quản lý Domain Aliases &amp;
+            Pointers.</li>
+          <li><strong>Subdomains, Redirects &amp; Handlers:</strong> Tạo Subdomain chuẩn hóa tiền tố, thiết lập chuyển
+            hướng <code>301/302</code> và cấu hình MIME/Apache Handlers.</li>
+          <li><strong>SSL/TLS Toàn diện:</strong> Let's Encrypt HTTP-01, Wildcard SSL qua Cloudflare DNS-01,
+            Shared/Cloudflare Origin SSL, Custom Certificate và <strong>Server TLS</strong> cho cổng Panel/Mail.</li>
         </ul>
       </div>
+
       <div class="card">
-        <h3>🛡️ Bảo mật Đa lớp &amp; Cô lập Đặc quyền</h3>
+        <h3>⚡ 3. WordPress Manager Chuyên sâu (WP-CLI &amp; 1-Click)</h3>
         <ul>
-          <li>Tiến trình <code>spanel-api</code> chạy dưới user <code>spanel</code> không quyền root; mọi tác vụ hệ thống đi qua <code>spanel-helper</code> kiểm duyệt chặt chẽ.</li>
-          <li>Tường lửa <code>iptables + ipset</code> hiệu năng cao kèm danh sách chặn IP tự động và Fail2ban.</li>
-          <li>WAF ModSecurity + OWASP CRS theo từng website, quét mã độc ClamAV + LMD, bảo mật 2FA TOTP &amp; Passkey.</li>
+          <li><strong>Nhận diện &amp; 1-Click SSO:</strong> Tự động phát hiện cài đặt WordPress ở cả thư mục gốc và thư
+            mục con (<code>/blog</code>, <code>/shop</code>); đăng nhập thẳng <code>wp-admin</code> không cần mật khẩu.
+          </li>
+          <li><strong>Quản lý Core, Plugins, Themes &amp; Users:</strong> Cập nhật, kích hoạt, gỡ bỏ trực tiếp trên giao
+            diện SPanel.</li>
+          <li><strong>Gia cố Bảo mật 1-Click:</strong> <code>Block PHP in Uploads</code> (chặn thực thi
+            <code>.php/.phtml/.phar</code> ở cả Nginx vhost và <code>.htaccess</code>), <code>Disable XML-RPC</code>,
+            <code>DISALLOW_FILE_EDIT</code>, <code>Hide WP Version</code>, <code>Maintenance Mode</code>,
+            <code>Redis Object Cache</code> &amp; <code>System Cron</code>.</li>
+          <li><strong>Snapshot &amp; Clone WordPress:</strong> Chụp nhanh mã nguồn + DB <code>.sql.gz</code>; nhân bản
+            sang tên miền khác kèm chống tấn công symlink/hardlink/UID spoofing.</li>
         </ul>
       </div>
+
       <div class="card">
-        <h3>📬 Email, DNS, Backup &amp; Di chuyển Dữ liệu</h3>
+        <h3>🔧 4. Đa phiên bản PHP (5.6 – 8.5), CustomBuild &amp; Smart PHP Guard</h3>
         <ul>
-          <li><strong>Email Suite:</strong> Exim4, Dovecot, Rspamd lọc thư rác, Forwarders, Autoresponders, DKIM/DMARC tự động và SPanel Webmail SSO (cổng <code>2096</code>).</li>
-          <li><strong>PowerDNS:</strong> Quản lý DNS Zone trực tiếp trên máy chủ (A, AAAA, CNAME, MX, TXT, SRV, CAA, NS).</li>
-          <li><strong>Backup &amp; Migration:</strong> Sao lưu tự động lên S3 / SFTP và nhập trực tiếp bản sao lưu từ <strong>DirectAdmin</strong> &amp; <strong>cPanel</strong>.</li>
+          <li><strong>Multi-PHP Song song:</strong> Hỗ trợ đầy đủ PHP <code>5.6</code>, <code>7.4</code>,
+            <code>8.0</code>, <code>8.1</code>, <code>8.2</code>, <code>8.3</code>, <code>8.4</code> và <code>8.5</code>
+            với pool PHP-FPM độc lập cho từng website.</li>
+          <li><strong>CustomBuild &amp; Smart PHP Guard:</strong> Cài đặt/gỡ bỏ nhánh PHP, quản lý Extensions, sửa
+            <code>php.ini</code> và tự động vá lỗi bảo mật PHP không gián đoạn dịch vụ (<strong>Zero-Downtime
+              Reload</strong>).</li>
+          <li><strong>Auto-Tuning &amp; Custom HTTPD:</strong> Tự động tối ưu <code>pm.max_children</code> và
+            <code>innodb_buffer_pool_size</code> theo RAM thực tế; kiểm tra <code>nginx -t</code> trước khi áp dụng cấu
+            hình Nginx tùy chỉnh.</li>
         </ul>
       </div>
+
       <div class="card">
-        <h3>🔔 Thông báo Phân loại &amp; Giao diện Mobile</h3>
+        <h3>🗄️ 5. MariaDB, Remote MySQL, MySQL Governor &amp; phpMyAdmin SSO</h3>
         <ul>
-          <li>Phân luồng thông báo độc lập cho <strong>Admin</strong>, <strong>Reseller</strong> và <strong>End User</strong> kèm bộ lọc theo danh mục (Hệ thống, Bảo mật, Sao lưu, Tài nguyên).</li>
-          <li>Thiết kế <strong>Mobile Responsive</strong> tối ưu cho điện thoại (<code>&lt;= 640px</code>) và máy tính bảng: bảng tự thu gọn cột phụ, hộp thoại cuộn mượt theo khung nhìn.</li>
+          <li><strong>MariaDB Nội bộ &amp; Remote MySQL:</strong> Quản lý database trên máy chủ nội bộ hoặc cụm
+            MySQL/MariaDB từ xa qua kết nối TLS xác thực chứng chỉ CA (giới hạn chặt chẽ IP kết nối).</li>
+          <li><strong>1-Click phpMyAdmin SSO:</strong> Đăng nhập thẳng vào phpMyAdmin bằng token một lần có hiệu lực 60
+            giây.</li>
+          <li><strong>Safe SQL Import / Export:</strong> Tự động lọc bỏ mệnh đề <code>DEFINER=</code> và từ chối các câu
+            lệnh đặc quyền (<code>GRANT</code>, <code>SUPER</code>, <code>SET GLOBAL</code>) khi nạp file
+            <code>.sql/.sql.gz</code>; tuyệt đối không fallback sang quyền <code>root</code>.</li>
+          <li><strong>MySQL Governor:</strong> Giới hạn truy vấn/giờ, kết nối/giờ và tự động khóa ghi
+            (<code>write_locked</code>) khi vượt hạn mức dung lượng DB.</li>
         </ul>
       </div>
+
       <div class="card">
-        <h3>🔌 Tích hợp WHMCS &amp; Trợ lý AI MCP</h3>
+        <h3>📊 6. Cô lập Tài nguyên Cgroups v2 &amp; Giám sát Thời gian thực</h3>
         <ul>
-          <li>Module WHMCS có sẵn tại <code>modules/servers/spanel/</code> hỗ trợ cấp phát, tạm khoá, nâng gói, đồng bộ dung lượng và đăng nhập 1-click (SSO).</li>
-          <li>Hỗ trợ giao thức <strong>MCP (Model Context Protocol)</strong> giúp kết nối Claude Code, Cursor, VS Code trực tiếp vào SPanel bằng token cá nhân.</li>
+          <li><strong>Giới hạn Cgroups v2 theo Gói &amp; User:</strong> Kiểm soát cứng <code>cpu_quota_percent</code>,
+            <code>memory_high_mb</code>, <code>memory_max_mb</code>, băng thông đọc/ghi đĩa (<code>io_read_mbps</code>,
+            <code>io_write_mbps</code>), <code>IOPS</code> và tổng số tiến trình (<code>tasks_max</code>).</li>
+          <li><strong>Resource Monitor &amp; Process Monitor:</strong> Theo dõi biểu đồ CPU, RAM, Disk I/O, Network,
+            Inodes và danh sách tiến trình theo thời gian thực; tự động phát hiện tài khoản bị tấn công
+            (<code>Under Attack</code>).</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>💾 7. Trung tâm Sao lưu 5 Phân khu, Granular Restore &amp; Migration</h3>
+        <ul>
+          <li><strong>5 Phân khu Chuyên biệt:</strong> <code>User Backups</code>, <code>Website Backups</code>,
+            <code>Scheduled Backups</code> (Full/Incremental + Retention),
+            <code>Panel Self-Backup &amp; Verification</code> và <code>Restore &amp; Destinations</code> (Local,
+            SFTP/FTP, AWS S3 / Cloudflare R2 / MinIO).</li>
+          <li><strong>Khôi phục Chi tiết (<code>Granular Restore</code>):</strong> Chọn khôi phục toàn bộ
+            (<code>Web + DB + Email</code>) hoặc từng phần riêng lẻ kèm xác thực mã băm <strong>SHA-256</strong>.</li>
+          <li><strong>Panel Migration:</strong> Nhập trực tiếp gói sao lưu từ <strong>DirectAdmin</strong>
+            (<code>.tar.zst</code>, <code>.tar.gz</code>) và <strong>cPanel</strong> (<code>cpmove-*.tar.gz</code>).
+          </li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>🛡️ 8. Tường lửa Chủ động, WAF ModSecurity, Fail2ban &amp; Quét Mã độc</h3>
+        <ul>
+          <li><strong>Tường lửa <code>iptables + ipset</code>:</strong> Quản lý cổng, chặn IP/CIDR tức thì và nạp danh
+            sách đen (IP Blocklist URLs) hàng trăm nghìn IP với độ trễ bằng 0.</li>
+          <li><strong>WAF ModSecurity + OWASP CRS &amp; HTTP Flood:</strong> Bảo vệ từng website khỏi SQLi/XSS/LFI, chặn
+            Bad Bots toàn cục và giới hạn tốc độ kết nối chống DDoS tầng 7.</li>
+          <li><strong>Brute Force Monitor &amp; Malware Scanner:</strong> Tích hợp Fail2ban khóa IP dò mật khẩu và quét
+            mã độc bằng <strong>LMD + ClamAV</strong> (theo yêu cầu, theo lịch và thời gian thực).</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>🔔 9. Hệ thống Thông báo Đa kênh (<code>System Notifications</code>)</h3>
+        <ul>
+          <li><strong>Chuông Thông báo Phân tầng:</strong> Tự động lọc cảnh báo theo cấp độ quyền hạn hiện tại
+            (<code>Admin Level</code>, <code>Reseller Level</code>, <code>User Level</code>).</li>
+          <li><strong>Giao diện 3 Tab trực quan cho Admin:</strong>
+            <ul>
+              <li><code>General</code>: Cấu hình chi tiết các sự kiện cảnh báo hạ tầng máy chủ và bảo mật tài khoản.
+              </li>
+              <li><code>Channels</code>: Kết nối <strong>SMTP Email</strong>, <strong>Telegram Bot</strong> và
+                <strong>Custom Webhooks</strong> (ký xác thực <code>HMAC-SHA256</code>).</li>
+              <li><code>Delivery log</code>: Nhật ký trạng thái gửi và tự động thử lại (Retry) khi kênh đích gián đoạn.
+              </li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>🧩 10. Hệ sinh thái Add-ons, Multi-Server, WHMCS &amp; MCP AI</h3>
+        <ul>
+          <li><strong>Add-ons Đồng bộ Menu:</strong> <code>Application</code> (Node.js, Python, Docker, Docker Compose),
+            <code>Email Server Suite</code> (Exim4, Dovecot, Rspamd, Webmail SSO cổng <code>2096</code>),
+            <code>DNS Management</code> (PowerDNS cổng <code>53</code>) và <code>Demo Mode</code>.</li>
+          <li><strong>Multi-Server Cluster:</strong> Kiểm tra xung đột tên miền/DNS xuyên cụm máy chủ và điều phối
+            <code>Remote MySQL</code>.</li>
+          <li><strong>WHMCS &amp; MCP Server:</strong> Module WHMCS có sẵn tại <code>modules/servers/spanel/</code> và
+            giao thức <strong>MCP</strong> kết nối Claude Code, Cursor, VS Code.</li>
         </ul>
       </div>
     </div>
 
-    <h2 class="section-title" id="roles">2. Danh mục Tài liệu Chuyên sâu trong Kho lưu trữ</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Tệp tài liệu</th>
-          <th>Mô tả nội dung</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><a href="README.md"><code>docs/README.md</code></a></td>
-          <td>Tổng quan kiến trúc hệ thống, sơ đồ luồng hoạt động và bảng ngăn xếp công nghệ (Tech Stack).</td>
-        </tr>
-        <tr>
-          <td><a href="FEATURES.md"><code>docs/FEATURES.md</code></a></td>
-          <td>Chi tiết tính năng theo 3 vai trò Admin / Reseller / User, quản lý Domains &amp; Subdomains, thông báo phân loại và danh sách Add-ons.</td>
-        </tr>
-        <tr>
-          <td><a href="INSTALLATION_AND_UPDATE.md"><code>docs/INSTALLATION_AND_UPDATE.md</code></a></td>
-          <td>Hướng dẫn cài đặt trên VPS Ubuntu 24.04 LTS mới, cài đặt tự động (Unattended) và quy trình cập nhật trực tuyến (Online Update).</td>
-        </tr>
-        <tr>
-          <td><a href="ADMIN_AND_CLI_GUIDE.md"><code>docs/ADMIN_AND_CLI_GUIDE.md</code></a></td>
-          <td>Mô hình bảo mật <code>spanel-helper</code>, bộ lệnh cứu hộ <code>spanel</code> qua SSH, tường lửa, tự động tối ưu hiệu năng và công cụ Migration.</td>
-        </tr>
-        <tr>
-          <td><a href="API_AND_WHMCS.md"><code>docs/API_AND_WHMCS.md</code></a></td>
-          <td>Hướng dẫn tích hợp module WHMCS, đặc tả các Endpoint Provisioning API và kết nối trợ lý AI qua MCP.</td>
-        </tr>
-      </tbody>
-    </table>
+    <h2 class="section-title" id="rbac">3. Ma trận Phân quyền 3 Cấp độ (Admin / Reseller / End User)</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Nhóm Chức năng</th>
+            <th>Admin (<code>admin</code>)</th>
+            <th>Reseller (<code>reseller</code>)</th>
+            <th>End User (<code>user</code>)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Quản trị Máy chủ, Dịch vụ, IP, Name Servers, CustomBuild</strong></td>
+            <td>✅ Toàn máy chủ</td>
+            <td>❌ Không</td>
+            <td>❌ Không</td>
+          </tr>
+          <tr>
+            <td><strong>Quản lý Gói Dịch vụ (<code>Packages</code>)</strong></td>
+            <td>✅ Gói Reseller &amp; User</td>
+            <td>✅ Gói User của đại lý</td>
+            <td>🔍 Xem hạn mức cá nhân</td>
+          </tr>
+          <tr>
+            <td><strong>Khởi tạo &amp; Quản lý Tài khoản (<code>Users</code>)</strong></td>
+            <td>✅ Admin / Reseller / User</td>
+            <td>✅ User thuộc đại lý</td>
+            <td>❌ Không</td>
+          </tr>
+          <tr>
+            <td><strong>Tuỳ biến Thương hiệu (<code>White-Label Branding</code>)</strong></td>
+            <td>✅ Toàn hệ thống</td>
+            <td>✅ Riêng cho khách đại lý</td>
+            <td>🎨 Hiển thị theo đại lý</td>
+          </tr>
+          <tr>
+            <td><strong>Chuyển đổi Góc nhìn (<code>Access Role Switch</code>) &amp; <code>Login as</code></strong></td>
+            <td>✅ <code>Admin / Reseller / User</code></td>
+            <td>✅ <code>Reseller / User</code></td>
+            <td>👤 Giao diện <code>User</code></td>
+          </tr>
+          <tr>
+            <td><strong>Quản trị Website, WordPress Manager, File, DB, Email, DNS, SSL</strong></td>
+            <td>✅ Toàn máy chủ + Chuyển chủ sở hữu (<code>Owner Transfer</code>)</td>
+            <td>✅ Các khách hàng thuộc đại lý</td>
+            <td>✅ Các tên miền của chính mình</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
-    <h2 class="section-title" id="install">3. Cài đặt &amp; Cập nhật Nhanh trên VPS</h2>
+    <h2 class="section-title" id="docs">4. Danh mục Tài liệu Kỹ thuật Chuyên sâu (<code>docs/</code>)</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Tệp tài liệu</th>
+            <th>Mô tả nội dung</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><a href="../README.md"><code>README.md</code></a></td>
+            <td>Tổng quan dự án SPanel <code>v1.0.7</code>, sơ đồ kiến trúc bảo mật, danh mục 10 nhóm tính năng và hướng
+              dẫn nhanh.</td>
+          </tr>
+          <tr>
+            <td><a href="README.md"><code>docs/README.md</code></a></td>
+            <td>Kiến trúc hệ thống chi tiết, sơ đồ luồng hoạt động và bảng ngăn xếp công nghệ (Tech Stack).</td>
+          </tr>
+          <tr>
+            <td><a href="FEATURES.md"><code>docs/FEATURES.md</code></a></td>
+            <td>Đặc tả tính năng theo 3 vai trò Admin / Reseller / End User, quản lý Domains &amp; Subdomains và hệ
+              thống Add-ons.</td>
+          </tr>
+          <tr>
+            <td><a href="INSTALLATION_AND_UPDATE.md"><code>docs/INSTALLATION_AND_UPDATE.md</code></a></td>
+            <td>Hướng dẫn cài đặt trên VPS Ubuntu 24.04 LTS mới, tham số Unattended Installation và quy trình Online
+              Update.</td>
+          </tr>
+          <tr>
+            <td><a href="ADMIN_AND_CLI_GUIDE.md"><code>docs/ADMIN_AND_CLI_GUIDE.md</code></a></td>
+            <td>Mô hình bảo mật <code>spanel-helper</code>, bộ lệnh cứu hộ <code>spanel</code> qua SSH, tường lửa, WAF
+              và công cụ Migration.</td>
+          </tr>
+          <tr>
+            <td><a href="API_AND_WHMCS.md"><code>docs/API_AND_WHMCS.md</code></a></td>
+            <td>Hướng dẫn tích hợp module WHMCS, đặc tả các Endpoint Provisioning API và kết nối trợ lý AI qua giao thức
+              MCP.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="section-title" id="install">5. Yêu cầu Hệ thống, Cài đặt &amp; Cập nhật Trực tuyến</h2>
     <div class="grid">
       <div class="card">
+        <h3>💻 Yêu cầu Hệ thống</h3>
+        <ul>
+          <li><strong>Hệ điều hành:</strong> Ubuntu 24.04 LTS (64-bit, cài mới).</li>
+          <li><strong>Cấu hình tối thiểu:</strong> 1 vCPU / 1 GB RAM / 20 GB SSD.</li>
+          <li><strong>Cấu hình khuyến nghị:</strong> Từ 2+ vCPU / 2 – 4+ GB RAM / 40+ GB NVMe SSD (đặc biệt khi bật
+            Rspamd hoặc ClamAV).</li>
+          <li><strong>Quyền truy cập:</strong> <code>root</code> hoặc <code>sudo</code>.</li>
+        </ul>
+      </div>
+      <div class="card">
         <h3>🚀 Cài đặt Tự động (Unattended)</h3>
-        <p>Chạy bằng quyền <code>root</code> trên máy chủ Ubuntu 24.04 LTS mới:</p>
-        <pre style="margin-top:10px;padding:12px;background:var(--code-bg);color:#e2e8f0;border-radius:8px;overflow-x:auto;font-size:12.5px;">curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" | sudo env npm_config_legacy_peer_deps=true bash -s -- \
+        <p>Thực thi bằng quyền <code>root</code> trên máy chủ Ubuntu 24.04 LTS:</p>
+        <pre class="code-block">curl -fsSL "https://raw.githubusercontent.com/shostwp-byte/spanel/refs/heads/main/install.sh?v=$(date +%s)" | sudo env npm_config_legacy_peer_deps=true bash -s -- \
   --admin-user admin \
   --admin-pass 'MatKhauManh@2026!' \
   --php-default 8.4</pre>
       </div>
       <div class="card">
-        <h3>🔄 Cập nhật Phiên bản Mới (Online Update)</h3>
-        <p>Cập nhật trực tiếp trong giao diện <strong>Admin → Cài đặt → Cập nhật</strong> hoặc chạy lệnh SSH:</p>
-        <pre style="margin-top:10px;padding:12px;background:var(--code-bg);color:#e2e8f0;border-radius:8px;overflow-x:auto;font-size:12.5px;">sudo spanel-update</pre>
-        <p style="margin-top:8px;">Bảo toàn 100% dữ liệu, cấu hình <code>.env</code>, tự động chạy migration DB và tự động rollback nếu gặp lỗi.</p>
+        <h3>🔄 Cập nhật Trực tuyến (Zero-Downtime Update)</h3>
+        <p>Thực hiện trực tiếp trên giao diện <strong>Server Manager → Maintenance / Panel Updates</strong> hoặc qua
+          SSH:</p>
+        <pre class="code-block">sudo spanel-update</pre>
+        <p style="margin-top:8px;">Tự động sao lưu <code>spanel.db</code> trước khi cập nhật, chạy migration Alembic,
+          kiểm tra dấu vân tay (fingerprint) gói Frontend và tự động rollback nếu phát sinh lỗi.</p>
       </div>
     </div>
 
-    <h2 class="section-title" id="cli">4. Các Lệnh Quản trị &amp; Cứu hộ Thường dùng qua SSH</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Lệnh thực thi</th>
-          <th>Công dụng</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><code>sudo spanel</code></td>
-          <td>Mở menu cứu hộ tương tác qua SSH (xem thông tin đăng nhập, khởi động lại dịch vụ, sửa quyền, cấp SSL).</td>
-        </tr>
-        <tr>
-          <td><code>sudo spanel change-admin-password</code></td>
-          <td>Đặt lại mật khẩu đăng nhập cho tài khoản <code>admin</code> của SPanel.</td>
-        </tr>
-        <tr>
-          <td><code>sudo spanel change-ip &lt;IP_CŨ&gt; &lt;IP_MỚI&gt;</code></td>
-          <td>Cập nhật địa chỉ IP máy chủ hàng loạt cho toàn bộ cấu hình Nginx vhost và DNS Zone.</td>
-        </tr>
-        <tr>
-          <td><code>sudo spanel-rescue-firewall</code></td>
-          <td>Sao lưu luật tường lửa hiện tại và khôi phục bộ luật tối thiểu khi bị khoá ngoài máy chủ.</td>
-        </tr>
-        <tr>
-          <td><code>sudo spanel-update</code></td>
-          <td>Kiểm tra và nâng cấp SPanel lên bản phát hành mới nhất từ kho GitHub.</td>
-        </tr>
-      </tbody>
-    </table>
+    <h2 class="section-title" id="cli">6. Bảng Lệnh Quản trị &amp; Cứu hộ CLI qua SSH</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Lệnh thực thi</th>
+            <th>Công dụng</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>sudo spanel</code></td>
+            <td>Mở menu quản trị &amp; cứu hộ tương tác qua SSH (xem thông tin đăng nhập, đổi mật khẩu admin, tắt 2FA
+              khẩn cấp, khởi động lại dịch vụ, sửa quyền, cấp SSL).</td>
+          </tr>
+          <tr>
+            <td><code>sudo spanel status</code></td>
+            <td>Kiểm tra nhanh trạng thái hoạt động của toàn bộ dịch vụ cốt lõi (<code>spanel-api</code>,
+              <code>nginx</code>, <code>mariadb</code>, <code>php-fpm</code>, <code>pdns</code>, <code>exim4</code>,
+              <code>dovecot</code>, <code>redis</code>).</td>
+          </tr>
+          <tr>
+            <td><code>sudo spanel change-admin-password</code></td>
+            <td>Đặt lại mật khẩu đăng nhập khẩn cấp cho tài khoản <code>admin</code> của SPanel.</td>
+          </tr>
+          <tr>
+            <td><code>sudo spanel change-ip &lt;IP_CŨ&gt; &lt;IP_MỚI&gt;</code></td>
+            <td>Cập nhật địa chỉ IP máy chủ hàng loạt cho toàn bộ cấu hình Nginx vhost và DNS Zone.</td>
+          </tr>
+          <tr>
+            <td><code>sudo spanel-rescue-firewall</code></td>
+            <td>Sao lưu luật tường lửa hiện tại và khôi phục bộ luật tối thiểu khi bị khóa ngoài máy chủ.</td>
+          </tr>
+          <tr>
+            <td><code>sudo spanel-update</code></td>
+            <td>Kiểm tra và nâng cấp SPanel lên bản phát hành mới nhất từ kho lưu trữ chính thức.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="section-title" id="limitations">7. Giới hạn đã biết (Known Limitations)</h2>
+    <div class="card">
+      <ul>
+        <li><strong>Kiến trúc Điều khiển Đơn điểm (Single-Node Control Plane):</strong> SPanel sử dụng SQLite ở chế độ
+          <code>WAL</code> (<code>busy_timeout=15000ms</code>) cho cơ sở dữ liệu điều khiển (<code>spanel.db</code>).
+          Thiết kế này tối ưu cho một máy chủ VPS/Dedicated độc lập (vận hành từ vài chục đến vài trăm website), không
+          hướng tới mô hình cụm điều khiển đa điểm ghi đồng thời (multi-master control plane).</li>
+        <li><strong>Cơ sở dữ liệu MySQL Từ xa (<code>Remote MySQL</code>):</strong> Quản trị viên cấu hình máy chủ
+          MySQL/MariaDB từ xa trong <strong>Multi-Server → Remote MySQL</strong> để người dùng chọn khi tạo database
+          mới, đổi mật khẩu, tải/nạp SQL, khóa ghi khi vượt hạn mức, sao lưu/khôi phục và đăng nhập phpMyAdmin SSO. Các
+          database tạo tự động kèm luồng cài đặt nhanh WordPress 1-Click, WHMCS Provisioning hoặc nhập từ
+          cPanel/DirectAdmin mặc định vẫn khởi tạo trên MariaDB nội bộ.</li>
+        <li><strong>Hạn mức Ổ đĩa Tầng Kernel (<code>setquota</code>):</strong> Cưỡng chế dung lượng đĩa bằng lệnh
+          <code>setquota</code> yêu cầu phân vùng <code>/home</code> hoặc <code>/</code> của máy chủ đã bật cờ mount
+          <code>usrquota</code> / <code>usrjquota</code>. Trên các VPS chưa bật <code>usrquota</code> ở tầng filesystem,
+          SPanel vẫn cưỡng chế đầy đủ hạn mức dung lượng ở tầng ứng dụng (File Manager, Upload, Giải nén, Khởi tạo
+          Website, Sao lưu và MySQL Governor).</li>
+        <li><strong>HTTP/3 (<code>QUIC</code>):</strong> Chỉ thị <code>listen 443 quic reuseport</code> và header
+          <code>Alt-Svc</code> được kích hoạt tự động khi binary Nginx trên máy chủ có biên dịch module
+          <code>ngx_http_v3_module</code> (như gói Nginx mainline từ <code>nginx.org</code>). Với gói Nginx mặc định của
+          Ubuntu chưa bật module này, SPanel tự động phục vụ qua <code>HTTP/2 + TLSv1.3</code>.</li>
+      </ul>
+    </div>
   </main>
 
   <footer>
-    SPanel v1.0.6 — Phát hành theo giấy phép GNU AGPLv3 ·
-    <a href="https://github.com/shostwp-byte/spanel" target="_blank" rel="noopener noreferrer">https://github.com/shostwp-byte/spanel</a>
+    SPanel v1.0.7 — Phát hành theo giấy phép GNU AGPLv3 ·
+    <a href="https://github.com/shostwp-byte/spanel" target="_blank"
+      rel="noopener noreferrer">https://github.com/shostwp-byte/spanel</a>
   </footer>
 
   <script>
     document.getElementById('themeBtn').addEventListener('click', function () {
       var html = document.documentElement;
-      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      var next = html.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
       html.setAttribute('data-theme', next);
     });
   </script>
 </body>
+
 </html>

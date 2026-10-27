@@ -3,7 +3,6 @@ import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown
 import { EmptyState } from '../components/EmptyState.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
-import { AlertWebhookCard } from '../components/AlertWebhookCard.jsx';
 
 const DEFAULT_SERVICE_NAMES = ['spanel-api', 'nginx', 'php8.3-fpm', 'php8.4-fpm', 'mariadb', 'redis-server'];
 
@@ -100,33 +99,6 @@ export function ServicesPage({ request, isAdmin }) {
       if (res && res.ok) {
         setNotice(`Đã tạo bản sao lưu nóng thành công: ${res.filename} (${formatBytes(res.size_bytes)}, integrity=${res.integrity})`);
         await loadWatchdogAndDb();
-      }
-    } finally {
-      setBusyBackup(false);
-    }
-  }
-
-  async function restoreHotBackup(bk) {
-    if (
-      !window.confirm(
-        t(
-          'Restore the panel database from {name}? Everything changed in the panel since {when} is lost. The panel stops for a few seconds; the current database is kept on the server as spanel.db.pre-restore-*.',
-          { name: bk.filename, when: bk.created_at ? new Date(bk.created_at).toLocaleString() : bk.filename }
-        )
-      )
-    ) {
-      return;
-    }
-    setBusyBackup(true);
-    try {
-      const res = await request(
-        `/services/db-backups/${encodeURIComponent(bk.filename)}/restore`,
-        { method: 'POST' },
-        t('Checking the backup and scheduling the restore...')
-      );
-      if (res) {
-        setNotice(res.detail || t('Restore scheduled.'));
-        setTimeout(() => window.location.reload(), 8000);
       }
     } finally {
       setBusyBackup(false);
@@ -240,37 +212,37 @@ export function ServicesPage({ request, isAdmin }) {
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '14px', fontSize: '0.84rem' }}>
-              <label style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start', gap: '10px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '9px 12px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
+              <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: '12px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
                 <input
                   type="checkbox"
+                  className="sp-switch-input"
                   checked={selfHealing?.enabled !== false}
                   disabled={busyWatchdog}
                   onChange={(e) => toggleSelfHealingOption('enabled', e.target.checked)}
-                  style={{ width: '16px', minWidth: '16px', height: '16px', minHeight: '16px', margin: '2px 0 0 0', padding: 0, flexShrink: 0, accentColor: 'var(--primary)', cursor: busyWatchdog ? 'not-allowed' : 'pointer' }}
                 />
                 <span style={{ flex: 1, minWidth: 0, color: 'var(--text)', fontWeight: 500, textAlign: 'left' }}>
                   Tự động khởi động lại dịch vụ cốt lõi (Nginx, MariaDB, Redis, PHP-FPM, Fail2ban) khi bị dừng
                 </span>
               </label>
-              <label style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start', gap: '10px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '9px 12px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
+              <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: '12px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
                 <input
                   type="checkbox"
+                  className="sp-switch-input"
                   checked={selfHealing?.validate_config_before_restart !== false}
                   disabled={busyWatchdog}
                   onChange={(e) => toggleSelfHealingOption('validate_config_before_restart', e.target.checked)}
-                  style={{ width: '16px', minWidth: '16px', height: '16px', minHeight: '16px', margin: '2px 0 0 0', padding: 0, flexShrink: 0, accentColor: 'var(--primary)', cursor: busyWatchdog ? 'not-allowed' : 'pointer' }}
                 />
                 <span style={{ flex: 1, minWidth: 0, color: 'var(--text)', fontWeight: 500, textAlign: 'left' }}>
                   Kiểm tra an toàn cú pháp (<code>nginx -t</code>, <code>php-fpm -t</code>) trước khi restart để tránh crash-loop
                 </span>
               </label>
-              <label style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-start', gap: '10px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '9px 12px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
+              <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start', gap: '12px', cursor: busyWatchdog ? 'not-allowed' : 'pointer', padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)', margin: 0, width: '100%', boxSizing: 'border-box', textAlign: 'left', lineHeight: 1.45 }}>
                 <input
                   type="checkbox"
+                  className="sp-switch-input"
                   checked={selfHealing?.auto_db_backup_enabled !== false}
                   disabled={busyWatchdog}
                   onChange={(e) => toggleSelfHealingOption('auto_db_backup_enabled', e.target.checked)}
-                  style={{ width: '16px', minWidth: '16px', height: '16px', minHeight: '16px', margin: '2px 0 0 0', padding: 0, flexShrink: 0, accentColor: 'var(--primary)', cursor: busyWatchdog ? 'not-allowed' : 'pointer' }}
                 />
                 <span style={{ flex: 1, minWidth: 0, color: 'var(--text)', fontWeight: 500, textAlign: 'left' }}>
                   Tự động sao lưu nóng cơ sở dữ liệu Panel (SQLite Online Hot-Backup) định kỳ mỗi 6 giờ
@@ -369,17 +341,8 @@ export function ServicesPage({ request, isAdmin }) {
                   {dbHealth.backups.slice(0, 6).map((bk) => (
                     <div key={bk.filename} style={{ padding: '6px 10px', borderRadius: '8px', background: 'var(--surface-1)', fontSize: '0.78rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <code>{bk.filename}</code>
-                      <span style={{ color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <span style={{ color: 'var(--text-muted)' }}>
                         {formatBytes(bk.size_bytes)} • {bk.created_at ? new Date(bk.created_at).toLocaleString() : ''}
-                        <button
-                          type="button"
-                          className="cb-btn secondary"
-                          style={{ height: '24px', padding: '0 8px', fontSize: '0.72rem' }}
-                          disabled={busyBackup || !!loading}
-                          onClick={() => restoreHotBackup(bk)}
-                        >
-                          <ArchiveRestore size={12} /> {t('Restore')}
-                        </button>
                       </span>
                     </div>
                   ))}
@@ -389,7 +352,6 @@ export function ServicesPage({ request, isAdmin }) {
           </div>
         </div>
       )}
-      {isAdmin && <AlertWebhookCard request={request} setNotice={setNotice} loading={loading} />}
     </div>;
   }
   return renderServices();

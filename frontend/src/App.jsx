@@ -1,21 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import ace from 'ace-builds/src-noconflict/ace';
-import 'ace-builds/src-noconflict/ext-language_tools';
-import 'ace-builds/src-noconflict/ext-searchbox';
-import 'ace-builds/src-noconflict/mode-css';
-import 'ace-builds/src-noconflict/mode-html';
-import 'ace-builds/src-noconflict/mode-ini';
-import 'ace-builds/src-noconflict/mode-javascript';
-import 'ace-builds/src-noconflict/mode-json';
-import 'ace-builds/src-noconflict/mode-php';
-import 'ace-builds/src-noconflict/mode-text';
-import 'ace-builds/src-noconflict/mode-yaml';
-import 'ace-builds/src-noconflict/theme-textmate';
-import 'ace-builds/src-noconflict/theme-tomorrow_night';
 import { Sparkles, UserPlus, ArrowRightLeft, Wrench, PenTool as Tool, BarChart, MessageSquare, Key, AlertTriangle, LayoutTemplate, Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Heart, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
-import { Terminal } from './components/Terminal';
-import { AIAssistant } from './components/AIAssistant.jsx';
 import { LANGUAGES, t, useLanguage } from './i18n.js';
 import './style.css';
 import './brand.css';
@@ -28,52 +13,55 @@ import { formatBytes, roleLabel } from './utils/helpers.js';
 import { AppContext, AppProvider, useAppContext, dnsTtlLabel } from './contexts/AppContext.jsx';
 import { WebsiteSelect } from './components/WebsiteSelect.jsx';
 
-import { Migration } from './pages/Migration.jsx';
-import { Packages } from './pages/Packages.jsx';
-import { IpManager } from './pages/IpManager.jsx';
-import { AppInstallerPage } from './pages/AppInstaller.jsx';
-import { WordPressManagerPage } from './pages/WordPressManager.jsx';
-import { ResellerSettingsPage } from './pages/ResellerSettings.jsx';
-import { UsersPage } from './pages/Users.jsx';
-import { MoveUsersPage } from './pages/MoveUsers.jsx';
-import { ChangePasswords } from './pages/ChangePasswords.jsx';
-import { SettingsPage } from './pages/Settings.jsx';
-import { FirewallPage } from './pages/Firewall.jsx';
-import { SecurityPage } from './pages/Security.jsx';
-import { UpdatesPage } from './pages/Updates.jsx';
-import { ServicesPage } from './pages/Services.jsx';
-import { DatabasesPage } from './pages/Databases.jsx';
-import { BackupsPage } from './pages/Backups.jsx';
-import { CronPage } from './pages/Cron.jsx';
-import { PhpConfigPage } from './pages/PhpConfig.jsx';
-import { SslPage } from './pages/Ssl.jsx';
-import { FilesPage } from './pages/Files.jsx';
-import { SftpPage } from './pages/Sftp.jsx';
-import { ApplicationsPage } from './pages/Applications.jsx';
-import { DnsPage } from './pages/Dns.jsx';
-import { MailPage } from './pages/Mail.jsx';
-import { WebsitesPage } from './pages/Websites.jsx';
-import { ServerTlsPage } from './pages/ServerTls.jsx';
-import { BruteForceMonitorPage } from './pages/BruteForceMonitor.jsx';
-import { ProcessMonitorPage } from './pages/ProcessMonitor.jsx';
-import { NameServersPage } from './pages/NameServers.jsx';
-import { MessageAllPage } from './pages/MessageAll.jsx';
-import { WafPage } from './pages/Waf.jsx';
-import { MalwarePage } from './pages/Malware.jsx';
-import { AddonsPage } from './pages/Addons.jsx';
-import { MailForwardersPage } from './pages/MailForwarders.jsx';
-import { MailAutorespondersPage } from './pages/MailAutoresponders.jsx';
-import { McpPage } from './pages/Mcp.jsx';
-import MessageTemplates from './pages/MessageTemplates.jsx';
-import { CustomHttpdPage } from './pages/CustomHttpd.jsx';
-import { CustomBuildPage } from './pages/CustomBuild.jsx';
-import { MaintenancePage } from './pages/Maintenance.jsx';
-import { ServerStatisticsPage } from './pages/ServerStatistics.jsx';
-import { RedirectsPage } from './pages/Redirects.jsx';
-import { ApacheHandlersPage } from './pages/ApacheHandlers.jsx';
-import { ResourceMonitorPage } from './pages/ResourceMonitor.jsx';
-import { MultiServerPage } from './pages/MultiServer.jsx';
-import { LicensingPage } from './pages/Licensing.jsx';
+const lazyNamed = (loader, exportName) =>
+  React.lazy(() => loader().then(mod => ({ default: mod[exportName] || mod.default })));
+
+const Migration = lazyNamed(() => import('./pages/Migration.jsx'), 'Migration');
+const Packages = lazyNamed(() => import('./pages/Packages.jsx'), 'Packages');
+const IpManager = lazyNamed(() => import('./pages/IpManager.jsx'), 'IpManager');
+const AppInstallerPage = lazyNamed(() => import('./pages/AppInstaller.jsx'), 'AppInstallerPage');
+const WordPressManagerPage = lazyNamed(() => import('./pages/WordPressManager.jsx'), 'WordPressManagerPage');
+const ResellerSettingsPage = lazyNamed(() => import('./pages/ResellerSettings.jsx'), 'ResellerSettingsPage');
+const UsersPage = lazyNamed(() => import('./pages/Users.jsx'), 'UsersPage');
+const MoveUsersPage = lazyNamed(() => import('./pages/MoveUsers.jsx'), 'MoveUsersPage');
+const ChangePasswords = lazyNamed(() => import('./pages/ChangePasswords.jsx'), 'ChangePasswords');
+const SettingsPage = lazyNamed(() => import('./pages/Settings.jsx'), 'SettingsPage');
+const FirewallPage = lazyNamed(() => import('./pages/Firewall.jsx'), 'FirewallPage');
+const SecurityPage = lazyNamed(() => import('./pages/Security.jsx'), 'SecurityPage');
+const UpdatesPage = lazyNamed(() => import('./pages/Updates.jsx'), 'UpdatesPage');
+const ServicesPage = lazyNamed(() => import('./pages/Services.jsx'), 'ServicesPage');
+const DatabasesPage = lazyNamed(() => import('./pages/Databases.jsx'), 'DatabasesPage');
+const BackupsPage = lazyNamed(() => import('./pages/Backups.jsx'), 'BackupsPage');
+const CronPage = lazyNamed(() => import('./pages/Cron.jsx'), 'CronPage');
+const PhpConfigPage = lazyNamed(() => import('./pages/PhpConfig.jsx'), 'PhpConfigPage');
+const SslPage = lazyNamed(() => import('./pages/Ssl.jsx'), 'SslPage');
+const FilesPage = lazyNamed(() => import('./pages/Files.jsx'), 'FilesPage');
+const SftpPage = lazyNamed(() => import('./pages/Sftp.jsx'), 'SftpPage');
+const ApplicationsPage = lazyNamed(() => import('./pages/Applications.jsx'), 'ApplicationsPage');
+const DnsPage = lazyNamed(() => import('./pages/Dns.jsx'), 'DnsPage');
+const MailPage = lazyNamed(() => import('./pages/Mail.jsx'), 'MailPage');
+const WebsitesPage = lazyNamed(() => import('./pages/Websites.jsx'), 'WebsitesPage');
+const ServerTlsPage = lazyNamed(() => import('./pages/ServerTls.jsx'), 'ServerTlsPage');
+const BruteForceMonitorPage = lazyNamed(() => import('./pages/BruteForceMonitor.jsx'), 'BruteForceMonitorPage');
+const ProcessMonitorPage = lazyNamed(() => import('./pages/ProcessMonitor.jsx'), 'ProcessMonitorPage');
+const NameServersPage = lazyNamed(() => import('./pages/NameServers.jsx'), 'NameServersPage');
+const MessageAllPage = lazyNamed(() => import('./pages/MessageAll.jsx'), 'MessageAllPage');
+const WafPage = lazyNamed(() => import('./pages/Waf.jsx'), 'WafPage');
+const MalwarePage = lazyNamed(() => import('./pages/Malware.jsx'), 'MalwarePage');
+const AddonsPage = lazyNamed(() => import('./pages/Addons.jsx'), 'AddonsPage');
+const MailForwardersPage = lazyNamed(() => import('./pages/MailForwarders.jsx'), 'MailForwardersPage');
+const MailAutorespondersPage = lazyNamed(() => import('./pages/MailAutoresponders.jsx'), 'MailAutorespondersPage');
+const McpPage = lazyNamed(() => import('./pages/Mcp.jsx'), 'McpPage');
+const MessageTemplates = React.lazy(() => import('./pages/MessageTemplates.jsx'));
+const CustomHttpdPage = lazyNamed(() => import('./pages/CustomHttpd.jsx'), 'CustomHttpdPage');
+const CustomBuildPage = lazyNamed(() => import('./pages/CustomBuild.jsx'), 'CustomBuildPage');
+const MaintenancePage = lazyNamed(() => import('./pages/Maintenance.jsx'), 'MaintenancePage');
+const ServerStatisticsPage = lazyNamed(() => import('./pages/ServerStatistics.jsx'), 'ServerStatisticsPage');
+const RedirectsPage = lazyNamed(() => import('./pages/Redirects.jsx'), 'RedirectsPage');
+const ApacheHandlersPage = lazyNamed(() => import('./pages/ApacheHandlers.jsx'), 'ApacheHandlersPage');
+const ResourceMonitorPage = lazyNamed(() => import('./pages/ResourceMonitor.jsx'), 'ResourceMonitorPage');
+const MultiServerPage = lazyNamed(() => import('./pages/MultiServer.jsx'), 'MultiServerPage');
+const LicensingPage = lazyNamed(() => import('./pages/Licensing.jsx'), 'LicensingPage');
 
 
 
@@ -151,7 +139,7 @@ function composeWebPorts(plan, wanted) {
 // Pages opened from inside another page instead of the sidebar. They have no
 // nav entry of their own, so without this the header falls back to the first
 // item and titles the page "Dashboard".
-const NAV_PARENT_PAGE = { 'waf-site': 'waf', 'malware-scan': 'malware' };
+const NAV_PARENT_PAGE = { 'waf-site': 'waf', 'malware-scan': 'malware', 'panel-settings': 'settings' };
 
 // 'waf-site' is reached from the WAF overview rather than the sidebar, but it
 // still belongs to Settings so the menu stays open and WAF stays highlighted.
@@ -216,6 +204,111 @@ const PAGE_ROUTES = {
   multi_server: '/multi-server',
   licensing: '/licensing',
 };
+
+const ADMIN_ALLOWED_PAGES = new Set([
+  'dashboard',
+  'users',
+  'my_users',
+  'resource_monitor',
+  'packages',
+  'move_users',
+  'message_templates',
+  'change_passwords',
+  'resellers',
+  'reseller_packages',
+  'administrators',
+  'settings',
+  'panel-settings',
+  'custom_httpd',
+  'dns',
+  'ipmanager',
+  'name_servers',
+  'multi_server',
+  'php',
+  'server_tls',
+  'notifications',
+  'custombuild',
+  'backups',
+  'brute_force',
+  'process_monitor',
+  'mail',
+  'services',
+  'migration',
+  'message_all',
+  'reseller_settings',
+  'access-logs',
+  'maintenance',
+  'all_crons',
+  'server_statistics',
+  'addons',
+  'waf',
+  'waf-site',
+  'waf-logs',
+  'malware',
+  'malware-scan',
+  'firewall',
+  'applications',
+  'mcp',
+  'updates',
+  'licensing',
+  'security',
+]);
+
+const RESELLER_ALLOWED_PAGES = new Set([
+  'dashboard',
+  'users',
+  'my_users',
+  'suspend',
+  'resource_monitor',
+  'packages',
+  'change_passwords',
+  'reseller_settings',
+  'backups',
+  'migration',
+  'ipmanager',
+  'server_statistics',
+  'access-logs',
+  'waf',
+  'waf-site',
+  'waf-logs',
+  'applications',
+  'mcp',
+  'security',
+]);
+
+const USER_ALLOWED_PAGES = new Set([
+  'dashboard',
+  'websites',
+  'subdomains',
+  'dns',
+  'ssl',
+  'sftp',
+  'databases',
+  'redirects',
+  'mail',
+  'mail_forwarders',
+  'mail_auto',
+  'applications',
+  'wordpress_manager',
+  'waf',
+  'waf-site',
+  'waf-logs',
+  'cron',
+  'backups',
+  'security',
+  'mcp',
+  'apache_handlers',
+  'files',
+  'access-logs',
+  'site_stats',
+]);
+
+function isPageAllowedForRole(targetPage, role) {
+  const normalizedPage = targetPage || 'dashboard';
+  if (role === 'admin') return ADMIN_ALLOWED_PAGES.has(normalizedPage);
+  if (role === 'reseller') return RESELLER_ALLOWED_PAGES.has(normalizedPage);
+  return USER_ALLOWED_PAGES.has(normalizedPage);
+}
 
 /* ---------------------------------------------------------------
    Theme (light / dark)
@@ -645,17 +738,49 @@ function NotificationToast({ type, message, onClose }) {
 const ACE_THEMES = { light: 'ace/theme/textmate', dark: 'ace/theme/tomorrow_night' };
 const aceThemeFor = theme => ACE_THEMES[theme] || ACE_THEMES.light;
 
+let _aceBundlePromise = null;
+function loadAceBundle() {
+  if (!_aceBundlePromise) {
+    _aceBundlePromise = (async () => {
+      const mod = await import('ace-builds/src-noconflict/ace');
+      const aceInstance = mod.default || mod;
+      await Promise.all([
+        import('ace-builds/src-noconflict/ext-language_tools'),
+        import('ace-builds/src-noconflict/ext-searchbox'),
+        import('ace-builds/src-noconflict/mode-css'),
+        import('ace-builds/src-noconflict/mode-html'),
+        import('ace-builds/src-noconflict/mode-ini'),
+        import('ace-builds/src-noconflict/mode-javascript'),
+        import('ace-builds/src-noconflict/mode-json'),
+        import('ace-builds/src-noconflict/mode-php'),
+        import('ace-builds/src-noconflict/mode-text'),
+        import('ace-builds/src-noconflict/mode-yaml'),
+        import('ace-builds/src-noconflict/theme-textmate'),
+        import('ace-builds/src-noconflict/theme-tomorrow_night'),
+      ]);
+      return aceInstance;
+    })();
+  }
+  return _aceBundlePromise;
+}
+
 function CodeEditor({ value, mode, disabled, onChange, onCursorChange }) {
   const hostRef = useRef(null);
   const editorRef = useRef(null);
   const suppressChangeRef = useRef(false);
   const onChangeRef = useRef(onChange);
   const onCursorChangeRef = useRef(onCursorChange);
+  const valueRef = useRef(value);
+  const modeRef = useRef(mode);
+  const disabledRef = useRef(disabled);
   const themeName = useThemeName();
   const themeRef = useRef(themeName);
 
   useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
   useEffect(() => { onCursorChangeRef.current = onCursorChange; }, [onCursorChange]);
+  useEffect(() => { valueRef.current = value; }, [value]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { disabledRef.current = disabled; }, [disabled]);
   useEffect(() => {
     themeRef.current = themeName;
     editorRef.current?.setTheme(aceThemeFor(themeName));
@@ -663,56 +788,66 @@ function CodeEditor({ value, mode, disabled, onChange, onCursorChange }) {
 
   useEffect(() => {
     if (!hostRef.current) return undefined;
-    const editor = ace.edit(hostRef.current, {
-      mode: `ace/mode/${aceModeName(mode)}`,
-      theme: aceThemeFor(themeRef.current),
-      value: value || '',
-      readOnly: !!disabled,
-      showPrintMargin: false,
-      highlightActiveLine: true,
-      fontSize: 13,
-      tabSize: 2,
-      useSoftTabs: true,
-      wrap: false,
-      selectionStyle: 'text',
+    let cancelled = false;
+    let cleanupEditor = null;
+    loadAceBundle().then(ace => {
+      if (cancelled || !hostRef.current) return;
+      const editor = ace.edit(hostRef.current, {
+        mode: `ace/mode/${aceModeName(modeRef.current)}`,
+        theme: aceThemeFor(themeRef.current),
+        value: valueRef.current || '',
+        readOnly: !!disabledRef.current,
+        showPrintMargin: false,
+        highlightActiveLine: true,
+        fontSize: 13,
+        tabSize: 2,
+        useSoftTabs: true,
+        wrap: false,
+        selectionStyle: 'text',
+      });
+
+      editor.setOptions({
+        enableBasicAutocompletion: true,
+        enableLiveAutocompletion: true,
+        enableMatchBrackets: true,
+        enableSnippets: false,
+        fontFamily: EDITOR_FONT_FAMILY,
+      });
+      editor.session.setUseWorker(false);
+      editor.session.setNewLineMode('unix');
+
+      let destroyed = false;
+      const reportCursor = () => {
+        if (destroyed || !editorRef.current || !onCursorChangeRef.current) return;
+        const pos = editorRef.current.getCursorPosition();
+        onCursorChangeRef.current({ line: pos.row + 1, column: pos.column + 1 });
+      };
+      const handleChange = () => {
+        if (destroyed || !editorRef.current) return;
+        if (!suppressChangeRef.current) {
+          if (onChangeRef.current) onChangeRef.current(editorRef.current.getValue());
+        }
+        // Only report cursor on explicit cursor moves, not on every content change
+      };
+
+      editor.session.on('change', handleChange);
+      editor.selection.on('changeCursor', reportCursor);
+      editorRef.current = editor;
+      reportCursor();
+
+      cleanupEditor = () => {
+        destroyed = true;
+        editor.session.off('change', handleChange);
+        editor.selection.off('changeCursor', reportCursor);
+        editor.destroy();
+        editorRef.current = null;
+        if (hostRef.current) hostRef.current.textContent = '';
+      };
     });
-
-    editor.setOptions({
-      enableBasicAutocompletion: true,
-      enableLiveAutocompletion: true,
-      enableMatchBrackets: true,
-      enableSnippets: false,
-      fontFamily: EDITOR_FONT_FAMILY,
-    });
-    editor.session.setUseWorker(false);
-    editor.session.setNewLineMode('unix');
-
-    let destroyed = false;
-    const reportCursor = () => {
-      if (destroyed || !editorRef.current || !onCursorChangeRef.current) return;
-      const pos = editorRef.current.getCursorPosition();
-      onCursorChangeRef.current({ line: pos.row + 1, column: pos.column + 1 });
-    };
-    const handleChange = () => {
-      if (destroyed || !editorRef.current) return;
-      if (!suppressChangeRef.current) {
-        if (onChangeRef.current) onChangeRef.current(editorRef.current.getValue());
-      }
-      // Only report cursor on explicit cursor moves, not on every content change
-    };
-
-    editor.session.on('change', handleChange);
-    editor.selection.on('changeCursor', reportCursor);
-    editorRef.current = editor;
-    reportCursor();
 
     return () => {
-      destroyed = true;
-      editor.session.off('change', handleChange);
-      editor.selection.off('changeCursor', reportCursor);
-      editor.destroy();
-      editorRef.current = null;
-      if (hostRef.current) hostRef.current.textContent = '';
+      cancelled = true;
+      if (cleanupEditor) cleanupEditor();
     };
   }, []);
 
@@ -1032,6 +1167,7 @@ function AppContent() {
   const [telegramChats, setTelegramChats] = useState(null);
   const [myChatInput, setMyChatInput] = useState('');
   const [notifyLimits, setNotifyLimits] = useState({ disk_percent: 90, ssl_days: 7, language: 'vi' });
+  const [notifyTab, setNotifyTab] = useState('general');
   // An old /api-tokens link opens the tab the tokens now live on.
   const [panelSettingsTab, setPanelSettingsTab] = useState(() => (/^\/api-tokens?\/?$/i.test(window.location.pathname) ? 'api' : 'general'));
   // The restore catalogue: local archives and whatever is in each S3 bucket,
@@ -1220,24 +1356,34 @@ function AppContent() {
   // installed at all, and the customer's package has to include it. Admins skip
   // the second one, never the first.
   const appsFeatureEnabled = applicationAddonInstalled && (actualRole === 'admin' || siteApps.limit > 0);
-  const currentSite = websites.find(site => String(site.id) === String(selectedWebsiteId));
+  const roleScopedWebsites = React.useMemo(() => {
+    if (isUser && currentUser) {
+      return (websites || []).filter(site => site.owner_id === currentUser.id);
+    }
+    return websites || [];
+  }, [websites, isUser, currentUser]);
+  const currentSite = roleScopedWebsites.find(site => String(site.id) === String(selectedWebsiteId));
   const accountLabel = currentUser?.package_name
     ? `${currentUser?.username || username} - ${currentUser.package_name}`
     : (currentUser?.username || username);
 
   const navigateToPage = useCallback((nextPage, options = {}) => {
-    const route = routeForPage(nextPage);
+    const resolvedPage = currentUser && !isPageAllowedForRole(nextPage, effectiveRole)
+      ? 'dashboard'
+      : nextPage;
+    const route = routeForPage(resolvedPage);
     if (!route) return;
     const nextUrl = route;
-    if (!options.replace && window.location.pathname !== route) {
+    const shouldReplace = Boolean(options.replace || resolvedPage !== nextPage);
+    if (!shouldReplace && window.location.pathname !== route) {
       window.history.pushState({}, '', nextUrl);
-    } else if (options.replace && window.location.pathname !== route) {
+    } else if (shouldReplace && window.location.pathname !== route) {
       window.history.replaceState({}, '', nextUrl);
     }
     // The sidebar's DNS Manager opens the list, not the zone last looked at.
-    if (nextPage === 'dns') { setDnsZone(null); setDnsTab('zones'); }
-    setPage(nextPage);
-  }, []);
+    if (resolvedPage === 'dns') { setDnsZone(null); setDnsTab('zones'); }
+    setPage(resolvedPage);
+  }, [currentUser, effectiveRole]);
 
   // Every page opens at its top. The window is the scroller and nothing
   // reset it, so the next page opened at the last one's offset - part-way
@@ -1365,6 +1511,9 @@ function AppContent() {
         'Content-Type': 'application/json',
         ...(fetchOptions.headers || {}),
       };
+      if (effectiveRole && !headers['X-Access-Role']) {
+        headers['X-Access-Role'] = effectiveRole;
+      }
       // CSRF: echo the spanel_csrf cookie back in a header for mutating
       // requests. The backend rejects mismatches when the request was
       // authenticated via cookie.
@@ -1430,6 +1579,7 @@ function AppContent() {
         // Don't keep the token anywhere: the HttpOnly cookie just got set by
         // the response. JS code MUST NOT touch the JWT.
         signedOutRef.current = false;
+        setViewLevel(null);
         setIsAuthenticated(true);
         setNeedsTwoFactor(false);
         setPasskeyPrompt(null);
@@ -1606,10 +1756,10 @@ function AppContent() {
   useEffect(() => { loadPanelSettings(); loadAppVersion(); }, []);
 
   useEffect(() => {
-    if (currentUser) {
+    if (currentUser?.id) {
       loadPanelSettings();
     }
-  }, [currentUser]);
+  }, [currentUser?.id, currentUser?.role]);
 
   useEffect(() => {
     const appName = panelSettings.app_name || 'spanel';
@@ -1651,11 +1801,14 @@ function AppContent() {
     if (data) setDatabases(data);
   }
 
-  async function refreshAll() {
+  async function refreshAll({ skipUserReload = false } = {}) {
+    const knownRole = currentUser?.role;
+    const canPreloadTenants = knownRole === 'admin' || knownRole === 'reseller';
     const [refreshedUser, siteData] = await Promise.all([
-      loadCurrentUser(),
+      skipUserReload && currentUser ? Promise.resolve(currentUser) : loadCurrentUser(),
       request('/websites'),
       loadPhpVersions({ silent: true }),
+      ...(canPreloadTenants ? [loadPackages(), loadUsers()] : []),
     ]);
     if (siteData) {
       setWebsites(siteData);
@@ -1665,7 +1818,9 @@ function AppContent() {
       }
     }
     if (refreshedUser?.role === 'admin' || refreshedUser?.role === 'reseller') {
-      await Promise.all([loadPackages(), loadUsers()]);
+      if (!canPreloadTenants) {
+        await Promise.all([loadPackages(), loadUsers()]);
+      }
     } else {
       setUsers([]);
     }
@@ -2011,6 +2166,7 @@ function AppContent() {
   async function loadAddons() {
     const data = await request('/addons', { silent: true });
     if (data) setAddons({ ...data, loaded: true });
+    return data;
   }
 
   async function loadCfZone(id) {
@@ -2746,9 +2902,9 @@ function AppContent() {
 
   useEffect(() => {
     if (isAuthenticated) {
-      refreshAll();
+      refreshAll({ skipUserReload: true });
     }
-  }, [isAuthenticated]);
+  }, [isAuthenticated, effectiveRole]);
 
   useEffect(() => {
     if (standaloneEditor) return undefined;
@@ -2757,6 +2913,13 @@ function AppContent() {
     window.addEventListener('popstate', syncPageFromLocation);
     return () => window.removeEventListener('popstate', syncPageFromLocation);
   }, [standaloneEditor]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser) return;
+    if (!isPageAllowedForRole(page, effectiveRole)) {
+      navigateToPage('dashboard', { replace: true });
+    }
+  }, [isAuthenticated, currentUser, page, effectiveRole, navigateToPage]);
 
   useEffect(() => {
     if (!isAuthenticated || !standaloneEditor) return;
@@ -2778,8 +2941,17 @@ function AppContent() {
     return () => window.removeEventListener('keydown', handler);
   }, [standaloneEditor, isAuthenticated, selectedWebsiteId, filePath, fileContent]);
 
+  const lastDashRoleRef = useRef(null);
   useEffect(() => {
-    if (isAuthenticated) loadDashboardSummary();
+    if (!isAuthenticated) {
+      lastDashRoleRef.current = null;
+      return;
+    }
+    const roleChanged = lastDashRoleRef.current !== effectiveRole;
+    if (roleChanged || page === 'dashboard' || !dashSummary) {
+      lastDashRoleRef.current = effectiveRole;
+      loadDashboardSummary();
+    }
   }, [isAuthenticated, page, effectiveRole]);
 
 
@@ -2913,7 +3085,7 @@ function AppContent() {
         ['multi_server', 'Multi Server Setup', Server],
         ['php', 'PHP Settings', Code2],
         ['server_tls', 'Server TLS Certificate', Lock],
-        ...(notificationsAddonInstalled ? [['notifications', 'Alerting & Webhooks', Bell]] : []),
+        ...(notificationsAddonInstalled ? [['notifications', 'System Notifications', Bell]] : []),
         ['custombuild', 'CustomBuild', Wrench],
       ]},
       { key: 'admin_tools', title: 'Admin Tools', items: [
@@ -2984,7 +3156,6 @@ function AppContent() {
         ['ssl', 'SSL Certificates', Lock],
         ['sftp', 'FTP Management', Upload],
         ['databases', 'MySQL Management', Database],
-        ['php_select', 'PHP Version Selection', Code2],
         ['redirects', 'Site Redirection', MoveRight],
       ]},
       ...(mailAddonInstalled ? [{ key: 'email_manager', title: 'Email Manager', items: [
@@ -2996,7 +3167,6 @@ function AppContent() {
       { key: 'advanced_features', title: 'Advanced Features', items: [
         ...(appsFeatureEnabled ? [['applications', 'Applications (Node/Python/Docker)', Cpu]] : []),
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
-        ['app_installer', 'Install Applications', Boxes],
         ['waf', 'Web Application Firewall', ShieldAlert],
         ['cron', 'Cron Jobs', Clock],
         ['backups', 'Create/Restore Backups', Archive],
@@ -3027,12 +3197,6 @@ function AppContent() {
       navigateToPage('subdomains');
       return;
     }
-    if (key === 'php_select') {
-      loadPhpVersions({ silent: true });
-      navigateToPage('websites');
-      setNotice(t('Select a website below to configure its PHP version.'));
-      return;
-    }
     if (key === 'mail_spam') {
       setMailTab('domains');
       navigateToPage('mail');
@@ -3052,10 +3216,19 @@ function AppContent() {
   }
 
   const allNavItems = navSections.flatMap(section => section.items);
-  const basePage = NAV_PARENT_PAGE[page] || page;
+  const effectivePage = isPageAllowedForRole(page, effectiveRole) ? page : 'dashboard';
+  const basePage = NAV_PARENT_PAGE[effectivePage] || effectivePage;
   const navPage = basePage;
-  const activeNavItem = page === 'dashboard' ? ['dashboard', 'Dashboard', Home] : (allNavItems.find(([key]) => key === navPage) || allNavItems[0]);
-  const pageItem = page === 'dashboard' ? ['dashboard', 'Dashboard', Home] : (allNavItems.find(([key]) => key === basePage) || activeNavItem);
+  const activeNavItem = effectivePage === 'dashboard'
+    ? ['dashboard', 'Dashboard', Home]
+    : effectivePage === 'security'
+    ? ['security', 'Account security', LockKeyhole]
+    : (allNavItems.find(([key]) => key === navPage) || ['dashboard', 'Dashboard', Home]);
+  const pageItem = effectivePage === 'dashboard'
+    ? ['dashboard', 'Dashboard', Home]
+    : effectivePage === 'security'
+    ? ['security', 'Account security', LockKeyhole]
+    : (allNavItems.find(([key]) => key === basePage) || activeNavItem);
 
   const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
   const [cmdPaletteQuery, setCmdPaletteQuery] = useState('');
@@ -3106,37 +3279,39 @@ function AppContent() {
         });
       });
     });
-    (websites || []).forEach(site => {
-      list.push({
-        id: `site-${site.id}`,
-        category: t('Website'),
-        title: site.domain,
-        subtitle: `PHP ${site.php_version || '8.4'} · ${site.root_path || ''}`,
-        icon: Globe,
-        run: () => {
-          setSelectedWebsiteId(String(site.id));
-          navigateToPage('websites');
-        },
+    if (isUser) {
+      (websites || []).forEach(site => {
+        list.push({
+          id: `site-${site.id}`,
+          category: t('Website'),
+          title: site.domain,
+          subtitle: `PHP ${site.php_version || '8.4'} · ${site.root_path || ''}`,
+          icon: Globe,
+          run: () => {
+            setSelectedWebsiteId(String(site.id));
+            navigateToPage('websites');
+          },
+        });
+        list.push({
+          id: `site-files-${site.id}`,
+          category: t('File Manager'),
+          title: `${site.domain} — ${t('Files')}`,
+          subtitle: site.root_path || '/public_html',
+          icon: FolderOpen,
+          run: () => openWebsiteFileManager(site),
+        });
       });
-      list.push({
-        id: `site-files-${site.id}`,
-        category: t('File Manager'),
-        title: `${site.domain} — ${t('Files')}`,
-        subtitle: site.root_path || '/public_html',
-        icon: FolderOpen,
-        run: () => openWebsiteFileManager(site),
+      (databases || []).forEach(db => {
+        list.push({
+          id: `db-${db.id || db.name}`,
+          category: t('Database'),
+          title: db.name,
+          subtitle: db.username ? `User: ${db.username}` : 'MariaDB / MySQL',
+          icon: Database,
+          run: () => navigateToPage('databases'),
+        });
       });
-    });
-    (databases || []).forEach(db => {
-      list.push({
-        id: `db-${db.id || db.name}`,
-        category: t('Database'),
-        title: db.name,
-        subtitle: db.username ? `User: ${db.username}` : 'MariaDB / MySQL',
-        icon: Database,
-        run: () => navigateToPage('databases'),
-      });
-    });
+    }
     (siteApps?.items || []).forEach(app => {
       list.push({
         id: `app-${app.id}`,
@@ -3501,153 +3676,186 @@ function AppContent() {
       <span><strong>{t(ev.label)}</strong><small>{t(ev.hint)}</small></span>
     </label>;
     const fmtTime = value => { const d = new Date(value.endsWith('Z') ? value : `${value}Z`); return Number.isNaN(d.getTime()) ? value : d.toLocaleString('vi-VN', { hour12: false }); };
-    return <>
+    const tabs = [
+      ['general', 'General', Bell],
+      ['channels', 'Channels', Send],
+      ['log', 'Delivery log', FileText],
+    ];
+    const activeTab = tabs.some(([id]) => id === notifyTab) ? notifyTab : 'general';
+    return (
       <section className="section">
-        <div className="section-title">
-          <div>
-            <h2>{t('My notifications')}</h2>
-            <p className="hint">{t('Where the panel reaches you, and about what.')}</p>
-          </div>
+        <div className="segmented-control backup-tabs" role="tablist" aria-label={t('System Notifications')} style={{ marginBottom: '16px' }}>
+          {tabs.map(([id, label, Icon]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              id={`notify-tab-button-${id}`}
+              aria-controls={`notify-tab-${id}`}
+              aria-selected={activeTab === id}
+              className={activeTab === id ? 'active' : ''}
+              onClick={() => setNotifyTab(id)}
+            >
+              <Icon size={14} />
+              {t(label)}
+            </button>
+          ))}
         </div>
-        {!me ? <p className="hint">{t('Loading...')}</p> : <>
-          <div className="notify-channels">
-            <div className="notify-channel">
-              <div className="notify-channel-head"><Mail size={16} /><strong>Email</strong>
-                <span className={me.channels.email && me.email_enabled ? 'badge ok' : 'badge'}>{me.channels.email ? (me.email_enabled ? t('On') : t('Off')) : t('Not set up')}</span>
+
+        {activeTab === 'general' && (
+          <div className="backup-tab-panel" id="notify-tab-general" role="tabpanel" aria-labelledby="notify-tab-button-general">
+            <div className="section-title">
+              <div>
+                <h2>{t('My notifications')}</h2>
+                <p className="hint">{t('Where the panel reaches you, and about what.')}</p>
               </div>
-              <p className="hint">{me.channels.email
-                ? t('Sent to {email}, the address on your account.', { email: me.email || '—' })
-                : t('Email is not set up on this server yet.')}</p>
-              {me.channels.email && <label className="switch-line"><input type="checkbox" checked={me.email_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ email_enabled: e.target.checked })} />{t('Send me email')}</label>}
             </div>
-            <div className="notify-channel">
-              <div className="notify-channel-head"><Send size={16} /><strong>Telegram</strong>
-                <span className={me.telegram_linked && me.telegram_enabled ? 'badge ok' : 'badge'}>{!me.channels.telegram ? t('Not set up') : me.telegram_linked ? (me.telegram_enabled ? t('On') : t('Off')) : t('Not connected')}</span>
-              </div>
-              {!me.channels.telegram && <p className="hint">{t('Telegram is not set up on this server yet.')}</p>}
-              {me.channels.telegram && me.telegram_linked && <>
-                <p className="hint">Chat ID: <code>{me.telegram_chat_id}</code></p>
-                <label className="switch-line"><input type="checkbox" checked={me.telegram_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ telegram_enabled: e.target.checked })} />{t('Send me Telegram messages')}</label>
-                <div className="notify-actions">
-                  <button type="button" className="secondary" disabled={!!loading} onClick={() => sendNotifyTest('telegram')}><Send size={14} />{t('Send a test')}</button>
-                  <button type="button" className="secondary-light" disabled={!!loading} onClick={unlinkTelegram}>{t('Disconnect')}</button>
+            {!me ? <p className="hint">{t('Loading...')}</p> : <>
+              <div className="notify-channels">
+                <div className="notify-channel">
+                  <div className="notify-channel-head"><Mail size={16} /><strong>Email</strong>
+                    <span className={me.channels.email && me.email_enabled ? 'badge ok' : 'badge'}>{me.channels.email ? (me.email_enabled ? t('On') : t('Off')) : t('Not set up')}</span>
+                  </div>
+                  <p className="hint">{me.channels.email
+                    ? t('Sent to {email}, the address on your account.', { email: me.email || '—' })
+                    : t('Email is not set up on this server yet.')}</p>
+                  {me.channels.email && <label className="switch-line"><input type="checkbox" checked={me.email_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ email_enabled: e.target.checked })} />{t('Send me email')}</label>}
                 </div>
-              </>}
-              {me.channels.telegram && !me.telegram_linked && me.telegram_admin_chat && <p className="hint">{t('You hear in the admin chat ({chat}). Connect a chat of your own to hear there instead.', { chat: me.telegram_admin_chat })}</p>}
-              {me.channels.telegram && !me.telegram_linked && <div className="notify-own-chat">
-                <input value={myChatInput} placeholder={t('Your chat ID')} aria-label={t('Your chat ID')} onChange={e => setMyChatInput(e.target.value)} />
-                <button type="button" className="secondary" disabled={!!loading || !myChatInput.trim()} onClick={() => saveNotifyMe({ telegram_chat_id: myChatInput.trim() })}>{t('Save')}</button>
-              </div>}
-              {me.channels.telegram && !me.telegram_linked && (telegramLink
-                ? <div className="notify-link">
-                  <ol>
-                    <li>{t('Open the bot and press Start:')}{' '}{telegramLink.link ? <a href={telegramLink.link} target="_blank" rel="noreferrer">@{telegramLink.bot_username}</a> : <code>@{telegramLink.bot_username}</code>}</li>
-                    <li>{t('Or send the bot this message:')}{' '}<code>/start {telegramLink.code}</code></li>
-                    <li>{t('Then press Check. The code works for {n} minutes.', { n: telegramLink.expires_minutes })}</li>
-                  </ol>
-                  <div className="notify-actions"><button type="button" disabled={!!loading} onClick={verifyTelegramLink}><Check size={14} />{t('Check')}</button></div>
+                <div className="notify-channel">
+                  <div className="notify-channel-head"><Send size={16} /><strong>Telegram</strong>
+                    <span className={me.telegram_linked && me.telegram_enabled ? 'badge ok' : 'badge'}>{!me.channels.telegram ? t('Not set up') : me.telegram_linked ? (me.telegram_enabled ? t('On') : t('Off')) : t('Not connected')}</span>
+                  </div>
+                  {!me.channels.telegram && <p className="hint">{t('Telegram is not set up on this server yet.')}</p>}
+                  {me.channels.telegram && me.telegram_linked && <>
+                    <p className="hint">Chat ID: <code>{me.telegram_chat_id}</code></p>
+                    <label className="switch-line"><input type="checkbox" checked={me.telegram_enabled} disabled={!!loading} onChange={e => saveNotifyMe({ telegram_enabled: e.target.checked })} />{t('Send me Telegram messages')}</label>
+                    <div className="notify-actions">
+                      <button type="button" className="secondary" disabled={!!loading} onClick={() => sendNotifyTest('telegram')}><Send size={14} />{t('Send a test')}</button>
+                      <button type="button" className="secondary-light" disabled={!!loading} onClick={unlinkTelegram}>{t('Disconnect')}</button>
+                    </div>
+                  </>}
+                  {me.channels.telegram && !me.telegram_linked && me.telegram_admin_chat && <p className="hint">{t('You hear in the admin chat ({chat}). Connect a chat of your own to hear there instead.', { chat: me.telegram_admin_chat })}</p>}
+                  {me.channels.telegram && !me.telegram_linked && <div className="notify-own-chat">
+                    <input value={myChatInput} placeholder={t('Your chat ID')} aria-label={t('Your chat ID')} onChange={e => setMyChatInput(e.target.value)} />
+                    <button type="button" className="secondary" disabled={!!loading || !myChatInput.trim()} onClick={() => saveNotifyMe({ telegram_chat_id: myChatInput.trim() })}>{t('Save')}</button>
+                  </div>}
+                  {me.channels.telegram && !me.telegram_linked && (telegramLink
+                    ? <div className="notify-link">
+                      <ol>
+                        <li>{t('Open the bot and press Start:')}{' '}{telegramLink.link ? <a href={telegramLink.link} target="_blank" rel="noreferrer">@{telegramLink.bot_username}</a> : <code>@{telegramLink.bot_username}</code>}</li>
+                        <li>{t('Or send the bot this message:')}{' '}<code>/start {telegramLink.code}</code></li>
+                        <li>{t('Then press Check. The code works for {n} minutes.', { n: telegramLink.expires_minutes })}</li>
+                      </ol>
+                      <div className="notify-actions"><button type="button" disabled={!!loading} onClick={verifyTelegramLink}><Check size={14} />{t('Check')}</button></div>
+                    </div>
+                    : <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading} onClick={startTelegramLink}><Send size={14} />{t('Find my chat ID for me')}</button></div>)}
                 </div>
-                : <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading} onClick={startTelegramLink}><Send size={14} />{t('Find my chat ID for me')}</button></div>)}
-            </div>
-          </div>
-          <div className="notify-events">
-            <h3>{t('About the server')}</h3>
-            <div className="notify-event-list">{events.filter(ev => ev.audience === 'admin').map(eventRow)}</div>
-            <h3>{t('About your account')}</h3>
-            <div className="notify-event-list">{events.filter(ev => ev.audience === 'user').map(eventRow)}</div>
-          </div>
-        </>}
-      </section>
-
-      {s && <section className="section">
-        <div className="section-title">
-          <div>
-            <h2>{t('Server channels')}</h2>
-            <p className="hint">{t('What every notification on this server goes out through.')}</p>
-          </div>
-        </div>
-        <div className="notify-settings">
-          <div className="notify-card">
-            <h3><Mail size={16} />{t('Email (SMTP)')}</h3>
-            <div className="notify-form">
-              <label><span>{t('SMTP server')}</span><input value={smtpForm.host} placeholder="smtp.example.com" onChange={e => setSmtpForm(f => ({ ...f, host: e.target.value }))} /></label>
-              <div className="notify-form-pair">
-                <label><span>{t('Encryption')}</span><select value={smtpForm.security} onChange={e => setSmtpForm(f => ({ ...f, security: e.target.value, port: { starttls: 587, ssl: 465, none: 25 }[e.target.value] }))}>
-                  <option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">{t('None')}</option>
-                </select></label>
-                <label><span>{t('Port')}</span><input type="number" value={smtpForm.port} onChange={e => setSmtpForm(f => ({ ...f, port: e.target.value }))} /></label>
               </div>
-              <label><span>{t('Username')}</span><input value={smtpForm.username} autoComplete="off" onChange={e => setSmtpForm(f => ({ ...f, username: e.target.value }))} /></label>
-              <label><span>{t('Password')}</span><input type="password" value={smtpForm.password} autoComplete="new-password" placeholder={s.smtp.password_set ? t('Saved - leave empty to keep it') : ''} onChange={e => setSmtpForm(f => ({ ...f, password: e.target.value }))} /></label>
-              <label><span>{t('Sender address')}</span><input value={smtpForm.from_email} placeholder="noreply@example.com" onChange={e => setSmtpForm(f => ({ ...f, from_email: e.target.value }))} /></label>
-              <label><span>{t('Sender name')}</span><input value={smtpForm.from_name} onChange={e => setSmtpForm(f => ({ ...f, from_name: e.target.value }))} /></label>
-            </div>
-            <div className="notify-actions">
-              <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({ smtp: { ...smtpForm, port: Number(smtpForm.port) || 587, password: smtpForm.password || null } }, t('Email settings saved.'))}>{t('Save')}</button>
-              <button type="button" className="secondary" disabled={!!loading || !s.smtp_ready} onClick={() => sendNotifyTest('email')}><Mail size={14} />{t('Send me a test email')}</button>
-            </div>
+              <div className="notify-events">
+                <h3>{t('About the server')}</h3>
+                <div className="notify-event-list">{events.filter(ev => ev.audience === 'admin').map(eventRow)}</div>
+                <h3>{t('About your account')}</h3>
+                <div className="notify-event-list">{events.filter(ev => ev.audience === 'user').map(eventRow)}</div>
+              </div>
+            </>}
           </div>
-          <div className="notify-card">
-            <h3><Send size={16} />{t('Telegram bot')}</h3>
-            <p className="hint">{t('Create a bot with @BotFather (/newbot) and paste its token. Then send the bot any message - or add it to a group - press Find chat ID and pick the chat.')}</p>
-            {s.telegram.token_set && <p className="notify-bot"><span className="badge ok">@{s.telegram.bot_username}</span></p>}
-            <label className="notify-form"><span>{t('Bot token')}</span><input type="password" value={botTokenInput} autoComplete="off" placeholder={s.telegram.token_set ? t('Saved - paste a new one to replace it') : '123456789:AA...'} onChange={e => setBotTokenInput(e.target.value)} /></label>
-            <div className="notify-form">
-              <label><span>Chat ID</span><input value={adminChatInput} placeholder="-1001234567890" onChange={e => setAdminChatInput(e.target.value)} /></label>
-              <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set} onClick={findTelegramChats}><Search size={14} />{t('Find chat ID')}</button></div>
-              {telegramChats && (telegramChats.length > 0
-                ? <div className="notify-chats">{telegramChats.map(chat => <button type="button" key={chat.id} className={adminChatInput === chat.id ? 'mini' : 'mini secondary'} onClick={() => setAdminChatInput(chat.id)}>{chat.name || chat.type}<code>{chat.id}</code></button>)}</div>
-                : <p className="hint">{t('No messages yet. Send the bot a message first, then press Find chat ID again.')}</p>)}
-            </div>
-            <p className="hint">{t('Server events go to this chat once. An administrator with no chat of their own hears about their account here too.')}</p>
-            <div className="notify-actions">
-              <button type="button" disabled={!!loading || (!s.telegram.token_set && !botTokenInput.trim())} onClick={() => saveNotifySettings({ telegram: { bot_token: botTokenInput.trim() || null, chat_id: adminChatInput.trim() } }, t('Telegram bot saved.'))}>{t('Save')}</button>
-              <button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set || !s.telegram.chat_id} onClick={() => sendNotifyTest('telegram_admin')}><Send size={14} />{t('Send a test')}</button>
-              {s.telegram.token_set && <button type="button" className="secondary-light" disabled={!!loading} onClick={() => saveNotifySettings({ telegram: { clear_bot_token: true } }, t('Telegram bot removed.'))}>{t('Remove the bot')}</button>}
-            </div>
-          </div>
-          <div className="notify-card">
-            <h3><AlertCircle size={16} />{t('When to warn')}</h3>
-            <div className="notify-form">
-              <label><span>{t('Disk usage (%)')}</span><input type="number" min="50" max="99" value={notifyLimits.disk_percent} onChange={e => setNotifyLimits(v => ({ ...v, disk_percent: e.target.value }))} /></label>
-              <label><span>{t('Certificate expiry (days)')}</span><input type="number" min="1" max="60" value={notifyLimits.ssl_days} onChange={e => setNotifyLimits(v => ({ ...v, ssl_days: e.target.value }))} /></label>
-              <label><span>{t('Language of the messages')}</span><select value={notifyLimits.language} onChange={e => setNotifyLimits(v => ({ ...v, language: e.target.value }))}>
-                <option value="vi">Tiếng Việt</option><option value="en">English</option>
-              </select></label>
-            </div>
-            <div className="notify-actions">
-              <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({
-                language: notifyLimits.language, thresholds: {
-                  disk_percent: Number(notifyLimits.disk_percent), ssl_days: Number(notifyLimits.ssl_days),
-                }
-              }, t('Saved.'))}>{t('Save')}</button>
-            </div>
-          </div>
-        </div>
-      </section>}
+        )}
 
-
-      <section className="section">
-        <div className="section-title">
-          <div><h2>{t('Delivery log')}</h2><p className="hint">{t('The last 100 messages sent, and the ones that failed.')}</p></div>
-          <div className="actions"><button type="button" className="secondary" disabled={!!loading} onClick={loadNotifyLog}><RefreshCw size={14} />{t('Refresh')}</button></div>
-        </div>
-
-        {notifyLog.length === 0
-          ? <EmptyState icon={Bell} message="Nothing sent yet." />
-          : <div className="notify-log">
-            {notifyLog.map(row => <div className="notify-log-row" key={row.id}>
-              <span className="notify-log-time">{fmtTime(row.created_at)}</span>
-              <span className="notify-log-user">{row.username || '—'}</span>
-              <span className="notify-log-title">{row.title}</span>
-              <span className="notify-log-channel">{row.channel === 'email' ? 'Email' : 'Telegram'}</span>
-              <span className={row.status === 'sent' ? 'badge ok' : 'badge danger'}>{row.status === 'sent' ? t('Sent') : t('Failed')}</span>
-              {row.status !== 'sent' && row.detail && <small className="notify-log-detail">{row.detail}</small>}
-            </div>)}
+        {activeTab === 'channels' && (
+          <div className="backup-tab-panel" id="notify-tab-channels" role="tabpanel" aria-labelledby="notify-tab-button-channels">
+            <div className="section-title">
+              <div>
+                <h2>{t('Server channels')}</h2>
+                <p className="hint">{t('What every notification on this server goes out through.')}</p>
+              </div>
+            </div>
+            {!s ? <p className="hint">{t('Loading...')}</p> : (
+              <div className="notify-settings">
+                <div className="notify-card">
+                  <h3><Mail size={16} />{t('Email (SMTP)')}</h3>
+                  <div className="notify-form">
+                    <label><span>{t('SMTP server')}</span><input value={smtpForm.host} placeholder="smtp.example.com" onChange={e => setSmtpForm(f => ({ ...f, host: e.target.value }))} /></label>
+                    <div className="notify-form-pair">
+                      <label><span>{t('Encryption')}</span><select value={smtpForm.security} onChange={e => setSmtpForm(f => ({ ...f, security: e.target.value, port: { starttls: 587, ssl: 465, none: 25 }[e.target.value] }))}>
+                        <option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">{t('None')}</option>
+                      </select></label>
+                      <label><span>{t('Port')}</span><input type="number" value={smtpForm.port} onChange={e => setSmtpForm(f => ({ ...f, port: e.target.value }))} /></label>
+                    </div>
+                    <label><span>{t('Username')}</span><input value={smtpForm.username} autoComplete="off" onChange={e => setSmtpForm(f => ({ ...f, username: e.target.value }))} /></label>
+                    <label><span>{t('Password')}</span><input type="password" value={smtpForm.password} autoComplete="new-password" placeholder={s.smtp.password_set ? t('Saved - leave empty to keep it') : ''} onChange={e => setSmtpForm(f => ({ ...f, password: e.target.value }))} /></label>
+                    <label><span>{t('Sender address')}</span><input value={smtpForm.from_email} placeholder="noreply@example.com" onChange={e => setSmtpForm(f => ({ ...f, from_email: e.target.value }))} /></label>
+                    <label><span>{t('Sender name')}</span><input value={smtpForm.from_name} onChange={e => setSmtpForm(f => ({ ...f, from_name: e.target.value }))} /></label>
+                  </div>
+                  <div className="notify-actions">
+                    <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({ smtp: { ...smtpForm, port: Number(smtpForm.port) || 587, password: smtpForm.password || null } }, t('Email settings saved.'))}>{t('Save')}</button>
+                    <button type="button" className="secondary" disabled={!!loading || !s.smtp_ready} onClick={() => sendNotifyTest('email')}><Mail size={14} />{t('Send me a test email')}</button>
+                  </div>
+                </div>
+                <div className="notify-card">
+                  <h3><Send size={16} />{t('Telegram bot')}</h3>
+                  <p className="hint">{t('Create a bot with @BotFather (/newbot) and paste its token. Then send the bot any message - or add it to a group - press Find chat ID and pick the chat.')}</p>
+                  {s.telegram.token_set && <p className="notify-bot"><span className="badge ok">@{s.telegram.bot_username}</span></p>}
+                  <label className="notify-form"><span>{t('Bot token')}</span><input type="password" value={botTokenInput} autoComplete="off" placeholder={s.telegram.token_set ? t('Saved - paste a new one to replace it') : '123456789:AA...'} onChange={e => setBotTokenInput(e.target.value)} /></label>
+                  <div className="notify-form">
+                    <label><span>Chat ID</span><input value={adminChatInput} placeholder="-1001234567890" onChange={e => setAdminChatInput(e.target.value)} /></label>
+                    <div className="notify-actions"><button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set} onClick={findTelegramChats}><Search size={14} />{t('Find chat ID')}</button></div>
+                    {telegramChats && (telegramChats.length > 0
+                      ? <div className="notify-chats">{telegramChats.map(chat => <button type="button" key={chat.id} className={adminChatInput === chat.id ? 'mini' : 'mini secondary'} onClick={() => setAdminChatInput(chat.id)}>{chat.name || chat.type}<code>{chat.id}</code></button>)}</div>
+                      : <p className="hint">{t('No messages yet. Send the bot a message first, then press Find chat ID again.')}</p>)}
+                  </div>
+                  <p className="hint">{t('Server events go to this chat once. An administrator with no chat of their own hears about their account here too.')}</p>
+                  <div className="notify-actions">
+                    <button type="button" disabled={!!loading || (!s.telegram.token_set && !botTokenInput.trim())} onClick={() => saveNotifySettings({ telegram: { bot_token: botTokenInput.trim() || null, chat_id: adminChatInput.trim() } }, t('Telegram bot saved.'))}>{t('Save')}</button>
+                    <button type="button" className="secondary" disabled={!!loading || !s.telegram.token_set || !s.telegram.chat_id} onClick={() => sendNotifyTest('telegram_admin')}><Send size={14} />{t('Send a test')}</button>
+                    {s.telegram.token_set && <button type="button" className="secondary-light" disabled={!!loading} onClick={() => saveNotifySettings({ telegram: { clear_bot_token: true } }, t('Telegram bot removed.'))}>{t('Remove the bot')}</button>}
+                  </div>
+                </div>
+                <div className="notify-card">
+                  <h3><AlertCircle size={16} />{t('When to warn')}</h3>
+                  <div className="notify-form">
+                    <label><span>{t('Disk usage (%)')}</span><input type="number" min="50" max="99" value={notifyLimits.disk_percent} onChange={e => setNotifyLimits(v => ({ ...v, disk_percent: e.target.value }))} /></label>
+                    <label><span>{t('Certificate expiry (days)')}</span><input type="number" min="1" max="60" value={notifyLimits.ssl_days} onChange={e => setNotifyLimits(v => ({ ...v, ssl_days: e.target.value }))} /></label>
+                    <label><span>{t('Language of the messages')}</span><select value={notifyLimits.language} onChange={e => setNotifyLimits(v => ({ ...v, language: e.target.value }))}>
+                      <option value="vi">Tiếng Việt</option><option value="en">English</option>
+                    </select></label>
+                  </div>
+                  <div className="notify-actions">
+                    <button type="button" disabled={!!loading} onClick={() => saveNotifySettings({
+                      language: notifyLimits.language, thresholds: {
+                        disk_percent: Number(notifyLimits.disk_percent), ssl_days: Number(notifyLimits.ssl_days),
+                      }
+                    }, t('Saved.'))}>{t('Save')}</button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
-        }
+        )}
+
+        {activeTab === 'log' && (
+          <div className="backup-tab-panel" id="notify-tab-log" role="tabpanel" aria-labelledby="notify-tab-button-log">
+            <div className="section-title">
+              <div><h2>{t('Delivery log')}</h2><p className="hint">{t('The last 100 messages sent, and the ones that failed.')}</p></div>
+              <div className="actions"><button type="button" className="secondary" disabled={!!loading} onClick={loadNotifyLog}><RefreshCw size={14} />{t('Refresh')}</button></div>
+            </div>
+
+            {notifyLog.length === 0
+              ? <EmptyState icon={Bell} message="Nothing sent yet." />
+              : <div className="notify-log">
+                {notifyLog.map(row => <div className="notify-log-row" key={row.id}>
+                  <span className="notify-log-time">{fmtTime(row.created_at)}</span>
+                  <span className="notify-log-user">{row.username || '—'}</span>
+                  <span className="notify-log-title">{row.title}</span>
+                  <span className="notify-log-channel">{row.channel === 'email' ? 'Email' : 'Telegram'}</span>
+                  <span className={row.status === 'sent' ? 'badge ok' : 'badge danger'}>{row.status === 'sent' ? t('Sent') : t('Failed')}</span>
+                  {row.status !== 'sent' && row.detail && <small className="notify-log-detail">{row.detail}</small>}
+                </div>)}
+              </div>
+            }
+          </div>
+        )}
       </section>
-    </>;
+    );
   }
 
   function renderSettingsHub() {
@@ -4121,10 +4329,11 @@ function AppContent() {
 
   const sharedContextValue = {
     ...baseContext,
+    websites: roleScopedWebsites,
     request, API, clearSession, handleAuthExpired, formatApiError, readCookie,
     copyText, copiedField, setCopiedField, generateRandomPassword,
     loadCurrentUser, loadUsers, loadPackages, loadDatabases, loadPanelSettings, loadSiteApps, loadSiteRuntimes, loadPhpVersions, loadAddons, loadDemoSettings, loadCfZone, refreshAll,
-    navigateToPage, page, setPage, isAdmin, isReseller, isUser, effectiveRole, actualRole,
+    navigateToPage, page, setPage, isAdmin, isReseller, isUser, effectiveRole, actualRole, viewLevel, setViewLevel,
     storageUsageText, formatFileTime, dnsTtlLabel, splitAddresses, normalizeHttpFloodConfig, isProxiedAppType, composeWebPorts,
     openWebsiteTerminal, openWebsiteFileManager, websiteUrl, websiteConfigForm, enableSsl, assignDomainToUser, submitPasswordChange,
     validateCompose, installDockerEngine, pruneDocker, installNodeMajor,
@@ -4151,6 +4360,9 @@ function AppContent() {
   };
 
   function renderPage() {
+    if (!isPageAllowedForRole(page, effectiveRole)) {
+      return renderDashboard();
+    }
     if (page === 'websites' || page === 'subdomains') return <WebsitesPage
       mode={page === 'subdomains' ? 'subdomains' : 'domains'}
       request={request} API={API} setPage={setPage} phpVersions={phpVersions} isReseller={isReseller}
@@ -4190,8 +4402,8 @@ function AppContent() {
     if (page === 'mail') return mailAddonInstalled ? <MailPage request={request} API={API} isAdmin={isAdmin} users={users} isReseller={isReseller} renderCopyBlock={renderCopyBlock} renderDnsRecordEditor={renderDnsRecordEditor} dnsTtlLabel={dnsTtlLabel} setPanelSettingsTab={setPanelSettingsTab} setPage={setPage} /> : renderAddonMissing('mail');
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
-    if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={websites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
-    if (page === 'app_installer') return <AppInstallerPage request={request} websites={websites} navigateToPage={navigateToPage} />;
+    if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
+    if (page === 'app_installer') return <AppInstallerPage request={request} websites={roleScopedWebsites} navigateToPage={navigateToPage} />;
     if (page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;
     if (page === 'databases') return <DatabasesPage request={request} API={API} navigateToPage={navigateToPage} refreshAll={refreshAll} />;
@@ -4309,7 +4521,7 @@ function AppContent() {
     </main>;
   }
 
-  if (standaloneEditor) return <AppContext.Provider value={sharedContextValue}>{renderStandaloneEditor()}</AppContext.Provider>;
+  if (standaloneEditor && isUser) return <AppContext.Provider value={sharedContextValue}>{renderStandaloneEditor()}</AppContext.Provider>;
 
   const ActiveIcon = pageItem?.[2] || Home;
 
@@ -4393,20 +4605,28 @@ function AppContent() {
               setDonateModalOpen(true);
             }}
             title={t('Donate to SPanel')}
+            aria-label={t('Donate to SPanel')}
           >
-            <Heart size={13} fill="currentColor" />
-            <span>{t('Donate')}</span>
+            <Heart size={14} fill="currentColor" className="donate-heart-icon" />
           </button>
         </div>
       </aside>
       <div className="content">
-        {effectiveRole !== actualRole && (
+        {currentUser?.impersonated && currentUser?.impersonated_by ? (
+          <div className="impersonation-banner">
+            <div className="banner-text">
+              <span className="banner-icon">⚠️</span>
+              <span>{t('You are currently logged in as')} <strong>{currentUser.username}</strong> ({t(roleLabel(actualRole))}).</span>
+            </div>
+            <button type="button" onClick={() => exitImpersonation()}>{t('Return to')} {currentUser.impersonated_by}</button>
+          </div>
+        ) : effectiveRole !== actualRole && (
           <div className="impersonation-banner">
             <div className="banner-text">
               <span className="banner-icon">⚠️</span>
               <span>You are currently viewing the panel as <strong>{effectiveRole.toUpperCase()}</strong>.</span>
             </div>
-            <button onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>Return to {actualRole.toUpperCase()}</button>
+            <button type="button" onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>Return to {actualRole.toUpperCase()}</button>
           </div>
         )}
         <section className="topbar">
@@ -4475,8 +4695,7 @@ function AppContent() {
                 title={t('Donate to SPanel')}
                 aria-label={t('Donate to SPanel')}
               >
-                <Heart size={14} fill="currentColor" className="donate-heart-icon" />
-                <span className="donate-trigger-label">{t('Donate')}</span>
+                <Heart size={16} fill="currentColor" className="donate-heart-icon" />
               </button>
 
               <div className="user-menu" ref={notificationsRef}>
@@ -4709,7 +4928,9 @@ function AppContent() {
         </section>
         {currentUser?.demo && <div className="demo-strip" role="status"><Eye size={15} /><span>{t('This is a demo: you can look at everything, but changes are not saved.')}</span></div>}
         <div className="content-body">
-          {renderPage()}
+          <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
+            {renderPage()}
+          </React.Suspense>
           {loading && <div className="loading"><span></span>{t(loading)}</div>}
         </div>
       </div>

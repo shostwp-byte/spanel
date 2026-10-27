@@ -475,7 +475,7 @@ export function ServerStatisticsPage({ request, isAdmin, isReseller, page }) {
                 <div className="cb-card-footer">
                   <div className="cb-card-unit"><code>/var/www</code></div>
                   <div className="cb-card-actions">
-                    {isReseller ? (
+                    {(isAdmin || isReseller) ? (
                       <button type="button" className="cb-btn secondary" onClick={() => navigateToPage('users')}>
                         <Users size={13} /> {t('List Users')}
                       </button>
@@ -514,8 +514,8 @@ export function ServerStatisticsPage({ request, isAdmin, isReseller, page }) {
                 <div className="cb-card-footer">
                   <div className="cb-card-unit"><code>tls + modsec</code></div>
                   <div className="cb-card-actions">
-                    <button type="button" className="cb-btn secondary" onClick={() => navigateToPage(isReseller ? 'waf' : 'ssl')}>
-                      <Lock size={13} /> {isReseller ? t('Manage WAF') : t('Manage SSL')}
+                    <button type="button" className="cb-btn secondary" onClick={() => navigateToPage((isAdmin || isReseller) ? 'waf' : 'ssl')}>
+                      <Lock size={13} /> {(isAdmin || isReseller) ? t('Manage WAF') : t('Manage SSL')}
                     </button>
                   </div>
                 </div>

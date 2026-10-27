@@ -123,7 +123,11 @@ def _build_user_resource_row(
         "websites_count": len(sites),
         "website_limit": int(user.website_limit or 0),
         "databases_count": len(dbs),
-        "database_limit": int(getattr(user, "database_limit", 5) or 0),
+        "database_limit": int(
+            getattr(user.package, "database_limit", getattr(user, "database_limit", 5))
+            if getattr(user, "package", None) is not None
+            else (getattr(user, "database_limit", 5) or 0)
+        ),
         "locked_databases_count": locked_dbs_count,
         "cpu_percent": live["cpu_percent"],
         "php_cpu_percent": float(live.get("php_cpu_percent") or 0.0),

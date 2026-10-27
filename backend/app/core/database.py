@@ -158,6 +158,35 @@ def _ensure_resource_limit_columns() -> None:
                 for col_name, col_ddl in cols:
                     if col_name not in existing:
                         conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"))
+            if inspector.has_table("users") and inspector.has_table("user_packages"):
+                sync_cols = [
+                    "database_limit",
+                    "bandwidth_limit_mb",
+                    "inode_limit",
+                    "cpu_quota_percent",
+                    "io_read_mbps",
+                    "io_write_mbps",
+                    "iops_read_max",
+                    "iops_write_max",
+                    "memory_high_mb",
+                    "memory_max_mb",
+                    "tasks_max",
+                    "mysql_storage_limit_mb",
+                    "mysql_max_db_size_mb",
+                    "mysql_max_queries_per_hour",
+                    "mysql_max_updates_per_hour",
+                    "mysql_max_connections_per_hour",
+                ]
+                set_clause = ", ".join(
+                    f"{col} = COALESCE((SELECT up.{col} FROM user_packages up WHERE up.id = users.package_id), {col})"
+                    for col in sync_cols
+                )
+                conn.execute(
+                    text(
+                        f"UPDATE users SET {set_clause} "
+                        "WHERE package_id IS NOT NULL AND EXISTS (SELECT 1 FROM user_packages up WHERE up.id = users.package_id)"
+                    )
+                )
     except Exception:
         pass
 

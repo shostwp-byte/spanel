@@ -345,17 +345,24 @@ def _option_value(value: str) -> str:
     return f'"{escaped}"'
 
 
-def render_client_defaults(host: RemoteDbHost, password: str, ca_path: Optional[str]) -> str:
+def render_client_defaults(
+    host: RemoteDbHost,
+    password: str,
+    ca_path: Optional[str],
+    *,
+    user: Optional[str] = None,
+) -> str:
     """The [client] option file mysqldump / mysql read for a remote host.
 
     The password goes in a 0600 file rather than argv or the environment, the
     same reason the local path pipes SQL through stdin.
     """
+    eff_user = (user or "").strip() or (host.admin_user or "root")
     lines = [
         "[client]",
         f"host={normalize_server_host(host.host)}",
         f"port={int(host.port or 3306)}",
-        f"user={_option_value(host.admin_user or 'root')}",
+        f"user={_option_value(eff_user)}",
         f"password={_option_value(password)}",
     ]
     if host.use_tls:
@@ -365,7 +372,12 @@ def render_client_defaults(host: RemoteDbHost, password: str, ca_path: Optional[
 
 
 @contextmanager
-def client_defaults_file(host: RemoteDbHost) -> Iterator[str]:
+def client_defaults_file(
+    host: RemoteDbHost,
+    *,
+    db_user: Optional[str] = None,
+    db_password: Optional[str] = None,
+) -> Iterator[str]:
     workdir = Path(tempfile.mkdtemp(prefix="spanel-rdb-"))
     try:
         ca_path = None
@@ -373,10 +385,18 @@ def client_defaults_file(host: RemoteDbHost) -> Iterator[str]:
             ca_file = workdir / "ca.pem"
             ca_file.write_text(host.ca_cert, encoding="utf-8")
             ca_path = str(ca_file)
+        eff_user = (db_user or "").strip()
+        if eff_user and db_password is not None:
+            safe_user = mariadb._validate_identifier(eff_user)
+            mariadb._reject_reserved_user(safe_user)
+            eff_pass = db_password
+        else:
+            safe_user = None
+            eff_pass = admin_password(host)
         cnf = workdir / "client.cnf"
         fd = os.open(str(cnf), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(render_client_defaults(host, admin_password(host), ca_path))
+            fh.write(render_client_defaults(host, eff_pass, ca_path, user=safe_user))
         yield str(cnf)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -629,14 +649,34 @@ class RemoteMySQLBackend:
             raise RemoteDatabaseError(f"{self.label}: dumping '{safe_name}' failed: {(result.stderr or '').strip()[:500]}")
         return result
 
-    def import_database(self, db_name: str, input_file: str):
+    def import_database(
+        self,
+        db_name: str,
+        input_file: str,
+        db_user: Optional[str] = None,
+        db_password: Optional[str] = None,
+    ):
         safe_name = mariadb._validate_identifier(db_name)
         sql_path = Path(input_file).resolve()
         if not sql_path.is_file():
             raise FileNotFoundError("SQL file not found")
         if settings.command_dry_run:
             return shell.run(["mysql", safe_name], sensitive=True)
-        with client_defaults_file(self.host) as cnf, sql_path.open("rb") as source:
+        eff_user = (db_user or "").strip()
+        eff_pass = db_password
+        if not (eff_user and eff_pass):
+            ctx_creds = mariadb._IMPORT_CREDS_CTX.get()
+            if ctx_creds:
+                eff_user, eff_pass = (ctx_creds[0] or "").strip(), ctx_creds[1]
+        with (
+            client_defaults_file(
+                self.host,
+                db_user=eff_user or None,
+                db_password=eff_pass if eff_user else None,
+            ) as cnf,
+            mariadb._strip_sql_definers(sql_path) as clean_sql_path,
+            clean_sql_path.open("rb") as source,
+        ):
             try:
                 completed = subprocess.run(
                     ["mysql", f"--defaults-file={cnf}", safe_name],
@@ -648,6 +688,25 @@ class RemoteMySQLBackend:
             stderr = completed.stderr.decode("utf-8", errors="replace").strip()[:500]
             raise RemoteDatabaseError(f"{self.label}: importing into '{safe_name}' failed: {stderr}")
         return completed
+
+    def import_database_as_tenant(
+        self,
+        db_name: str,
+        input_file: str,
+        db_user: Optional[str] = None,
+        db_password: Optional[str] = None,
+    ):
+        safe_name = mariadb._reject_reserved_database(db_name)
+        eff_user, eff_pass = mariadb._resolve_tenant_import_credentials(
+            safe_name, db_user=db_user, db_password=db_password
+        )
+        if RemoteMySQLBackend.import_database is not _default_remote_import_database:
+            with mariadb.tenant_import_credentials(eff_user, eff_pass):
+                return self.import_database(db_name, input_file)
+        return self.import_database(db_name, input_file, db_user=eff_user, db_password=eff_pass)
+
+
+_default_remote_import_database = RemoteMySQLBackend.import_database
 
 
 # --- host records -------------------------------------------------------------

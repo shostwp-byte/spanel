@@ -196,14 +196,6 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
 
     if db.query(User).filter(User.username == payload.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
-    if payload.domain:
-        try:
-            from app.api.websites import reconcile_websites_from_disk
-            reconcile_websites_from_disk(db)
-        except Exception:
-            pass
-        if db.query(Website).filter(Website.domain == payload.domain).first():
-            raise HTTPException(status_code=409, detail="Domain already exists")
     if payload.domain and (
         db.query(Website).filter(Website.domain == payload.domain).first()
         or nginx.vhost_exists(payload.domain)
@@ -279,6 +271,8 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
         if payload.domain:
             root_path = site_users.site_root_for_panel_user(payload.username, payload.domain)
             if install_wp:
+                from app.api.databases import enforce_user_database_limit
+                enforce_user_database_limit(db, user)
                 db_info = mariadb.create_database(payload.domain)
                 linux_user = site_users.ensure_site_runtime(payload.domain, root_path, payload.php_version, linux_user)
                 root_path = wordpress.install_wordpress(

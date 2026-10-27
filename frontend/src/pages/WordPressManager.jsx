@@ -162,6 +162,14 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       if (data) {
         const list = Array.isArray(data.instances) ? data.instances : [];
         setInstances(list);
+        const nextPlugins = {};
+        const nextThemes = {};
+        for (const inst of list) {
+          if (Array.isArray(inst.plugins)) nextPlugins[inst.id] = inst.plugins;
+          if (Array.isArray(inst.themes)) nextThemes[inst.id] = inst.themes;
+        }
+        setInstancePluginsMap(nextPlugins);
+        setInstanceThemesMap(nextThemes);
         if (Array.isArray(data.sets)) setPackageSets(data.sets);
         if (Array.isArray(data.websites) && data.websites.length > 0) {
           setAllWebsites(data.websites);
@@ -175,6 +183,15 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   function updateSingleInstanceState(updated) {
     if (!updated || !updated.id) return;
     setInstances(prev => prev.map(item => (item.id === updated.id ? updated : item)));
+    if (Array.isArray(updated.plugins)) {
+      setInstancePluginsMap(prev => ({ ...prev, [updated.id]: updated.plugins }));
+    }
+    if (Array.isArray(updated.themes)) {
+      setInstanceThemesMap(prev => ({ ...prev, [updated.id]: updated.themes }));
+    }
+    if (snapshotModalInst && snapshotModalInst.id === updated.id) {
+      setSnapshotModalInst(updated);
+    }
   }
 
   function getSubTab(instId) {
@@ -183,16 +200,43 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
 
   async function selectSubTab(inst, tabKey) {
     setInstanceTabMap(prev => ({ ...prev, [inst.id]: tabKey }));
-    if (tabKey === 'plugins' && !instancePluginsMap[inst.id]) {
+    if (tabKey === 'plugins') {
       const res = await request(`/wordpress-manager/instances/${inst.id}/plugins`, { silent: true });
-      if (res?.plugins) {
+      if (Array.isArray(res?.plugins)) {
         setInstancePluginsMap(prev => ({ ...prev, [inst.id]: res.plugins }));
+        setInstances(prev =>
+          prev.map(item =>
+            item.id === inst.id
+              ? {
+                  ...item,
+                  plugins: res.plugins,
+                  plugins_count: res.plugins.length,
+                  plugins_active_count: res.plugins.filter(p => p.status === 'active').length,
+                  plugins_updatable_count: res.plugins.filter(p => p.update_available).length,
+                }
+              : item
+          )
+        );
       }
     }
-    if (tabKey === 'themes' && !instanceThemesMap[inst.id]) {
+    if (tabKey === 'themes') {
       const res = await request(`/wordpress-manager/instances/${inst.id}/themes`, { silent: true });
-      if (res?.themes) {
+      if (Array.isArray(res?.themes)) {
         setInstanceThemesMap(prev => ({ ...prev, [inst.id]: res.themes }));
+        const activeTh = res.themes.find(th => th.status === 'active');
+        setInstances(prev =>
+          prev.map(item =>
+            item.id === inst.id
+              ? {
+                  ...item,
+                  themes: res.themes,
+                  themes_count: res.themes.length,
+                  themes_updatable_count: res.themes.filter(th => th.update_available).length,
+                  active_theme: activeTh ? activeTh.name : item.active_theme,
+                }
+              : item
+          )
+        );
       }
     }
     if (tabKey === 'security' && !securityCheckedMap[inst.id]) {
@@ -654,35 +698,45 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       <button
         type="button"
         role="switch"
+        className={`sp-switch${checked ? ' is-on' : ''}`}
         aria-checked={checked}
         disabled={disabled}
         onClick={onChange}
         style={{
           position: 'relative',
-          width: '44px',
+          display: 'inline-block',
+          width: '42px',
+          minWidth: '42px',
           height: '24px',
           minHeight: '24px',
           borderRadius: '999px',
           padding: 0,
-          border: checked ? '1px solid var(--primary)' : '1px solid var(--border)',
-          background: checked ? 'var(--primary)' : 'var(--surface-alt)',
+          margin: 0,
+          border: checked ? '1px solid var(--primary)' : '1px solid rgba(15, 23, 42, 0.14)',
+          background: checked ? 'var(--primary)' : '#cbd5e1',
           cursor: disabled ? 'not-allowed' : 'pointer',
-          transition: 'all 0.18s ease',
-          display: 'inline-flex',
-          alignItems: 'center',
+          transition: 'background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
           flexShrink: 0,
-          boxShadow: 'none',
+          verticalAlign: 'middle',
+          boxSizing: 'border-box',
+          boxShadow: checked ? 'none' : 'inset 0 1px 2px rgba(15, 23, 42, 0.08)',
         }}
       >
         <span
+          className="sp-switch-thumb"
           style={{
+            position: 'absolute',
+            top: '2px',
+            left: '2px',
             width: '18px',
             height: '18px',
             borderRadius: '50%',
             background: '#ffffff',
-            boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-            transform: checked ? 'translateX(21px)' : 'translateX(3px)',
-            transition: 'transform 0.18s ease',
+            boxShadow: '0 1px 3px rgba(15, 23, 42, 0.28), 0 1px 1px rgba(15, 23, 42, 0.14)',
+            transform: checked ? 'translateX(18px)' : 'translateX(0)',
+            transition: 'transform 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+            pointerEvents: 'none',
+            display: 'block',
           }}
         />
       </button>
@@ -857,11 +911,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            <label
+            <div
+              onClick={toggleSelectAll}
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: '6px',
+                gap: '7px',
                 fontSize: '13px',
                 cursor: 'pointer',
                 marginRight: '4px',
@@ -872,12 +927,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 type="checkbox"
                 checked={allSelected}
                 onChange={toggleSelectAll}
-                style={{ width: '15px', height: '15px' }}
+                onClick={e => e.stopPropagation()}
+                style={{ width: '15px', height: '15px', margin: 0, flexShrink: 0, cursor: 'pointer' }}
               />
-              <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>
+              <span style={{ color: 'var(--text-secondary)', fontWeight: 500, whiteSpace: 'nowrap' }}>
                 {selectedIds.length > 0 ? `Đã chọn (${selectedIds.length})` : 'Chọn tất cả'}
               </span>
-            </label>
+            </div>
 
             <button
               type="button"
@@ -1072,7 +1128,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 <thead>
                   <tr style={{ background: 'var(--surface-alt)', borderBottom: '1px solid var(--border)' }}>
                     <th style={{ padding: '11px 16px', width: '36px' }}>
-                      <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
+                      <input
+                        type="checkbox"
+                        checked={allSelected}
+                        onChange={toggleSelectAll}
+                        style={{ width: '15px', height: '15px', margin: 0, cursor: 'pointer' }}
+                      />
                     </th>
                     <th style={{ padding: '11px 14px' }}>Website / Domain</th>
                     <th style={{ padding: '11px 14px' }}>Tiêu đề Site</th>
@@ -1091,6 +1152,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                           type="checkbox"
                           checked={selectedIds.includes(inst.id)}
                           onChange={() => toggleSelectOne(inst.id)}
+                          style={{ width: '15px', height: '15px', margin: 0, cursor: 'pointer' }}
                         />
                       </td>
                       <td style={{ padding: '11px 14px', fontWeight: 600 }}>
@@ -1254,8 +1316,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               {filteredInstances.map(inst => {
                 const isCollapsed = !!collapsedMap[inst.id];
                 const subTab = getSubTab(inst.id);
-                const instPlugins = instancePluginsMap[inst.id] || [];
-                const instThemes = instanceThemesMap[inst.id] || [];
+                const instPlugins = instancePluginsMap[inst.id] ?? inst.plugins ?? [];
+                const instThemes = instanceThemesMap[inst.id] ?? inst.themes ?? [];
                 const checkedSecIds =
                   securityCheckedMap[inst.id] || (inst.security_checks || []).map(c => c.id);
 
@@ -2033,12 +2095,21 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                                     {renderSwitch(
                                       !!inst.toggles?.password_protection,
-                                      () =>
+                                      () => {
+                                        if (!inst.toggles?.password_protection && !inst.password_protection_configured) {
+                                          setPasswordAuthModalInst(inst);
+                                          setBasicAuthForm({
+                                            user: inst.basic_auth_user || 'preview',
+                                            password: '',
+                                          });
+                                          return;
+                                        }
                                         handleToggleSwitch(
                                           inst,
                                           'password_protection',
                                           !inst.toggles?.password_protection
-                                        )
+                                        );
+                                      }
                                     )}
                                     <button
                                       type="button"
@@ -2145,6 +2216,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                     </tr>
                                   </thead>
                                   <tbody>
+                                    {instPlugins.length === 0 && (
+                                      <tr>
+                                        <td colSpan={4} style={{ padding: '22px 14px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                                          Không có Plugin nào đang được cài đặt trên website này.
+                                        </td>
+                                      </tr>
+                                    )}
                                     {instPlugins.map(pl => (
                                       <tr key={pl.slug} style={{ borderBottom: '1px solid var(--border)' }}>
                                         <td style={{ padding: '9px 14px' }}>
@@ -2246,6 +2324,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                     </tr>
                                   </thead>
                                   <tbody>
+                                    {instThemes.length === 0 && (
+                                      <tr>
+                                        <td colSpan={4} style={{ padding: '22px 14px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                                          Không có Theme nào đang được cài đặt trên website này.
+                                        </td>
+                                      </tr>
+                                    )}
                                     {instThemes.map(th => (
                                       <tr key={th.slug} style={{ borderBottom: '1px solid var(--border)' }}>
                                         <td style={{ padding: '9px 14px' }}>
@@ -2293,12 +2378,31 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
 
                           {/* SUB-TAB 4: SECURITY HARDENING & CHECKSUMS */}
                           {subTab === 'security' && (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  alignItems: 'center',
+                                  flexWrap: 'wrap',
+                                  gap: '10px',
+                                  padding: '10px 14px',
+                                  background: 'var(--surface-alt)',
+                                  border: '1px solid var(--border)',
+                                  borderRadius: '10px',
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                   <button
                                     type="button"
-                                    onClick={() => handleSecurityAction(inst, 'secure', checkedSecIds)}
+                                    disabled={!!busyAction}
+                                    onClick={() =>
+                                      handleSecurityAction(
+                                        inst,
+                                        'secure',
+                                        (inst.security_checks || []).map(c => c.id)
+                                      )
+                                    }
                                     style={{
                                       height: '32px',
                                       minHeight: '32px',
@@ -2311,19 +2415,27 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                       borderRadius: '7px',
                                     }}
                                   >
-                                    <ShieldCheck size={14} /> Secure Selected ({checkedSecIds.length})
+                                    <ShieldCheck size={14} /> Bật tất cả ({inst.security_passed}/{inst.security_total})
                                   </button>
                                   <button
                                     type="button"
                                     className="secondary-light"
-                                    onClick={() => handleSecurityAction(inst, 'revert', checkedSecIds)}
+                                    disabled={!!busyAction}
+                                    onClick={() =>
+                                      handleSecurityAction(
+                                        inst,
+                                        'revert',
+                                        (inst.security_checks || []).map(c => c.id)
+                                      )
+                                    }
                                     style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12.5px' }}
                                   >
-                                    Revert
+                                    Tắt tất cả (Revert)
                                   </button>
                                   <button
                                     type="button"
                                     className="secondary-light"
+                                    disabled={!!busyAction}
                                     onClick={() => handleSecurityAction(inst, 'verify_checksums')}
                                     style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12.5px' }}
                                   >
@@ -2332,60 +2444,89 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   <button
                                     type="button"
                                     className="secondary-light"
+                                    disabled={!!busyAction}
                                     onClick={() => handleSecurityAction(inst, 'reinstall_core')}
                                     style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12.5px' }}
                                   >
                                     <RotateCcw size={13} /> Reinstall Clean Core
                                   </button>
                                 </div>
+                                <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                                  Gạt công tắc từng mục để bật/tắt trực tiếp lớp bảo vệ tương ứng
+                                </span>
                               </div>
 
-                              <div style={{ border: '1px solid var(--border)', borderRadius: '10px', overflow: 'hidden' }}>
-                                {(inst.security_checks || []).map(chk => {
-                                  const isChecked = checkedSecIds.includes(chk.id);
+                              <div
+                                style={{
+                                  border: '1px solid var(--border)',
+                                  borderRadius: '10px',
+                                  overflow: 'hidden',
+                                  background: 'var(--surface)',
+                                }}
+                              >
+                                {(inst.security_checks || []).map((chk, idx, arr) => {
+                                  const isSecured = !!chk.passed;
                                   return (
-                                    <label
+                                    <div
                                       key={chk.id}
+                                      onClick={() => {
+                                        if (!busyAction) {
+                                          handleSecurityAction(inst, isSecured ? 'revert' : 'secure', [chk.id]);
+                                        }
+                                      }}
                                       style={{
-                                        display: 'flex',
-                                        justifyContent: 'space-between',
+                                        display: 'grid',
+                                        gridTemplateColumns: '52px minmax(0, 1fr) auto',
                                         alignItems: 'center',
-                                        padding: '10px 14px',
-                                        borderBottom: '1px solid var(--border)',
-                                        cursor: 'pointer',
-                                        gap: '12px',
+                                        padding: '13px 18px',
+                                        borderBottom: idx < arr.length - 1 ? '1px solid var(--border)' : 'none',
+                                        background: isSecured
+                                          ? 'color-mix(in srgb, var(--primary) 3%, var(--surface))'
+                                          : 'var(--surface)',
+                                        cursor: busyAction ? 'wait' : 'pointer',
+                                        gap: '14px',
+                                        transition: 'background 0.15s ease',
                                       }}
                                     >
-                                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
-                                        <input
-                                          type="checkbox"
-                                          checked={isChecked}
-                                          onChange={() => {
-                                            setSecurityCheckedMap(prev => {
-                                              const cur = prev[inst.id] || [];
-                                              return {
-                                                ...prev,
-                                                [inst.id]: cur.includes(chk.id)
-                                                  ? cur.filter(x => x !== chk.id)
-                                                  : [...cur, chk.id],
-                                              };
-                                            });
+                                      <div
+                                        onClick={e => e.stopPropagation()}
+                                        style={{ display: 'flex', alignItems: 'center' }}
+                                      >
+                                        {renderSwitch(
+                                          isSecured,
+                                          () => handleSecurityAction(inst, isSecured ? 'revert' : 'secure', [chk.id]),
+                                          !!busyAction
+                                        )}
+                                      </div>
+
+                                      <div style={{ minWidth: 0 }}>
+                                        <div
+                                          style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '8px',
+                                            flexWrap: 'wrap',
+                                            marginBottom: '3px',
                                           }}
-                                          style={{ marginTop: '3px' }}
-                                        />
-                                        <div>
-                                          <strong style={{ fontSize: '13px', color: 'var(--text)', display: 'block' }}>
+                                        >
+                                          <strong style={{ fontSize: '13.5px', color: 'var(--text)', lineHeight: 1.35 }}>
                                             {chk.title}
                                           </strong>
-                                          <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
-                                            {chk.description}
-                                          </span>
+                                        </div>
+                                        <div style={{ fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+                                          {chk.description}
                                         </div>
                                       </div>
-                                      <span className={`badge ${chk.passed ? 'ok' : chk.critical ? 'bad' : 'warn'}`}>
-                                        {chk.passed ? 'Secured' : chk.critical ? 'Critical' : 'Warning'}
-                                      </span>
-                                    </label>
+
+                                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
+                                        <span
+                                          className={`badge ${chk.passed ? 'ok' : chk.critical ? 'bad' : 'warn'}`}
+                                          style={{ minWidth: '74px', justifyContent: 'center', textAlign: 'center' }}
+                                        >
+                                          {chk.passed ? 'Secured' : chk.critical ? 'Critical' : 'Warning'}
+                                        </span>
+                                      </div>
+                                    </div>
                                   );
                                 })}
                               </div>
@@ -2417,7 +2558,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   <code>{inst.table_prefix}</code>
                                   <span style={{ color: 'var(--text-muted)' }}>Tables / Size:</span>
                                   <span>
-                                    <strong>{inst.database?.table_count ?? 12}</strong> bảng ({inst.database?.size_mb ?? 2.4} MB)
+                                    <strong>{inst.database?.table_count ?? 0}</strong> bảng ({inst.database?.size_mb ?? inst.db_size_mb ?? 0} MB)
                                   </span>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', marginTop: '14px' }}>
@@ -2454,8 +2595,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                   Hiệu năng wp-config.php
                                 </strong>
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '13px' }}>
-                                  <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <span>WP_MEMORY_LIMIT</span>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                                    <code>WP_MEMORY_LIMIT</code>
                                     <select
                                       value={inst.wp_memory_limit || '256M'}
                                       onChange={e =>
@@ -2464,17 +2605,17 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                           wp_memory_limit: e.target.value,
                                         })
                                       }
-                                      style={{ width: '130px', height: '32px' }}
+                                      style={{ width: '155px', height: '32px' }}
                                     >
                                       <option value="128M">128M</option>
                                       <option value="256M">256M (Khuyên dùng)</option>
                                       <option value="512M">512M</option>
                                       <option value="1024M">1024M</option>
                                     </select>
-                                  </label>
+                                  </div>
 
-                                  <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <span>WP_MAX_MEMORY_LIMIT</span>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                                    <code>WP_MAX_MEMORY_LIMIT</code>
                                     <select
                                       value={inst.wp_max_memory_limit || '512M'}
                                       onChange={e =>
@@ -2483,16 +2624,16 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                           wp_max_memory_limit: e.target.value,
                                         })
                                       }
-                                      style={{ width: '130px', height: '32px' }}
+                                      style={{ width: '155px', height: '32px' }}
                                     >
                                       <option value="256M">256M</option>
                                       <option value="512M">512M</option>
                                       <option value="1024M">1024M</option>
                                     </select>
-                                  </label>
+                                  </div>
 
-                                  <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <span>WP_POST_REVISIONS</span>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+                                    <code>WP_POST_REVISIONS</code>
                                     <select
                                       value={String(inst.wp_post_revisions || '10')}
                                       onChange={e =>
@@ -2501,14 +2642,14 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                           wp_post_revisions: e.target.value,
                                         })
                                       }
-                                      style={{ width: '130px', height: '32px' }}
+                                      style={{ width: '155px', height: '32px' }}
                                     >
                                       <option value="false">Tắt lưu bản nháp</option>
                                       <option value="5">Tối đa 5 bản</option>
                                       <option value="10">Tối đa 10 bản</option>
                                       <option value="25">Tối đa 25 bản</option>
                                     </select>
-                                  </label>
+                                  </div>
                                 </div>
                               </div>
                             </div>
@@ -3256,40 +3397,32 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               </button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', fontSize: '13px' }}>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
-                  <input
-                    type="checkbox"
-                    checked={!!debugModalInst.toggles?.debugging}
-                    onChange={e => {
-                      const v = e.target.checked;
-                      handleToggleSwitch(debugModalInst, 'debugging', v);
-                      setDebugModalInst(prev => ({
-                        ...prev,
-                        toggles: { ...prev.toggles, debugging: v },
-                      }));
-                    }}
-                  />
-                  <span>WP_DEBUG (Bật chế độ gỡ lỗi)</span>
-                </label>
+              <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', fontSize: '13px' }}>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '10px' }}>
+                  {renderSwitch(!!debugModalInst.toggles?.debugging, () => {
+                    const v = !debugModalInst.toggles?.debugging;
+                    handleToggleSwitch(debugModalInst, 'debugging', v);
+                    setDebugModalInst(prev => ({
+                      ...prev,
+                      toggles: { ...prev.toggles, debugging: v },
+                    }));
+                  })}
+                  <span style={{ fontWeight: 500 }}>WP_DEBUG (Bật chế độ gỡ lỗi)</span>
+                </div>
 
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
-                  <input
-                    type="checkbox"
-                    checked={!!debugModalInst.toggles?.debug_log}
-                    onChange={e => {
-                      const v = e.target.checked;
-                      handleToggleSwitch(debugModalInst, 'debug_log', v, {
-                        debugging: debugModalInst.toggles?.debugging,
-                      });
-                      setDebugModalInst(prev => ({
-                        ...prev,
-                        toggles: { ...prev.toggles, debug_log: v },
-                      }));
-                    }}
-                  />
-                  <span>WP_DEBUG_LOG (Ghi vào wp-content/debug.log)</span>
-                </label>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '10px' }}>
+                  {renderSwitch(!!debugModalInst.toggles?.debug_log, () => {
+                    const v = !debugModalInst.toggles?.debug_log;
+                    handleToggleSwitch(debugModalInst, 'debug_log', v, {
+                      debugging: debugModalInst.toggles?.debugging,
+                    });
+                    setDebugModalInst(prev => ({
+                      ...prev,
+                      toggles: { ...prev.toggles, debug_log: v },
+                    }));
+                  })}
+                  <span style={{ fontWeight: 500 }}>WP_DEBUG_LOG (Ghi vào wp-content/debug.log)</span>
+                </div>
               </div>
 
               <div>
@@ -3654,14 +3787,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                   onChange={e => setSearchReplaceForm(prev => ({ ...prev, replace_to: e.target.value }))}
                 />
               </label>
-              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
-                <input
-                  type="checkbox"
-                  checked={searchReplaceForm.dry_run}
-                  onChange={e => setSearchReplaceForm(prev => ({ ...prev, dry_run: e.target.checked }))}
-                />
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '10px', fontSize: '13px', marginTop: '4px' }}>
+                {renderSwitch(searchReplaceForm.dry_run, () =>
+                  setSearchReplaceForm(prev => ({ ...prev, dry_run: !prev.dry_run }))
+                )}
                 <span>Chạy thử (Dry-run) kiểm tra trước khi ghi vào Database</span>
-              </label>
+              </div>
             </div>
             <div className="modal-footer">
               <button type="button" className="secondary-light" onClick={() => setSearchReplaceModalInst(null)}>

@@ -29,9 +29,12 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 def _user_out(user: User, db: Session, *, cached_usage: bool = False) -> dict:
+    from app.api.databases import effective_database_limit
+
     data = UserOut.model_validate(user).model_dump()
     data["package_name"] = user.package.name if user.package else None
     data["subdomain_limit"] = int(getattr(user.package, "subdomain_limit", 0) or 0) if user.package else 0
+    data["database_limit"] = effective_database_limit(user)
     owner = None
     if user.reseller_id:
         owner = db.query(User).filter(User.id == user.reseller_id).first()
@@ -295,6 +298,7 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
         reseller_id=current_user.id if payload.role == Role.end_user else None,
         website_limit=payload.website_limit,
         storage_limit_mb=payload.storage_limit_mb,
+        database_limit=payload.database_limit,
         sftp_accounts_limit=payload.sftp_accounts_limit,
         mail_accounts_limit=payload.mail_accounts_limit,
         terminal_enabled=bool(payload.terminal_enabled) if payload.terminal_enabled is not None else False,
@@ -331,7 +335,12 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
                 body = template.body
 
             brand = panel_settings.get_brand(db, reseller_id)
-            login_url = f"https://{brand.panel_domain}" if brand and brand.panel_domain else "https://your-server-ip:2222"
+            login_url = (
+                getattr(brand, "panel_url", "")
+                or (f"https://{brand.panel_domain}" if brand and getattr(brand, "panel_domain", "") else "")
+                or panel_settings.configured_panel_url()
+                or "https://your-server-ip:2222"
+            )
 
             subject = subject.replace("{username}", user.username)
             body = body.replace("{username}", user.username).replace("{password}", payload.password).replace("{login_url}", login_url)
@@ -389,9 +398,13 @@ def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_c
     if current_user.role == Role.reseller:
         query = query.filter(User.reseller_id == current_user.id)
 
+    from app.api.databases import effective_database_limit
+
     for user in query.order_by(User.id.desc()).all():
         data = UserOut.model_validate(user).model_dump()
         data["package_name"] = user.package.name if user.package else None
+        data["subdomain_limit"] = int(getattr(user.package, "subdomain_limit", 0) or 0) if user.package else 0
+        data["database_limit"] = effective_database_limit(user)
         owner = managers.get(user.reseller_id) if user.reseller_id else (
             primary_admin if user.role in (Role.end_user, "user") else None
         )
@@ -486,6 +499,8 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, db: Session
         user.sftp_accounts_limit = payload.sftp_accounts_limit
     if payload.mail_accounts_limit is not None:
         user.mail_accounts_limit = payload.mail_accounts_limit
+    if payload.database_limit is not None:
+        user.database_limit = payload.database_limit
     if package:
         _apply_package_limits(user, package)
     if payload.terminal_enabled is not None:
@@ -516,6 +531,17 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, db: Session
     db.commit()
     db.refresh(user)
     if active_changed:
+        try:
+            if user.is_active:
+                site_users.unlock_linux_user(user.username)
+            else:
+                site_users.lock_linux_user(user.username)
+        except Exception:
+            pass
+        try:
+            teardown.set_owner_databases_locked(db, user.id, not user.is_active)
+        except Exception:
+            pass
         # A suspended account's mailboxes keep receiving but cannot sign in.
         mail.sync_quietly(db)
     log_action(db, current_user.id, "update_user", user.username, request=request)

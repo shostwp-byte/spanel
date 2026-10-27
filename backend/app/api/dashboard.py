@@ -8,6 +8,7 @@ waits on the network - opening the dashboard must stay cheap.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -15,6 +16,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import Role, is_admin_role, normalize_role
 from app.models.entities import BackupSchedule, DatabaseAccount, User, Website
@@ -28,6 +30,8 @@ UNSECURED_SHOWN = 5
 # A scan that ran to the end. An interrupted or failed one says nothing about
 # whether the files are clean, so the card reports the last one that finished.
 FINISHED_SCANS = {"done", "infected"}
+_PROBES_CACHE: dict[str, tuple[float, Any]] = {}
+_PROBES_TTL_SECONDS = 15.0
 
 
 def _safe(read: Callable[[], Any], default: Any = None) -> Any:
@@ -36,6 +40,18 @@ def _safe(read: Callable[[], Any], default: Any = None) -> Any:
     except Exception as exc:  # noqa: BLE001 - one broken probe must not blank the dashboard
         logger.warning("dashboard: %s failed: %s", getattr(read, "__name__", "probe"), exc)
         return default
+
+
+def _cached_probe(key: str, read: Callable[[], Any], default: Any = None) -> Any:
+    if not settings.command_dry_run:
+        now = time.monotonic()
+        cached = _PROBES_CACHE.get(key)
+        if cached is not None and (now - cached[0]) < _PROBES_TTL_SECONDS:
+            return cached[1]
+        val = _safe(read, default)
+        _PROBES_CACHE[key] = (now, val)
+        return val
+    return _safe(read, default)
 
 
 def _services() -> dict:
@@ -182,10 +198,10 @@ def dashboard_summary(db: Session = Depends(get_db), current_user: User = Depend
 
     summary["tenants"] = _safe(_tenants_summary, {})
     if admin:
-        summary["firewall"] = {"enabled": _safe(firewall.is_enabled)}
-        summary["waf"] = {"engine": _safe(_waf_engine, "unknown")}
-        summary["malware"] = _safe(_malware)
-        summary["services"] = _safe(_services)
+        summary["firewall"] = {"enabled": _cached_probe("firewall", firewall.is_enabled)}
+        summary["waf"] = {"engine": _cached_probe("waf", _waf_engine, "unknown")}
+        summary["malware"] = _cached_probe("malware", _malware)
+        summary["services"] = _cached_probe("services", _services)
         summary["updates"] = _safe(updates.cached_release_summary)
         summary["php_updates"] = _safe(php.cached_php_update_summary)
         summary["backups"] = _safe(lambda: _backups(db))
