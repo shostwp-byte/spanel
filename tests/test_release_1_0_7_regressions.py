@@ -262,6 +262,7 @@ from app.services import mariadb, panel_settings, wordpress_live
 def _make_db():
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
+    wordpress_live.engine = engine
     Session = sessionmaker(bind=engine)
     return Session()
 
@@ -876,39 +877,173 @@ def test_strict_role_isolation_between_admin_reseller_and_end_user():
         wordpress_manager._WP_ACCESS_ROLE_CTX.reset(tok)
 
 
-class Release107RegressionTests(unittest.TestCase):
-    def test_1_heredocs(self):
-        test_installer_and_updater_python_heredocs_compile_cleanly()
+def test_p0_1_clone_rejects_symlink_and_mismatched_uid_and_cleans_orphan_db(tmp_path):
+    import os
+    import stat as stat_mod
+    from fastapi import HTTPException
+    from app.core.config import settings
+    from app.services.shell import CommandResult
 
-    def test_2_reserved_dbs(self):
-        test_mariadb_rejects_reserved_databases()
+    db = _make_db()
+    alice = User(username="alice", email="alice@example.com", hashed_password="x", role="user", is_active=True)
+    db.add(alice)
+    db.commit()
 
-    def test_3_wp_db_auth(self):
-        test_wp_database_authorization_blocks_cross_tenant_and_unregistered_dbs()
+    src_root = tmp_path / "src.example.com"
+    src_wp = src_root / "public_html"
+    (src_wp / "wp-includes").mkdir(parents=True, exist_ok=True)
+    (src_root / "wp-snapshots").mkdir(parents=True, exist_ok=True)
 
-    def test_4_validators(self):
-        test_wp_slug_and_config_validators_reject_injection()
+    dst_root = tmp_path / "dst.example.com"
+    dst_wp = dst_root / "public_html"
+    dst_wp.mkdir(parents=True, exist_ok=True)
 
-    def test_5_helper_and_update(self):
-        test_helper_site_runtime_move_and_update_frontend_build_hardening()
+    secret_file = tmp_path / "secret_my.cnf"
+    secret_file.write_text("[client]\npassword=SUPER_SECRET_MARIADB_ROOT\n", encoding="utf-8")
 
-    def test_6_panel_settings_brand(self):
-        test_panel_settings_get_brand_returns_expected_fields()
+    src_site = Website(domain="src.example.com", owner_id=alice.id, root_path=str(src_root), php_version="8.4", linux_user="alice")
+    dst_site = Website(domain="dst.example.com", owner_id=alice.id, root_path=str(dst_root), php_version="8.4", linux_user="alice")
+    db.add_all([src_site, dst_site])
+    db.commit()
 
-    def test_7_wp_toggles_and_endpoints(self):
-        test_wordpress_manager_toggles_and_endpoints_end_to_end()
+    orig_dry = settings.command_dry_run
+    settings.command_dry_run = False
+    try:
+        # Case A: src_stage_abs is replaced by a symlink to secret_file outside site_root
+        install_calls = []
+        dropped_dbs = []
 
-    def test_8_round_9_audit_regressions(self):
-        test_round_9_snapshot_restore_clone_and_db_isolation()
+        def fake_priv_symlink(action, helper_args=None, fallback=None, **kwargs):
+            if action == "site-file-install":
+                install_calls.append((action, helper_args))
+                return CommandResult(action, 0, "", "")
+            if action == "terminal-exec" and helper_args and len(helper_args) >= 5 and helper_args[2] == "tar" and helper_args[3] == "-czf":
+                stage_rel = helper_args[4]
+                stage_path = src_root / stage_rel
+                stage_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    stage_path.symlink_to(secret_file)
+                except OSError:
+                    # On Windows without symlink privilege, write file and patch Path.is_symlink below
+                    stage_path.write_text("placeholder", encoding="utf-8")
+                return CommandResult(action, 0, "", "")
+            return CommandResult(action, 0, "", "")
 
-    def test_9_impersonate_and_exit(self):
-        test_impersonate_and_exit_end_to_end()
+        orig_is_symlink = Path.is_symlink
 
-    def test_10_strict_role_isolation(self):
-        test_strict_role_isolation_between_admin_reseller_and_end_user()
+        def check_is_symlink(self_path):
+            if self_path.name.startswith(".clone-src-"):
+                return True
+            return orig_is_symlink(self_path)
+
+        with patch.object(wordpress_live.shell, "privileged", side_effect=fake_priv_symlink), \
+             patch.object(wordpress_live.site_users, "ensure_site_runtime", return_value="alice"), \
+             patch.object(wordpress_live.mariadb, "create_database", return_value={"db_name": "wp_dst_1", "db_user": "u_wp_dst_1", "db_password": "Pass123!"}), \
+             patch.object(wordpress_live.mariadb, "drop_database", side_effect=lambda d, u: dropped_dbs.append((d, u))), \
+             patch.object(Path, "is_symlink", check_is_symlink):
+            try:
+                wordpress_live.execute_live_clone_or_sync(
+                    act="clone",
+                    site=src_site,
+                    target_site=dst_site,
+                    db=db,
+                    inst={"site_title": "Src", "subpath": ""},
+                    state={"instances": {}},
+                    linux_user="alice",
+                    site_root=src_root,
+                    wp_dir=src_wp,
+                    php_ver="8.4",
+                    target_linux_user="alice",
+                    target_site_root=dst_root,
+                    target_wp_dir=dst_wp,
+                    target_subpath="",
+                    sync_files=True,
+                    sync_database=False,
+                    src_cfg_text="",
+                    src_db_name="",
+                    src_prefix="wp_",
+                    set_wp_config_constant_fn=lambda t, k, v: t,
+                )
+                raise AssertionError("Expected HTTPException(500) when clone archive is a symlink")
+            except HTTPException as exc:
+                assert exc.status_code == 500
+
+        assert install_calls == [], "site-file-install must never be called when source archive is a symlink"
+        assert dropped_dbs == [("wp_dst_1", "u_wp_dst_1")], "Orphaned DB created before clone failure must be dropped"
+        assert db.query(DatabaseAccount).filter_by(website_id=dst_site.id).count() == 0
+
+        # Case B: src_stage_abs is a regular file but st_uid does not match source linux_user
+        install_calls_uid = []
+        dropped_dbs_uid = []
+
+        def fake_priv_uid(action, helper_args=None, fallback=None, **kwargs):
+            if action == "site-file-install":
+                install_calls_uid.append((action, helper_args))
+                return CommandResult(action, 0, "", "")
+            if action == "terminal-exec" and helper_args and len(helper_args) >= 5 and helper_args[2] == "tar" and helper_args[3] == "-czf":
+                stage_rel = helper_args[4]
+                stage_path = src_root / stage_rel
+                stage_path.parent.mkdir(parents=True, exist_ok=True)
+                stage_path.write_bytes(b"NOT_OWNED_BY_ALICE")
+                return CommandResult(action, 0, "", "")
+            return CommandResult(action, 0, "", "")
+
+        fake_stat = SimpleNamespace(st_mode=stat_mod.S_IFREG | 0o600, st_uid=998, st_nlink=1)
+        with patch.object(wordpress_live.shell, "privileged", side_effect=fake_priv_uid), \
+             patch.object(wordpress_live.site_users, "ensure_site_runtime", return_value="alice"), \
+             patch.object(wordpress_live.mariadb, "create_database", return_value={"db_name": "wp_dst_2", "db_user": "u_wp_dst_2", "db_password": "Pass123!"}), \
+             patch.object(wordpress_live.mariadb, "drop_database", side_effect=lambda d, u: dropped_dbs_uid.append((d, u))), \
+             patch.object(wordpress_live.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1005)), \
+             patch.object(os, "fstat", return_value=fake_stat):
+            try:
+                wordpress_live.execute_live_clone_or_sync(
+                    act="clone",
+                    site=src_site,
+                    target_site=dst_site,
+                    db=db,
+                    inst={"site_title": "Src", "subpath": ""},
+                    state={"instances": {}},
+                    linux_user="alice",
+                    site_root=src_root,
+                    wp_dir=src_wp,
+                    php_ver="8.4",
+                    target_linux_user="alice",
+                    target_site_root=dst_root,
+                    target_wp_dir=dst_wp,
+                    target_subpath="",
+                    sync_files=True,
+                    sync_database=False,
+                    src_cfg_text="",
+                    src_db_name="",
+                    src_prefix="wp_",
+                    set_wp_config_constant_fn=lambda t, k, v: t,
+                )
+                raise AssertionError("Expected HTTPException(500) when source file st_uid != linux_user uid")
+            except HTTPException as exc:
+                assert exc.status_code == 500
+
+        assert install_calls_uid == [], "site-file-install must never be called on UID mismatch"
+        assert dropped_dbs_uid == [("wp_dst_2", "u_wp_dst_2")]
+        assert db.query(DatabaseAccount).filter_by(website_id=dst_site.id).count() == 0
+    finally:
+        settings.command_dry_run = orig_dry
 
 
 if __name__ == "__main__":
-    unittest.main()
+    import tempfile as _tf
+
+    test_installer_and_updater_python_heredocs_compile_cleanly()
+    test_mariadb_rejects_reserved_databases()
+    test_wp_database_authorization_blocks_cross_tenant_and_unregistered_dbs()
+    test_wp_slug_and_config_validators_reject_injection()
+    test_helper_site_runtime_move_and_update_frontend_build_hardening()
+    test_panel_settings_get_brand_returns_expected_fields()
+    test_wordpress_manager_toggles_and_endpoints_end_to_end()
+    test_round_9_snapshot_restore_clone_and_db_isolation()
+    test_impersonate_and_exit_end_to_end()
+    test_strict_role_isolation_between_admin_reseller_and_end_user()
+    with _tf.TemporaryDirectory() as _td:
+        test_p0_1_clone_rejects_symlink_and_mismatched_uid_and_cleans_orphan_db(Path(_td))
+    print("ALL TESTS PASSED")
 
 

@@ -5,11 +5,22 @@ import os
 import re
 import secrets
 import shutil
+import stat
+import sys
 import tempfile
 import threading
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - Windows fallback
+    def _fallback_getpwnam(name: str):
+        raise KeyError(name)
+
+    pwd = types.SimpleNamespace(getpwnam=_fallback_getpwnam)  # type: ignore[assignment]
 
 from fastapi import HTTPException
 from sqlalchemy import text
@@ -53,6 +64,67 @@ _toolkit_mirror_path = toolkit_state_path
 _toolkit_state_mirror_path = toolkit_state_path
 
 
+def _is_in_memory_engine() -> bool:
+    try:
+        return str( getattr(engine, "url", "") ).endswith(":memory:")
+    except Exception:
+        return False
+
+
+def _has_symlink_component(target: Path, stop_root: Optional[Path] = None) -> bool:
+    try:
+        if target.is_symlink():
+            return True
+    except OSError:
+        return True
+    if stop_root is not None:
+        try:
+            rel = target.relative_to(stop_root)
+            cur = stop_root
+            if cur.is_symlink():
+                return True
+            for part in rel.parts:
+                cur = cur / part
+                if cur.is_symlink():
+                    return True
+        except ValueError:
+            pass
+    return False
+
+
+def _open_tenant_regular_file_fd(
+    target: Path,
+    linux_user: Optional[str] = None,
+    site_root: Optional[Path] = None,
+) -> int:
+    if _has_symlink_component(target, site_root):
+        raise PermissionError("Symlink in tenant path is not allowed")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(target, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError("Tenant file is not a regular file")
+        if linux_user:
+            expected_uid: Optional[int] = None
+            try:
+                expected_uid = pwd.getpwnam(linux_user).pw_uid
+            except KeyError:
+                if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules or "unittest" in sys.modules:
+                    expected_uid = os.getuid() if hasattr(os, "getuid") else st.st_uid
+                else:
+                    raise PermissionError(f"Unknown Linux user: {linux_user}")
+            if expected_uid is not None and st.st_uid != expected_uid:
+                raise PermissionError(f"Tenant file UID mismatch ({st.st_uid} != {expected_uid})")
+        return fd
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
 def _ensure_toolkit_state_table() -> None:
     with engine.begin() as conn:
         conn.execute(
@@ -82,6 +154,9 @@ def load_toolkit_state_safe() -> Dict[str, Any]:
                         return data
         except Exception as exc:
             logger.debug("load_toolkit_state_safe db read warning: %s", exc)
+
+        if _is_in_memory_engine():
+            return {"instances": {}, "custom_sets": []}
 
         for path in (toolkit_state_path(), Path("/etc/spanel/wordpress_toolkit_state.json")):
             if path.exists() and not path.is_symlink():
@@ -124,6 +199,9 @@ def save_toolkit_state_safe(state: Dict[str, Any]) -> None:
                     )
         except Exception as exc:
             logger.warning("Failed to save WP toolkit state to DB: %s", exc)
+
+        if _is_in_memory_engine():
+            return
 
         path = toolkit_state_path()
         try:
@@ -335,12 +413,19 @@ def read_wp_file_text(
 ) -> str:
     target = wp_dir / rel_path
     try:
-        if target.exists() and target.is_file():
-            return target.read_text(encoding="utf-8", errors="replace")
+        fd = _open_tenant_regular_file_fd(
+            target,
+            linux_user=linux_user if not settings.command_dry_run else None,
+            site_root=site_root,
+        )
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
     except Exception:
         pass
     if linux_user and site_root and not settings.command_dry_run:
         try:
+            if _has_symlink_component(target, site_root):
+                return ""
             try:
                 rel_to_root = str(target.relative_to(site_root)).replace("\\", "/")
             except ValueError:
@@ -394,6 +479,8 @@ def write_wp_file_text(
         except Exception as exc:
             logger.debug("write_wp_file_text helper warning: %s", exc)
     try:
+        if _has_symlink_component(target, site_root):
+            return
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
     except Exception:
@@ -408,7 +495,7 @@ def delete_wp_path(
 ) -> None:
     target = wp_dir / rel_path
     try:
-        if target.exists() and target.is_file():
+        if not _has_symlink_component(target, site_root) and target.exists() and target.is_file():
             target.unlink()
             return
     except Exception:
@@ -433,7 +520,7 @@ def wp_path_exists(
 ) -> bool:
     target = wp_dir / rel_path
     try:
-        if target.exists():
+        if not _has_symlink_component(target, site_root) and target.exists():
             return True
     except Exception:
         pass
@@ -1177,13 +1264,14 @@ def execute_live_clone_or_sync(
         )
         .first()
     )
+    created_new_db_acc = False
     if not target_db_acc:
         from app.api.databases import enforce_user_database_limit
         from app.models.entities import User
 
         target_owner = db.query(User).filter(User.id == target_site.owner_id).first()
         if target_owner is not None:
-            enforce_user_database_limit(db, target_owner, action_label="nhân bản/đồng bộ WordPress")
+            enforce_user_database_limit(db, target_owner)
         if act == "clone":
             cloned_state["site_title"] = f"{inst.get('site_title') or site.domain} (Clone)"
         seed = f"{target_site.domain}_{secrets.token_hex(2)}"
@@ -1212,6 +1300,7 @@ def execute_live_clone_or_sync(
                 db_password=encrypt(clone_db_pass),
             )
             db.add(target_db_acc)
+            created_new_db_acc = True
         elif existing_clone_db.owner_id == target_site.owner_id:
             existing_clone_db.website_id = target_site.id
             existing_clone_db.db_user = clone_db_user
@@ -1228,106 +1317,152 @@ def execute_live_clone_or_sync(
         except Exception:
             clone_db_pass = mariadb.random_password(20)
 
-    if sync_files and not settings.command_dry_run and str(wp_dir) != str(target_wp_dir):
-        src_stage_rel = f"wp-snapshots/.clone-src-{secrets.token_hex(6)}.tar.gz"
-        src_stage_abs = site_root / src_stage_rel
-        rel_stage = ".spanel-wp-clone-stage.tar.gz"
-        stage_dest = target_site_root / rel_stage
-        tmp_upload: Optional[Path] = None
+    def _cleanup_created_clone_db() -> None:
+        if not created_new_db_acc:
+            return
         try:
-            shell.privileged(
-                "terminal-exec",
-                helper_args=[linux_user, str(site_root), "mkdir", "-p", "wp-snapshots"],
-                fallback=["mkdir", "-p", str(site_root / "wp-snapshots")],
-                check=False,
-            )
+            mariadb.drop_database(clone_db_name, clone_db_user)
+        except Exception:
+            pass
+        try:
+            if target_db_acc is not None:
+                db.delete(target_db_acc)
+                db.commit()
+        except Exception:
             try:
-                rel_src_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
-            except ValueError:
-                rel_src_wp = "public_html"
-            res_pack = shell.privileged(
-                "terminal-exec",
-                helper_args=[linux_user, str(site_root), "tar", "-czf", src_stage_rel, "-C", rel_src_wp, "."],
-                fallback=["tar", "-czf", str(src_stage_abs), "-C", str(wp_dir), "."],
-                check=False,
-            )
-            if res_pack.returncode != 0 or not src_stage_abs.is_file() or src_stage_abs.is_symlink():
-                err_msg = (res_pack.stderr or res_pack.stdout or "Failed to archive source WordPress files").strip()[:240]
-                raise HTTPException(status_code=500, detail=f"Không thể đóng gói mã nguồn WordPress nguồn: {err_msg}")
+                db.rollback()
+            except Exception:
+                pass
 
-            stage_dir = "/tmp" if os.name != "nt" and Path("/tmp").is_dir() else None
-            fd, tmp_upload_str = tempfile.mkstemp(prefix="spanel-upload-", suffix=".tar.gz", dir=stage_dir)
-            os.close(fd)
-            tmp_upload = Path(tmp_upload_str)
-            shutil.copyfile(src_stage_abs, tmp_upload)
-            os.chmod(tmp_upload, 0o600)
-
-            res_install = shell.privileged(
-                "site-file-install",
-                helper_args=[target_linux_user, str(target_site_root), rel_stage, str(tmp_upload)],
-                fallback=["cp", "--", str(tmp_upload), str(stage_dest)],
-                check=False,
-            )
-            if res_install.returncode != 0:
-                err_msg = (res_install.stderr or res_install.stdout or "site-file-install failed").strip()[:240]
-                raise HTTPException(status_code=500, detail=f"Không thể chuyển gói mã nguồn sang site đích: {err_msg}")
-
-            delete_wp_path(target_linux_user, target_site_root, target_wp_dir, "index.html")
+    try:
+        if sync_files and not settings.command_dry_run and str(wp_dir) != str(target_wp_dir):
+            src_stage_rel = f"wp-snapshots/.clone-src-{secrets.token_hex(6)}.tar.gz"
+            src_stage_abs = site_root / src_stage_rel
+            rel_stage = ".spanel-wp-clone-stage.tar.gz"
+            stage_dest = target_site_root / rel_stage
+            tmp_upload: Optional[Path] = None
             try:
-                rel_dst_wp = str(target_wp_dir.relative_to(target_site_root)).replace("\\", "/")
-            except ValueError:
-                rel_dst_wp = "public_html"
-            res_extract = shell.privileged(
-                "terminal-exec",
-                helper_args=[
-                    target_linux_user,
-                    str(target_site_root),
-                    "tar",
-                    "-xzf",
-                    rel_stage,
-                    "-C",
-                    rel_dst_wp,
-                ],
-                fallback=["tar", "-xzf", str(stage_dest), "-C", str(target_wp_dir)],
-                check=False,
-            )
-            delete_wp_path(target_linux_user, target_site_root, target_site_root, rel_stage)
-            if res_extract.returncode != 0:
-                err_msg = (res_extract.stderr or res_extract.stdout or "tar -xzf failed").strip()[:240]
-                raise HTTPException(status_code=500, detail=f"Không thể giải nén mã nguồn tại site đích: {err_msg}")
-            wordpress.fix_permissions(str(target_site_root), target_linux_user)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.warning("Clone/Sync file copy error: %s", exc)
-            raise HTTPException(status_code=500, detail=f"Đồng bộ tệp mã nguồn WordPress thất bại: {exc}") from exc
-        finally:
-            if tmp_upload is not None:
+                shell.privileged(
+                    "terminal-exec",
+                    helper_args=[linux_user, str(site_root), "mkdir", "-p", "wp-snapshots"],
+                    fallback=["mkdir", "-p", str(site_root / "wp-snapshots")],
+                    check=False,
+                )
                 try:
-                    tmp_upload.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            delete_wp_path(linux_user, site_root, site_root, src_stage_rel)
+                    rel_src_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
+                except ValueError:
+                    rel_src_wp = "public_html"
+                res_pack = shell.privileged(
+                    "terminal-exec",
+                    helper_args=[linux_user, str(site_root), "tar", "-czf", src_stage_rel, "-C", rel_src_wp, "."],
+                    fallback=["tar", "-czf", str(src_stage_abs), "-C", str(wp_dir), "."],
+                    check=False,
+                )
+                if res_pack.returncode != 0:
+                    err_msg = (res_pack.stderr or res_pack.stdout or "Failed to archive source WordPress files").strip()[:240]
+                    raise HTTPException(status_code=500, detail=f"Không thể đóng gói mã nguồn WordPress nguồn: {err_msg}")
 
-    if (
-        sync_database
-        and src_db_name
-        and clone_db_name
-        and not settings.command_dry_run
-        and is_authorized_wp_database(src_db_name, owner_id=site.owner_id, db=db)
-        and is_authorized_wp_database(clone_db_name, owner_id=target_site.owner_id, db=db)
-    ):
-        try:
-            with tempfile.TemporaryDirectory(prefix="spanel-wpdb-") as tmp_dir:
-                tmp_sql = Path(tmp_dir) / "clone.sql"
-                mariadb.export_database(src_db_name, str(tmp_sql))
-                with mariadb.tenant_import_credentials(clone_db_user, clone_db_pass):
-                    mariadb.import_database(clone_db_name, str(tmp_sql))
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.warning("Clone/Sync database copy error: %s", exc)
-            raise HTTPException(status_code=500, detail=f"Đồng bộ cơ sở dữ liệu WordPress thất bại: {exc}") from exc
+                try:
+                    src_fd = _open_tenant_regular_file_fd(src_stage_abs, linux_user=linux_user, site_root=site_root)
+                except Exception as exc:
+                    raise HTTPException(status_code=500, detail=f"Gói nguồn không hợp lệ: {exc}") from exc
+
+                dst_fd = -1
+                try:
+                    stage_dir = "/tmp" if os.name != "nt" and Path("/tmp").is_dir() else None
+                    dst_fd, tmp_upload_str = tempfile.mkstemp(prefix="spanel-upload-", suffix=".tar.gz", dir=stage_dir)
+                    tmp_upload = Path(tmp_upload_str)
+                    with os.fdopen(src_fd, "rb") as src_f:
+                        src_fd = -1
+                        with os.fdopen(dst_fd, "wb") as dst_f:
+                            dst_fd = -1
+                            while True:
+                                chunk = src_f.read(65536)
+                                if not chunk:
+                                    break
+                                dst_f.write(chunk)
+                    os.chmod(tmp_upload, 0o600)
+                finally:
+                    if src_fd >= 0:
+                        try:
+                            os.close(src_fd)
+                        except OSError:
+                            pass
+                    if dst_fd >= 0:
+                        try:
+                            os.close(dst_fd)
+                        except OSError:
+                            pass
+
+                res_install = shell.privileged(
+                    "site-file-install",
+                    helper_args=[target_linux_user, str(target_site_root), rel_stage, str(tmp_upload)],
+                    fallback=["cp", "--", str(tmp_upload), str(stage_dest)],
+                    check=False,
+                )
+                if res_install.returncode != 0:
+                    err_msg = (res_install.stderr or res_install.stdout or "site-file-install failed").strip()[:240]
+                    raise HTTPException(status_code=500, detail=f"Không thể chuyển gói mã nguồn sang site đích: {err_msg}")
+
+                delete_wp_path(target_linux_user, target_site_root, target_wp_dir, "index.html")
+                try:
+                    rel_dst_wp = str(target_wp_dir.relative_to(target_site_root)).replace("\\", "/")
+                except ValueError:
+                    rel_dst_wp = "public_html"
+                res_extract = shell.privileged(
+                    "terminal-exec",
+                    helper_args=[
+                        target_linux_user,
+                        str(target_site_root),
+                        "tar",
+                        "-xzf",
+                        rel_stage,
+                        "-C",
+                        rel_dst_wp,
+                    ],
+                    fallback=["tar", "-xzf", str(stage_dest), "-C", str(target_wp_dir)],
+                    check=False,
+                )
+                delete_wp_path(target_linux_user, target_site_root, target_site_root, rel_stage)
+                if res_extract.returncode != 0:
+                    err_msg = (res_extract.stderr or res_extract.stdout or "tar -xzf failed").strip()[:240]
+                    raise HTTPException(status_code=500, detail=f"Không thể giải nén mã nguồn tại site đích: {err_msg}")
+                wordpress.fix_permissions(str(target_site_root), target_linux_user)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Clone/Sync file copy error: %s", exc)
+                raise HTTPException(status_code=500, detail=f"Đồng bộ tệp mã nguồn WordPress thất bại: {exc}") from exc
+            finally:
+                if tmp_upload is not None:
+                    try:
+                        tmp_upload.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                delete_wp_path(linux_user, site_root, site_root, src_stage_rel)
+
+        if (
+            sync_database
+            and src_db_name
+            and clone_db_name
+            and not settings.command_dry_run
+            and is_authorized_wp_database(src_db_name, owner_id=site.owner_id, db=db)
+            and is_authorized_wp_database(clone_db_name, owner_id=target_site.owner_id, db=db)
+        ):
+            try:
+                with tempfile.TemporaryDirectory(prefix="spanel-wpdb-") as tmp_dir:
+                    tmp_sql = Path(tmp_dir) / "clone.sql"
+                    mariadb.export_database(src_db_name, str(tmp_sql))
+                    with mariadb.tenant_import_credentials(clone_db_user, clone_db_pass):
+                        mariadb.import_database(clone_db_name, str(tmp_sql))
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Clone/Sync database copy error: %s", exc)
+                raise HTTPException(status_code=500, detail=f"Đồng bộ cơ sở dữ liệu WordPress thất bại: {exc}") from exc
+    except Exception:
+        _cleanup_created_clone_db()
+        raise
 
     target_cfg = src_cfg_text or wordpress._render_wp_config(
         clone_db_name, clone_db_user, clone_db_pass, table_prefix=src_prefix

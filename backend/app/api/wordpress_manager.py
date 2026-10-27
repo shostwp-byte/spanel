@@ -392,29 +392,7 @@ def _read_wp_file_text(
     linux_user: Optional[str] = None,
     site_root: Optional[Path] = None,
 ) -> str:
-    target = wp_dir / rel_path
-    try:
-        if target.exists() and target.is_file():
-            return target.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-    if linux_user and site_root and not settings.command_dry_run:
-        try:
-            try:
-                rel_to_root = str(target.relative_to(site_root)).replace("\\", "/")
-            except ValueError:
-                rel_to_root = f"public_html/{rel_path.lstrip('/')}"
-            res = shell.privileged(
-                "terminal-exec",
-                helper_args=[linux_user, str(site_root), "cat", rel_to_root],
-                fallback=["cat", str(target)],
-                check=False,
-            )
-            if res.returncode == 0 and res.stdout:
-                return res.stdout
-        except Exception:
-            pass
-    return ""
+    return wordpress_live.read_wp_file_text(wp_dir, rel_path, linux_user=linux_user, site_root=site_root)
 
 
 def _write_wp_file_text(
