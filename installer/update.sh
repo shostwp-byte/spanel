@@ -2221,12 +2221,12 @@ else
     log "Installing npm dependencies..."
     rm -rf node_modules package-lock.json
     chown -R -h spanel:spanel "$APP_DIR/frontend" 2>/dev/null || true
-    sudo -u spanel npm install
+    sudo -u spanel npm install --ignore-scripts
     step_mark_done frontend-deps package.json
   fi
   log "Building frontend with VITE_API_URL=/api..."
   sudo -u spanel VITE_API_URL=/api npm run build 2>&1 || { log "BUILD FAILED"; exit 1; }
-  chown -R -h root:root "$APP_DIR/frontend/node_modules" "$APP_DIR/frontend/dist" 2>/dev/null || true
+  chown -R -h root:root "$APP_DIR/frontend" 2>/dev/null || true
 
   [[ -f dist/index.html ]] || fail "Frontend build failed: dist/index.html missing"
   HASHED=$(grep -oE 'index-[a-zA-Z0-9_-]+\.js' dist/index.html | head -n1 || true)
@@ -2254,10 +2254,9 @@ migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
 # The empty database earlier updates left behind when the cron migration ran
-# from frontend/ (see migrate_site_cron_php_binary). As spanel: frontend/ is
-# spanel's directory.
+# from frontend/ (see migrate_site_cron_php_binary).
 if [[ -f "$APP_DIR/frontend/spanel.db" && ! -L "$APP_DIR/frontend/spanel.db" ]]; then
-  sudo -u spanel rm -f -- "$APP_DIR/frontend/spanel.db" || true
+  rm -f -- "$APP_DIR/frontend/spanel.db" || true
 fi
 nginx -t
 systemctl reload nginx

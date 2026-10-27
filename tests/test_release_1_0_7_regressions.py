@@ -450,7 +450,22 @@ def test_wordpress_manager_toggles_and_endpoints_end_to_end():
         orig_dry_run = settings.command_dry_run
         settings.command_dry_run = True
         try:
-            # 1. Test all 6 toggles + standalone debug_log + password_protection with and without credentials
+          with patch.object(wordpress_live, "toolkit_state_path", side_effect=lambda: Path(tmpdir) / "wordpress_toolkit_state.json"):
+            # 0. Enabling password_protection before any password is set must return HTTP 400 (never lock out user with random password)
+            from fastapi import HTTPException
+
+            try:
+                wordpress_manager.update_wp_toggles(
+                    website_id=site.id,
+                    payload=wordpress_manager.WpTogglesPayload(password_protection=True),
+                    db=db,
+                    current_user=user,
+                )
+                raise AssertionError("Expected HTTPException(400) when enabling password_protection without a password")
+            except HTTPException as exc:
+                assert exc.status_code == 400
+
+            # 1. Test all 6 toggles + standalone debug_log + password_protection with credentials
             r1 = wordpress_manager.update_wp_toggles(
                 website_id=site.id,
                 payload=wordpress_manager.WpTogglesPayload(
@@ -461,6 +476,8 @@ def test_wordpress_manager_toggles_and_endpoints_end_to_end():
                     debug_log=True,
                     debug_display=False,
                     password_protection=True,
+                    basic_auth_user="staging_admin",
+                    basic_auth_password="StrongPassword123!",
                     disable_wp_cron=True,
                 ),
                 db=db,
@@ -488,13 +505,11 @@ def test_wordpress_manager_toggles_and_endpoints_end_to_end():
             )
             assert r2["instance"]["toggles"]["debug_log"] is False
 
-            # Password protection with explicit credentials
+            # Re-enable / update password protection after hash is already configured
             r3 = wordpress_manager.update_wp_toggles(
                 website_id=site.id,
                 payload=wordpress_manager.WpTogglesPayload(
                     password_protection=True,
-                    basic_auth_user="staging_admin",
-                    basic_auth_password="StrongPassword123!",
                 ),
                 db=db,
                 current_user=user,
@@ -561,6 +576,134 @@ def test_wordpress_manager_toggles_and_endpoints_end_to_end():
             settings.command_dry_run = orig_dry_run
 
 
+def test_round_9_snapshot_restore_clone_and_db_isolation():
+    import tempfile
+    from fastapi import HTTPException
+    from app.api import wordpress_manager
+    from app.core.config import settings
+    from app.services.shell import CommandResult
+
+    db = _make_db()
+    admin = User(username="admin", email="admin@example.com", hashed_password="x", role="admin")
+    alice = User(username="alice", email="alice@example.com", hashed_password="x", role="user")
+    bob = User(username="bob", email="bob@example.com", hashed_password="x", role="user")
+    db.add_all([admin, alice, bob])
+    db.commit()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        alice_root = Path(tmpdir) / "alice.example.com"
+        alice_wp = alice_root / "public_html"
+        (alice_wp / "wp-includes").mkdir(parents=True, exist_ok=True)
+        (alice_root / "wp-snapshots").mkdir(parents=True, exist_ok=True)
+        (alice_wp / "wp-includes" / "version.php").write_text("<?php\n$wp_version = '6.8.1';\n", encoding="utf-8")
+
+        bob_root = Path(tmpdir) / "bob.example.com"
+        bob_wp = bob_root / "public_html"
+        bob_wp.mkdir(parents=True, exist_ok=True)
+
+        alice_site = Website(domain="alice.example.com", owner_id=alice.id, root_path=str(alice_root), php_version="8.4")
+        bob_site = Website(domain="bob.example.com", owner_id=bob.id, root_path=str(bob_root), php_version="8.4")
+        db.add_all([alice_site, bob_site])
+        db.commit()
+
+        alice_db = DatabaseAccount(
+            owner_id=alice.id,
+            website_id=alice_site.id,
+            db_name="wp_alice_db",
+            db_user="u_alice_db",
+            db_password="enc",
+        )
+        db.add(alice_db)
+        db.commit()
+
+        # 1. query_wp_db_live_meta without owner_id/site_id must return empty metadata without running SQL
+        with patch.object(wordpress_live, "_run_mariadb_sql") as sql_mock:
+            meta = wordpress_live.query_wp_db_live_meta("wp_alice_db", "wp_")
+            assert meta["site_title"] == ""
+            sql_mock.assert_not_called()
+
+        # 2. restore_live_snapshot must reject snapshot_id not in inst["snapshots"] (404)
+        (alice_root / "wp-snapshots" / "rogue.tar.gz").write_bytes(b"fake")
+        inst_state = {"snapshots": [{"id": "legit-snap.tar.gz"}]}
+        try:
+            wordpress_live.restore_live_snapshot(
+                "alice",
+                alice_root,
+                alice_wp,
+                "wp_alice_db",
+                "rogue.tar.gz",
+                inst=inst_state,
+                owner_id=alice.id,
+                site_id=alice_site.id,
+                db=db,
+            )
+            raise AssertionError("Expected 404 for untracked snapshot_id")
+        except HTTPException as exc:
+            assert exc.status_code == 404
+
+        # 3. restore_live_snapshot must NEVER call mariadb.import_database when wp db import fails
+        (alice_root / "wp-snapshots" / "legit-snap.tar.gz").write_bytes(b"archive")
+        (alice_root / "wp-snapshots" / "legit-snap.tar.gz.sql").write_text("GRANT ALL ON *.* TO 'pwn'@'%';\n", encoding="utf-8")
+        orig_dry = settings.command_dry_run
+        settings.command_dry_run = False
+        try:
+            with patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("tar", 0, "", "")), \
+                 patch.object(wordpress_live, "run_wp_cli", return_value=CommandResult("wp", 1, "", "ERROR 1044: Access denied")), \
+                 patch.object(wordpress_live.mariadb, "import_database") as root_import_mock:
+                try:
+                    wordpress_live.restore_live_snapshot(
+                        "alice",
+                        alice_root,
+                        alice_wp,
+                        "wp_alice_db",
+                        "legit-snap.tar.gz",
+                        inst=inst_state,
+                        owner_id=alice.id,
+                        site_id=alice_site.id,
+                        db=db,
+                    )
+                    raise AssertionError("Expected HTTPException(400) when wp db import fails")
+                except HTTPException as exc:
+                    assert exc.status_code == 400
+                root_import_mock.assert_not_called()
+        finally:
+            settings.command_dry_run = orig_dry
+
+        # 4. install_wp_instance with db_mode='existing' must block binding Alice's DB to Bob's site even for admin
+        try:
+            wordpress_manager.install_wp_instance(
+                payload=wordpress_manager.WpInstallPayload(
+                    website_id=bob_site.id,
+                    db_mode="existing",
+                    database_id=alice_db.id,
+                ),
+                db=db,
+                current_user=admin,
+            )
+            raise AssertionError("Expected HTTPException(403) when admin binds Alice's DB to Bob's website")
+        except HTTPException as exc:
+            assert exc.status_code == 403
+
+        # 5. mariadb.import_database with tenant_import_credentials uses tenant --defaults-file and --binary-mode
+        sql_file = Path(tmpdir) / "tenant.sql"
+        sql_file.write_text("CREATE TABLE t (id INT);\n", encoding="utf-8")
+        seen_cmd = []
+        orig_dry2 = settings.command_dry_run
+        settings.command_dry_run = False
+        try:
+            def fake_run(cmd, **kwargs):
+                seen_cmd.extend(cmd)
+                return SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
+
+            with patch.object(mariadb.subprocess, "run", side_effect=fake_run):
+                with mariadb.tenant_import_credentials("u_alice_db", "TenantSecret123!"):
+                    mariadb.import_database("wp_alice_db", str(sql_file))
+            assert "--binary-mode" in seen_cmd
+            assert any(arg.startswith("--defaults-file=") and "spanel-mysql-import-" in arg for arg in seen_cmd)
+        finally:
+            settings.command_dry_run = orig_dry2
+
+
 class Release107RegressionTests(unittest.TestCase):
     def test_1_heredocs(self):
         test_installer_and_updater_python_heredocs_compile_cleanly()
@@ -582,6 +725,9 @@ class Release107RegressionTests(unittest.TestCase):
 
     def test_7_wp_toggles_and_endpoints(self):
         test_wordpress_manager_toggles_and_endpoints_end_to_end()
+
+    def test_8_round_9_audit_regressions(self):
+        test_round_9_snapshot_restore_clone_and_db_isolation()
 
 
 if __name__ == "__main__":

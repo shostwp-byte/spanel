@@ -15,7 +15,7 @@ ini_set('session.use_cookies', 'true');
 $isHttpsRequest = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
     || (strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https')
     || ((string)($_SERVER['SERVER_PORT'] ?? '') === '443');
-$cookieSecure = __SPANEL_PMA_COOKIE_SECURE__ ? $isHttpsRequest : $isHttpsRequest;
+$cookieSecure = __SPANEL_PMA_COOKIE_SECURE__ && $isHttpsRequest;
 session_set_cookie_params([
     'lifetime' => 0,
     'path' => '/',
@@ -54,7 +54,9 @@ if (
 
 $apiUrl = '__SPANEL_API_BASE__' . rawurlencode($token);
 $candidateUrls = [$apiUrl];
-if (strpos($apiUrl, 'https://') === 0) {
+$apiHost = (string)(parse_url($apiUrl, PHP_URL_HOST) ?? '');
+$isLoopbackApiHost = in_array(strtolower($apiHost), ['127.0.0.1', 'localhost', '[::1]', '::1'], true);
+if ($isLoopbackApiHost && strpos($apiUrl, 'https://') === 0) {
     $candidateUrls[] = 'http://' . substr($apiUrl, 8);
 } elseif (strpos($apiUrl, 'http://') === 0) {
     $candidateUrls[] = 'https://' . substr($apiUrl, 7);

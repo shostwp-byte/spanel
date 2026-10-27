@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -162,6 +163,8 @@ def is_authorized_wp_database(
         return False
     if clean_db.lower() in mariadb.RESERVED_DATABASES:
         return False
+    if owner_id is None and site_id is None:
+        return False
     close_session = False
     session = db
     try:
@@ -177,10 +180,12 @@ def is_authorized_wp_database(
             return False
         if owner_id is not None and acc.owner_id != owner_id:
             return False
-        if site_id is not None and acc.website_id is not None and acc.website_id != site_id:
+        if site_id is not None:
+            if acc.website_id is not None and acc.website_id != site_id:
+                return False
             if owner_id is None:
                 site = session.query(Website).filter(Website.id == site_id).first()
-                if site is not None and acc.owner_id != site.owner_id:
+                if site is None or acc.owner_id != site.owner_id:
                     return False
         return True
     except Exception as exc:
@@ -510,6 +515,8 @@ def query_wp_db_live_meta(
         clean_db = (db_name or "").strip()
         clean_prefix = (table_prefix or "wp_").strip()
         if not clean_db or settings.command_dry_run:
+            return meta
+        if owner_id is None and site_id is None:
             return meta
         if not DB_IDENT_RE.fullmatch(clean_db) or not WP_PREFIX_RE.fullmatch(clean_prefix):
             return meta
@@ -973,16 +980,27 @@ def create_live_snapshot_archive(
                 sensitive=True,
             )
             if res.returncode != 0:
-                with tempfile.TemporaryDirectory(prefix="spanel-wpsnap-") as tmp_dir:
-                    tmp_sql = Path(tmp_dir) / "dump.sql"
+                stage_dir = "/tmp" if os.name != "nt" and Path("/tmp").is_dir() else None
+                fd, tmp_sql_str = tempfile.mkstemp(prefix="spanel-upload-", suffix=".sql", dir=stage_dir)
+                os.close(fd)
+                tmp_sql = Path(tmp_sql_str)
+                try:
                     mariadb.export_database(db_name, str(tmp_sql))
-                    if tmp_sql.exists():
-                        shell.privileged(
+                    if tmp_sql.exists() and not tmp_sql.is_symlink():
+                        os.chmod(tmp_sql, 0o600)
+                        res_inst = shell.privileged(
                             "site-file-install",
                             helper_args=[linux_user, str(site_root), rel_sql, str(tmp_sql)],
                             fallback=["cp", "--", str(tmp_sql), str(site_root / rel_sql)],
                             check=False,
                         )
+                        if res_inst.returncode != 0:
+                            logger.warning("Snapshot DB stage install warning: %s", res_inst.stderr or res_inst.stdout)
+                finally:
+                    try:
+                        tmp_sql.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         except Exception as exc:
             logger.warning("Snapshot DB dump warning: %s", exc)
 
@@ -990,15 +1008,15 @@ def create_live_snapshot_archive(
         rel_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
     except ValueError:
         rel_wp = "public_html"
-    try:
-        shell.privileged(
-            "terminal-exec",
-            helper_args=[linux_user, str(site_root), "tar", "-czf", f"wp-snapshots/{snap_id}", "-C", rel_wp, "."],
-            fallback=["tar", "-czf", str(snap_file), "-C", str(wp_dir), "."],
-            check=False,
-        )
-    except Exception as exc:
-        logger.warning("Snapshot tar warning: %s", exc)
+    res_tar = shell.privileged(
+        "terminal-exec",
+        helper_args=[linux_user, str(site_root), "tar", "-czf", f"wp-snapshots/{snap_id}", "-C", rel_wp, "."],
+        fallback=["tar", "-czf", str(snap_file), "-C", str(wp_dir), "."],
+        check=False,
+    )
+    if res_tar.returncode != 0:
+        err_msg = (res_tar.stderr or res_tar.stdout or "tar -czf failed").strip()[:240]
+        raise HTTPException(status_code=500, detail=f"Không thể tạo tệp nén Snapshot: {err_msg}")
     try:
         if snap_file.exists() and not snap_file.is_symlink():
             real_size_mb = max(0.01, round(snap_file.stat().st_size / (1024 * 1024), 2))
@@ -1014,6 +1032,7 @@ def restore_live_snapshot(
     db_name: str,
     snapshot_id: Optional[str],
     *,
+    inst: Optional[Dict[str, Any]] = None,
     owner_id: Optional[int] = None,
     site_id: Optional[int] = None,
     php_ver: str = "8.4",
@@ -1022,6 +1041,20 @@ def restore_live_snapshot(
     snap_id = Path((snapshot_id or "").strip()).name
     if not snap_id:
         raise HTTPException(status_code=400, detail="Vui lòng chọn bản Snapshot cần khôi phục.")
+    effective_inst = inst
+    if effective_inst is None and site_id is not None:
+        effective_inst = (load_toolkit_state_safe().get("instances") or {}).get(str(site_id))
+    if isinstance(effective_inst, dict):
+        known_ids = {
+            str(s.get("id") or "").strip()
+            for s in (effective_inst.get("snapshots") or [])
+            if isinstance(s, dict) and s.get("id")
+        }
+        if snap_id not in known_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy bản Snapshot {snap_id} trong danh sách sao lưu hợp lệ.",
+            )
     snap_file = site_root / "wp-snapshots" / snap_id
     if not settings.command_dry_run:
         if not wp_path_exists(site_root, f"wp-snapshots/{snap_id}", linux_user, site_root):
@@ -1030,12 +1063,15 @@ def restore_live_snapshot(
             rel_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
         except ValueError:
             rel_wp = "public_html"
-        shell.privileged(
+        res_tar = shell.privileged(
             "terminal-exec",
             helper_args=[linux_user, str(site_root), "tar", "-xzf", f"wp-snapshots/{snap_id}", "-C", rel_wp],
             fallback=["tar", "-xzf", str(snap_file), "-C", str(wp_dir)],
             check=False,
         )
+        if res_tar.returncode != 0:
+            err_msg = (res_tar.stderr or res_tar.stdout or "tar -xzf failed").strip()[:240]
+            raise HTTPException(status_code=500, detail=f"Không thể giải nén bản Snapshot {snap_id}: {err_msg}")
         # Ensure any legacy in-docroot SQL dump extracted from older archives is removed immediately
         delete_wp_path(linux_user, site_root, wp_dir, ".spanel-db-snapshot.sql")
         sql_dump = site_root / "wp-snapshots" / f"{snap_id}.sql"
@@ -1044,19 +1080,20 @@ def restore_live_snapshot(
             and is_authorized_wp_database(db_name, owner_id=owner_id, site_id=site_id, db=db)
             and wp_path_exists(site_root, f"wp-snapshots/{snap_id}.sql", linux_user, site_root)
         ):
-            try:
-                res = run_wp_cli(
-                    linux_user,
-                    php_ver,
-                    wp_dir,
-                    ["db", "import", str(sql_dump)],
-                    check=False,
-                    sensitive=True,
+            res = run_wp_cli(
+                linux_user,
+                php_ver,
+                wp_dir,
+                ["db", "import", str(sql_dump)],
+                check=False,
+                sensitive=True,
+            )
+            if res.returncode != 0:
+                err_msg = (res.stderr or res.stdout or "wp db import failed").strip()[:240]
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Khôi phục cơ sở dữ liệu từ Snapshot thất bại: {err_msg}",
                 )
-                if res.returncode != 0 and sql_dump.exists() and not sql_dump.is_symlink():
-                    mariadb.import_database(db_name, str(sql_dump))
-            except Exception as exc:
-                logger.warning("Snapshot DB restore warning: %s", exc)
     return snap_id
 
 
@@ -1192,11 +1229,11 @@ def execute_live_clone_or_sync(
             clone_db_pass = mariadb.random_password(20)
 
     if sync_files and not settings.command_dry_run and str(wp_dir) != str(target_wp_dir):
-        delete_wp_path(target_linux_user, target_site_root, target_wp_dir, "index.html")
         src_stage_rel = f"wp-snapshots/.clone-src-{secrets.token_hex(6)}.tar.gz"
         src_stage_abs = site_root / src_stage_rel
         rel_stage = ".spanel-wp-clone-stage.tar.gz"
         stage_dest = target_site_root / rel_stage
+        tmp_upload: Optional[Path] = None
         try:
             shell.privileged(
                 "terminal-exec",
@@ -1208,45 +1245,68 @@ def execute_live_clone_or_sync(
                 rel_src_wp = str(wp_dir.relative_to(site_root)).replace("\\", "/")
             except ValueError:
                 rel_src_wp = "public_html"
-            shell.privileged(
+            res_pack = shell.privileged(
                 "terminal-exec",
                 helper_args=[linux_user, str(site_root), "tar", "-czf", src_stage_rel, "-C", rel_src_wp, "."],
                 fallback=["tar", "-czf", str(src_stage_abs), "-C", str(wp_dir), "."],
                 check=False,
             )
-            if src_stage_abs.exists() and not src_stage_abs.is_symlink():
-                try:
-                    shell.privileged(
-                        "site-file-install",
-                        helper_args=[target_linux_user, str(target_site_root), rel_stage, str(src_stage_abs)],
-                        fallback=["cp", "--", str(src_stage_abs), str(stage_dest)],
-                        check=False,
-                    )
-                except Exception:
-                    pass
-                try:
-                    rel_dst_wp = str(target_wp_dir.relative_to(target_site_root)).replace("\\", "/")
-                except ValueError:
-                    rel_dst_wp = "public_html"
-                shell.privileged(
-                    "terminal-exec",
-                    helper_args=[
-                        target_linux_user,
-                        str(target_site_root),
-                        "tar",
-                        "-xzf",
-                        rel_stage,
-                        "-C",
-                        rel_dst_wp,
-                    ],
-                    fallback=["tar", "-xzf", str(stage_dest), "-C", str(target_wp_dir)],
-                    check=False,
-                )
-                delete_wp_path(target_linux_user, target_site_root, target_site_root, rel_stage)
+            if res_pack.returncode != 0 or not src_stage_abs.is_file() or src_stage_abs.is_symlink():
+                err_msg = (res_pack.stderr or res_pack.stdout or "Failed to archive source WordPress files").strip()[:240]
+                raise HTTPException(status_code=500, detail=f"Không thể đóng gói mã nguồn WordPress nguồn: {err_msg}")
+
+            stage_dir = "/tmp" if os.name != "nt" and Path("/tmp").is_dir() else None
+            fd, tmp_upload_str = tempfile.mkstemp(prefix="spanel-upload-", suffix=".tar.gz", dir=stage_dir)
+            os.close(fd)
+            tmp_upload = Path(tmp_upload_str)
+            shutil.copyfile(src_stage_abs, tmp_upload)
+            os.chmod(tmp_upload, 0o600)
+
+            res_install = shell.privileged(
+                "site-file-install",
+                helper_args=[target_linux_user, str(target_site_root), rel_stage, str(tmp_upload)],
+                fallback=["cp", "--", str(tmp_upload), str(stage_dest)],
+                check=False,
+            )
+            if res_install.returncode != 0:
+                err_msg = (res_install.stderr or res_install.stdout or "site-file-install failed").strip()[:240]
+                raise HTTPException(status_code=500, detail=f"Không thể chuyển gói mã nguồn sang site đích: {err_msg}")
+
+            delete_wp_path(target_linux_user, target_site_root, target_wp_dir, "index.html")
+            try:
+                rel_dst_wp = str(target_wp_dir.relative_to(target_site_root)).replace("\\", "/")
+            except ValueError:
+                rel_dst_wp = "public_html"
+            res_extract = shell.privileged(
+                "terminal-exec",
+                helper_args=[
+                    target_linux_user,
+                    str(target_site_root),
+                    "tar",
+                    "-xzf",
+                    rel_stage,
+                    "-C",
+                    rel_dst_wp,
+                ],
+                fallback=["tar", "-xzf", str(stage_dest), "-C", str(target_wp_dir)],
+                check=False,
+            )
+            delete_wp_path(target_linux_user, target_site_root, target_site_root, rel_stage)
+            if res_extract.returncode != 0:
+                err_msg = (res_extract.stderr or res_extract.stdout or "tar -xzf failed").strip()[:240]
+                raise HTTPException(status_code=500, detail=f"Không thể giải nén mã nguồn tại site đích: {err_msg}")
             wordpress.fix_permissions(str(target_site_root), target_linux_user)
+        except HTTPException:
+            raise
         except Exception as exc:
-            logger.warning("Clone/Sync file copy warning: %s", exc)
+            logger.warning("Clone/Sync file copy error: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Đồng bộ tệp mã nguồn WordPress thất bại: {exc}") from exc
         finally:
+            if tmp_upload is not None:
+                try:
+                    tmp_upload.unlink(missing_ok=True)
+                except OSError:
+                    pass
             delete_wp_path(linux_user, site_root, site_root, src_stage_rel)
 
     if (
@@ -1261,9 +1321,13 @@ def execute_live_clone_or_sync(
             with tempfile.TemporaryDirectory(prefix="spanel-wpdb-") as tmp_dir:
                 tmp_sql = Path(tmp_dir) / "clone.sql"
                 mariadb.export_database(src_db_name, str(tmp_sql))
-                mariadb.import_database(clone_db_name, str(tmp_sql))
+                with mariadb.tenant_import_credentials(clone_db_user, clone_db_pass):
+                    mariadb.import_database(clone_db_name, str(tmp_sql))
+        except HTTPException:
+            raise
         except Exception as exc:
-            logger.warning("Clone/Sync database copy warning: %s", exc)
+            logger.warning("Clone/Sync database copy error: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Đồng bộ cơ sở dữ liệu WordPress thất bại: {exc}") from exc
 
     target_cfg = src_cfg_text or wordpress._render_wp_config(
         clone_db_name, clone_db_user, clone_db_pass, table_prefix=src_prefix
@@ -1334,10 +1398,6 @@ def apply_wp_password_protection(
     eff_user = username if username is not None else auth_user
     eff_pass = password if password is not None else auth_password
 
-    if enabled is not None:
-        target_inst["password_protection_enabled"] = bool(enabled)
-        if isinstance(target_inst.get("toggles"), dict):
-            target_inst["toggles"]["password_protection"] = bool(enabled)
     if eff_user is not None and eff_user.strip():
         clean_u = re.sub(r"[^a-zA-Z0-9._@-]", "", eff_user.strip())[:64]
         if clean_u:
@@ -1355,17 +1415,28 @@ def apply_wp_password_protection(
         target_inst["password_protection_hash"] = f"pbkdf2_sha256$100000${salt}${digest}"
         target_inst.pop("password_protection_password", None)
 
+    want_enabled = bool(enabled) if enabled is not None else bool(target_inst.get("password_protection_enabled"))
+    if want_enabled:
+        pw_hash = target_inst.get("password_protection_hash") or ""
+        if not pw_hash.startswith("pbkdf2_sha256$"):
+            target_inst["password_protection_enabled"] = False
+            if isinstance(target_inst.get("toggles"), dict):
+                target_inst["toggles"]["password_protection"] = False
+            raise HTTPException(
+                status_code=400,
+                detail="Vui lòng thiết lập mật khẩu bảo vệ trang (tối thiểu 6 ký tự) trước khi bật khóa HTTP Basic Auth.",
+            )
+
+    if enabled is not None:
+        target_inst["password_protection_enabled"] = bool(enabled)
+        if isinstance(target_inst.get("toggles"), dict):
+            target_inst["toggles"]["password_protection"] = bool(enabled)
+
     # Always remove any legacy plaintext .htpasswd from docroot
     delete_wp_path(linux_user, site_root, wp_dir, ".htpasswd")
 
     if target_inst.get("password_protection_enabled"):
         pw_hash = target_inst.get("password_protection_hash") or ""
-        if not pw_hash.startswith("pbkdf2_sha256$"):
-            auto_pw = secrets.token_urlsafe(12)
-            salt = secrets.token_hex(16)
-            digest = hashlib.pbkdf2_hmac("sha256", auto_pw.encode("utf-8"), salt.encode("ascii"), 100_000).hex()
-            pw_hash = f"pbkdf2_sha256$100000${salt}${digest}"
-            target_inst["password_protection_hash"] = pw_hash
         _, iter_str, salt, digest = pw_hash.split("$", 3)
         user_str = (
             re.sub(

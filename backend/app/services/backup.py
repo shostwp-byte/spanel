@@ -1602,7 +1602,8 @@ def restore_user_backup(
                     sql_member = db_info.get("sql_member") or f"databases/{domain}.sql"
                     sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
                     if sql_path:
-                        backend.import_database(db_name, str(sql_path))
+                        with mariadb.tenant_import_credentials(db_user, db_password):
+                            backend.import_database(db_name, str(sql_path))
                     db_account = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
                     if db_account is None:
                         db.add(DatabaseAccount(
@@ -1673,7 +1674,8 @@ def restore_user_backup(
                 if sql_member:
                     sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
                     if sql_path:
-                        backend.import_database(db_name, str(sql_path))
+                        with mariadb.tenant_import_credentials(db_user, db_password):
+                            backend.import_database(db_name, str(sql_path))
                 linked_website_id = None
                 linked_domain = (extra_db.get("website_domain") or "").strip().lower()
                 if linked_domain:
@@ -1983,7 +1985,12 @@ def restore_backup(
             with tempfile.TemporaryDirectory(prefix="spanel-site-sql-") as sql_tmp:
                 sql_path = _extract_member_to_file(archive, sql_member, Path(sql_tmp))
                 if sql_path:
-                    db_backends.backend_for(db_item).import_database(db_item.db_name, str(sql_path))
+                    try:
+                        item_db_pass = decrypt(db_item.db_password) if db_item.db_password else None
+                    except Exception:
+                        item_db_pass = None
+                    with mariadb.tenant_import_credentials(db_item.db_user, item_db_pass):
+                        db_backends.backend_for(db_item).import_database(db_item.db_name, str(sql_path))
 
     return str(destination)
 

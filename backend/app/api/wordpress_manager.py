@@ -1029,17 +1029,18 @@ def _list_site_snapshots(site_root: Path, saved: Dict[str, Any]) -> List[Dict[st
     snap_dir = site_root / "wp-snapshots"
     if not settings.command_dry_run:
         snaps = [s for s in snaps if s.get("id") and (snap_dir / str(s["id"])).exists()]
+    return [dict(s) for s in snaps if isinstance(s, dict) and s.get("id")]
     if snap_dir.exists() and snap_dir.is_dir():
         known_ids = {s.get("id") for s in snaps}
         try:
             for f in sorted(snap_dir.glob("*.tar.gz"), reverse=True):
-                if f.name not in known_ids and f.stem not in known_ids:
+                if f.stem not in known_ids:
                     sz_mb = round(f.stat().st_size / (1024 * 1024), 2)
                     snaps.append({
                         "id": f.name,
                         "label": "Automatic Snapshot",
                         "created_at": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat(),
-                        "size_mb": max(0.01, sz_mb),
+                        "size_mb": max(0.1, sz_mb),
                     })
         except Exception:
             pass
@@ -1271,15 +1272,9 @@ def install_wp_instance(
             existing_check = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == payload.db_name.strip()).first()
         if existing_check is None:
             raise HTTPException(status_code=404, detail="Database not found. Please create the database first.")
-        if existing_check.owner_id != site.owner_id and not is_admin_role(current_user.role):
+        if existing_check.owner_id != site.owner_id:
             raise HTTPException(status_code=403, detail="Cannot bind a database owned by another user.")
         reusing_existing_db = True
-    if False and payload.db_mode == "existing" and payload.db_name and payload.db_user:
-        existing_check = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == payload.db_name.strip()).first()
-        if existing_check is not None:
-            if existing_check.owner_id != site.owner_id and not is_admin_role(current_user.role):
-                raise HTTPException(status_code=403, detail="Cannot bind a database owned by another user.")
-            reusing_existing_db = True
     if not reusing_existing_db:
         enforce_user_database_limit(db, site_owner)
 
@@ -1862,9 +1857,6 @@ def update_wp_toggles(
             config_changed = True
 
     if payload.password_protection is not None:
-        toggles["password_protection"] = payload.password_protection
-        if payload.basic_auth_user:
-            inst["basic_auth_user"] = payload.basic_auth_user.strip()
         try:
             wordpress_live.apply_wp_password_protection(
                 linux_user=linux_user,
@@ -1877,6 +1869,9 @@ def update_wp_toggles(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        toggles["password_protection"] = payload.password_protection
+        if payload.basic_auth_user:
+            inst["basic_auth_user"] = payload.basic_auth_user.strip()
         if False and payload.password_protection:
             auth_u = (inst.get("basic_auth_user") or "preview").strip()
             auth_p = (payload.basic_auth_password or "preview123").strip()
@@ -1976,7 +1971,6 @@ def list_instance_plugins(
 
     if not settings.command_dry_run or "plugins" not in inst:
         cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
-        db_meta = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
         db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg)
         db_meta = wordpress_live.query_wp_db_live_meta(db_acc.db_name if db_acc else (cfg["db_name"] or ""), cfg["table_prefix"] or "wp_", owner_id=site.owner_id, site_id=site.id, db=db)
         inst["plugins"] = _default_plugins_for_instance(
@@ -1999,7 +1993,6 @@ def manage_instance_plugins(
     linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
     php_ver = site.php_version or "8.4"
     cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
-    db_meta = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
     db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg)
     db_name = db_acc.db_name if db_acc else (cfg["db_name"] or "")
     db_meta = wordpress_live.query_wp_db_live_meta(db_name, cfg["table_prefix"] or "wp_", owner_id=site.owner_id, site_id=site.id, db=db)
@@ -2087,7 +2080,6 @@ def manage_instance_plugins(
         msg = f"Đã cài đặt{' và kích hoạt' if payload.activate_after_install else ''} plugin {title}!"
 
     if not settings.command_dry_run:
-        db_meta_after = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
         db_meta_after = wordpress_live.query_wp_db_live_meta(db_name, cfg["table_prefix"] or "wp_", owner_id=site.owner_id, site_id=site.id, db=db)
         plugins = _default_plugins_for_instance(
             wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta_after
@@ -2138,7 +2130,6 @@ def list_instance_themes(
 
     if not settings.command_dry_run or "themes" not in inst:
         cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
-        db_meta = wordpress_live.query_wp_db_live_meta(cfg["db_name"] or inst.get("db_name") or "", cfg["table_prefix"] or "wp_")
         db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg)
         db_meta = wordpress_live.query_wp_db_live_meta(db_acc.db_name if db_acc else (cfg["db_name"] or ""), cfg["table_prefix"] or "wp_", owner_id=site.owner_id, site_id=site.id, db=db)
         inst["themes"] = _default_themes_for_instance(
@@ -2161,11 +2152,9 @@ def manage_instance_themes(
     linux_user, site_root, wp_dir = _resolve_site_paths(site, db, inst.get("subpath") or "")
     php_ver = site.php_version or "8.4"
     cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
-    db_name = cfg["db_name"] or inst.get("db_name") or ""
     db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg)
     db_name = db_acc.db_name if db_acc else (cfg["db_name"] or "")
     table_prefix = cfg["table_prefix"] or inst.get("table_prefix") or "wp_"
-    db_meta = wordpress_live.query_wp_db_live_meta(db_name, table_prefix)
     db_meta = wordpress_live.query_wp_db_live_meta(db_name, table_prefix, owner_id=site.owner_id, site_id=site.id, db=db)
     themes: List[Dict[str, Any]] = list(
         inst.get("themes")
@@ -2246,7 +2235,6 @@ def manage_instance_themes(
         msg = f"Đã cài đặt{' và kích hoạt' if payload.activate_after_install else ''} giao diện {title}!"
 
     if not settings.command_dry_run:
-        db_meta_after = wordpress_live.query_wp_db_live_meta(db_name, table_prefix)
         db_meta_after = wordpress_live.query_wp_db_live_meta(db_name, table_prefix, owner_id=site.owner_id, site_id=site.id, db=db)
         themes = _default_themes_for_instance(
             wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta_after
@@ -2396,6 +2384,22 @@ def apply_wp_security(
                 "0644",
             )
             _write_wp_file_text(linux_user, site_root, wp_dir, "wp-content/uploads/.spanel-no-php", "1\n", "0644")
+            if not settings.command_dry_run and site.app_type != "wordpress":
+                try:
+                    site.app_type = "wordpress"
+                    db.commit()
+                    php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
+                    nginx.rewrite_vhost(
+                        site.domain,
+                        str(site_root),
+                        app_type="wordpress",
+                        php_version=php_ver,
+                        php_fpm_socket_override=php_socket,
+                        document_root=site.document_root or "public_html",
+                        rewrite_mode="front_controller",
+                    )
+                except Exception:
+                    pass
         elif cid == "uploads_php_blocked" and not turn_on:
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.htaccess")
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.spanel-no-php")
@@ -2575,7 +2579,16 @@ def execute_wp_tool(
         cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
         db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg)
         wordpress_live.restore_live_snapshot(
-            linux_user, site_root, wp_dir, db_acc.db_name if db_acc else (cfg["db_name"] or ""), snap_id, owner_id=site.owner_id, site_id=site.id, db=db
+            linux_user,
+            site_root,
+            wp_dir,
+            db_acc.db_name if db_acc else (cfg["db_name"] or ""),
+            snap_id,
+            inst=inst,
+            owner_id=site.owner_id,
+            site_id=site.id,
+            php_ver=php_ver,
+            db=db,
         )
         return {
             "message": f"Đã khôi phục thành công website {site.domain} về thời điểm Snapshot {snap_id}.",

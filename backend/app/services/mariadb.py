@@ -1,13 +1,53 @@
+from contextlib import contextmanager
+import contextvars
 from datetime import datetime
+import os
 from pathlib import Path
 import re
 import secrets
 import string
 import subprocess
-from typing import Dict
+import tempfile
+from typing import Dict, Iterator, Optional
 
 from app.core.config import settings
 from app.services.shell import shell
+
+_IMPORT_CREDS_CTX: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
+    "spanel_mariadb_import_creds", default=None
+)
+
+
+@contextmanager
+def tenant_import_credentials(db_user: Optional[str], db_password: Optional[str]) -> Iterator[None]:
+    """Scope a database import to a tenant's own MySQL account instead of the panel's global ~/.my.cnf."""
+    if db_user and db_password:
+        token = _IMPORT_CREDS_CTX.set((db_user.strip(), db_password))
+        try:
+            yield
+        finally:
+            _IMPORT_CREDS_CTX.reset(token)
+    else:
+        yield
+
+
+@contextmanager
+def _tenant_client_defaults_file(db_user: str, db_password: str) -> Iterator[Path]:
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    escaped_pw = (db_password or "").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    fd, raw_path = tempfile.mkstemp(prefix="spanel-mysql-import-", suffix=".cnf")
+    path = Path(raw_path)
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f'[client]\nhost=localhost\nuser="{safe_user}"\npassword="{escaped_pw}"\n')
+        yield path
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 IDENTIFIER_CHARS = set(string.ascii_lowercase + string.digits + "_")
@@ -217,16 +257,48 @@ def export_database(db_name: str, output_file: str):
     return shell.run(args, sensitive=True)
 
 
-def import_database(db_name: str, input_file: str):
+def import_database(
+    db_name: str,
+    input_file: str,
+    *,
+    db_user: Optional[str] = None,
+    db_password: Optional[str] = None,
+):
     safe_name = _reject_reserved_database(db_name)
     sql_path = Path(input_file).resolve()
     if not sql_path.exists() or not sql_path.is_file():
         raise FileNotFoundError("SQL file not found")
     if settings.command_dry_run:
         return shell.run(["mysql", safe_name], sensitive=True)
-    args = _mysql_args([safe_name])
-    with sql_path.open("rb") as source:
-        completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
+
+    eff_user = (db_user or "").strip()
+    eff_pass = db_password
+    if not (eff_user and eff_pass):
+        ctx_creds = _IMPORT_CREDS_CTX.get()
+        if ctx_creds:
+            eff_user, eff_pass = ctx_creds
+    if not (eff_user and eff_pass):
+        try:
+            from app.core.database import SessionLocal
+            from app.core.secrets import decrypt
+            from app.models.entities import DatabaseAccount
+
+            with SessionLocal() as session:
+                acc = session.query(DatabaseAccount).filter(DatabaseAccount.db_name == safe_name).first()
+                if acc and acc.db_user and acc.db_password:
+                    eff_user = acc.db_user.strip()
+                    eff_pass = decrypt(acc.db_password)
+        except Exception:
+            pass
+
+    if eff_user and eff_pass:
+        with _tenant_client_defaults_file(eff_user, eff_pass) as cnf_path, sql_path.open("rb") as source:
+            args = ["mysql", f"--defaults-file={cnf_path}", "--binary-mode", safe_name]
+            completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
+    else:
+        args = _mysql_args(["--binary-mode", safe_name])
+        with sql_path.open("rb") as source:
+            completed = subprocess.run(args, stdin=source, capture_output=True, check=False)
     if completed.returncode != 0:
         stderr = completed.stderr.decode("utf-8", errors="replace")
         raise RuntimeError(f"Database import failed: {stderr.strip()}")
