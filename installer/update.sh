@@ -2228,7 +2228,7 @@ systemctl restart spanel-api
 update_progress 80 "frontend" "Building frontend"
 cd "$APP_DIR/frontend"
 
-FRONTEND_INPUTS=(src public index.html package.json package-lock.json)
+FRONTEND_INPUTS=(src public index.html package.json package-lock.json vite.config.js)
 FRONTEND_FP="$(fingerprint "${FRONTEND_INPUTS[@]}" || true)"
 FRONTEND_REBUILT=0
 if [[ -f dist/index.html && -f dist/.build-fingerprint && -n "$FRONTEND_FP" && "$(cat dist/.build-fingerprint 2>/dev/null)" == "$FRONTEND_FP" ]] && ! step_inputs_changed frontend "${FRONTEND_INPUTS[@]}"; then

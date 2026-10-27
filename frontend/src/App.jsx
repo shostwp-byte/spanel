@@ -1,21 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import ace from 'ace-builds/src-noconflict/ace';
-import 'ace-builds/src-noconflict/ext-language_tools';
-import 'ace-builds/src-noconflict/ext-searchbox';
-import 'ace-builds/src-noconflict/mode-css';
-import 'ace-builds/src-noconflict/mode-html';
-import 'ace-builds/src-noconflict/mode-ini';
-import 'ace-builds/src-noconflict/mode-javascript';
-import 'ace-builds/src-noconflict/mode-json';
-import 'ace-builds/src-noconflict/mode-php';
-import 'ace-builds/src-noconflict/mode-text';
-import 'ace-builds/src-noconflict/mode-yaml';
-import 'ace-builds/src-noconflict/theme-textmate';
-import 'ace-builds/src-noconflict/theme-tomorrow_night';
 import { Sparkles, UserPlus, ArrowRightLeft, Wrench, PenTool as Tool, BarChart, MessageSquare, Key, AlertTriangle, LayoutTemplate, Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Heart, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
-import { Terminal } from './components/Terminal';
-import { AIAssistant } from './components/AIAssistant.jsx';
 import { LANGUAGES, t, useLanguage } from './i18n.js';
 import './style.css';
 import './brand.css';
@@ -28,52 +13,55 @@ import { formatBytes, roleLabel } from './utils/helpers.js';
 import { AppContext, AppProvider, useAppContext, dnsTtlLabel } from './contexts/AppContext.jsx';
 import { WebsiteSelect } from './components/WebsiteSelect.jsx';
 
-import { Migration } from './pages/Migration.jsx';
-import { Packages } from './pages/Packages.jsx';
-import { IpManager } from './pages/IpManager.jsx';
-import { AppInstallerPage } from './pages/AppInstaller.jsx';
-import { WordPressManagerPage } from './pages/WordPressManager.jsx';
-import { ResellerSettingsPage } from './pages/ResellerSettings.jsx';
-import { UsersPage } from './pages/Users.jsx';
-import { MoveUsersPage } from './pages/MoveUsers.jsx';
-import { ChangePasswords } from './pages/ChangePasswords.jsx';
-import { SettingsPage } from './pages/Settings.jsx';
-import { FirewallPage } from './pages/Firewall.jsx';
-import { SecurityPage } from './pages/Security.jsx';
-import { UpdatesPage } from './pages/Updates.jsx';
-import { ServicesPage } from './pages/Services.jsx';
-import { DatabasesPage } from './pages/Databases.jsx';
-import { BackupsPage } from './pages/Backups.jsx';
-import { CronPage } from './pages/Cron.jsx';
-import { PhpConfigPage } from './pages/PhpConfig.jsx';
-import { SslPage } from './pages/Ssl.jsx';
-import { FilesPage } from './pages/Files.jsx';
-import { SftpPage } from './pages/Sftp.jsx';
-import { ApplicationsPage } from './pages/Applications.jsx';
-import { DnsPage } from './pages/Dns.jsx';
-import { MailPage } from './pages/Mail.jsx';
-import { WebsitesPage } from './pages/Websites.jsx';
-import { ServerTlsPage } from './pages/ServerTls.jsx';
-import { BruteForceMonitorPage } from './pages/BruteForceMonitor.jsx';
-import { ProcessMonitorPage } from './pages/ProcessMonitor.jsx';
-import { NameServersPage } from './pages/NameServers.jsx';
-import { MessageAllPage } from './pages/MessageAll.jsx';
-import { WafPage } from './pages/Waf.jsx';
-import { MalwarePage } from './pages/Malware.jsx';
-import { AddonsPage } from './pages/Addons.jsx';
-import { MailForwardersPage } from './pages/MailForwarders.jsx';
-import { MailAutorespondersPage } from './pages/MailAutoresponders.jsx';
-import { McpPage } from './pages/Mcp.jsx';
-import MessageTemplates from './pages/MessageTemplates.jsx';
-import { CustomHttpdPage } from './pages/CustomHttpd.jsx';
-import { CustomBuildPage } from './pages/CustomBuild.jsx';
-import { MaintenancePage } from './pages/Maintenance.jsx';
-import { ServerStatisticsPage } from './pages/ServerStatistics.jsx';
-import { RedirectsPage } from './pages/Redirects.jsx';
-import { ApacheHandlersPage } from './pages/ApacheHandlers.jsx';
-import { ResourceMonitorPage } from './pages/ResourceMonitor.jsx';
-import { MultiServerPage } from './pages/MultiServer.jsx';
-import { LicensingPage } from './pages/Licensing.jsx';
+const lazyNamed = (loader, exportName) =>
+  React.lazy(() => loader().then(mod => ({ default: mod[exportName] || mod.default })));
+
+const Migration = lazyNamed(() => import('./pages/Migration.jsx'), 'Migration');
+const Packages = lazyNamed(() => import('./pages/Packages.jsx'), 'Packages');
+const IpManager = lazyNamed(() => import('./pages/IpManager.jsx'), 'IpManager');
+const AppInstallerPage = lazyNamed(() => import('./pages/AppInstaller.jsx'), 'AppInstallerPage');
+const WordPressManagerPage = lazyNamed(() => import('./pages/WordPressManager.jsx'), 'WordPressManagerPage');
+const ResellerSettingsPage = lazyNamed(() => import('./pages/ResellerSettings.jsx'), 'ResellerSettingsPage');
+const UsersPage = lazyNamed(() => import('./pages/Users.jsx'), 'UsersPage');
+const MoveUsersPage = lazyNamed(() => import('./pages/MoveUsers.jsx'), 'MoveUsersPage');
+const ChangePasswords = lazyNamed(() => import('./pages/ChangePasswords.jsx'), 'ChangePasswords');
+const SettingsPage = lazyNamed(() => import('./pages/Settings.jsx'), 'SettingsPage');
+const FirewallPage = lazyNamed(() => import('./pages/Firewall.jsx'), 'FirewallPage');
+const SecurityPage = lazyNamed(() => import('./pages/Security.jsx'), 'SecurityPage');
+const UpdatesPage = lazyNamed(() => import('./pages/Updates.jsx'), 'UpdatesPage');
+const ServicesPage = lazyNamed(() => import('./pages/Services.jsx'), 'ServicesPage');
+const DatabasesPage = lazyNamed(() => import('./pages/Databases.jsx'), 'DatabasesPage');
+const BackupsPage = lazyNamed(() => import('./pages/Backups.jsx'), 'BackupsPage');
+const CronPage = lazyNamed(() => import('./pages/Cron.jsx'), 'CronPage');
+const PhpConfigPage = lazyNamed(() => import('./pages/PhpConfig.jsx'), 'PhpConfigPage');
+const SslPage = lazyNamed(() => import('./pages/Ssl.jsx'), 'SslPage');
+const FilesPage = lazyNamed(() => import('./pages/Files.jsx'), 'FilesPage');
+const SftpPage = lazyNamed(() => import('./pages/Sftp.jsx'), 'SftpPage');
+const ApplicationsPage = lazyNamed(() => import('./pages/Applications.jsx'), 'ApplicationsPage');
+const DnsPage = lazyNamed(() => import('./pages/Dns.jsx'), 'DnsPage');
+const MailPage = lazyNamed(() => import('./pages/Mail.jsx'), 'MailPage');
+const WebsitesPage = lazyNamed(() => import('./pages/Websites.jsx'), 'WebsitesPage');
+const ServerTlsPage = lazyNamed(() => import('./pages/ServerTls.jsx'), 'ServerTlsPage');
+const BruteForceMonitorPage = lazyNamed(() => import('./pages/BruteForceMonitor.jsx'), 'BruteForceMonitorPage');
+const ProcessMonitorPage = lazyNamed(() => import('./pages/ProcessMonitor.jsx'), 'ProcessMonitorPage');
+const NameServersPage = lazyNamed(() => import('./pages/NameServers.jsx'), 'NameServersPage');
+const MessageAllPage = lazyNamed(() => import('./pages/MessageAll.jsx'), 'MessageAllPage');
+const WafPage = lazyNamed(() => import('./pages/Waf.jsx'), 'WafPage');
+const MalwarePage = lazyNamed(() => import('./pages/Malware.jsx'), 'MalwarePage');
+const AddonsPage = lazyNamed(() => import('./pages/Addons.jsx'), 'AddonsPage');
+const MailForwardersPage = lazyNamed(() => import('./pages/MailForwarders.jsx'), 'MailForwardersPage');
+const MailAutorespondersPage = lazyNamed(() => import('./pages/MailAutoresponders.jsx'), 'MailAutorespondersPage');
+const McpPage = lazyNamed(() => import('./pages/Mcp.jsx'), 'McpPage');
+const MessageTemplates = React.lazy(() => import('./pages/MessageTemplates.jsx'));
+const CustomHttpdPage = lazyNamed(() => import('./pages/CustomHttpd.jsx'), 'CustomHttpdPage');
+const CustomBuildPage = lazyNamed(() => import('./pages/CustomBuild.jsx'), 'CustomBuildPage');
+const MaintenancePage = lazyNamed(() => import('./pages/Maintenance.jsx'), 'MaintenancePage');
+const ServerStatisticsPage = lazyNamed(() => import('./pages/ServerStatistics.jsx'), 'ServerStatisticsPage');
+const RedirectsPage = lazyNamed(() => import('./pages/Redirects.jsx'), 'RedirectsPage');
+const ApacheHandlersPage = lazyNamed(() => import('./pages/ApacheHandlers.jsx'), 'ApacheHandlersPage');
+const ResourceMonitorPage = lazyNamed(() => import('./pages/ResourceMonitor.jsx'), 'ResourceMonitorPage');
+const MultiServerPage = lazyNamed(() => import('./pages/MultiServer.jsx'), 'MultiServerPage');
+const LicensingPage = lazyNamed(() => import('./pages/Licensing.jsx'), 'LicensingPage');
 
 
 
@@ -750,17 +738,49 @@ function NotificationToast({ type, message, onClose }) {
 const ACE_THEMES = { light: 'ace/theme/textmate', dark: 'ace/theme/tomorrow_night' };
 const aceThemeFor = theme => ACE_THEMES[theme] || ACE_THEMES.light;
 
+let _aceBundlePromise = null;
+function loadAceBundle() {
+  if (!_aceBundlePromise) {
+    _aceBundlePromise = (async () => {
+      const mod = await import('ace-builds/src-noconflict/ace');
+      const aceInstance = mod.default || mod;
+      await Promise.all([
+        import('ace-builds/src-noconflict/ext-language_tools'),
+        import('ace-builds/src-noconflict/ext-searchbox'),
+        import('ace-builds/src-noconflict/mode-css'),
+        import('ace-builds/src-noconflict/mode-html'),
+        import('ace-builds/src-noconflict/mode-ini'),
+        import('ace-builds/src-noconflict/mode-javascript'),
+        import('ace-builds/src-noconflict/mode-json'),
+        import('ace-builds/src-noconflict/mode-php'),
+        import('ace-builds/src-noconflict/mode-text'),
+        import('ace-builds/src-noconflict/mode-yaml'),
+        import('ace-builds/src-noconflict/theme-textmate'),
+        import('ace-builds/src-noconflict/theme-tomorrow_night'),
+      ]);
+      return aceInstance;
+    })();
+  }
+  return _aceBundlePromise;
+}
+
 function CodeEditor({ value, mode, disabled, onChange, onCursorChange }) {
   const hostRef = useRef(null);
   const editorRef = useRef(null);
   const suppressChangeRef = useRef(false);
   const onChangeRef = useRef(onChange);
   const onCursorChangeRef = useRef(onCursorChange);
+  const valueRef = useRef(value);
+  const modeRef = useRef(mode);
+  const disabledRef = useRef(disabled);
   const themeName = useThemeName();
   const themeRef = useRef(themeName);
 
   useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
   useEffect(() => { onCursorChangeRef.current = onCursorChange; }, [onCursorChange]);
+  useEffect(() => { valueRef.current = value; }, [value]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+  useEffect(() => { disabledRef.current = disabled; }, [disabled]);
   useEffect(() => {
     themeRef.current = themeName;
     editorRef.current?.setTheme(aceThemeFor(themeName));
@@ -768,56 +788,66 @@ function CodeEditor({ value, mode, disabled, onChange, onCursorChange }) {
 
   useEffect(() => {
     if (!hostRef.current) return undefined;
-    const editor = ace.edit(hostRef.current, {
-      mode: `ace/mode/${aceModeName(mode)}`,
-      theme: aceThemeFor(themeRef.current),
-      value: value || '',
-      readOnly: !!disabled,
-      showPrintMargin: false,
-      highlightActiveLine: true,
-      fontSize: 13,
-      tabSize: 2,
-      useSoftTabs: true,
-      wrap: false,
-      selectionStyle: 'text',
+    let cancelled = false;
+    let cleanupEditor = null;
+    loadAceBundle().then(ace => {
+      if (cancelled || !hostRef.current) return;
+      const editor = ace.edit(hostRef.current, {
+        mode: `ace/mode/${aceModeName(modeRef.current)}`,
+        theme: aceThemeFor(themeRef.current),
+        value: valueRef.current || '',
+        readOnly: !!disabledRef.current,
+        showPrintMargin: false,
+        highlightActiveLine: true,
+        fontSize: 13,
+        tabSize: 2,
+        useSoftTabs: true,
+        wrap: false,
+        selectionStyle: 'text',
+      });
+
+      editor.setOptions({
+        enableBasicAutocompletion: true,
+        enableLiveAutocompletion: true,
+        enableMatchBrackets: true,
+        enableSnippets: false,
+        fontFamily: EDITOR_FONT_FAMILY,
+      });
+      editor.session.setUseWorker(false);
+      editor.session.setNewLineMode('unix');
+
+      let destroyed = false;
+      const reportCursor = () => {
+        if (destroyed || !editorRef.current || !onCursorChangeRef.current) return;
+        const pos = editorRef.current.getCursorPosition();
+        onCursorChangeRef.current({ line: pos.row + 1, column: pos.column + 1 });
+      };
+      const handleChange = () => {
+        if (destroyed || !editorRef.current) return;
+        if (!suppressChangeRef.current) {
+          if (onChangeRef.current) onChangeRef.current(editorRef.current.getValue());
+        }
+        // Only report cursor on explicit cursor moves, not on every content change
+      };
+
+      editor.session.on('change', handleChange);
+      editor.selection.on('changeCursor', reportCursor);
+      editorRef.current = editor;
+      reportCursor();
+
+      cleanupEditor = () => {
+        destroyed = true;
+        editor.session.off('change', handleChange);
+        editor.selection.off('changeCursor', reportCursor);
+        editor.destroy();
+        editorRef.current = null;
+        if (hostRef.current) hostRef.current.textContent = '';
+      };
     });
-
-    editor.setOptions({
-      enableBasicAutocompletion: true,
-      enableLiveAutocompletion: true,
-      enableMatchBrackets: true,
-      enableSnippets: false,
-      fontFamily: EDITOR_FONT_FAMILY,
-    });
-    editor.session.setUseWorker(false);
-    editor.session.setNewLineMode('unix');
-
-    let destroyed = false;
-    const reportCursor = () => {
-      if (destroyed || !editorRef.current || !onCursorChangeRef.current) return;
-      const pos = editorRef.current.getCursorPosition();
-      onCursorChangeRef.current({ line: pos.row + 1, column: pos.column + 1 });
-    };
-    const handleChange = () => {
-      if (destroyed || !editorRef.current) return;
-      if (!suppressChangeRef.current) {
-        if (onChangeRef.current) onChangeRef.current(editorRef.current.getValue());
-      }
-      // Only report cursor on explicit cursor moves, not on every content change
-    };
-
-    editor.session.on('change', handleChange);
-    editor.selection.on('changeCursor', reportCursor);
-    editorRef.current = editor;
-    reportCursor();
 
     return () => {
-      destroyed = true;
-      editor.session.off('change', handleChange);
-      editor.selection.off('changeCursor', reportCursor);
-      editor.destroy();
-      editorRef.current = null;
-      if (hostRef.current) hostRef.current.textContent = '';
+      cancelled = true;
+      if (cleanupEditor) cleanupEditor();
     };
   }, []);
 
@@ -1726,10 +1756,10 @@ function AppContent() {
   useEffect(() => { loadPanelSettings(); loadAppVersion(); }, []);
 
   useEffect(() => {
-    if (currentUser) {
+    if (currentUser?.id) {
       loadPanelSettings();
     }
-  }, [currentUser]);
+  }, [currentUser?.id, currentUser?.role]);
 
   useEffect(() => {
     const appName = panelSettings.app_name || 'spanel';
@@ -1771,11 +1801,14 @@ function AppContent() {
     if (data) setDatabases(data);
   }
 
-  async function refreshAll() {
+  async function refreshAll({ skipUserReload = false } = {}) {
+    const knownRole = currentUser?.role;
+    const canPreloadTenants = knownRole === 'admin' || knownRole === 'reseller';
     const [refreshedUser, siteData] = await Promise.all([
-      loadCurrentUser(),
+      skipUserReload && currentUser ? Promise.resolve(currentUser) : loadCurrentUser(),
       request('/websites'),
       loadPhpVersions({ silent: true }),
+      ...(canPreloadTenants ? [loadPackages(), loadUsers()] : []),
     ]);
     if (siteData) {
       setWebsites(siteData);
@@ -1785,7 +1818,9 @@ function AppContent() {
       }
     }
     if (refreshedUser?.role === 'admin' || refreshedUser?.role === 'reseller') {
-      await Promise.all([loadPackages(), loadUsers()]);
+      if (!canPreloadTenants) {
+        await Promise.all([loadPackages(), loadUsers()]);
+      }
     } else {
       setUsers([]);
     }
@@ -2866,7 +2901,7 @@ function AppContent() {
 
   useEffect(() => {
     if (isAuthenticated) {
-      refreshAll();
+      refreshAll({ skipUserReload: true });
     }
   }, [isAuthenticated, effectiveRole]);
 
@@ -2905,8 +2940,17 @@ function AppContent() {
     return () => window.removeEventListener('keydown', handler);
   }, [standaloneEditor, isAuthenticated, selectedWebsiteId, filePath, fileContent]);
 
+  const lastDashRoleRef = useRef(null);
   useEffect(() => {
-    if (isAuthenticated) loadDashboardSummary();
+    if (!isAuthenticated) {
+      lastDashRoleRef.current = null;
+      return;
+    }
+    const roleChanged = lastDashRoleRef.current !== effectiveRole;
+    if (roleChanged || page === 'dashboard' || !dashSummary) {
+      lastDashRoleRef.current = effectiveRole;
+      loadDashboardSummary();
+    }
   }, [isAuthenticated, page, effectiveRole]);
 
 
@@ -4883,7 +4927,9 @@ function AppContent() {
         </section>
         {currentUser?.demo && <div className="demo-strip" role="status"><Eye size={15} /><span>{t('This is a demo: you can look at everything, but changes are not saved.')}</span></div>}
         <div className="content-body">
-          {renderPage()}
+          <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
+            {renderPage()}
+          </React.Suspense>
           {loading && <div className="loading"><span></span>{t(loading)}</div>}
         </div>
       </div>
