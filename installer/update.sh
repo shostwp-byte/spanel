@@ -1722,6 +1722,11 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
       install -d -m 0755 -o root -g root /usr/local/lib/spanel
       install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/spanel_mailtool.py" /usr/local/lib/spanel/spanel_mailtool.py
     fi
+    if [[ -f "$SOURCE_DIR/installer/files/webmail/backend/main.py" && -f "$SOURCE_DIR/installer/files/webmail/backend/requirements.txt" ]]; then
+      install -d -m 0755 -o root -g root /usr/local/lib/spanel/webmail /usr/local/lib/spanel/webmail/backend
+      install -m 0755 -o root -g root "$SOURCE_DIR/installer/files/webmail/backend/main.py" /usr/local/lib/spanel/webmail/backend/main.py
+      install -m 0644 -o root -g root "$SOURCE_DIR/installer/files/webmail/backend/requirements.txt" /usr/local/lib/spanel/webmail/backend/requirements.txt
+    fi
     if [[ -f "$SOURCE_DIR/installer/files/spanel_webshells.yar" ]]; then
       install -d -m 0755 -o root -g spanel /etc/spanel/yara
       install -m 0644 -o root -g spanel "$SOURCE_DIR/installer/files/spanel_webshells.yar" /etc/spanel/yara/spanel_webshells.yar
