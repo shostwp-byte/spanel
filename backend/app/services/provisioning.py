@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.security import hash_password
 from app.models.entities import ApiToken, DatabaseAccount, ProvisioningAccount, User, Website
 from app.services import backup as backup_service, teardown
-from app.services import db_backends, nginx, site_users, ssl, storage_quota, waf, wordpress
+from app.services import db_backends, mariadb, nginx, site_users, ssl, storage_quota, waf, wordpress
 
 logger = logging.getLogger("spanel.provisioning")
 

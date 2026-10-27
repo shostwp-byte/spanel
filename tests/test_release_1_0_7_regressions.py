@@ -451,6 +451,10 @@ def test_wordpress_manager_toggles_and_endpoints_end_to_end():
         settings.command_dry_run = True
         try:
           with patch.object(wordpress_live, "toolkit_state_path", side_effect=lambda: Path(tmpdir) / "wordpress_toolkit_state.json"):
+            st = wordpress_manager._load_toolkit_state()
+            st.setdefault("instances", {}).pop(str(site.id), None)
+            wordpress_manager._save_toolkit_state(st)
+
             # 0. Enabling password_protection before any password is set must return HTTP 400 (never lock out user with random password)
             from fastapi import HTTPException
 
@@ -704,6 +708,73 @@ def test_round_9_snapshot_restore_clone_and_db_isolation():
             settings.command_dry_run = orig_dry2
 
 
+def test_impersonate_and_exit_end_to_end():
+    from fastapi import HTTPException, Response
+    from jose import jwt
+    from app.api import auth, deps
+    from app.core.config import settings
+    from app.core.security import ALGORITHM
+
+    db = _make_db()
+    admin = User(username="admin", email="admin@example.com", hashed_password="x", role="admin", is_active=True, token_version=1)
+    customer = User(username="shostc", email="shostc@example.com", hashed_password="x", role="user", is_active=True, token_version=0)
+    db.add_all([admin, customer])
+    db.commit()
+
+    def _dummy_request(payload=None, token=None):
+        return SimpleNamespace(
+            client=SimpleNamespace(host="127.0.0.1"),
+            headers={"user-agent": "unittest", "x-forwarded-proto": "https"},
+            url=SimpleNamespace(scheme="https", netloc="localhost:2222"),
+            cookies={},
+            state=SimpleNamespace(jwt_payload=payload or {}, jwt_token=token),
+        )
+
+    # 1. Admin impersonates customer
+    orig_rl = settings.rate_limit_backend
+    settings.rate_limit_backend = "memory"
+    try:
+        req1 = _dummy_request()
+        resp1 = Response()
+        imp_res = auth.impersonate_user(
+            user_id=customer.id,
+            request=req1,
+            response=resp1,
+            otp="",
+            db=db,
+            current_user=admin,
+        )
+    finally:
+        settings.rate_limit_backend = orig_rl
+    assert imp_res.access_token
+    imp_payload = jwt.decode(imp_res.access_token, settings.secret_key, algorithms=[ALGORITHM])
+    assert imp_payload["sub"] == "shostc"
+    assert imp_payload["imp"] is True
+    assert imp_payload["imp_by"] == admin.id
+    assert imp_payload["imp_user"] == "admin"
+
+    # 2. Exit impersonation ("Return to admin")
+    req2 = _dummy_request(payload=imp_payload, token=imp_res.access_token)
+    resp2 = Response()
+    exit_res = auth.exit_impersonation(
+        request=req2,
+        response=resp2,
+        db=db,
+        current_user=customer,
+    )
+    assert exit_res.access_token
+    admin_payload = jwt.decode(exit_res.access_token, settings.secret_key, algorithms=[ALGORITHM])
+    assert admin_payload["sub"] == "admin"
+    assert not admin_payload.get("imp")
+
+    # 3. Revoked impersonation token can no longer be used
+    try:
+        deps._user_from_token(imp_res.access_token, db)
+        raise AssertionError("Expected revoked impersonation token to be rejected with HTTP 401")
+    except HTTPException as exc:
+        assert exc.status_code == 401
+
+
 class Release107RegressionTests(unittest.TestCase):
     def test_1_heredocs(self):
         test_installer_and_updater_python_heredocs_compile_cleanly()
@@ -728,6 +799,9 @@ class Release107RegressionTests(unittest.TestCase):
 
     def test_8_round_9_audit_regressions(self):
         test_round_9_snapshot_restore_clone_and_db_isolation()
+
+    def test_9_impersonate_and_exit(self):
+        test_impersonate_and_exit_end_to_end()
 
 
 if __name__ == "__main__":
