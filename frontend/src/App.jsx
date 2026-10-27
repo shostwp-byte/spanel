@@ -151,7 +151,7 @@ function composeWebPorts(plan, wanted) {
 // Pages opened from inside another page instead of the sidebar. They have no
 // nav entry of their own, so without this the header falls back to the first
 // item and titles the page "Dashboard".
-const NAV_PARENT_PAGE = { 'waf-site': 'waf', 'malware-scan': 'malware' };
+const NAV_PARENT_PAGE = { 'waf-site': 'waf', 'malware-scan': 'malware', 'panel-settings': 'settings' };
 
 // 'waf-site' is reached from the WAF overview rather than the sidebar, but it
 // still belongs to Settings so the menu stays open and WAF stays highlighted.
@@ -216,6 +216,112 @@ const PAGE_ROUTES = {
   multi_server: '/multi-server',
   licensing: '/licensing',
 };
+
+const ADMIN_ALLOWED_PAGES = new Set([
+  'dashboard',
+  'users',
+  'my_users',
+  'resource_monitor',
+  'packages',
+  'move_users',
+  'message_templates',
+  'change_passwords',
+  'resellers',
+  'reseller_packages',
+  'administrators',
+  'settings',
+  'panel-settings',
+  'custom_httpd',
+  'dns',
+  'ipmanager',
+  'name_servers',
+  'multi_server',
+  'php',
+  'server_tls',
+  'notifications',
+  'custombuild',
+  'backups',
+  'brute_force',
+  'process_monitor',
+  'mail',
+  'services',
+  'migration',
+  'message_all',
+  'reseller_settings',
+  'access-logs',
+  'maintenance',
+  'all_crons',
+  'server_statistics',
+  'addons',
+  'waf',
+  'waf-site',
+  'waf-logs',
+  'malware',
+  'malware-scan',
+  'firewall',
+  'applications',
+  'mcp',
+  'updates',
+  'licensing',
+  'security',
+]);
+
+const RESELLER_ALLOWED_PAGES = new Set([
+  'dashboard',
+  'users',
+  'my_users',
+  'suspend',
+  'resource_monitor',
+  'packages',
+  'change_passwords',
+  'reseller_settings',
+  'backups',
+  'migration',
+  'ipmanager',
+  'server_statistics',
+  'access-logs',
+  'waf',
+  'waf-site',
+  'waf-logs',
+  'applications',
+  'mcp',
+  'security',
+]);
+
+const USER_ALLOWED_PAGES = new Set([
+  'dashboard',
+  'websites',
+  'subdomains',
+  'dns',
+  'ssl',
+  'sftp',
+  'databases',
+  'redirects',
+  'mail',
+  'mail_forwarders',
+  'mail_auto',
+  'applications',
+  'wordpress_manager',
+  'app_installer',
+  'waf',
+  'waf-site',
+  'waf-logs',
+  'cron',
+  'backups',
+  'security',
+  'mcp',
+  'apache_handlers',
+  'files',
+  'access-logs',
+  'site_stats',
+]);
+
+function isPageAllowedForRole(targetPage, role) {
+  const normalizedPage = targetPage || 'dashboard';
+  if (role === 'admin') return ADMIN_ALLOWED_PAGES.has(normalizedPage);
+  if (role === 'reseller') return RESELLER_ALLOWED_PAGES.has(normalizedPage);
+  return USER_ALLOWED_PAGES.has(normalizedPage);
+}
 
 /* ---------------------------------------------------------------
    Theme (light / dark)
@@ -782,14 +888,7 @@ function AppContent() {
 
   const rawRole = currentUser?.role || 'user';
   const actualRole = rawRole === 'end_user' ? 'user' : rawRole;
-  const canSwitchToAdmin = actualRole === 'admin';
-  const canSwitchToReseller = actualRole === 'admin' || actualRole === 'reseller';
-  const validViewLevel = (
-    actualRole === 'admin' ? ['admin', 'reseller', 'user'].includes(viewLevel) :
-    actualRole === 'reseller' ? ['reseller', 'user'].includes(viewLevel) :
-    false
-  ) ? viewLevel : null;
-  const effectiveRole = validViewLevel || actualRole;
+  const effectiveRole = actualRole;
   const isAdmin = effectiveRole === 'admin';
   const isReseller = effectiveRole === 'reseller';
   const isUser = effectiveRole === 'user' || effectiveRole === 'end_user';
@@ -1226,18 +1325,22 @@ function AppContent() {
     : (currentUser?.username || username);
 
   const navigateToPage = useCallback((nextPage, options = {}) => {
-    const route = routeForPage(nextPage);
+    const resolvedPage = currentUser && !isPageAllowedForRole(nextPage, effectiveRole)
+      ? 'dashboard'
+      : nextPage;
+    const route = routeForPage(resolvedPage);
     if (!route) return;
     const nextUrl = route;
-    if (!options.replace && window.location.pathname !== route) {
+    const shouldReplace = Boolean(options.replace || resolvedPage !== nextPage);
+    if (!shouldReplace && window.location.pathname !== route) {
       window.history.pushState({}, '', nextUrl);
-    } else if (options.replace && window.location.pathname !== route) {
+    } else if (shouldReplace && window.location.pathname !== route) {
       window.history.replaceState({}, '', nextUrl);
     }
     // The sidebar's DNS Manager opens the list, not the zone last looked at.
-    if (nextPage === 'dns') { setDnsZone(null); setDnsTab('zones'); }
-    setPage(nextPage);
-  }, []);
+    if (resolvedPage === 'dns') { setDnsZone(null); setDnsTab('zones'); }
+    setPage(resolvedPage);
+  }, [currentUser, effectiveRole]);
 
   // Every page opens at its top. The window is the scroller and nothing
   // reset it, so the next page opened at the last one's offset - part-way
@@ -2759,6 +2862,13 @@ function AppContent() {
   }, [standaloneEditor]);
 
   useEffect(() => {
+    if (!isAuthenticated || !currentUser) return;
+    if (!isPageAllowedForRole(page, effectiveRole)) {
+      navigateToPage('dashboard', { replace: true });
+    }
+  }, [isAuthenticated, currentUser, page, effectiveRole, navigateToPage]);
+
+  useEffect(() => {
     if (!isAuthenticated || !standaloneEditor) return;
     setSelectedWebsiteId(standaloneEditor.websiteId);
     setFileAppId(standaloneEditor.appId || '');
@@ -3052,10 +3162,19 @@ function AppContent() {
   }
 
   const allNavItems = navSections.flatMap(section => section.items);
-  const basePage = NAV_PARENT_PAGE[page] || page;
+  const effectivePage = isPageAllowedForRole(page, effectiveRole) ? page : 'dashboard';
+  const basePage = NAV_PARENT_PAGE[effectivePage] || effectivePage;
   const navPage = basePage;
-  const activeNavItem = page === 'dashboard' ? ['dashboard', 'Dashboard', Home] : (allNavItems.find(([key]) => key === navPage) || allNavItems[0]);
-  const pageItem = page === 'dashboard' ? ['dashboard', 'Dashboard', Home] : (allNavItems.find(([key]) => key === basePage) || activeNavItem);
+  const activeNavItem = effectivePage === 'dashboard'
+    ? ['dashboard', 'Dashboard', Home]
+    : effectivePage === 'security'
+    ? ['security', 'Account security', LockKeyhole]
+    : (allNavItems.find(([key]) => key === navPage) || ['dashboard', 'Dashboard', Home]);
+  const pageItem = effectivePage === 'dashboard'
+    ? ['dashboard', 'Dashboard', Home]
+    : effectivePage === 'security'
+    ? ['security', 'Account security', LockKeyhole]
+    : (allNavItems.find(([key]) => key === basePage) || activeNavItem);
 
   const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
   const [cmdPaletteQuery, setCmdPaletteQuery] = useState('');
@@ -3106,37 +3225,39 @@ function AppContent() {
         });
       });
     });
-    (websites || []).forEach(site => {
-      list.push({
-        id: `site-${site.id}`,
-        category: t('Website'),
-        title: site.domain,
-        subtitle: `PHP ${site.php_version || '8.4'} · ${site.root_path || ''}`,
-        icon: Globe,
-        run: () => {
-          setSelectedWebsiteId(String(site.id));
-          navigateToPage('websites');
-        },
+    if (isUser) {
+      (websites || []).forEach(site => {
+        list.push({
+          id: `site-${site.id}`,
+          category: t('Website'),
+          title: site.domain,
+          subtitle: `PHP ${site.php_version || '8.4'} · ${site.root_path || ''}`,
+          icon: Globe,
+          run: () => {
+            setSelectedWebsiteId(String(site.id));
+            navigateToPage('websites');
+          },
+        });
+        list.push({
+          id: `site-files-${site.id}`,
+          category: t('File Manager'),
+          title: `${site.domain} — ${t('Files')}`,
+          subtitle: site.root_path || '/public_html',
+          icon: FolderOpen,
+          run: () => openWebsiteFileManager(site),
+        });
       });
-      list.push({
-        id: `site-files-${site.id}`,
-        category: t('File Manager'),
-        title: `${site.domain} — ${t('Files')}`,
-        subtitle: site.root_path || '/public_html',
-        icon: FolderOpen,
-        run: () => openWebsiteFileManager(site),
+      (databases || []).forEach(db => {
+        list.push({
+          id: `db-${db.id || db.name}`,
+          category: t('Database'),
+          title: db.name,
+          subtitle: db.username ? `User: ${db.username}` : 'MariaDB / MySQL',
+          icon: Database,
+          run: () => navigateToPage('databases'),
+        });
       });
-    });
-    (databases || []).forEach(db => {
-      list.push({
-        id: `db-${db.id || db.name}`,
-        category: t('Database'),
-        title: db.name,
-        subtitle: db.username ? `User: ${db.username}` : 'MariaDB / MySQL',
-        icon: Database,
-        run: () => navigateToPage('databases'),
-      });
-    });
+    }
     (siteApps?.items || []).forEach(app => {
       list.push({
         id: `app-${app.id}`,
@@ -4151,6 +4272,9 @@ function AppContent() {
   };
 
   function renderPage() {
+    if (!isPageAllowedForRole(page, effectiveRole)) {
+      return renderDashboard();
+    }
     if (page === 'websites' || page === 'subdomains') return <WebsitesPage
       mode={page === 'subdomains' ? 'subdomains' : 'domains'}
       request={request} API={API} setPage={setPage} phpVersions={phpVersions} isReseller={isReseller}
@@ -4309,7 +4433,7 @@ function AppContent() {
     </main>;
   }
 
-  if (standaloneEditor) return <AppContext.Provider value={sharedContextValue}>{renderStandaloneEditor()}</AppContext.Provider>;
+  if (standaloneEditor && isUser) return <AppContext.Provider value={sharedContextValue}>{renderStandaloneEditor()}</AppContext.Provider>;
 
   const ActiveIcon = pageItem?.[2] || Home;
 
@@ -4400,13 +4524,13 @@ function AppContent() {
         </div>
       </aside>
       <div className="content">
-        {effectiveRole !== actualRole && (
+        {currentUser?.impersonated && currentUser?.impersonated_by && (
           <div className="impersonation-banner">
             <div className="banner-text">
               <span className="banner-icon">⚠️</span>
-              <span>You are currently viewing the panel as <strong>{effectiveRole.toUpperCase()}</strong>.</span>
+              <span>{t('You are currently logged in as')} <strong>{currentUser.username}</strong> ({t(roleLabel(actualRole))}).</span>
             </div>
-            <button onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>Return to {actualRole.toUpperCase()}</button>
+            <button type="button" onClick={() => exitImpersonation()}>{t('Return to')} {currentUser.impersonated_by}</button>
           </div>
         )}
         <section className="topbar">
@@ -4421,13 +4545,20 @@ function AppContent() {
           {/* The page title, then one account menu - profile, account security
               and sign out live in it, as they do in OPanel. */}
           <div className="top-actions">
-            {(canSwitchToAdmin || canSwitchToReseller) && (
-              <div className="segmented role-switcher-seg" aria-label="Access Level">
-                {canSwitchToAdmin && <button className={effectiveRole === 'admin' ? 'active' : ''} onClick={() => { setViewLevel('admin'); navigateToPage('dashboard'); }}>Admin</button>}
-                {canSwitchToReseller && <button className={effectiveRole === 'reseller' ? 'active' : ''} onClick={() => { setViewLevel('reseller'); navigateToPage('dashboard'); }}>Reseller</button>}
-                <button className={effectiveRole === 'user' ? 'active' : ''} onClick={() => { setViewLevel('user'); navigateToPage('dashboard'); }}>User</button>
-              </div>
-            )}
+            <div className="segmented role-switcher-seg" aria-label="Access Role">
+              <button type="button" className="active" style={{ cursor: 'default' }} title={t('Current Access Role')}>
+                {isAdmin ? t('Admin') : isReseller ? t('Reseller') : t('End User')}
+              </button>
+              {currentUser?.impersonated && currentUser?.impersonated_by && (
+                <button
+                  type="button"
+                  onClick={() => exitImpersonation()}
+                  title={`${t('Return to')} ${currentUser.impersonated_by}`}
+                >
+                  {t('Return to')} {currentUser.impersonated_by}
+                </button>
+              )}
+            </div>
 
             <div className="top-utility-group">
               <button

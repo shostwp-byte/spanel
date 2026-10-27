@@ -673,20 +673,21 @@ def test_round_9_snapshot_restore_clone_and_db_isolation():
         finally:
             settings.command_dry_run = orig_dry
 
-        # 4. install_wp_instance with db_mode='existing' must block binding Alice's DB to Bob's site even for admin
-        try:
-            wordpress_manager.install_wp_instance(
-                payload=wordpress_manager.WpInstallPayload(
-                    website_id=bob_site.id,
-                    db_mode="existing",
-                    database_id=alice_db.id,
-                ),
-                db=db,
-                current_user=admin,
-            )
-            raise AssertionError("Expected HTTPException(403) when admin binds Alice's DB to Bob's website")
-        except HTTPException as exc:
-            assert exc.status_code == 403
+        # 4. install_wp_instance with db_mode='existing' must block binding Alice's DB to Bob's site (and block admin direct access)
+        for caller in (admin, bob):
+            try:
+                wordpress_manager.install_wp_instance(
+                    payload=wordpress_manager.WpInstallPayload(
+                        website_id=bob_site.id,
+                        db_mode="existing",
+                        database_id=alice_db.id,
+                    ),
+                    db=db,
+                    current_user=caller,
+                )
+                raise AssertionError(f"Expected HTTPException(403) for caller={caller.username}")
+            except HTTPException as exc:
+                assert exc.status_code == 403
 
         # 5. mariadb.import_database with tenant_import_credentials uses tenant --defaults-file and --binary-mode
         sql_file = Path(tmpdir) / "tenant.sql"
@@ -775,6 +776,89 @@ def test_impersonate_and_exit_end_to_end():
         assert exc.status_code == 401
 
 
+def test_strict_role_isolation_between_admin_reseller_and_end_user():
+    from fastapi import BackgroundTasks, HTTPException
+    from app.api import app_installer, databases, websites, wordpress_manager
+    from app.schemas.schemas import WebsiteCreate, WebsiteUpdate
+
+    db = _make_db()
+    admin = User(username="admin", email="admin@example.com", hashed_password="x", role="admin", is_active=True)
+    reseller = User(username="reseller1", email="reseller@example.com", hashed_password="x", role="reseller", is_active=True)
+    customer = User(username="shostc", email="shostc@example.com", hashed_password="x", role="user", is_active=True)
+    db.add_all([admin, reseller, customer])
+    db.commit()
+
+    site = Website(domain="shost.com.vn", owner_id=customer.id, root_path="/home/shostc/shost.com.vn", php_version="8.4")
+    db.add(site)
+    db.commit()
+
+    cust_db = DatabaseAccount(owner_id=customer.id, website_id=site.id, db_name="wp_shost", db_user="u_shost", db_password="enc")
+    db.add(cust_db)
+    db.commit()
+
+    # 1. WordPress Manager endpoints must reject Admin and Reseller (403) unless impersonating an End User
+    for privileged_user in (admin, reseller):
+        for fn_call in (
+            lambda u=privileged_user: wordpress_manager.list_wp_instances(db=db, current_user=u),
+            lambda u=privileged_user: wordpress_manager.scan_wp_instances(db=db, current_user=u),
+            lambda u=privileged_user: wordpress_manager._get_accessible_website(site.id, db, u),
+        ):
+            try:
+                fn_call()
+                raise AssertionError(f"Expected 403 for WordPress Manager access by {privileged_user.role}")
+            except HTTPException as exc:
+                assert exc.status_code == 403
+
+    # End User can access their own WordPress Manager instances
+    wp_list = wordpress_manager.list_wp_instances(db=db, current_user=customer)
+    assert len(wp_list["websites"]) == 1 and wp_list["websites"][0]["domain"] == "shost.com.vn"
+
+    # 2. App Installer must reject Admin and Reseller (403)
+    for privileged_user in (admin, reseller):
+        try:
+            app_installer.install_app(
+                payload=app_installer.AppInstallRequest(app_type="wordpress", domain="shost.com.vn"),
+                background_tasks=BackgroundTasks(),
+                db=db,
+                current_user=privileged_user,
+            )
+            raise AssertionError(f"Expected 403 for App Installer access by {privileged_user.role}")
+        except HTTPException as exc:
+            assert exc.status_code == 403
+
+    # 3. Websites creation/assignment must reject Admin/Reseller owning websites directly
+    dummy_req = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={})
+    with patch.object(websites, "reconcile_websites_from_disk"):
+        for privileged_user in (admin, reseller):
+            try:
+                websites.create_website(
+                    payload=WebsiteCreate(domain="illegal-admin-site.com", php_version="8.4", install_wordpress=False),
+                    request=dummy_req,
+                    db=db,
+                    current_user=privileged_user,
+                )
+                raise AssertionError(f"Expected 403 when {privileged_user.role} creates website without End User owner")
+            except HTTPException as exc:
+                assert exc.status_code == 403
+
+        # Assigning a domain to an Admin or Reseller account must be rejected with 403
+        for non_end_user in (admin, reseller):
+            try:
+                websites.update_website(
+                    website_id=site.id,
+                    payload=WebsiteUpdate(owner_id=non_end_user.id),
+                    db=db,
+                    current_user=admin,
+                )
+                raise AssertionError(f"Expected 403 when assigning domain to {non_end_user.role}")
+            except HTTPException as exc:
+                assert exc.status_code == 403
+
+    # 4. list_databases scopes strictly to current_user.id (Admin does not see End User DBs in End-User MySQL list)
+    assert databases.list_databases(q="", db=db, current_user=admin) == []
+    assert len(databases.list_databases(q="", db=db, current_user=customer)) == 1
+
+
 class Release107RegressionTests(unittest.TestCase):
     def test_1_heredocs(self):
         test_installer_and_updater_python_heredocs_compile_cleanly()
@@ -802,6 +886,9 @@ class Release107RegressionTests(unittest.TestCase):
 
     def test_9_impersonate_and_exit(self):
         test_impersonate_and_exit_end_to_end()
+
+    def test_10_strict_role_isolation(self):
+        test_strict_role_isolation_between_admin_reseller_and_end_user()
 
 
 if __name__ == "__main__":

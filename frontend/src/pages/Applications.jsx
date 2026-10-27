@@ -188,9 +188,10 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
   }
 
   function openAppFileManager(app) {
+    if (isAdmin || isReseller) return;
     setFileAppId(String(app.id));
     setFileListPath('');
-    setPage('files');
+    navigateToPage('files');
   }
 
   function renderApplications() {
@@ -451,7 +452,7 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
               </div>
               <div className="site-app-buttons">
                 <button className="mini secondary-light" disabled={!!loading} onClick={() => openSiteAppEdit(app)}><Pencil size={13}/> {app.kind === 'compose' ? 'Compose' : 'Environment'}</button>
-                <button className="mini secondary-light" disabled={!!loading} onClick={() => openAppFileManager(app)}><FolderOpen size={13}/>{t('Files')}</button>
+                {!isAdmin && !isReseller && <button className="mini secondary-light" disabled={!!loading} onClick={() => openAppFileManager(app)}><FolderOpen size={13}/>{t('Files')}</button>}
                 <button className="mini secondary-light" disabled={!!loading} onClick={() => copyWebhookUrl(app)} title={t('Copy GitHub/GitLab Push Webhook URL')}><Copy size={13}/>{t('Webhook')}</button>
                 <button className="mini secondary-light" disabled={!!loading} onClick={() => gitDeploySiteApp(app)} title={t('Pull latest Git commit & redeploy')}><Download size={13}/>{t('Git Deploy')}</button>
                 <button className="mini" disabled={!!loading} onClick={() => deploySiteApp(app)}><Play size={13}/>{t('Deploy')}</button>

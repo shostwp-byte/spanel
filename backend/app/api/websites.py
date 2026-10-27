@@ -636,6 +636,16 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
     folder + Nginx vhost (no DB, no WordPress files)."""
     reconcile_websites_from_disk(db)
     requested_owner_id = payload.owner_id
+    if normalize_role(current_user.role) == Role.reseller:
+        raise HTTPException(
+            status_code=403,
+            detail="Reseller accounts cannot create websites directly. Please use 'Login as' on an End User account.",
+        )
+    if is_admin_role(current_user.role) and requested_owner_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin accounts cannot create websites without an End User owner. Please use 'Login as' on an End User account.",
+        )
     if requested_owner_id is not None and requested_owner_id != current_user.id:
         ensure_role(current_user.role, Role.admin)
 
@@ -645,18 +655,11 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
             raise HTTPException(status_code=404, detail="Owner not found")
     else:
         owner = current_user
-        if False and is_admin_role(current_user.role):
-            end_users = [
-                u for u in db.query(User).order_by(User.id.asc()).all()
-                if not is_admin_role(u.role) and normalize_role(u.role) != Role.reseller
-            ]
-            for u in end_users:
-                if _domain_matches_user(payload.domain, u):
-                    u_count = db.query(Website).filter(Website.owner_id == u.id).count()
-                    eff_limit = int(u.website_limit if u.website_limit is not None else (u.package.website_limit if getattr(u, "package", None) else 0) or 0)
-                    if eff_limit == 0 or u_count < eff_limit:
-                        owner = u
-                        break
+    if is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller:
+        raise HTTPException(
+            status_code=403,
+            detail="Websites can only belong to End User accounts.",
+        )
 
     existing_website = db.query(Website).filter(Website.domain == payload.domain).first()
     if False and existing_website is not None:
@@ -1157,7 +1160,9 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
         owner = db.query(User).filter(User.id == payload.owner_id).first()
         if not owner:
             raise HTTPException(status_code=404, detail="Owner not found")
-        if not is_admin_role(current_user.role) and owner.id != current_user.id and owner.reseller_id != current_user.id:
+        if is_admin_role(owner.role) or normalize_role(owner.role) == Role.reseller:
+            raise HTTPException(status_code=403, detail="Domains can only be assigned to End User accounts")
+        if not is_admin_role(current_user.role) and owner.reseller_id != current_user.id:
             raise HTTPException(status_code=403, detail="Cannot assign domain to a user outside your reseller pool")
         assigned_count = db.query(Website).filter(Website.owner_id == owner.id, Website.id != website.id).count()
         if not is_admin_role(owner.role) and owner.website_limit != 0 and assigned_count >= owner.website_limit:

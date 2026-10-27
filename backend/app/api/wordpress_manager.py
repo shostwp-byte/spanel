@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role, is_admin_role
+from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, User, Website
 from app.services import mariadb, nginx, site_users, wordpress, wordpress_live
@@ -295,14 +295,22 @@ def _visible_custom_sets(state: Dict[str, Any], current_user: User) -> List[Dict
 
 # ── Helpers for Website Access & WP-CLI Execution ────────────────────────────
 
+def _require_end_user_wp_access(current_user: User) -> None:
+    role = normalize_role(getattr(current_user, "role", None))
+    if is_admin_role(getattr(current_user, "role", None)) or role == Role.reseller:
+        raise HTTPException(
+            status_code=403,
+            detail="WordPress Manager is only available for End User accounts. Please use 'Login as' to manage a user's WordPress instances.",
+        )
+
+
 def _get_accessible_website(website_id: int, db: Session, current_user: User) -> Website:
+    _require_end_user_wp_access(current_user)
     site = db.query(Website).filter(Website.id == website_id).first()
     if not site:
         raise HTTPException(status_code=404, detail="Website not found")
-    if site.owner_id != current_user.id and not is_admin_role(current_user.role):
-        owner = db.query(User).filter(User.id == site.owner_id).first()
-        if not (current_user.role == Role.reseller.value and owner and owner.reseller_id == current_user.id):
-            ensure_role(current_user.role, Role.admin)
+    if site.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
     return site
 
 
@@ -1148,10 +1156,9 @@ def list_wp_instances(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    _require_end_user_wp_access(current_user)
     reconcile_wordpress_databases(db)
-    query = db.query(Website)
-    if not is_admin_role(current_user.role):
-        query = query.filter(Website.owner_id == current_user.id)
+    query = db.query(Website).filter(Website.owner_id == current_user.id)
     websites = query.order_by(Website.id.desc()).all()
 
     state = _load_toolkit_state()
@@ -1187,10 +1194,9 @@ def scan_wp_instances(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    _require_end_user_wp_access(current_user)
     reconcile_wordpress_databases(db)
-    query = db.query(Website)
-    if not is_admin_role(current_user.role):
-        query = query.filter(Website.owner_id == current_user.id)
+    query = db.query(Website).filter(Website.owner_id == current_user.id)
     websites = query.all()
 
     state = _load_toolkit_state()
@@ -1233,6 +1239,7 @@ def install_wp_instance(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    _require_end_user_wp_access(current_user)
     site: Optional[Website] = None
     if payload.website_id:
         site = _get_accessible_website(payload.website_id, db, current_user)
@@ -2725,6 +2732,7 @@ def create_package_set(
     payload: WpPackageSetCreatePayload,
     current_user: User = Depends(get_current_user),
 ):
+    _require_end_user_wp_access(current_user)
     name = (payload.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Vui lòng nhập tên Bộ cài đặt (Package Set).")
@@ -2761,6 +2769,7 @@ def delete_package_set(
     set_id: str,
     current_user: User = Depends(get_current_user),
 ):
+    _require_end_user_wp_access(current_user)
     state = _load_toolkit_state()
     raw_sets = list(state.get("custom_sets") or [])
     target_set = next((s for s in raw_sets if s.get("id") == set_id), None)
@@ -2784,6 +2793,7 @@ def apply_package_set(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    _require_end_user_wp_access(current_user)
     state = _load_toolkit_state()
     all_sets = [*DEFAULT_PACKAGE_SETS, *(state.get("custom_sets") or [])]
     all_sets = [*DEFAULT_PACKAGE_SETS, *_visible_custom_sets(state, current_user)]

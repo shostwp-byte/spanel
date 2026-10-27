@@ -149,9 +149,7 @@ def list_databases(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = db.query(DatabaseAccount)
-    if not is_admin_role(current_user.role):
-        query = query.filter(DatabaseAccount.owner_id == current_user.id)
+    query = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == current_user.id)
     search = (q or "").strip().lower()
     if search:
         like = f"%{search}%"
