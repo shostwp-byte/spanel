@@ -1029,6 +1029,121 @@ def test_p0_1_clone_rejects_symlink_and_mismatched_uid_and_cleans_orphan_db(tmp_
         settings.command_dry_run = orig_dry
 
 
+def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path):
+    from app.api import wordpress_manager
+    from app.core.config import settings
+    from app.models.entities import WebsiteAlias
+    from app.services import nginx
+    from app.services.shell import CommandResult
+
+    db = _make_db()
+    alice = User(username="alice", email="alice@example.com", hashed_password="x", role="user", is_active=True)
+    db.add(alice)
+    db.commit()
+
+    site_root = tmp_path / "alice.example.com"
+    wp_dir = site_root / "public_html"
+    (wp_dir / "wp-includes").mkdir(parents=True, exist_ok=True)
+    (wp_dir / "wp-content" / "uploads").mkdir(parents=True, exist_ok=True)
+    (wp_dir / "wp-includes" / "version.php").write_text("<?php\n$wp_version = '6.8.1';\n", encoding="utf-8")
+    (wp_dir / "wp-config.php").write_text("<?php\ndefine('DB_NAME', 'wp_a');\n", encoding="utf-8")
+
+    site = Website(
+        domain="alice.example.com",
+        owner_id=alice.id,
+        root_path=str(site_root),
+        php_version="8.4",
+        linux_user="alice",
+        app_type="php",
+        nginx_custom="# custom directive keep me\n",
+        waf_enabled=False,
+        http_flood_enabled=True,
+    )
+    db.add(site)
+    db.commit()
+
+    alias_mirror = WebsiteAlias(website_id=site.id, domain="www.alice.example.com", mode="alias")
+    alias_redir = WebsiteAlias(website_id=site.id, domain="old.alice.example.com", mode="redirect")
+    db.add_all([alias_mirror, alias_redir])
+    db.commit()
+    db.refresh(site)
+
+    orig_dry = settings.command_dry_run
+    settings.command_dry_run = False
+    try:
+        captured_vhost_calls = []
+
+        def fake_rewrite_vhost(domain, root_path, **kwargs):
+            captured_vhost_calls.append((domain, root_path, kwargs))
+            return "server {}"
+
+        # 1. Root site: enabling uploads_php_blocked calls _rewrite_website_vhost preserving aliases, redirects, custom_directives, waf_enabled
+        st = wordpress_manager._load_toolkit_state()
+        st.setdefault("instances", {})[str(site.id)] = {"installed": True, "subpath": ""}
+        wordpress_manager._save_toolkit_state(st)
+
+        with patch.object(nginx, "rewrite_vhost", side_effect=fake_rewrite_vhost), \
+             patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("write", 0, "", "")):
+            wordpress_manager.apply_wp_security(
+                website_id=site.id,
+                payload=wordpress_manager.WpSecurityActionPayload(
+                    check_ids=["uploads_php_blocked"],
+                    action="secure",
+                ),
+                db=db,
+                current_user=alice,
+            )
+
+        assert len(captured_vhost_calls) == 1
+        dom, _, kw = captured_vhost_calls[0]
+        assert dom == "alice.example.com"
+        assert kw["app_type"] == "wordpress"
+        assert kw["custom_directives"] == "# custom directive keep me\n"
+        assert kw["waf_enabled"] is False
+        assert kw["http_flood_enabled"] is True
+        assert "www.alice.example.com" in (kw.get("aliases") or [])
+        assert "old.alice.example.com" in (kw.get("redirects") or [])
+        assert site.app_type == "wordpress"
+
+        # 2. Subpath WordPress on a non-wordpress site: site.app_type must NOT change
+        site.app_type = "php"
+        db.commit()
+        st = wordpress_manager._load_toolkit_state()
+        st.setdefault("instances", {})[str(site.id)] = {"installed": True, "subpath": "blog"}
+        wordpress_manager._save_toolkit_state(st)
+        (wp_dir / "blog" / "wp-includes").mkdir(parents=True, exist_ok=True)
+        (wp_dir / "blog" / "wp-includes" / "version.php").write_text("<?php\n$wp_version = '6.8.1';\n", encoding="utf-8")
+
+        captured_vhost_calls.clear()
+        with patch.object(nginx, "rewrite_vhost", side_effect=fake_rewrite_vhost), \
+             patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("write", 0, "", "")):
+            wordpress_manager.apply_wp_security(
+                website_id=site.id,
+                payload=wordpress_manager.WpSecurityActionPayload(
+                    check_ids=["uploads_php_blocked"],
+                    action="secure",
+                ),
+                db=db,
+                current_user=alice,
+            )
+            # Also verify turning off sensitive_files_blocked does not write fake readme.html (P2-4)
+            wordpress_manager.apply_wp_security(
+                website_id=site.id,
+                payload=wordpress_manager.WpSecurityActionPayload(
+                    check_ids=["sensitive_files_blocked"],
+                    action="revert",
+                ),
+                db=db,
+                current_user=alice,
+            )
+
+        assert site.app_type == "php", "Subpath WordPress must not overwrite parent site.app_type"
+        assert captured_vhost_calls == []
+        assert not (wp_dir / "blog" / "readme.html").exists()
+    finally:
+        settings.command_dry_run = orig_dry
+
+
 if __name__ == "__main__":
     import tempfile as _tf
 
@@ -1044,6 +1159,8 @@ if __name__ == "__main__":
     test_strict_role_isolation_between_admin_reseller_and_end_user()
     with _tf.TemporaryDirectory() as _td:
         test_p0_1_clone_rejects_symlink_and_mismatched_uid_and_cleans_orphan_db(Path(_td))
+    with _tf.TemporaryDirectory() as _td2:
+        test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(Path(_td2))
     print("ALL TESTS PASSED")
 
 

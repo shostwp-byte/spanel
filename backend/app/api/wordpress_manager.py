@@ -532,6 +532,24 @@ def _detect_wp_version(
     return ""
 
 
+def _vhost_blocks_uploads_php(site: Optional[Website], subpath: str = "") -> bool:
+    if site is None:
+        return False
+    clean_sub = (subpath or "").strip("/")
+    expected_prefix = f"/{clean_sub}/wp-content/uploads/" if clean_sub else "/wp-content/uploads/"
+    try:
+        vhost_file = Path(settings.nginx_sites_available) / f"{site.domain}.conf"
+        if vhost_file.is_file():
+            content = vhost_file.read_text(encoding="utf-8", errors="replace")
+            if expected_prefix in content and "deny all" in content:
+                return True
+    except Exception:
+        pass
+    if not clean_sub and getattr(site, "app_type", "") == "wordpress":
+        return True
+    return False
+
+
 def _evaluate_security_checks(
     wp_dir: Path,
     config_info: Dict[str, Any],
@@ -539,6 +557,7 @@ def _evaluate_security_checks(
     linux_user: Optional[str] = None,
     site_root: Optional[Path] = None,
     live_admin_user: Optional[str] = None,
+    site: Optional[Website] = None,
 ) -> List[Dict[str, Any]]:
     sec_overrides = saved_inst.get("security_overrides") or {}
     uploads_ht = _read_wp_file_text(wp_dir, "wp-content/uploads/.htaccess", linux_user=linux_user, site_root=site_root)
@@ -553,8 +572,8 @@ def _evaluate_security_checks(
             or wordpress_live.wp_path_exists(wp_dir, ".spanel-block-xmlrpc", linux_user, site_root)
         ),
         "uploads_php_blocked": bool(
-            ("php" in uploads_ht.lower())
-            or wordpress_live.wp_path_exists(wp_dir, "wp-content/uploads/.spanel-no-php", linux_user, site_root)
+            _vhost_blocks_uploads_php(site, saved_inst.get("subpath") or "")
+            or ("php" in uploads_ht.lower())
         ),
         "permissions_strict": bool(sec_overrides.get("permissions_strict", True)),
         "keys_salts_fresh": int(config_info.get("salts_count") or 0) >= 8 or bool(sec_overrides.get("keys_salts_fresh")),
@@ -886,7 +905,7 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
         toggles["password_protection"] = htpasswd_active
 
     sec_checks = _evaluate_security_checks(
-        wp_dir, cfg, saved, linux_user=linux_user, site_root=site_root, live_admin_user=live_admin_user
+        wp_dir, cfg, saved, linux_user=linux_user, site_root=site_root, live_admin_user=live_admin_user, site=site
     )
     passed_count = sum(1 for c in sec_checks if c["passed"])
     critical_failed = any(c["critical"] and not c["passed"] for c in sec_checks)
@@ -1293,11 +1312,13 @@ def install_wp_instance(
     except Exception as exc:
         logger.warning("ensure_site_runtime warning on WP install: %s", exc)
 
-    site.app_type = "wordpress"
+    subpath_clean_install = (payload.subpath or "").strip("/")
+    if not subpath_clean_install:
+        site.app_type = "wordpress"
+        site.nginx_rewrite_mode = "front_controller"
     site.php_version = php_ver
     site.linux_user = linux_user
     site.root_path = str(site_root)
-    site.nginx_rewrite_mode = "front_controller"
 
     # 2. Provision or bind MySQL Database
     db_acc: Optional[DatabaseAccount] = None
@@ -1469,15 +1490,20 @@ def install_wp_instance(
 
     # Update Nginx vhost for WordPress front controller
     try:
+        from app.api.websites import _rewrite_website_vhost
+
         php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
-        nginx.rewrite_vhost(
-            site.domain,
-            str(site_root),
-            app_type="wordpress",
+        eff_app_type = site.app_type if subpath_clean_install else "wordpress"
+        eff_rewrite_mode = (site.nginx_rewrite_mode or "front_controller") if subpath_clean_install else "front_controller"
+        _rewrite_website_vhost(
+            site,
+            root_path=str(site_root),
+            linux_user=linux_user,
+            app_type=eff_app_type,
             php_version=php_ver,
             php_fpm_socket_override=php_socket,
             document_root=site.document_root or "public_html",
-            rewrite_mode="front_controller",
+            rewrite_mode=eff_rewrite_mode,
         )
     except Exception as exc:
         logger.warning("Nginx rewrite on WP install warning: %s", exc)
@@ -1721,11 +1747,14 @@ def update_wp_general(
     if payload.php_version and payload.php_version != site.php_version:
         site.php_version = payload.php_version
         try:
+            from app.api.websites import _rewrite_website_vhost
+
             site_users.ensure_site_runtime(site.domain, str(site_root), site.php_version, linux_user)
             php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), site.php_version)
-            nginx.rewrite_vhost(
-                site.domain,
-                str(site_root),
+            _rewrite_website_vhost(
+                site,
+                root_path=str(site_root),
+                linux_user=linux_user,
                 app_type=site.app_type,
                 php_version=site.php_version,
                 php_fpm_socket_override=php_socket,
@@ -2390,23 +2419,35 @@ def apply_wp_security(
                 "<Files *.php>\ndeny from all\n</Files>\n",
                 "0644",
             )
-            _write_wp_file_text(linux_user, site_root, wp_dir, "wp-content/uploads/.spanel-no-php", "1\n", "0644")
-            if not settings.command_dry_run and site.app_type != "wordpress":
+            subpath_clean = (inst.get("subpath") or "").strip("/")
+            if not settings.command_dry_run and not subpath_clean and site.app_type != "wordpress":
+                from app.api.websites import _rewrite_website_vhost
+
+                prev_app_type = site.app_type
+                prev_rewrite_mode = site.nginx_rewrite_mode
                 try:
-                    site.app_type = "wordpress"
-                    db.commit()
                     php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
-                    nginx.rewrite_vhost(
-                        site.domain,
-                        str(site_root),
+                    _rewrite_website_vhost(
+                        site,
+                        root_path=str(site_root),
+                        linux_user=linux_user,
                         app_type="wordpress",
                         php_version=php_ver,
                         php_fpm_socket_override=php_socket,
                         document_root=site.document_root or "public_html",
                         rewrite_mode="front_controller",
                     )
-                except Exception:
-                    pass
+                    site.app_type = "wordpress"
+                    site.nginx_rewrite_mode = "front_controller"
+                    db.commit()
+                except Exception as exc:
+                    site.app_type = prev_app_type
+                    site.nginx_rewrite_mode = prev_rewrite_mode
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Không thể cập nhật cấu hình Nginx vhost khi bật chặn PHP trong uploads: {exc}",
+                    ) from exc
         elif cid == "uploads_php_blocked" and not turn_on:
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.htaccess")
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.spanel-no-php")
@@ -2414,8 +2455,6 @@ def apply_wp_security(
             if turn_on:
                 wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "readme.html")
                 wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-config-sample.php")
-            else:
-                _write_wp_file_text(linux_user, site_root, wp_dir, "readme.html", "WordPress\n", "0644")
         elif cid == "author_enum_blocked" and turn_on:
             _write_wp_file_text(
                 linux_user,
