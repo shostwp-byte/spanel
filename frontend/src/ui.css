@@ -3325,5 +3325,187 @@ input[type="checkbox"].sp-switch-input:disabled,
   background: var(--surface-alt);
 }
 
+/* ==========================================================================
+   Unified Modal Dialogs (.modal-overlay, .modal-backdrop, .modal, .modal-card)
+   Ensures solid elevated background across WordPress Manager, Laravel Manager,
+   Databases, IP Manager, Resource Monitor, and Maintenance dialogs.
+   ========================================================================== */
+.modal-overlay,
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.modal,
+.modal-card {
+  background: var(--bg-elevated, #ffffff) !important;
+  color: var(--text, #0f172a);
+  border-radius: 16px !important;
+  width: 100%;
+  max-width: 560px;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 24px 48px -12px rgba(15, 23, 42, 0.35), 0 0 0 1px rgba(15, 23, 42, 0.08) !important;
+  border: 1px solid var(--border-strong, #cbd5e1) !important;
+}
+
+.modal-header {
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--border, #e2e8f0);
+  background: var(--surface-alt, #f8fafc);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text, #0f172a);
+}
+
+.modal-header .icon-button {
+  width: 32px !important;
+  min-width: 32px !important;
+  height: 32px !important;
+  min-height: 32px !important;
+  padding: 0 !important;
+  border-radius: 8px !important;
+  background: transparent !important;
+  color: var(--text-secondary, #475569) !important;
+  border: 1px solid transparent !important;
+  box-shadow: none !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+.modal-header .icon-button:hover {
+  background: var(--surface-hover, #e2e8f0) !important;
+  color: var(--text, #0f172a) !important;
+}
+
+.modal-body {
+  padding: 20px 22px;
+  background: var(--bg-elevated, #ffffff);
+}
+
+.modal label:not(.check-line),
+.modal-body label:not(.check-line) {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #0f172a);
+  margin: 0;
+}
+
+.modal label.check-line,
+.modal-body label.check-line {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text, #0f172a);
+}
+
+.modal label > span,
+.modal-body label > span {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary, #475569);
+}
+
+.modal label.check-line > span,
+.modal-body label.check-line > span {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text, #0f172a);
+}
+
+.modal input:not([type="checkbox"]):not([type="radio"]),
+.modal select,
+.modal textarea,
+.modal-body input:not([type="checkbox"]):not([type="radio"]),
+.modal-body select,
+.modal-body textarea {
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 12px;
+  border: 1px solid var(--border-strong, #cbd5e1);
+  border-radius: 8px;
+  background: var(--bg-elevated, #ffffff);
+  color: var(--text, #0f172a);
+  font-size: 13.5px;
+}
+
+.modal input:not([type="checkbox"]):not([type="radio"]):focus,
+.modal select:focus,
+.modal textarea:focus,
+.modal-body input:not([type="checkbox"]):not([type="radio"]):focus,
+.modal-body select:focus,
+.modal-body textarea:focus {
+  outline: none;
+  border-color: var(--primary, #4f46e5);
+  box-shadow: 0 0 0 3px var(--ring, rgba(79, 70, 229, 0.2));
+}
+
+.modal-footer {
+  padding: 14px 22px;
+  background: var(--surface-alt, #f8fafc);
+  border-top: 1px solid var(--border, #e2e8f0);
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+}
+
+:root[data-theme="dark"] .modal-overlay,
+:root[data-theme="dark"] .modal-backdrop {
+  background-color: rgba(2, 6, 23, 0.72);
+}
+
+:root[data-theme="dark"] .modal,
+:root[data-theme="dark"] .modal-card {
+  background: var(--bg-elevated, #1e293b) !important;
+  border-color: var(--border-strong, #475569) !important;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.65) !important;
+}
+
+:root[data-theme="dark"] .modal-header,
+:root[data-theme="dark"] .modal-footer {
+  background: var(--surface-sunken, #0f172a);
+  border-color: var(--border, #334155);
+}
+
+:root[data-theme="dark"] .modal-body {
+  background: var(--bg-elevated, #1e293b);
+}
+
+:root[data-theme="dark"] .modal input:not([type="checkbox"]):not([type="radio"]),
+:root[data-theme="dark"] .modal select,
+:root[data-theme="dark"] .modal textarea,
+:root[data-theme="dark"] .modal-body input:not([type="checkbox"]):not([type="radio"]),
+:root[data-theme="dark"] .modal-body select,
+:root[data-theme="dark"] .modal-body textarea {
+  background: var(--surface-sunken, #0f172a);
+  border-color: var(--border-strong, #475569);
+  color: var(--text, #f8fafc);
+}
+
+
 
 
