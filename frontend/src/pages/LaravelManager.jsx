@@ -666,98 +666,6 @@ export function LaravelManagerPage({
 
   // ── Sub-renderers ──────────────────────────────────────────────────────────
 
-  function renderTopAppSwitcher() {
-    const appTabs = [
-      { key: 'docker_manager', num: '1', label: 'Docker', active: false },
-      { key: 'nodejs_manager', num: '2', label: 'Node.js', active: false },
-      { key: 'laravel_manager', num: '3', label: 'Laravel', active: true },
-      { key: 'wordpress_manager', num: '4', label: 'WordPress', active: false },
-    ];
-    return (
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          flexWrap: 'wrap',
-          gap: '12px',
-          paddingBottom: '14px',
-          marginBottom: '18px',
-          borderBottom: '1px solid var(--border)',
-        }}
-      >
-        <div
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: '4px',
-            padding: '4px',
-            borderRadius: '10px',
-            background: 'var(--surface-alt)',
-            border: '1px solid var(--border)',
-          }}
-        >
-          {appTabs.map(tab => (
-            <button
-              key={tab.key}
-              type="button"
-              onClick={() => !tab.active && navigateToPage && navigateToPage(tab.key)}
-              style={{
-                height: '32px',
-                minHeight: '32px',
-                padding: '0 14px',
-                borderRadius: '7px',
-                fontSize: '12.5px',
-                fontWeight: tab.active ? 700 : 600,
-                border: tab.active ? '1px solid var(--border)' : '1px solid transparent',
-                background: tab.active ? 'var(--surface)' : 'transparent',
-                color: tab.active ? 'var(--text)' : 'var(--text-muted)',
-                boxShadow: tab.active ? '0 1px 2px rgba(15, 23, 42, 0.06)' : 'none',
-                cursor: tab.active ? 'default' : 'pointer',
-              }}
-            >
-              {tab.num}. {tab.label}
-            </button>
-          ))}
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          <button
-            type="button"
-            className="secondary-light"
-            disabled={isBusy('scan')}
-            onClick={handleScanSites}
-            style={{ height: '36px', minHeight: '36px', padding: '0 14px', fontSize: '12.5px', fontWeight: 600 }}
-          >
-            <RefreshCw size={14} className={isBusy('scan') ? 'spin' : ''} />
-            <span>{t('Quét dự án Laravel có sẵn')}</span>
-          </button>
-          <button
-            type="button"
-            onClick={openInstallModal}
-            style={{
-              height: '36px',
-              minHeight: '36px',
-              padding: '0 16px',
-              borderRadius: '9px',
-              background: '#0f172a',
-              color: '#ffffff',
-              border: '1px solid #0f172a',
-              fontSize: '12.5px',
-              fontWeight: 700,
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
-            }}
-          >
-            <Plus size={15} />
-            <span>+ Cài Laravel 1-Click</span>
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   function renderProjectMinimalCard(inst) {
     const isSelected = selectedInstance?.id === inst.id;
     const isDown = !!inst.maintenance_mode;
@@ -2396,7 +2304,7 @@ export function LaravelManagerPage({
   }
 
   return (
-    <section className="section laravel-manager-page">
+    <div className="section laravel-manager-page" style={{ padding: '20px 24px' }}>
       <style>{`
         .lv-minimal-card:hover {
           border-color: #0f172a !important;
@@ -2437,63 +2345,182 @@ export function LaravelManagerPage({
         }
       `}</style>
 
-      {/* Top Application Group Switcher [1. Docker | 2. Node.js | 3. Laravel | 4. WordPress] */}
-      {renderTopAppSwitcher()}
-
-      {/* Main Title & Subtitle matching Mockup #3 */}
+      {/* 1. Page Header & Breadcrumb (matching WordPress Manager) */}
       <div
         style={{
           display: 'flex',
-          alignItems: 'flex-start',
           justifyContent: 'space-between',
+          alignItems: 'center',
           flexWrap: 'wrap',
           gap: '12px',
-          marginBottom: '12px',
+          marginBottom: '16px',
         }}
       >
-        <div>
-          <h2 style={{ margin: 0, fontSize: '21px', fontWeight: 800, color: 'var(--text)' }}>
-            3. Quản lý Dự án Laravel
-          </h2>
-          <p style={{ margin: '4px 0 0', fontSize: '13px', color: 'var(--text-muted)' }}>
-            Cài đặt Laravel 1-Click bằng Composer, tự động trỏ <code>/public</code>, tích hợp
-            Artisan Toolkit &amp; Queue Worker.
-          </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div
+            style={{
+              width: '38px',
+              height: '38px',
+              borderRadius: '10px',
+              background: 'color-mix(in srgb, var(--primary) 12%, transparent)',
+              color: 'var(--primary)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <LaravelBrandIcon size={22} />
+          </div>
+          <div>
+            <h2 style={{ margin: 0, fontSize: '18px', fontWeight: 700, color: 'var(--text)' }}>
+              Laravel Manager
+            </h2>
+            <p className="hint" style={{ margin: '2px 0 0', fontSize: '12.5px' }}>
+              Quản lý tập trung toàn bộ vòng đời Dự án Laravel: Cài đặt Composer 1-Click, tự động trỏ{' '}
+              <code>/public</code>, tích hợp Artisan Toolkit, Queue Worker &amp; Bảo mật.
+            </p>
+          </div>
         </div>
 
-        {/* View Mode Switcher & Search */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <button
+            type="button"
+            className="secondary-light"
+            disabled={isBusy('refresh')}
+            onClick={() => loadInstances(true)}
+            style={{ height: '36px', padding: '0 14px', fontSize: '13px' }}
+          >
+            <RefreshCw size={14} className={isBusy('refresh') ? 'spin' : ''} /> Làm mới
+          </button>
+        </div>
+      </div>
+
+      {/* 2. Global Top Tabs + Search Bar (matching WordPress Manager) */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-end',
+          flexWrap: 'wrap',
+          gap: '12px',
+          borderBottom: '1px solid var(--border)',
+          marginBottom: '16px',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            style={{
+              height: '40px',
+              minHeight: '40px',
+              padding: '0 18px',
+              marginBottom: '-1px',
+              borderRadius: '8px 8px 0 0',
+              border: '1px solid var(--border)',
+              borderBottom: '2px solid var(--primary)',
+              background: 'var(--surface)',
+              color: 'var(--primary)',
+              fontWeight: 600,
+              fontSize: '13.5px',
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '7px',
+              boxShadow: 'none',
+            }}
+          >
+            <span>Instances</span>
+            <span
+              className="badge"
+              style={{
+                fontSize: '11px',
+                padding: '1px 6px',
+                background: 'color-mix(in srgb, var(--primary) 12%, transparent)',
+                color: 'var(--primary)',
+              }}
+            >
+              {instances.length}
+            </span>
+          </button>
+        </div>
+
+        <div style={{ position: 'relative', width: '280px', marginBottom: '6px' }}>
+          <Search
+            size={15}
+            style={{
+              position: 'absolute',
+              left: '11px',
+              top: '50%',
+              transform: 'translateY(-50%)',
+              color: 'var(--text-muted)',
+            }}
+          />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Tìm kiếm tên miền, DB, phiên bản..."
+            style={{
+              height: '34px',
+              paddingLeft: '34px',
+              paddingRight: '10px',
+              fontSize: '13px',
+              width: '100%',
+              borderRadius: '8px',
+            }}
+          />
+        </div>
+      </div>
+
+      {/* 3. Global Action Toolbar (matching WordPress Manager) */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: '10px',
+          marginBottom: '16px',
+          padding: '10px 14px',
+          background: 'var(--surface-alt)',
+          border: '1px solid var(--border)',
+          borderRadius: '10px',
+        }}
+      >
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          <div style={{ position: 'relative' }}>
-            <Search
-              size={14}
-              style={{
-                position: 'absolute',
-                left: '11px',
-                top: '50%',
-                transform: 'translateY(-50%)',
-                color: 'var(--text-muted)',
-              }}
-            />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
-              placeholder="Tìm tên miền, DB, phiên bản..."
-              style={{
-                height: '34px',
-                paddingLeft: '32px',
-                paddingRight: '12px',
-                fontSize: '12.5px',
-                width: '220px',
-                borderRadius: '8px',
-              }}
-            />
-          </div>
+          <button
+            type="button"
+            onClick={openInstallModal}
+            style={{
+              height: '34px',
+              minHeight: '34px',
+              padding: '0 14px',
+              fontSize: '13px',
+              fontWeight: 600,
+              background: 'var(--primary)',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '7px',
+            }}
+          >
+            <Plus size={14} /> Install
+          </button>
+
+          <button
+            type="button"
+            className="secondary-light"
+            disabled={isBusy('scan')}
+            onClick={handleScanSites}
+            style={{ height: '34px', minHeight: '34px', padding: '0 12px', fontSize: '13px' }}
+            title="Quét tự động các dự án Laravel có sẵn trên tài khoản"
+          >
+            <Search size={14} /> Scan
+          </button>
 
           <select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
-            style={{ height: '34px', fontSize: '12.5px', borderRadius: '8px', width: 'auto' }}
+            style={{ height: '34px', fontSize: '12.5px', borderRadius: '7px', width: 'auto' }}
           >
             <option value="all">Tất cả dự án ({instances.length})</option>
             <option value="healthy">Healthy (Hoạt động tốt)</option>
@@ -2502,100 +2529,74 @@ export function LaravelManagerPage({
             <option value="maintenance">Đang Bảo trì (Down)</option>
             <option value="security_warn">Cần gia cố bảo mật</option>
           </select>
+        </div>
 
-          <div
+        <div
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: '7px',
+            padding: '2px',
+            gap: '2px',
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setViewMode('cards')}
             style={{
-              display: 'inline-flex',
-              padding: '3px',
-              borderRadius: '8px',
-              background: 'var(--surface-alt)',
-              border: '1px solid var(--border)',
+              height: '28px',
+              minHeight: '28px',
+              padding: '0 10px',
+              fontSize: '11.5px',
+              borderRadius: '5px',
+              background: viewMode === 'cards' ? 'var(--primary)' : 'transparent',
+              color: viewMode === 'cards' ? '#fff' : 'var(--text-secondary)',
+              border: 'none',
+              fontWeight: viewMode === 'cards' ? 600 : 500,
+              boxShadow: 'none',
             }}
           >
-            <button
-              type="button"
-              onClick={() => setViewMode('cards')}
-              style={{
-                height: '28px',
-                minHeight: '28px',
-                padding: '0 10px',
-                fontSize: '11.5px',
-                borderRadius: '6px',
-                background: viewMode === 'cards' ? 'var(--surface)' : 'transparent',
-                color: viewMode === 'cards' ? 'var(--text)' : 'var(--text-muted)',
-                border: 'none',
-                fontWeight: viewMode === 'cards' ? 700 : 500,
-              }}
-            >
-              Thẻ &amp; Toolkit
-            </button>
-            <button
-              type="button"
-              onClick={() => setViewMode('expanded')}
-              style={{
-                height: '28px',
-                minHeight: '28px',
-                padding: '0 10px',
-                fontSize: '11.5px',
-                borderRadius: '6px',
-                background: viewMode === 'expanded' ? 'var(--surface)' : 'transparent',
-                color: viewMode === 'expanded' ? 'var(--text)' : 'var(--text-muted)',
-                border: 'none',
-                fontWeight: viewMode === 'expanded' ? 700 : 500,
-              }}
-            >
-              Chi tiết 5 Tab
-            </button>
-            <button
-              type="button"
-              onClick={() => setViewMode('list')}
-              style={{
-                height: '28px',
-                minHeight: '28px',
-                padding: '0 10px',
-                fontSize: '11.5px',
-                borderRadius: '6px',
-                background: viewMode === 'list' ? 'var(--surface)' : 'transparent',
-                color: viewMode === 'list' ? 'var(--text)' : 'var(--text-muted)',
-                border: 'none',
-                fontWeight: viewMode === 'list' ? 700 : 500,
-              }}
-            >
-              Dạng Bảng
-            </button>
-          </div>
+            Thẻ &amp; Toolkit
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode('expanded')}
+            style={{
+              height: '28px',
+              minHeight: '28px',
+              padding: '0 10px',
+              fontSize: '11.5px',
+              borderRadius: '5px',
+              background: viewMode === 'expanded' ? 'var(--primary)' : 'transparent',
+              color: viewMode === 'expanded' ? '#fff' : 'var(--text-secondary)',
+              border: 'none',
+              fontWeight: viewMode === 'expanded' ? 600 : 500,
+              boxShadow: 'none',
+            }}
+          >
+            Chi tiết 5 Tab
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode('list')}
+            style={{
+              height: '28px',
+              minHeight: '28px',
+              padding: '0 10px',
+              fontSize: '11.5px',
+              borderRadius: '5px',
+              background: viewMode === 'list' ? 'var(--primary)' : 'transparent',
+              color: viewMode === 'list' ? '#fff' : 'var(--text-secondary)',
+              border: 'none',
+              fontWeight: viewMode === 'list' ? 600 : 500,
+              boxShadow: 'none',
+            }}
+          >
+            Dạng Bảng
+          </button>
         </div>
-      </div>
-
-      {/* Minimalist Design Hint Pill matching Mockup #3 */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '8px',
-          padding: '8px 14px',
-          borderRadius: '9px',
-          background: 'rgba(16, 185, 129, 0.06)',
-          border: '1px solid rgba(16, 185, 129, 0.22)',
-          color: '#047857',
-          fontSize: '12px',
-          fontWeight: 600,
-          marginBottom: '18px',
-        }}
-      >
-        <span
-          style={{
-            width: '7px',
-            height: '7px',
-            borderRadius: '999px',
-            background: '#10b981',
-            flexShrink: 0,
-          }}
-        />
-        <span>
-          Thiết kế tối giản: Mặc định chỉ hiện thông tin cốt lõi. Khi di chuột (Hover) vào Card mới
-          hiện thanh nút Icon hành động.
-        </span>
       </div>
 
       {/* Newly Installed Credentials Banner */}
@@ -2657,33 +2658,60 @@ export function LaravelManagerPage({
       ) : filteredInstances.length === 0 ? (
         <div
           style={{
-            padding: '54px 24px',
-            borderRadius: '16px',
-            border: '1px dashed var(--border)',
+            border: '1px solid var(--border)',
+            borderRadius: '14px',
             background: 'var(--surface)',
+            padding: '48px 24px',
             textAlign: 'center',
           }}
         >
-          <Code2 size={40} style={{ color: '#ef4444', opacity: 0.85, margin: '0 auto 12px' }} />
-          <h3 style={{ margin: '0 0 6px', fontSize: '16px', fontWeight: 700 }}>
+          <div
+            style={{
+              width: '54px',
+              height: '54px',
+              borderRadius: '14px',
+              background: 'color-mix(in srgb, var(--primary) 10%, transparent)',
+              color: 'var(--primary)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              margin: '0 auto 14px',
+            }}
+          >
+            <LaravelBrandIcon size={28} />
+          </div>
+          <h3 style={{ margin: '0 0 6px', fontSize: '16px', color: 'var(--text)' }}>
             Chưa có dự án Laravel nào được quản lý
           </h3>
           <p
+            className="hint"
             style={{
               margin: '0 auto 18px',
-              maxWidth: '520px',
+              maxWidth: '500px',
               fontSize: '13px',
-              color: 'var(--text-muted)',
+              lineHeight: 1.55,
             }}
           >
-            Khởi tạo dự án Laravel 11.x / 10.x mới bằng Composer chỉ với 1-Click (tự động tạo
-            Database, sinh khóa <code>APP_KEY</code> và trỏ Document Root vào <code>/public</code>),
-            hoặc quét các dự án có sẵn trên tài khoản.
+            Bấm <strong>Install</strong> để khởi tạo dự án Laravel 11.x / 10.x mới bằng Composer chỉ
+            với 1 cú nhấp chuột (tự động tạo Database, sinh khóa <code>APP_KEY</code> và trỏ Document
+            Root vào <code>/public</code>), hoặc bấm <strong>Scan</strong> để nhận diện các dự án có
+            sẵn.
           </p>
           <div style={{ display: 'inline-flex', gap: '10px', flexWrap: 'wrap' }}>
-            <button type="button" onClick={openInstallModal} style={{ height: '38px', padding: '0 18px' }}>
-              <Plus size={15} />
-              <span>+ Cài Laravel 1-Click</span>
+            <button
+              type="button"
+              onClick={openInstallModal}
+              style={{
+                height: '38px',
+                padding: '0 18px',
+                background: 'var(--primary)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '8px',
+                fontWeight: 600,
+              }}
+            >
+              <Plus size={15} /> Cài đặt Laravel ngay
             </button>
             <button
               type="button"
@@ -2691,8 +2719,7 @@ export function LaravelManagerPage({
               onClick={handleScanSites}
               style={{ height: '38px', padding: '0 16px' }}
             >
-              <RefreshCw size={14} />
-              <span>Quét dự án có sẵn</span>
+              <Search size={15} /> Quét nhận diện (Scan)
             </button>
           </div>
         </div>
@@ -3648,7 +3675,7 @@ export function LaravelManagerPage({
           </div>
         </div>
       )}
-    </section>
+    </div>
   );
 }
 
