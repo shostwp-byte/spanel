@@ -9725,7 +9725,9 @@ quota_status() {
   fi
   command -v setquota >/dev/null 2>&1 && tools=yes
   if [[ "$tools" == yes && "$active" == yes && "$fstype" == ext4 ]]; then
-    if [[ "$(type -t quotaon)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+    if [[ "$(type -t quotaon)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+      qon_out="$(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no -- quotaon -pu "$mp" 2>/dev/null || true)"
+    elif [[ "$(type -t quotaon)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
       qon_out="$(nsenter -t 1 -m -- quotaon -pu "$mp" 2>/dev/null || true)"
     else
       qon_out="$(quotaon -pu "$mp" 2>/dev/null || true)"
@@ -9756,6 +9758,10 @@ quota_enable() {
     ext4|xfs) ;;
     *) deny "kernel quota needs ext4 or xfs; ${mp} is ${fstype:-unknown}" ;;
   esac
+  if [[ -f /etc/systemd/system/spanel-api.service.d/10-spanel-helper.conf ]] && ! grep -q '^PrivateDevices=false' /etc/systemd/system/spanel-api.service.d/10-spanel-helper.conf 2>/dev/null; then
+    printf '\nPrivateDevices=false\nProtectKernelModules=false\n' >>/etc/systemd/system/spanel-api.service.d/10-spanel-helper.conf 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   if ! command -v setquota >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y quota >/dev/null || deny "apt-get could not install the quota tools"
@@ -9803,15 +9809,30 @@ quota_enable() {
   if [[ "$fstype" == ext4 ]]; then
     # Journaled quota: build the quota file once, then switch it on. -m keeps
     # the filesystem mounted read-write while it is counted.
-    local -a ns_prefix=()
-    if [[ "$(type -t quotacheck)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
-      ns_prefix=(nsenter -t 1 -m --)
+    # spanel-api.service's PrivateDevices=true attaches a cgroup BPF device
+    # filter (DevicePolicy=closed) that rejects open("/dev/sda1") with EPERM
+    # (errno 1) even inside PID 1's mount namespace. Run quotacheck/quotaon in
+    # a transient unit with PrivateDevices=no so it executes outside the
+    # restricted cgroup.
+    local -a host_run=()
+    if [[ "$(type -t quotacheck)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+      host_run=(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no --)
+    elif [[ "$(type -t quotacheck)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+      host_run=(nsenter -t 1 -m --)
     fi
-    if [[ ! -f "${mp%/}/aquota.user" ]]; then
-      "${ns_prefix[@]}" quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
+    if [[ ! -s "${mp%/}/aquota.user" ]]; then
+      "${host_run[@]}" quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
     fi
-    if [[ "$("${ns_prefix[@]}" quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
-      "${ns_prefix[@]}" quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
+    if [[ "$("${host_run[@]}" quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
+      if ! "${host_run[@]}" quotaon -u "$mp" 2>/dev/null; then
+        export DEBIAN_FRONTEND=noninteractive
+        "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
+        if ! "${host_run[@]}" quotaon -u "$mp" 2>/dev/null; then
+          apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
+          "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
+          "${host_run[@]}" quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
+        fi
+      fi
     fi
   fi
   quota_status
@@ -9840,12 +9861,14 @@ apply_kernel_quota() {
   mp="$(quota_mount_field TARGET)"
   [[ -n "$mp" ]] || return 0
   limits="$(quota_limits "$2" "$3")"
-  local -a ns_prefix=()
-  if [[ "$(type -t setquota)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
-    ns_prefix=(nsenter -t 1 -m --)
+  local -a host_run=()
+  if [[ "$(type -t setquota)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+    host_run=(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no --)
+  elif [[ "$(type -t setquota)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+    host_run=(nsenter -t 1 -m --)
   fi
   # shellcheck disable=SC2086 # four numbers, split on purpose
-  "${ns_prefix[@]}" setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
+  "${host_run[@]}" setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
     echo "warning: setquota failed for ${user} on ${mp}" >&2
 }
 
