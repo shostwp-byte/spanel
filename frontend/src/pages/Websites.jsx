@@ -5,7 +5,22 @@ import { NoAutofillInput } from '../components/NoAutofillInput.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
-const Terminal = React.lazy(() => import('../components/Terminal').then(m => ({ default: m.Terminal || m.default })));
+const Terminal = React.lazy(() =>
+  import('../components/Terminal')
+    .then(m => ({ default: m.Terminal || m.default }))
+    .catch(err => {
+      try {
+        const key = 'spanel_chunk_reload_ts';
+        const last = Number(sessionStorage.getItem(key) || '0');
+        if (!last || Date.now() - last > 15000) {
+          sessionStorage.setItem(key, String(Date.now()));
+          window.location.reload();
+          return new Promise(() => {});
+        }
+      } catch {}
+      throw err;
+    })
+);
 
 export function WebsitesPage({ 
   mode = 'domains',

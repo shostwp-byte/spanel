@@ -13,8 +13,97 @@ import { formatBytes, roleLabel } from './utils/helpers.js';
 import { AppContext, AppProvider, useAppContext, dnsTtlLabel } from './contexts/AppContext.jsx';
 import { WebsiteSelect } from './components/WebsiteSelect.jsx';
 
+const CHUNK_RELOAD_KEY = 'spanel_chunk_reload_ts';
+
+function isChunkLoadError(err) {
+  const msg = String(err?.message || err || '');
+  return (
+    err?.name === 'ChunkLoadError' ||
+    /Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module|Unable to preload CSS/i.test(msg)
+  );
+}
+
+function tryReloadOnceForChunkError() {
+  try {
+    const last = Number(sessionStorage.getItem(CHUNK_RELOAD_KEY) || '0');
+    const now = Date.now();
+    if (!last || now - last > 15000) {
+      sessionStorage.setItem(CHUNK_RELOAD_KEY, String(now));
+      window.location.reload();
+      return true;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return false;
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('vite:preloadError', event => {
+    if (tryReloadOnceForChunkError()) {
+      event?.preventDefault?.();
+    }
+  });
+}
+
+class ChunkErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    if (isChunkLoadError(error)) {
+      tryReloadOnceForChunkError();
+    }
+  }
+
+  componentDidUpdate(prevProps) {
+    if (this.state.error && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ error: null });
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="section" style={{ padding: '24px', textAlign: 'center' }}>
+          <h3>{t('Page update available')}</h3>
+          <p className="hint" style={{ marginBottom: '12px' }}>
+            {t('A newer panel build was deployed. Please reload the page to continue.')}
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              try { sessionStorage.removeItem(CHUNK_RELOAD_KEY); } catch {}
+              window.location.reload();
+            }}
+          >
+            <RefreshCw size={14} />
+            {t('Reload page')}
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 const lazyNamed = (loader, exportName) =>
-  React.lazy(() => loader().then(mod => ({ default: mod[exportName] || mod.default })));
+  React.lazy(() =>
+    loader()
+      .then(mod => ({ default: mod[exportName] || mod.default }))
+      .catch(err => {
+        if (isChunkLoadError(err) && tryReloadOnceForChunkError()) {
+          return new Promise(() => {});
+        }
+        throw err;
+      })
+  );
 
 const Migration = lazyNamed(() => import('./pages/Migration.jsx'), 'Migration');
 const Packages = lazyNamed(() => import('./pages/Packages.jsx'), 'Packages');
@@ -759,7 +848,10 @@ function loadAceBundle() {
         import('ace-builds/src-noconflict/theme-tomorrow_night'),
       ]);
       return aceInstance;
-    })();
+    })().catch(err => {
+      _aceBundlePromise = null;
+      throw err;
+    });
   }
   return _aceBundlePromise;
 }
@@ -4928,9 +5020,11 @@ function AppContent() {
         </section>
         {currentUser?.demo && <div className="demo-strip" role="status"><Eye size={15} /><span>{t('This is a demo: you can look at everything, but changes are not saved.')}</span></div>}
         <div className="content-body">
-          <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
-            {renderPage()}
-          </React.Suspense>
+          <ChunkErrorBoundary resetKey={page}>
+            <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
+              {renderPage()}
+            </React.Suspense>
+          </ChunkErrorBoundary>
           {loading && <div className="loading"><span></span>{t(loading)}</div>}
         </div>
       </div>
