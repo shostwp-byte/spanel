@@ -3162,4 +3162,168 @@ input[type="checkbox"].sp-switch-input:disabled,
   border-color: rgba(239, 68, 68, 0.3);
 }
 
+/* ==========================================================================
+   Resource Monitor Account Telemetry Table (Single Clean Card Border)
+   ========================================================================== */
+.rm-account-table-card {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-sm);
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.rm-account-table {
+  min-width: 1060px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border: none;
+  background: transparent;
+}
+
+.rm-account-header-row {
+  display: grid;
+  align-items: center;
+  gap: 16px;
+  padding: 11px 18px;
+  background: var(--surface-alt);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.rm-account-row {
+  display: grid;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 18px;
+  background: var(--surface);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  min-width: 0;
+  transition: background 0.15s ease;
+}
+
+.rm-account-row:last-child {
+  border-bottom: none;
+}
+
+.rm-account-row:hover {
+  background: var(--surface-alt);
+}
+
+.rm-account-row.is-selected {
+  background: var(--surface-alt);
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.rm-account-row.is-under-attack {
+  background: rgba(239, 68, 68, 0.04);
+  box-shadow: inset 3px 0 0 #ef4444;
+}
+
+.rm-usage-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 136px;
+}
+
+.rm-usage-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 12.5px;
+  gap: 6px;
+}
+
+.rm-usage-used {
+  color: var(--text);
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.rm-usage-limit {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.rm-progress-track {
+  height: 6px;
+  background: var(--border);
+  background: color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 999px;
+  overflow: hidden;
+  border: none;
+}
+
+.rm-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.rm-usage-sub {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-secondary);
+  gap: 6px;
+}
+
+.rm-usage-sublabel {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rm-usage-pct {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.rm-sublist {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.rm-sublist-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  transition: background 0.15s ease;
+}
+
+.rm-sublist-row:last-child {
+  border-bottom: none;
+}
+
+.rm-sublist-row:hover {
+  background: var(--surface-alt);
+}
+
+
 

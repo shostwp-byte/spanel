@@ -25,23 +25,31 @@ function barColor(pct, locked = false) {
 }
 
 function UsageProgressCell({ usedLabel, limitLabel, percent, subLabel, alertBadge }) {
-  const clamped = Math.min(100, Math.max(0, Number(percent) || 0));
-  const color = barColor(percent, !!alertBadge);
+  const numPct = Number(percent) || 0;
+  const clamped = Math.min(100, Math.max(0, numPct));
+  const color = barColor(numPct, !!alertBadge);
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: '140px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', fontSize: '12px', gap: '6px' }}>
-        <strong style={{ color: 'var(--text)', whiteSpace: 'nowrap' }}>{usedLabel}</strong>
-        <span style={{ color: 'var(--text-secondary)', fontSize: '11.5px', whiteSpace: 'nowrap' }}>/ {limitLabel}</span>
+    <div className="rm-usage-cell">
+      <div className="rm-usage-top">
+        <strong className="rm-usage-used">{usedLabel}</strong>
+        <span className="rm-usage-limit">/ {limitLabel}</span>
       </div>
-      <div style={{ height: '6px', background: 'var(--surface-alt)', borderRadius: '999px', overflow: 'hidden', border: '1px solid var(--border)' }}>
-        <div style={{ width: `${clamped}%`, height: '100%', background: color, borderRadius: '999px', transition: 'width 0.25s ease' }} />
+      <div className="rm-progress-track">
+        <div
+          className="rm-progress-fill"
+          style={{
+            width: `${clamped}%`,
+            minWidth: numPct > 0 ? '4px' : 0,
+            background: color,
+          }}
+        />
       </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px', color: 'var(--text-secondary)' }}>
-        <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{subLabel}</span>
+      <div className="rm-usage-sub">
+        <span className="rm-usage-sublabel">{subLabel}</span>
         {alertBadge ? (
           <span className="badge danger" style={{ fontSize: '10px', padding: '1px 6px' }}>{alertBadge}</span>
         ) : (
-          <span>{Math.round(Number(percent) || 0)}%</span>
+          <span className="rm-usage-pct">{Math.round(numPct)}%</span>
         )}
       </div>
     </div>
@@ -410,9 +418,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
                 {(!bottlenecksData?.mysql_slow_queries || bottlenecksData.mysql_slow_queries.length === 0) ? (
                   <p className="hint" style={{ margin: 0 }}>{t('No slow SQL queries detected. MariaDB InnoDB buffer pool & indexes are healthy.')}</p>
                 ) : (
-                  <div className="table" style={{ maxHeight: '260px', overflowY: 'auto' }}>
+                  <div className="rm-sublist" style={{ maxHeight: '260px', overflowY: 'auto' }}>
                     {bottlenecksData.mysql_slow_queries.map((q, idx) => (
-                      <div className="row" key={`msq-${idx}`} style={{ flexDirection: 'column', alignItems: 'stretch', gap: '4px', padding: '8px 10px' }}>
+                      <div className="rm-sublist-row" key={`msq-${idx}`} style={{ flexDirection: 'column', alignItems: 'stretch', gap: '4px', padding: '8px 10px' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', flexWrap: 'wrap', gap: '6px' }}>
                           <span>
                             <strong>{q.username}</strong> · <code>{q.db_name}</code>
@@ -441,9 +449,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
                 {(!bottlenecksData?.php_slow_traces || bottlenecksData.php_slow_traces.length === 0) ? (
                   <p className="hint" style={{ margin: 0 }}>{t('No slow PHP-FPM scripts or hanging plugin calls recorded.')}</p>
                 ) : (
-                  <div className="table" style={{ maxHeight: '260px', overflowY: 'auto' }}>
+                  <div className="rm-sublist" style={{ maxHeight: '260px', overflowY: 'auto' }}>
                     {bottlenecksData.php_slow_traces.map((tr, idx) => (
-                      <div className="row" key={`php-tr-${idx}`} style={{ flexDirection: 'column', alignItems: 'stretch', gap: '4px', padding: '8px 10px' }}>
+                      <div className="rm-sublist-row" key={`php-tr-${idx}`} style={{ flexDirection: 'column', alignItems: 'stretch', gap: '4px', padding: '8px 10px' }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', flexWrap: 'wrap', gap: '6px' }}>
                           <span>
                             <strong>{tr.username}</strong> · <code>{tr.domain}</code>
@@ -781,9 +789,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
               {(!userDetail?.databases || userDetail.databases.length === 0) ? (
                 <p className="hint">{t('This user has no MySQL databases.')}</p>
               ) : (
-                <div className="table">
+                <div className="rm-sublist">
                   {userDetail.databases.map(dbItem => (
-                    <div className="row" key={dbItem.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                    <div className="rm-sublist-row" key={dbItem.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                           <strong>{dbItem.db_name}</strong>
@@ -912,9 +920,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
                 {(!userDetail?.live?.processes || userDetail.live.processes.length === 0) ? (
                   <p className="hint">{t('No active processes running right now.')}</p>
                 ) : (
-                  <div className="table">
+                  <div className="rm-sublist">
                     {userDetail.live.processes.map((proc, idx) => (
-                      <div className="row" key={`${proc.pid}-${idx}`} style={{ fontSize: '12px' }}>
+                      <div className="rm-sublist-row" key={`${proc.pid}-${idx}`} style={{ fontSize: '12px' }}>
                         <span><strong>PID {proc.pid}</strong> · {proc.cpu_percent}% CPU · {fmtBytes(proc.memory_bytes)}</span>
                         <code style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>{proc.command}</code>
                       </div>
@@ -927,9 +935,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
                 {(!userDetail?.websites || userDetail.websites.length === 0) ? (
                   <p className="hint">{t('No domains hosted under this account.')}</p>
                 ) : (
-                  <div className="table">
+                  <div className="rm-sublist">
                     {userDetail.websites.map(w => (
-                      <div className="row" key={w.id} style={{ fontSize: '12px', display: 'flex', justifyContent: 'space-between' }}>
+                      <div className="rm-sublist-row" key={w.id} style={{ fontSize: '12px', display: 'flex', justifyContent: 'space-between' }}>
                         <strong>
                           {w.domain} <small className="badge">PHP {w.php_version}</small>
                           {w.http_flood_enabled && <small className="badge danger" style={{ marginLeft: '6px' }}>Anti-Flood Shield</small>}
@@ -949,25 +957,12 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
       {filteredItems.length === 0 ? (
         <EmptyState icon={Cpu} message={t('No user accounts match the current filter.')} />
       ) : (
-        <div className="table-scroll-wrap">
-          <div className="table" style={{ minWidth: '1060px' }}>
+        <div className="rm-account-table-card">
+          <div className="rm-account-table" style={{ minWidth: '1060px' }}>
             {/* Column Header Row */}
             <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: rowGridTemplate,
-                alignItems: 'center',
-                gap: '14px',
-                padding: '8px 14px',
-                background: 'var(--surface-alt)',
-                border: '1px solid var(--border)',
-                borderRadius: '10px',
-                fontSize: '11.5px',
-                fontWeight: 700,
-                textTransform: 'uppercase',
-                letterSpacing: '0.03em',
-                color: 'var(--text-secondary)',
-              }}
+              className="rm-account-header-row"
+              style={{ gridTemplateColumns: rowGridTemplate }}
             >
               <span>{t('Account / Package')}</span>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}><Cpu size={13} /> {t('CPU & Tasks')}</span>
@@ -980,15 +975,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
 
             {filteredItems.map(item => (
               <div
-                className="row"
+                className={`rm-account-row${item.under_attack ? ' is-under-attack' : ''}${selectedUser?.id === item.id ? ' is-selected' : ''}`}
                 key={item.id}
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: rowGridTemplate,
-                  alignItems: 'center',
-                  gap: '14px',
-                  borderColor: item.under_attack ? '#ef4444' : selectedUser?.id === item.id ? 'var(--primary)' : undefined,
-                }}
+                style={{ gridTemplateColumns: rowGridTemplate }}
               >
                 {/* User & Package Info */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 }}>
@@ -1101,9 +1090,9 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
               {(!inspectTablesModal.tables || inspectTablesModal.tables.length === 0) ? (
                 <p className="hint">{t('No tables found in this database.')}</p>
               ) : (
-                <div className="table">
+                <div className="rm-sublist">
                   {inspectTablesModal.tables.map(tbl => (
-                    <div className="row" key={tbl.table_name} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
+                    <div className="rm-sublist-row" key={tbl.table_name} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
                       <div>
                         <strong>{tbl.table_name}</strong> <span className="badge">{tbl.engine}</span>
                         <small style={{ marginLeft: '8px', color: 'var(--text-secondary)' }}>{tbl.rows.toLocaleString()} rows</small>
