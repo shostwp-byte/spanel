@@ -44,23 +44,77 @@ export function DiskQuotaCard({ request, setNotice, busy }) {
   if (!quota) return null;
   const kernel = quota.mode === 'kernel';
   return (
-    <div className="card" style={{ marginBottom: '14px', padding: '12px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
-      <div style={{ minWidth: 0 }}>
-        <strong style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontSize: '13.5px' }}>
-          <HardDrive size={15} /> {t('Disk quota enforcement')}
-          <span className={kernel ? 'badge ok' : 'badge warn'}>{kernel ? t('Kernel') : t('Panel only')}</span>
-          <span className="badge">{t(STATE_LABELS[quota.state] || quota.state)}</span>
-        </strong>
-        <p className="hint" style={{ margin: '4px 0 0' }}>
-          {quota.mount ? `${quota.mount} (${quota.fstype || '?'}) · ` : ''}{quota.hint}
-        </p>
+    <div
+      className="disk-quota-banner"
+      style={{
+        marginBottom: '16px',
+        padding: '12px 16px',
+        minHeight: 0,
+        display: 'flex',
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: '14px',
+        flexWrap: 'wrap',
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: '12px',
+        boxShadow: 'var(--shadow-sm)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: '1 1 420px', minWidth: 0 }}>
+        <div className={`cb-stat-icon ${kernel ? 'emerald' : 'amber'}`} style={{ flexShrink: 0 }}>
+          <HardDrive size={18} />
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            <strong style={{ fontSize: '13.5px', fontWeight: 700, color: 'var(--text)' }}>
+              {t('Disk quota enforcement')}
+            </strong>
+            <span className={kernel ? 'badge ok' : 'badge warn'}>
+              {kernel ? t('Kernel') : t('Panel only')}
+            </span>
+            <span className="badge">
+              {t(STATE_LABELS[quota.state] || quota.state)}
+            </span>
+            {quota.mount && (
+              <code
+                style={{
+                  fontSize: '11.5px',
+                  padding: '1px 7px',
+                  borderRadius: '6px',
+                  background: 'var(--surface-alt)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                {quota.mount}{quota.fstype ? ` (${quota.fstype})` : ''}{quota.device ? ` · ${quota.device}` : ''}
+              </code>
+            )}
+          </div>
+          <p className="hint" style={{ margin: 0, fontSize: '12.5px', maxWidth: 'none', lineHeight: 1.4 }}>
+            {quota.hint}
+          </p>
+        </div>
       </div>
-      <div style={{ display: 'flex', gap: '8px' }}>
-        <button type="button" className="mini secondary-light" disabled={working || busy} onClick={load}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0, marginLeft: 'auto' }}>
+        <button
+          type="button"
+          className="mini secondary-light"
+          style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+          disabled={working || busy}
+          onClick={load}
+        >
           <RefreshCw size={13} /> {t('Refresh')}
         </button>
         {quota.can_enable && (
-          <button type="button" className="mini" disabled={working || busy} onClick={enable}>
+          <button
+            type="button"
+            className="mini primary"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+            disabled={working || busy}
+            onClick={enable}
+          >
             {t('Enable kernel quota')}
           </button>
         )}
