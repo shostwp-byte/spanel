@@ -448,3 +448,59 @@ def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
     )
     assert r_ok.status_code == 200
     assert r_ok.json()["authenticated"] is True
+
+
+def test_webmail_non_ascii_password_login_via_sasl_plain(tmp_path, monkeypatch):
+    import imaplib
+
+    wm = load_webmail()
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AUTH_SECRET", "test-auth-secret-key-1234567890")
+
+    real_imap_error = imaplib.IMAP4.error
+
+    class AsciiStrictIMAP(FakeIMAP):
+        """Simulates Python imaplib's ASCII-only .login() and SASL PLAIN .authenticate()."""
+
+        error = real_imap_error
+
+        def __init__(self, host: str, port: int, timeout: int = 15):
+            super().__init__("", "")
+            self._encoding = "ascii"
+            self.sasl_payloads: list[bytes] = []
+
+        def login(self, user: str, password: str):
+            # Standard imaplib.IMAP4.login encodes using ASCII and raises UnicodeEncodeError
+            user.encode("ascii")
+            password.encode("ascii")
+            raise AssertionError("conn.login() should not be used when authenticate() is available")
+
+        def authenticate(self, mechanism: str, authobject):
+            assert mechanism == "PLAIN"
+            raw = authobject(b"")
+            assert isinstance(raw, bytes)
+            self.sasl_payloads.append(raw)
+            expected = "\x00info@khach.vn\x00mậtkhẩu123".encode("utf-8")
+            if raw != expected:
+                raise imaplib.IMAP4.error("AUTHENTICATE PLAIN failed")
+            return "OK", [b"Logged in"]
+
+    monkeypatch.setattr(wm.imaplib, "IMAP4", AsciiStrictIMAP)
+    client = TestClient(wm.app)
+
+    # Non-ASCII password succeeds via SASL PLAIN UTF-8
+    r_ok = client.post(
+        "/api/auth/login",
+        json={"email": "info@khach.vn", "password": "mậtkhẩu123"},
+        headers={"X-Forwarded-For": "198.51.100.88"},
+    )
+    assert r_ok.status_code == 200
+    assert r_ok.json()["authenticated"] is True
+
+    # Wrong non-ASCII password returns 401 (never 500 UnicodeEncodeError)
+    r_bad = client.post(
+        "/api/auth/login",
+        json={"email": "info@khach.vn", "password": "sai-mậtkhẩu-999"},
+        headers={"X-Forwarded-For": "198.51.100.89"},
+    )
+    assert r_bad.status_code == 401

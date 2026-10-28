@@ -481,6 +481,18 @@ def _session_credentials(session: dict[str, Any]) -> tuple[str, str]:
     raise HTTPException(status_code=503, detail="Chưa cấu hình thông tin xác thực hộp thư.")
 
 
+def _imap_authenticate(conn: imaplib.IMAP4, auth_user: str, auth_pass: str) -> None:
+    """Authenticate over IMAP using UTF-8 SASL PLAIN so non-ASCII passwords work."""
+    conn._encoding = "utf-8"
+    if "\x00" in auth_user or "\x00" in auth_pass or "\r" in auth_user or "\n" in auth_user:
+        raise imaplib.IMAP4.error("Invalid credentials")
+    if hasattr(conn, "authenticate"):
+        auth_bytes = f"\x00{auth_user}\x00{auth_pass}".encode("utf-8")
+        conn.authenticate("PLAIN", lambda _: auth_bytes)
+    else:
+        conn.login(auth_user, auth_pass)
+
+
 def _open_imap_with_creds(auth_user: str, auth_pass: str) -> imaplib.IMAP4:
     host = _cfg("IMAP_HOST", "127.0.0.1")
     port = _cfg_int("IMAP_PORT", 143)
@@ -493,9 +505,16 @@ def _open_imap_with_creds(auth_user: str, auth_pass: str) -> imaplib.IMAP4:
             conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
         else:
             conn = imaplib.IMAP4(host, port, timeout=15)
-        conn.login(auth_user, auth_pass)
+        try:
+            _imap_authenticate(conn, auth_user, auth_pass)
+        except Exception:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+            raise
         return conn
-    except imaplib.IMAP4.error as exc:
+    except (imaplib.IMAP4.error, UnicodeError) as exc:
         raise HTTPException(status_code=401, detail="Tài khoản email hoặc mật khẩu không chính xác (hoặc hộp thư đang tạm khóa).") from exc
     except OSError as exc:
         raise HTTPException(status_code=503, detail=f"Không thể kết nối tới máy chủ IMAP ({host}:{port}).") from exc
