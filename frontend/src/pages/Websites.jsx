@@ -86,6 +86,11 @@ export function WebsitesPage({
   const [renameModalOpen, setRenameModalOpen] = useState(false);
   const [renameTargetId, setRenameTargetId] = useState('');
   const [renameNewDomain, setRenameNewDomain] = useState('');
+  const [transferOwnerTargetId, setTransferOwnerTargetId] = useState('');
+  const endUsers = React.useMemo(
+    () => (users || []).filter(u => u && u.role !== 'admin' && u.role !== 'reseller'),
+    [users]
+  );
   const [defaultDomainId, setDefaultDomainId] = useState(() => {
     try { return localStorage.getItem('spanel_default_domain_id') || ''; } catch { return ''; }
   });
@@ -181,6 +186,7 @@ export function WebsitesPage({
     setLogViewer(null);
     setTerminalViewer(null);
     setWebsiteSettingsForm(websiteConfigForm(site));
+    setTransferOwnerTargetId(String(site?.owner_id || ''));
     const data = await request(`/websites/${site.id}/nginx-custom`, {}, t('Loading Custom Nginx...'));
     if (data !== null) {
       setNginxCustomEditing({
@@ -454,6 +460,26 @@ export function WebsitesPage({
         </select></label>
         <div className="website-settings-actions">
           <button disabled={!!loading} onClick={saveWebsiteSettings}><Save size={14}/>{t('Save settings')}</button>
+        </div>
+      </div>}
+      {!fullConfig && isAdmin && endUsers.length > 0 && <div className="website-settings-grid" style={{ marginTop: '10px' }}>
+        <label><span>{t('Owner (End User)')}</span><select
+          value={transferOwnerTargetId}
+          onChange={e => setTransferOwnerTargetId(e.target.value)}
+          disabled={!!loading}
+        >
+          <option value="">{t('Select End User...')}</option>
+          {endUsers.map(u => <option key={u.id} value={String(u.id)}>{u.username} ({u.email})</option>)}
+        </select></label>
+        <div className="website-settings-actions">
+          <button
+            type="button"
+            className="secondary-light"
+            disabled={!!loading || !transferOwnerTargetId || String(transferOwnerTargetId) === String(settingsSite.owner_id || '')}
+            onClick={() => handleTransferWebsiteOwner(nginxCustomEditing.id, transferOwnerTargetId)}
+          >
+            <Users size={14}/>{t('Transfer Owner')}
+          </button>
         </div>
       </div>}
       {!fullConfig && <div className="site-aliases settings-domain-manager">
@@ -776,6 +802,35 @@ export function WebsitesPage({
       setRenameModalOpen(false);
       setRenameNewDomain('');
       setNotice(t('Renamed domain to {domain}.', { domain: cleanNew }));
+      await loadWebsiteList(websiteSearch, false);
+      if (refreshAll) await refreshAll();
+    }
+  }
+
+  async function handleTransferWebsiteOwner(websiteId = nginxCustomEditing?.id, targetOwnerId = transferOwnerTargetId) {
+    const cleanSiteId = Number(websiteId);
+    const cleanOwnerId = Number(targetOwnerId);
+    if (!cleanSiteId || !cleanOwnerId) {
+      setError(t('Please select an End User account to transfer this website to.'));
+      return;
+    }
+    const targetUser = (users || []).find(u => Number(u.id) === cleanOwnerId);
+    const data = await request(
+      `/websites/${cleanSiteId}/transfer-owner`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ target_owner_id: cleanOwnerId }),
+      },
+      t('Transferring website ownership...')
+    );
+    if (data) {
+      setNotice(
+        t('Transferred {domain} to {user}.', {
+          domain: data.domain || nginxCustomEditing?.domain || '',
+          user: targetUser?.username || String(cleanOwnerId),
+        })
+      );
+      setNginxCustomEditing(prev => (prev && prev.id === cleanSiteId ? { ...prev, site: data } : prev));
       await loadWebsiteList(websiteSearch, false);
       if (refreshAll) await refreshAll();
     }

@@ -1845,29 +1845,179 @@ def transfer_website_owner(
             detail="Websites can only be assigned to End User accounts.",
         )
 
+    from app.models.entities import DnsZone, MailAccount, MailDomain, SftpAccount
+    from app.services import sftp_accounts
+
+    old_owner_id = website.owner_id
+    site_domains = {(website.domain or "").strip().lower()}
+    for alias in getattr(website, "aliases", None) or []:
+        if getattr(alias, "domain", None):
+            site_domains.add(alias.domain.strip().lower())
+    site_domains.discard("")
+
+    if website.owner_id != target_owner.id:
+        existing_sites = (
+            db.query(Website)
+            .filter(Website.owner_id == target_owner.id, Website.id != website.id)
+            .all()
+        )
+        existing_domains = {(s.domain or "").strip().lower() for s in existing_sites if s.domain}
+        domain_lower = (website.domain or "").strip().lower()
+        is_subdomain = any(domain_lower != d and domain_lower.endswith("." + d) for d in existing_domains)
+        existing_subdomains_count = sum(
+            1 for d in existing_domains if any(d != parent and d.endswith("." + parent) for parent in existing_domains)
+        )
+        existing_root_domains_count = len(existing_domains) - existing_subdomains_count
+        if is_subdomain:
+            eff_subdomain_limit = int((target_owner.package.subdomain_limit if getattr(target_owner, "package", None) else 0) or 0)
+            if eff_subdomain_limit > 0 and existing_subdomains_count >= eff_subdomain_limit:
+                raise HTTPException(status_code=403, detail="Target owner has reached their subdomain limit")
+        else:
+            eff_site_limit = int(
+                target_owner.website_limit
+                if target_owner.website_limit is not None
+                else ((target_owner.package.website_limit if getattr(target_owner, "package", None) else 0) or 0)
+            )
+            if eff_site_limit > 0 and existing_root_domains_count >= eff_site_limit:
+                raise HTTPException(status_code=403, detail="Target owner has reached their website limit")
+
+        moving_dbs = (
+            db.query(DatabaseAccount)
+            .filter(DatabaseAccount.website_id == website.id, DatabaseAccount.owner_id != target_owner.id)
+            .count()
+        )
+        if moving_dbs > 0:
+            eff_db_limit = int(
+                target_owner.database_limit
+                if getattr(target_owner, "database_limit", None) is not None
+                else ((target_owner.package.database_limit if getattr(target_owner, "package", None) else 0) or 0)
+            )
+            if eff_db_limit > 0:
+                current_dbs = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == target_owner.id).count()
+                if current_dbs + moving_dbs > eff_db_limit:
+                    raise HTTPException(status_code=403, detail="Target owner has reached their database limit")
+
+        moving_sftps = (
+            db.query(SftpAccount)
+            .filter(SftpAccount.website_id == website.id, SftpAccount.owner_id != target_owner.id)
+            .count()
+        )
+        if moving_sftps > 0:
+            eff_sftp_limit = int(
+                target_owner.sftp_accounts_limit
+                if getattr(target_owner, "sftp_accounts_limit", None) is not None
+                else ((target_owner.package.sftp_accounts_limit if getattr(target_owner, "package", None) else 0) or 0)
+            )
+            if eff_sftp_limit > 0:
+                current_sftps = db.query(SftpAccount).filter(SftpAccount.owner_id == target_owner.id).count()
+                if current_sftps + moving_sftps > eff_sftp_limit:
+                    raise HTTPException(status_code=403, detail="Target owner has reached their SFTP account limit")
+
+        moving_mailboxes = (
+            db.query(MailAccount)
+            .filter(MailAccount.domain.in_(list(site_domains)), MailAccount.owner_id != target_owner.id)
+            .count()
+        )
+        if moving_mailboxes > 0:
+            eff_mail_limit = int(
+                target_owner.mail_accounts_limit
+                if getattr(target_owner, "mail_accounts_limit", None) is not None
+                else ((target_owner.package.mail_accounts_limit if getattr(target_owner, "package", None) else 0) or 0)
+            )
+            if eff_mail_limit > 0:
+                current_mailboxes = db.query(MailAccount).filter(MailAccount.owner_id == target_owner.id).count()
+                if current_mailboxes + moving_mailboxes > eff_mail_limit:
+                    raise HTTPException(status_code=403, detail="Target owner has reached their mailbox limit")
+
+        site_bytes = storage_quota.website_storage_used_bytes(website)
+        try:
+            storage_quota.enforce_user_storage_quota(db, target_owner, incoming_bytes=site_bytes)
+        except storage_quota.StorageQuotaExceeded as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    old_root_path = website.root_path
+    old_linux_user = website.linux_user
     new_linux_user = site_users.linux_user_for_panel_username(target_owner.username)
     new_root_path = site_users.site_root_for_panel_user(target_owner.username, website.domain)
     runtime_php = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
-    if website.root_path != new_root_path or website.linux_user != new_linux_user:
-        site_users.move_site_runtime(website.root_path, new_root_path, new_linux_user, runtime_php)
-        website.root_path = new_root_path
-        website.linux_user = new_linux_user
-        _ensure_default_waf_file(website.domain)
-        _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
+    moved_runtime = False
+    mail_changed = False
 
-    website.owner_id = target_owner.id
-    for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).all():
-        db_acc.owner_id = target_owner.id
     try:
-        from app.models.entities import DnsZone
+        if website.root_path != new_root_path or website.linux_user != new_linux_user:
+            site_users.move_site_runtime(website.root_path, new_root_path, new_linux_user, runtime_php)
+            moved_runtime = True
+            website.root_path = new_root_path
+            website.linux_user = new_linux_user
+            _ensure_default_waf_file(website.domain)
+            _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
 
-        z = db.query(DnsZone).filter(DnsZone.name == website.domain).first()
-        if z:
+        website.owner_id = target_owner.id
+        for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).all():
+            db_acc.owner_id = target_owner.id
+
+        for sftp_acc in db.query(SftpAccount).filter(SftpAccount.website_id == website.id).all():
+            sftp_acc.owner_id = target_owner.id
+            sftp_acc.chroot_path = sftp_accounts.ensure_account(
+                new_linux_user, sftp_acc.linux_user, new_root_path
+            )
+
+        if website.app_id:
+            app_row = db.query(SiteApp).filter(SiteApp.id == website.app_id).first()
+            if app_row and app_row.owner_id != target_owner.id:
+                other_site = (
+                    db.query(Website)
+                    .filter(Website.app_id == app_row.id, Website.id != website.id)
+                    .first()
+                )
+                if not other_site:
+                    conflict = (
+                        db.query(SiteApp)
+                        .filter(SiteApp.owner_id == target_owner.id, SiteApp.name == app_row.name, SiteApp.id != app_row.id)
+                        .first()
+                    )
+                    if conflict:
+                        app_row.name = f"{app_row.name[:50]}-{app_row.id}"
+                    app_row.owner_id = target_owner.id
+
+        for z in db.query(DnsZone).filter(DnsZone.name.in_(list(site_domains))).all():
             z.owner_id = target_owner.id
-    except Exception:
-        pass
 
-    db.commit()
+        for md in db.query(MailDomain).filter(MailDomain.domain.in_(list(site_domains))).all():
+            if md.owner_id != target_owner.id:
+                md.owner_id = target_owner.id
+                mail_changed = True
+
+        for ma in db.query(MailAccount).filter(MailAccount.domain.in_(list(site_domains))).all():
+            if ma.owner_id != target_owner.id:
+                ma.owner_id = target_owner.id
+                mail_changed = True
+
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        if moved_runtime and old_linux_user:
+            try:
+                site_users.move_site_runtime(new_root_path, old_root_path, old_linux_user, runtime_php)
+                website.root_path = old_root_path
+                website.linux_user = old_linux_user
+                _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
+            except Exception:
+                pass
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"Failed to transfer website ownership: {exc}") from exc
+
+    storage_quota.forget_user_storage(old_owner_id)
+    storage_quota.forget_user_storage(target_owner.id)
+    if mail_changed:
+        try:
+            from app.services import mail
+
+            mail.sync_quietly(db)
+        except Exception:
+            pass
+
     db.refresh(website)
     log_action(
         db,

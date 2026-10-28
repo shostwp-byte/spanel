@@ -1261,33 +1261,90 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
 def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     from fastapi import HTTPException
     from app.api import websites
+    from app.models.entities import DnsZone, MailAccount, MailDomain, SftpAccount, SiteApp
+    from app.services import sftp_accounts, teardown
 
     db = _make_db()
     admin = User(username="admin", email="admin@example.com", hashed_password="x", role="admin", is_active=True)
     reseller = User(username="res1", email="res1@example.com", hashed_password="x", role="reseller", is_active=True)
-    end_user = User(username="alice", email="alice@example.com", hashed_password="x", role="user", is_active=True)
-    db.add_all([admin, reseller, end_user])
+    end_user = User(
+        username="alice",
+        email="alice@example.com",
+        hashed_password="x",
+        role="user",
+        is_active=True,
+        website_limit=2,
+        database_limit=2,
+        sftp_accounts_limit=2,
+        mail_accounts_limit=5,
+        storage_limit_mb=1024,
+    )
+    capped_user = User(
+        username="bobcap",
+        email="bobcap@example.com",
+        hashed_password="x",
+        role="user",
+        is_active=True,
+        website_limit=1,
+    )
+    db.add_all([admin, reseller, end_user, capped_user])
+    db.commit()
+
+    bob_existing = Website(
+        domain="bob-existing.example.com",
+        owner_id=capped_user.id,
+        root_path="/home/bobcap/bob-existing.example.com",
+        php_version="8.4",
+        linux_user="bobcap",
+        app_type="php",
+    )
+    db.add(bob_existing)
+    db.commit()
+
+    app_row = SiteApp(
+        owner_id=reseller.id,
+        name="legacy-node-app",
+        kind="node",
+        port=4310,
+    )
+    db.add(app_row)
     db.commit()
 
     legacy_site = Website(
         domain="legacy-admin.example.com",
-        owner_id=admin.id,
-        root_path="/home/admin/legacy-admin.example.com",
+        owner_id=reseller.id,
+        root_path="/home/res1/legacy-admin.example.com",
         php_version="8.4",
-        linux_user="admin",
+        linux_user="res1",
         app_type="wordpress",
+        app_id=app_row.id,
     )
     db.add(legacy_site)
     db.commit()
 
     legacy_db = DatabaseAccount(
-        owner_id=admin.id,
+        owner_id=reseller.id,
         website_id=legacy_site.id,
         db_name="wp_legacy_admin",
         db_user="u_legacy_admin",
         db_password="secret",
     )
-    db.add(legacy_db)
+    legacy_sftp = SftpAccount(
+        owner_id=reseller.id,
+        website_id=legacy_site.id,
+        label="deploy",
+        linux_user="sftp_res1_deploy_a1b2c3",
+        chroot_path="/var/lib/spanel-sftp/sftp_res1_deploy_a1b2c3",
+    )
+    legacy_zone = DnsZone(name="legacy-admin.example.com", owner_id=reseller.id)
+    legacy_mail_domain = MailDomain(domain="legacy-admin.example.com", owner_id=reseller.id)
+    legacy_mailbox = MailAccount(
+        owner_id=reseller.id,
+        domain="legacy-admin.example.com",
+        local_part="info",
+        password_hash="{SHA512-CRYPT}$6$xyz",
+    )
+    db.add_all([legacy_db, legacy_sftp, legacy_zone, legacy_mail_domain, legacy_mailbox])
     db.commit()
 
     report = websites.audit_privileged_role_owned_resources(db)
@@ -1296,7 +1353,7 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     assert any("legacy-admin.example.com" in w for w in report["warnings"])
     assert any("wp_legacy_admin" in w for w in report["warnings"])
 
-    # Cannot transfer ownership to another privileged role (reseller)
+    # 1. Cannot transfer ownership to another privileged role (reseller)
     try:
         websites.transfer_website_owner(
             website_id=legacy_site.id,
@@ -1309,10 +1366,49 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     except HTTPException as exc:
         assert exc.status_code == 403
 
-    # Transferring ownership to End User moves site + linked DB and clears warning
+    # 2. Cannot transfer to an End User who has reached website_limit
+    try:
+        websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=capped_user.id),
+            request=None,
+            db=db,
+            current_user=admin,
+        )
+        raise AssertionError("Expected 403 when target End User has reached website_limit")
+    except HTTPException as exc:
+        assert exc.status_code == 403
+        assert "website limit" in exc.detail.lower()
+
+    # 3. If vhost rewrite fails after runtime move, runtime is rolled back to old path/owner
+    move_calls = []
+    with patch.object(websites.site_users, "move_site_runtime", side_effect=lambda o, n, u, p=None: move_calls.append((o, n, u))), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost", side_effect=[HTTPException(status_code=500, detail="nginx failed"), None]):
+        try:
+            websites.transfer_website_owner(
+                website_id=legacy_site.id,
+                payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
+                request=None,
+                db=db,
+                current_user=admin,
+            )
+            raise AssertionError("Expected 500 when vhost rewrite fails")
+        except HTTPException as exc:
+            assert exc.status_code == 500
+    expected_alice_root = websites.site_users.site_root_for_panel_username("alice", "legacy-admin.example.com") if hasattr(websites.site_users, "site_root_for_panel_username") else websites.site_users.site_root_for_panel_user("alice", "legacy-admin.example.com")
+    assert len(move_calls) == 2
+    assert move_calls[0] == ("/home/res1/legacy-admin.example.com", expected_alice_root, "alice")
+    assert move_calls[1] == (expected_alice_root, "/home/res1/legacy-admin.example.com", "res1")
+    db.refresh(legacy_site)
+    assert legacy_site.owner_id == reseller.id
+
+    # 4. Transferring ownership to End User moves site + DB + SFTP + SiteApp + DNS + Mail
+    sftp_ensured = []
     with patch.object(websites.site_users, "move_site_runtime"), \
          patch.object(websites, "_ensure_default_waf_file"), \
-         patch.object(websites, "_rewrite_website_vhost"):
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: (sftp_ensured.append((owner_u, sub_u, root)) or f"/var/lib/spanel-sftp/{sub_u}")):
         updated = websites.transfer_website_owner(
             website_id=legacy_site.id,
             payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
@@ -1322,8 +1418,33 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
         )
     assert updated.owner_id == end_user.id
     assert updated.linux_user == "alice"
+    assert updated.root_path == expected_alice_root
+    assert sftp_ensured == [("alice", "sftp_res1_deploy_a1b2c3", expected_alice_root)]
+
     db.refresh(legacy_db)
+    db.refresh(legacy_sftp)
+    db.refresh(app_row)
+    db.refresh(legacy_zone)
+    db.refresh(legacy_mail_domain)
+    db.refresh(legacy_mailbox)
     assert legacy_db.owner_id == end_user.id
+    assert legacy_sftp.owner_id == end_user.id
+    assert app_row.owner_id == end_user.id
+    assert legacy_zone.owner_id == end_user.id
+    assert legacy_mail_domain.owner_id == end_user.id
+    assert legacy_mailbox.owner_id == end_user.id
+
+    # 5. Deleting the old owner (reseller) does NOT delete transferred resources
+    teardown.purge_owned_resources(db, reseller.id)
+    db.delete(reseller)
+    db.commit()
+
+    assert db.query(Website).filter(Website.id == legacy_site.id).first() is not None
+    assert db.query(DatabaseAccount).filter(DatabaseAccount.id == legacy_db.id).first() is not None
+    assert db.query(SftpAccount).filter(SftpAccount.id == legacy_sftp.id).first() is not None
+    assert db.query(SiteApp).filter(SiteApp.id == app_row.id).first() is not None
+    assert db.query(MailDomain).filter(MailDomain.id == legacy_mail_domain.id).first() is not None
+    assert db.query(MailAccount).filter(MailAccount.id == legacy_mailbox.id).first() is not None
 
     report_after = websites.audit_privileged_role_owned_resources(db)
     assert report_after["websites"] == []
