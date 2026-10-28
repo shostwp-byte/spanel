@@ -77,6 +77,81 @@ const PROVISIONING_ENDPOINTS = [
   { method: 'POST', path: '/token/rotate', desc: 'Token tự xoay vòng (scope tokens:rotate)' },
 ];
 
+function parseAuditDetail(rawDetail) {
+  const raw = String(rawDetail || '').trim();
+  if (!raw) return { summary: '', ip: '', ua: '', uaShort: '', raw: '' };
+
+  let summaryPart = raw;
+  let metaPart = '';
+
+  const pipeIdx = raw.lastIndexOf(' | ip=');
+  if (pipeIdx !== -1) {
+    summaryPart = raw.slice(0, pipeIdx).trim();
+    metaPart = raw.slice(pipeIdx + 3).trim();
+  } else if (raw.startsWith('ip=') || raw.startsWith('ua=')) {
+    summaryPart = '';
+    metaPart = raw;
+  } else {
+    const uaPipeIdx = raw.lastIndexOf(' | ua=');
+    if (uaPipeIdx !== -1) {
+      summaryPart = raw.slice(0, uaPipeIdx).trim();
+      metaPart = raw.slice(uaPipeIdx + 3).trim();
+    }
+  }
+
+  let ip = '';
+  let ua = '';
+  if (metaPart) {
+    const uaIdx = metaPart.indexOf(' ua=');
+    if (uaIdx !== -1) {
+      const ipToken = metaPart.slice(0, uaIdx).trim();
+      if (ipToken.startsWith('ip=')) {
+        ip = ipToken.slice(3).replace(/^::ffff:/i, '').trim();
+      }
+      ua = metaPart.slice(uaIdx + 4).trim();
+    } else if (metaPart.startsWith('ip=')) {
+      ip = metaPart.slice(3).replace(/^::ffff:/i, '').trim();
+    } else if (metaPart.startsWith('ua=')) {
+      ua = metaPart.slice(3).trim();
+    }
+  }
+
+  let uaShort = ua;
+  if (ua) {
+    const edg = ua.match(/Edg\/(\d+)/);
+    const opr = ua.match(/OPR\/(\d+)/);
+    const chr = ua.match(/Chrome\/(\d+)/);
+    const ffx = ua.match(/Firefox\/(\d+)/);
+    const saf = ua.match(/Version\/(\d+).*Safari/);
+    const crl = ua.match(/curl\/([\d.]+)/i);
+    const py = ua.match(/python-requests\/([\d.]+)/i);
+
+    const browser = edg ? `Edge ${edg[1]}`
+      : opr ? `Opera ${opr[1]}`
+      : chr ? `Chrome ${chr[1]}`
+      : ffx ? `Firefox ${ffx[1]}`
+      : saf ? `Safari ${saf[1]}`
+      : crl ? `curl/${crl[1]}`
+      : py ? 'python-requests'
+      : '';
+
+    const os = /Windows NT/.test(ua) ? 'Windows'
+      : /Mac OS X/.test(ua) ? 'macOS'
+      : /Android/.test(ua) ? 'Android'
+      : /iPhone|iPad|iOS/.test(ua) ? 'iOS'
+      : /Linux/.test(ua) ? 'Linux'
+      : '';
+
+    if (browser || os) {
+      uaShort = [browser, os].filter(Boolean).join(' • ');
+    } else if (ua.length > 36) {
+      uaShort = `${ua.slice(0, 34)}…`;
+    }
+  }
+
+  return { summary: summaryPart, ip, ua, uaShort, raw };
+}
+
 export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanelHost }) {
   const {
     loading, setLoading, setError, setNotice, currentUser, loadCurrentUser, panelSettings, setPanelSettings,
@@ -1633,13 +1708,13 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
           {/* Section 1: Cron Namespace & PHP CLI Confinement */}
           <div style={{ padding: '20px 22px', borderRadius: '14px', background: 'var(--surface-2)', border: '1px solid var(--border-subtle)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '14px', flexWrap: 'wrap', marginBottom: '14px' }}>
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ flex: '1 1 520px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                   <ShieldCheck size={18} style={{ color: '#10b981' }} />
                   <h3 style={{ margin: 0, fontSize: '1rem' }}>Cron & Terminal Namespace Confinement (Zero-Escape Jail)</h3>
                   <span className="badge ok">ACTIVE ENFORCEMENT</span>
                 </div>
-                <p className="hint" style={{ margin: '4px 0 0 0', fontSize: '0.82rem' }}>
+                <p className="hint" style={{ margin: '6px 0 0 0', fontSize: '0.82rem', maxWidth: '880px', lineHeight: 1.5 }}>
                   Mọi tác vụ Cron PHP và Terminal đều bị khóa cứng trong <code>open_basedir</code> riêng của từng Linux User, vô hiệu hóa hàm thực thi shell (<code>disable_functions</code>) và cô lập Mount Namespace (<code>unshare --mount --propagation private</code>).
                 </p>
               </div>
@@ -1685,15 +1760,15 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
           {/* Section 2: Tamper-Evident SHA-256 Hash-Chained Security Audit Trail */}
           <div style={{ padding: '20px 22px', borderRadius: '14px', background: 'var(--surface-2)', border: '1px solid var(--border-subtle)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '14px', flexWrap: 'wrap', marginBottom: '16px' }}>
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ flex: '1 1 520px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                   <Lock size={18} style={{ color: 'var(--accent-primary)' }} />
                   <h3 style={{ margin: 0, fontSize: '1rem' }}>Tamper-Evident Security Audit Trail (SHA-256 Hash Chain)</h3>
                   <span className={auditChain?.valid !== false ? 'badge ok' : 'badge bad'}>
                     {auditChain?.valid !== false ? 'CHUỖI BĂM SHA-256 TOÀN VẸN 100%' : 'PHÁT HIỆN SAI LỆCH CHUỖI BĂM'}
                   </span>
                 </div>
-                <p className="hint" style={{ margin: '4px 0 0 0', fontSize: '0.82rem' }}>
+                <p className="hint" style={{ margin: '6px 0 0 0', fontSize: '0.82rem', maxWidth: '880px', lineHeight: 1.5 }}>
                   Mỗi hành động quản trị đều được ký băm mật mã học <code>SHA-256(prev_hash | user | action | target | detail | timestamp)</code> nối tiếp nhau như chuỗi khối (Blockchain), giúp phát hiện ngay lập tức mọi hành vi xóa hoặc sửa trộm nhật ký trong DB.
                 </p>
               </div>
@@ -1732,7 +1807,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   {auditChain?.valid !== false ? 'Verified • Không có chỉnh sửa trái phép' : `${auditChain?.tampered_entries?.length || 1} bản ghi bị can thiệp`}
                 </div>
               </div>
-              <div style={{ padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }}>
+              <div style={{ padding: '10px 14px', borderRadius: '10px', background: 'var(--surface-1)', border: '1px solid var(--border-subtle)' }} title={auditChain?.head_hash || ''}>
                 <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Mã băm đỉnh chuỗi (Head SHA-256)</div>
                 <div style={{ fontSize: '0.78rem', fontFamily: 'monospace', fontWeight: 600, marginTop: '4px', wordBreak: 'break-all' }}>
                   {auditChain?.head_hash ? `${auditChain.head_hash.slice(0, 28)}...` : '—'}
@@ -1760,43 +1835,87 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
               </button>
             </div>
 
-            <div className="pkg-table-scroll" style={{ maxHeight: '460px', overflowY: 'auto' }}>
-              <table className="pkg-clean-table">
+            <div className="audit-trail-table-wrap">
+              <table className="audit-trail-table">
                 <thead>
                   <tr>
-                    <th>#ID</th>
-                    <th>Thời gian (UTC)</th>
-                    <th>Tài khoản</th>
-                    <th>Hành động</th>
-                    <th>Đối tượng</th>
-                    <th>Chi tiết & Địa chỉ IP</th>
-                    <th>Chuỗi băm SHA-256 (Prev → Entry)</th>
+                    <th className="col-id">#ID</th>
+                    <th className="col-time">Thời gian (UTC)</th>
+                    <th className="col-user">Tài khoản</th>
+                    <th className="col-action">Hành động</th>
+                    <th className="col-target">Đối tượng</th>
+                    <th className="col-detail">Chi tiết & Địa chỉ IP</th>
+                    <th className="col-hash">Chuỗi băm SHA-256 (Prev → Entry)</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {auditLogs.map((row) => (
-                    <tr key={row.id}>
-                      <td style={{ fontFamily: 'monospace', fontSize: '0.78rem', color: 'var(--text-muted)' }}>#{row.id}</td>
-                      <td style={{ fontSize: '0.78rem', whiteSpace: 'nowrap' }}>
-                        {row.created_at ? new Date(row.created_at).toLocaleString() : '—'}
-                      </td>
-                      <td>
-                        <strong style={{ fontSize: '0.8rem' }}>{row.username}</strong>
-                      </td>
-                      <td>
-                        <code style={{ fontSize: '0.76rem', fontWeight: 700, color: 'var(--accent-primary)' }}>{row.action}</code>
-                      </td>
-                      <td style={{ fontSize: '0.8rem', fontWeight: 600 }}>{row.target}</td>
-                      <td style={{ fontSize: '0.76rem', color: 'var(--text-muted)', maxWidth: '280px', wordBreak: 'break-word' }}>
-                        {row.detail || '—'}
-                      </td>
-                      <td style={{ fontFamily: 'monospace', fontSize: '0.73rem', whiteSpace: 'nowrap' }} title={`Prev: ${row.prev_hash}\nEntry: ${row.entry_hash}`}>
-                        <span style={{ color: 'var(--text-muted)' }}>{(row.prev_hash || '').slice(0, 8)}</span>
-                        {' → '}
-                        <strong style={{ color: '#10b981' }}>{(row.entry_hash || '').slice(0, 12)}</strong>
-                      </td>
-                    </tr>
-                  ))}
+                  {(() => {
+                    const tamperedMap = new Map(
+                      (auditChain?.tampered_entries || []).map((tItem) => [Number(tItem.id), tItem])
+                    );
+                    return auditLogs.map((row) => {
+                      const parsed = parseAuditDetail(row.detail);
+                      const tamperedInfo = tamperedMap.get(Number(row.id));
+                      return (
+                        <tr key={row.id}>
+                          <td className="col-id" style={{ fontFamily: 'monospace', fontSize: '0.78rem', color: 'var(--text-muted)', fontWeight: 600 }}>
+                            #{row.id}
+                          </td>
+                          <td className="col-time" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                            {row.created_at ? new Date(row.created_at).toLocaleString() : '—'}
+                          </td>
+                          <td className="col-user" title={row.username || ''}>
+                            <strong style={{ fontSize: '0.8rem' }}>{row.username || 'system'}</strong>
+                          </td>
+                          <td className="col-action" title={row.action || ''}>
+                            <span className="audit-action-pill">{row.action}</span>
+                          </td>
+                          <td className="col-target" style={{ fontSize: '0.8rem', fontWeight: 600 }} title={row.target || ''}>
+                            {row.target || '—'}
+                          </td>
+                          <td className="col-detail" title={parsed.raw || ''}>
+                            {parsed.summary || parsed.ip || parsed.uaShort ? (
+                              <div className="audit-detail-cell">
+                                {parsed.summary && (
+                                  <div className="audit-detail-summary">{parsed.summary}</div>
+                                )}
+                                {(parsed.ip || parsed.uaShort) && (
+                                  <div className="audit-detail-meta">
+                                    {parsed.ip && (
+                                      <span className="audit-ip-badge">IP: {parsed.ip}</span>
+                                    )}
+                                    {parsed.uaShort && (
+                                      <span className="audit-ua-badge" title={parsed.ua}>
+                                        {parsed.uaShort}
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <span style={{ color: 'var(--text-muted)' }}>—</span>
+                            )}
+                          </td>
+                          <td
+                            className="col-hash"
+                            title={
+                              tamperedInfo
+                                ? `CẢNH BÁO SAI LỆCH MÃ BĂM!\nExpected: ${tamperedInfo.expected_hash}\nActual: ${tamperedInfo.actual_hash}\nPrev: ${row.prev_hash || '—'}\nEntry: ${row.entry_hash || '—'}`
+                                : `Prev: ${row.prev_hash || '—'}\nEntry: ${row.entry_hash || '—'}`
+                            }
+                          >
+                            <span className={`audit-hash-pill${tamperedInfo ? ' is-tampered' : ''}`}>
+                              <span style={{ color: 'var(--text-muted)' }}>{(row.prev_hash || '').slice(0, 8) || 'genesis'}</span>
+                              <span style={{ color: 'var(--text-muted)', opacity: 0.7 }}>→</span>
+                              <strong style={{ color: tamperedInfo ? '#ef4444' : '#10b981' }}>
+                                {(row.entry_hash || '').slice(0, 12) || 'MISSING'}
+                              </strong>
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    });
+                  })()}
                   {auditLogs.length === 0 && (
                     <tr>
                       <td colSpan="7" style={{ textAlign: 'center', padding: '18px', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
