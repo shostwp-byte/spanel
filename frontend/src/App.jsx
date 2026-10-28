@@ -378,6 +378,7 @@ const USER_ALLOWED_PAGES = new Set([
   'mail_forwarders',
   'mail_auto',
   'applications',
+  'app_installer',
   'wordpress_manager',
   'waf',
   'waf-site',
@@ -1603,7 +1604,7 @@ function AppContent() {
         'Content-Type': 'application/json',
         ...(fetchOptions.headers || {}),
       };
-      if (effectiveRole && !headers['X-Access-Role']) {
+      if (currentUser && effectiveRole && !headers['X-Access-Role']) {
         headers['X-Access-Role'] = effectiveRole;
       }
       // CSRF: echo the spanel_csrf cookie back in a header for mutating
@@ -1672,7 +1673,6 @@ function AppContent() {
         // the response. JS code MUST NOT touch the JWT.
         signedOutRef.current = false;
         setViewLevel(null);
-        setIsAuthenticated(true);
         setNeedsTwoFactor(false);
         setPasskeyPrompt(null);
         setOtpCode('');
@@ -2993,10 +2993,10 @@ function AppContent() {
 
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (isAuthenticated && currentUser) {
       refreshAll({ skipUserReload: true });
     }
-  }, [isAuthenticated, effectiveRole]);
+  }, [isAuthenticated, currentUser?.id, effectiveRole]);
 
   useEffect(() => {
     if (standaloneEditor) return undefined;
@@ -3035,7 +3035,7 @@ function AppContent() {
 
   const lastDashRoleRef = useRef(null);
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (!isAuthenticated || !currentUser) {
       lastDashRoleRef.current = null;
       return;
     }
@@ -3044,7 +3044,7 @@ function AppContent() {
       lastDashRoleRef.current = effectiveRole;
       loadDashboardSummary();
     }
-  }, [isAuthenticated, page, effectiveRole]);
+  }, [isAuthenticated, currentUser?.id, page, effectiveRole]);
 
 
   useEffect(() => {
@@ -3258,6 +3258,7 @@ function AppContent() {
       ]}] : []),
       { key: 'advanced_features', title: 'Advanced Features', items: [
         ...(appsFeatureEnabled ? [['applications', 'Applications (Node/Python/Docker)', Cpu]] : []),
+        ['app_installer', 'App Installer', Boxes],
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
         ['waf', 'Web Application Firewall', ShieldAlert],
         ['cron', 'Cron Jobs', Clock],
@@ -4716,9 +4717,9 @@ function AppContent() {
           <div className="impersonation-banner">
             <div className="banner-text">
               <span className="banner-icon">⚠️</span>
-              <span>You are currently viewing the panel as <strong>{effectiveRole.toUpperCase()}</strong>.</span>
+              <span>{t('UI Preview Mode: You are currently viewing the panel interface as')} <strong>{effectiveRole.toUpperCase()}</strong> ({t('use "Login as" on a user account for full tenant impersonation')}).</span>
             </div>
-            <button type="button" onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>Return to {actualRole.toUpperCase()}</button>
+            <button type="button" onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>{t('Return to')} {actualRole.toUpperCase()}</button>
           </div>
         )}
         <section className="topbar">
@@ -4734,7 +4735,7 @@ function AppContent() {
               and sign out live in it, as they do in OPanel. */}
           <div className="top-actions">
             {(canSwitchToAdmin || canSwitchToReseller) && (
-              <div className="segmented role-switcher-seg" aria-label="Access Level">
+              <div className="segmented role-switcher-seg" aria-label="Access Level Preview" title={t('UI View Level Preview (use Login As in Users list to manage a specific customer account)')}>
                 {canSwitchToAdmin && <button className={effectiveRole === 'admin' ? 'active' : ''} onClick={() => { setViewLevel('admin'); navigateToPage('dashboard'); }}>Admin</button>}
                 {canSwitchToReseller && <button className={effectiveRole === 'reseller' ? 'active' : ''} onClick={() => { setViewLevel('reseller'); navigateToPage('dashboard'); }}>Reseller</button>}
                 <button className={effectiveRole === 'user' ? 'active' : ''} onClick={() => { setViewLevel('user'); navigateToPage('dashboard'); }}>User</button>

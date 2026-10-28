@@ -121,3 +121,48 @@ function loadAceBundleSim() {{
     data = json.loads(proc.stdout.strip().splitlines()[-1])
     assert data["ok"] is True
     assert data["reloadCount"] == 1
+
+
+def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(ROOT / "backend"))
+    from app.core import database as db_mod
+    from app.services import dns as dns_mod
+
+    monkeypatch.setattr(db_mod, "run_migrations", lambda: None)
+    monkeypatch.setattr(dns_mod, "sync", lambda *a, **kw: None)
+    from app import main as panel_main
+
+    # P2-14: X-Access-Role is allowed in CORS preflight headers
+    cors_mw = next((m for m in panel_main.app.user_middleware if "CORSMiddleware" in str(m.cls)), None)
+    assert cors_mw is not None
+    allow_headers = cors_mw.kwargs.get("allow_headers") if hasattr(cors_mw, "kwargs") else cors_mw.options.get("allow_headers")
+    assert "X-Access-Role" in allow_headers
+
+    # P2-16: SelectiveGZipMiddleware uses compresslevel=5 and skips /download, /export, .tar.gz, .sql
+    gzip_mw = next((m for m in panel_main.app.user_middleware if "SelectiveGZipMiddleware" in str(m.cls)), None)
+    assert gzip_mw is not None
+    gzip_opts = gzip_mw.kwargs if hasattr(gzip_mw, "kwargs") else gzip_mw.options
+    assert gzip_opts.get("compresslevel") == 5
+
+    # Also execute SelectiveGZipMiddleware against a /download path and a JSON path
+    import asyncio
+
+    called_inner = []
+
+    async def dummy_app(scope, receive, send):
+        called_inner.append(scope.get("path"))
+
+    mw = panel_main.SelectiveGZipMiddleware(dummy_app, minimum_size=1000, compresslevel=5)
+    asyncio.run(mw({"type": "http", "path": "/api/files/download", "headers": [(b"accept-encoding", b"gzip")]}, None, None))
+    assert called_inner == ["/api/files/download"]
+
+    # P2-15 & P2-12: App.jsx includes app_installer in USER_ALLOWED_PAGES and awaits loadCurrentUser before refreshAll
+    app_src = APP_JSX.read_text(encoding="utf-8")
+    user_pages_block = app_src.split("const USER_ALLOWED_PAGES = new Set([", 1)[1].split("]);", 1)[0]
+    assert "'app_installer'" in user_pages_block
+    assert "['app_installer', 'App Installer', Boxes]" in app_src
+    assert "if (isAuthenticated && currentUser)" in app_src
+    assert "if (currentUser && effectiveRole && !headers['X-Access-Role'])" in app_src
+

@@ -112,14 +112,44 @@ cors_origins = settings.cors_origins
 if not cors_origins and settings.app_env != "production":
     cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
+class SelectiveGZipMiddleware:
+    """Apply GZip (compresslevel=5) while bypassing binary/archive/SQL downloads so
+    Content-Length is preserved and CPU is not wasted recompressing archives or dumps."""
+
+    EXCLUDED_CONTENT_TYPES = frozenset({
+        "application/sql",
+        "application/x-sql",
+        "application/x-tar",
+        "application/gzip",
+        "application/x-gzip",
+        "application/zip",
+        "application/octet-stream",
+    })
+    SKIP_PATH_SUFFIXES = ("/download", "/export", "/raw")
+
+    def __init__(self, app, minimum_size: int = 1000, compresslevel: int = 5):
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+        self.gzip_app = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=compresslevel)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = (scope.get("path") or "").rstrip("/").lower()
+            if path.endswith(self.SKIP_PATH_SUFFIXES) or path.endswith((".tar.gz", ".tgz", ".zip", ".sql")):
+                await self.app(scope, receive, send)
+                return
+        await self.gzip_app(scope, receive, send)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"],
+    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "X-Access-Role"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=1000, compresslevel=5)
 
 
 def _is_potentially_trustworthy_origin(request) -> bool:
