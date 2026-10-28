@@ -9618,7 +9618,30 @@ QUOTA_HOME="/home"
 FSTAB_FILE="/etc/fstab"
 
 quota_mount_field() {
-  findmnt -no "$1" -T "$QUOTA_HOME" 2>/dev/null | head -n1 | tr -d '[:space:]' || true
+  # spanel-api.service's ReadWritePaths=/home creates a bind mount at /home
+  # inside the service's mount namespace (SOURCE=/dev/...[/home], TARGET=/home)
+  # even when /home lives on the / filesystem in /etc/fstab. Resolve back to /
+  # when the detected mount is a bind mount or has no /etc/fstab entry while /
+  # does.
+  local target="$QUOTA_HOME" mp src
+  mp="$(findmnt -no TARGET -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+  src="$(findmnt -no SOURCE -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+  if [[ -n "$mp" && "$mp" != "/" && -f "$FSTAB_FILE" ]]; then
+    if [[ -z "$(fstab_quota_options "$FSTAB_FILE" "$mp")" && -n "$(fstab_quota_options "$FSTAB_FILE" /)" ]]; then
+      if [[ "$1" == "TARGET" ]]; then
+        echo "/"
+        return 0
+      fi
+      target="/"
+    fi
+  elif [[ -n "$mp" && "$mp" != "/" && "$src" == *"["*"]" ]]; then
+    if [[ "$1" == "TARGET" ]]; then
+      echo "/"
+      return 0
+    fi
+    target="/"
+  fi
+  findmnt -no "$1" -T "$target" 2>/dev/null | head -n1 | sed 's/\[.*\]$//' | tr -d '[:space:]' || true
 }
 
 # Whether a mount option string turns user quota on.
@@ -9691,7 +9714,7 @@ quota_state() {
 }
 
 quota_status() {
-  local mp fstype device options active=no fstab=no on=no tools=no state hint=""
+  local mp fstype device options active=no fstab=no on=no tools=no state hint="" qon_out=""
   mp="$(quota_mount_field TARGET)"
   fstype="$(quota_mount_field FSTYPE)"
   device="$(quota_mount_field SOURCE)"
@@ -9702,7 +9725,12 @@ quota_status() {
   fi
   command -v setquota >/dev/null 2>&1 && tools=yes
   if [[ "$tools" == yes && "$active" == yes && "$fstype" == ext4 ]]; then
-    [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" == *" is on"* ]] && on=yes
+    if [[ "$(type -t quotaon)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+      qon_out="$(nsenter -t 1 -m -- quotaon -pu "$mp" 2>/dev/null || true)"
+    else
+      qon_out="$(quotaon -pu "$mp" 2>/dev/null || true)"
+    fi
+    [[ "$qon_out" == *" is on"* ]] && on=yes
   fi
   state="$(quota_state "$fstype" "$mp" "$active" "$fstab" "$on")"
   case "$state" in
@@ -9747,10 +9775,19 @@ quota_enable() {
         deny "could not prepare ${FSTAB_FILE}"
       fi
       # Refuse anything findmnt cannot parse: a broken fstab is a server that
-      # does not boot.
+      # does not boot. When PrivateDevices=true hides /dev/disk inside the unit,
+      # findmnt --verify fails on UUID= resolution even for an untouched fstab;
+      # fall back to checking the edited fstab structure in that case.
       if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]] && ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
-        rm -f -- "$tmp"
-        deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+        if [[ ! -d /dev/disk ]] && ! findmnt --verify --tab-file "$FSTAB_FILE" >/dev/null 2>&1; then
+          awk -v mp="$mp" '$1 !~ /^#/ && NF > 0 && NF < 4 { exit 1 } $1 !~ /^#/ && $2 == mp { ok=1 } END { if (!ok) exit 1 }' "$tmp" || {
+            rm -f -- "$tmp"
+            deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+          }
+        else
+          rm -f -- "$tmp"
+          deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+        fi
       fi
       backup="${FSTAB_FILE}.spanel-$(date +%Y%m%d%H%M%S)"
       cp -p -- "$FSTAB_FILE" "$backup"
@@ -9766,11 +9803,15 @@ quota_enable() {
   if [[ "$fstype" == ext4 ]]; then
     # Journaled quota: build the quota file once, then switch it on. -m keeps
     # the filesystem mounted read-write while it is counted.
-    if [[ ! -f "${mp%/}/aquota.user" ]]; then
-      quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
+    local -a ns_prefix=()
+    if [[ "$(type -t quotacheck)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+      ns_prefix=(nsenter -t 1 -m --)
     fi
-    if [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
-      quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
+    if [[ ! -f "${mp%/}/aquota.user" ]]; then
+      "${ns_prefix[@]}" quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
+    fi
+    if [[ "$("${ns_prefix[@]}" quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
+      "${ns_prefix[@]}" quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
     fi
   fi
   quota_status
@@ -9799,8 +9840,12 @@ apply_kernel_quota() {
   mp="$(quota_mount_field TARGET)"
   [[ -n "$mp" ]] || return 0
   limits="$(quota_limits "$2" "$3")"
+  local -a ns_prefix=()
+  if [[ "$(type -t setquota)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+    ns_prefix=(nsenter -t 1 -m --)
+  fi
   # shellcheck disable=SC2086 # four numbers, split on purpose
-  setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
+  "${ns_prefix[@]}" setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
     echo "warning: setquota failed for ${user} on ${mp}" >&2
 }
 

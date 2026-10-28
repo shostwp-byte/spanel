@@ -139,6 +139,17 @@ def test_enable_edits_fstab_and_asks_for_a_remount_instead_of_doing_it(tmp_path)
 
 
 @needs_bash
+def test_enable_resolves_home_bind_mount_to_root_in_fstab(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    out = run_bash(tmp_path, _script(tmp_path, "quota_enable"), env={"FAKE_MP": "/home"})
+    status = _kv(out.stdout)
+    assert status["mount"] == "/"
+    assert status["state"] == "remount-required"
+    assert "usrjquota=aquota.user,jqfmt=vfsv1" in (tmp_path / "fstab").read_text(encoding="utf-8")
+
+
+
+@needs_bash
 def test_enable_switches_quota_on_once_the_options_are_mounted(tmp_path):
     (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
     run_bash(tmp_path, _script(tmp_path, "quota_enable"),
