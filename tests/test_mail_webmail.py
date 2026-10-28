@@ -504,3 +504,103 @@ def test_webmail_non_ascii_password_login_via_sasl_plain(tmp_path, monkeypatch):
         headers={"X-Forwarded-For": "198.51.100.89"},
     )
     assert r_bad.status_code == 401
+
+
+def test_webmail_csrf_draft_safety_and_crlf_sanitization(tmp_path, monkeypatch):
+    wm = load_webmail()
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AUTH_SECRET", "test-auth-secret-key-1234567890")
+
+    fake_imaps: list[FakeIMAP] = []
+
+    def fake_open_imap(auth_user: str, auth_pass: str):
+        inst = FakeIMAP(auth_user, auth_pass)
+        fake_imaps.append(inst)
+        return inst
+
+    monkeypatch.setattr(wm, "_open_imap_with_creds", fake_open_imap)
+    client = TestClient(wm.app)
+
+    r_login = client.post(
+        "/api/auth/login",
+        json={"email": "info@khach.vn", "password": "secret"},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    assert r_login.status_code == 200
+    assert "SameSite=strict" in r_login.headers.get("set-cookie", "")
+    client.cookies.update(r_login.cookies)
+
+    # P2-5: State-changing requests without Origin or X-Requested-With are rejected (403)
+    r_csrf_missing = client.post(
+        "/api/messages/action",
+        json={"action": "mark_read", "folder": "INBOX", "uids": ["101"]},
+    )
+    assert r_csrf_missing.status_code == 403
+
+    # State-changing requests with a mismatched Origin are rejected even if X-Requested-With is set
+    r_csrf_bad_origin = client.post(
+        "/api/messages/action",
+        json={"action": "mark_read", "folder": "INBOX", "uids": ["101"]},
+        headers={"Origin": "https://evil.example.com", "X-Requested-With": "XMLHttpRequest"},
+    )
+    assert r_csrf_bad_origin.status_code == 403
+
+    # State-changing requests with X-Requested-With (or matching Origin) succeed
+    r_csrf_ok = client.post(
+        "/api/messages/action",
+        json={"action": "mark_read", "folder": "INBOX", "uids": ["101"]},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    assert r_csrf_ok.status_code == 200
+
+    # P2-9: Display name containing CR/LF is sanitized on save and never causes 500 when building emails
+    r_prefs = client.put(
+        "/api/settings",
+        json={"display_name": "Nguyen Van A\r\nBcc: victim@example.com", "reply_to": "info@khach.vn"},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    assert r_prefs.status_code == 200
+    saved_dn = r_prefs.json()["display_name"]
+    assert "\r" not in saved_dn and "\n" not in saved_dn
+
+    # P2-8: Saving a draft appends the new draft BEFORE deleting the old draft;
+    # if APPEND fails (e.g. quota full), the old draft UID is NOT marked \Deleted.
+    r_draft_ok = client.post(
+        "/api/messages/draft",
+        json={"to": "khach@example.com", "subject": "Line1\r\nLine2", "body_text": "Noi dung nhap", "draft_uid": "55"},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    assert r_draft_ok.status_code == 200
+    last_imap = fake_imaps[-1]
+    assert len(last_imap.appended) == 1
+    assert last_imap.stored == [("55", "+FLAGS.SILENT", "(\\Deleted)")]
+
+    class QuotaFullIMAP(FakeIMAP):
+        def append(self, mailbox, flags, date_time, message):
+            return "NO", [b"[OVERQUOTA] Mailbox is full"]
+
+    monkeypatch.setattr(wm, "_open_imap_with_creds", lambda u, p: QuotaFullIMAP(u, p))
+    quota_imaps: list[QuotaFullIMAP] = []
+
+    def track_quota_imap(u, p):
+        inst = QuotaFullIMAP(u, p)
+        quota_imaps.append(inst)
+        return inst
+
+    monkeypatch.setattr(wm, "_open_imap_with_creds", track_quota_imap)
+    r_draft_fail = client.post(
+        "/api/messages/draft",
+        json={"to": "khach@example.com", "subject": "Draft 2", "body_text": "Noi dung", "draft_uid": "55"},
+        headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    assert r_draft_fail.status_code == 500
+    assert quota_imaps[-1].stored == [], "Old draft must not be deleted when APPEND fails"
+
+
+def test_helper_locks_mail_configure_and_reconfigure():
+    cfg_body = helper_function("mail_configure")
+    reconfig_body = helper_function("mail_reconfigure")
+    assert "/run/spanel-mail-install.lock" in cfg_body
+    assert "/run/spanel-mail-install.lock" in reconfig_body
+    assert "pip install" in reconfig_body
+

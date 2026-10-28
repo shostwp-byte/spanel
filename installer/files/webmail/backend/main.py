@@ -32,7 +32,7 @@ import time
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -413,7 +413,33 @@ def _get_session(request: Request) -> dict[str, Any] | None:
         return None
 
 
+def _verify_csrf_request(request: Request) -> None:
+    if request.method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    origin = (request.headers.get("origin") or "").strip()
+    xrw = (request.headers.get("x-requested-with") or "").strip()
+    expected_host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+        or ""
+    ).split(",")[0].strip().lower()
+
+    if origin:
+        if origin.lower() == "null":
+            raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (CSRF Origin không hợp lệ).")
+        parsed_origin = urlsplit(origin)
+        origin_host = (parsed_origin.netloc or "").strip().lower()
+        if not origin_host or (expected_host and origin_host != expected_host):
+            raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (CSRF Origin không khớp).")
+        return
+
+    if xrw.lower() != "xmlhttprequest":
+        raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (thiếu xác thực CSRF).")
+
+
 def _require_session(request: Request) -> dict[str, Any]:
+    _verify_csrf_request(request)
     sess = _get_session(request)
     if not sess:
         raise HTTPException(status_code=401, detail="Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.")
@@ -662,9 +688,10 @@ def _load_user_prefs(address: str) -> dict[str, Any]:
 def _save_user_prefs(address: str, updates: dict[str, Any]) -> dict[str, Any]:
     prefs = _load_user_prefs(address)
     if "display_name" in updates:
-        prefs["display_name"] = str(updates["display_name"] or "").strip()[:120]
+        clean_dn = re.sub(r"[\r\n\x00]+", " ", str(updates["display_name"] or "")).strip()[:120]
+        prefs["display_name"] = clean_dn
     if "reply_to" in updates:
-        rt = str(updates["reply_to"] or "").strip()
+        rt = re.sub(r"[\r\n\x00]+", "", str(updates["reply_to"] or "")).strip()
         if rt and not EMAIL_RE.fullmatch(rt):
             raise HTTPException(status_code=400, detail="Địa chỉ Reply-To không hợp lệ.")
         prefs["reply_to"] = rt
@@ -871,7 +898,7 @@ def api_auth_sso(request: Request, token: str = Query(default="")):
         max_age=MASTER_SESSION_TTL_SECONDS,
         path="/",
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         secure=is_https,
     )
     return response
@@ -916,7 +943,7 @@ async def api_auth_login(request: Request, response: Response):
         max_age=SESSION_TTL_SECONDS,
         path="/",
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         secure=is_https,
     )
     return {
@@ -928,6 +955,7 @@ async def api_auth_login(request: Request, response: Response):
 
 @app.post("/api/auth/logout")
 def api_auth_logout(request: Request, response: Response):
+    _verify_csrf_request(request)
     sess = _get_session(request)
     if sess and sess.get("session_id"):
         (_sessions_dir() / f"{sess['session_id']}.json").unlink(missing_ok=True)
@@ -1248,21 +1276,21 @@ def api_download_attachment(
 
 async def _build_email_from_request(request: Request, sender_address: str) -> tuple[EmailMessage, list[str], str | None]:
     prefs = _load_user_prefs(sender_address)
-    display_name = prefs.get("display_name", "").strip()
-    reply_to_pref = prefs.get("reply_to", "").strip()
+    display_name = re.sub(r"[\r\n\x00]+", " ", str(prefs.get("display_name") or "")).strip()
+    reply_to_pref = re.sub(r"[\r\n\x00]+", "", str(prefs.get("reply_to") or "")).strip()
 
     ctype = (request.headers.get("content-type") or "").lower()
     uploads: list[tuple[str, str, bytes]] = []
     if "multipart/form-data" in ctype:
         form = await request.form()
-        to_raw = str(form.get("to") or "").strip()
-        cc_raw = str(form.get("cc") or "").strip()
-        bcc_raw = str(form.get("bcc") or "").strip()
-        subject = str(form.get("subject") or "").strip()
+        to_raw = re.sub(r"[\r\n\x00]+", " ", str(form.get("to") or "")).strip()
+        cc_raw = re.sub(r"[\r\n\x00]+", " ", str(form.get("cc") or "")).strip()
+        bcc_raw = re.sub(r"[\r\n\x00]+", " ", str(form.get("bcc") or "")).strip()
+        subject = re.sub(r"[\r\n\x00]+", " ", str(form.get("subject") or "")).strip()
         body_text = str(form.get("body_text") or "")
         body_html = str(form.get("body_html") or "")
-        in_reply_to = str(form.get("in_reply_to") or "").strip()
-        references = str(form.get("references") or "").strip()
+        in_reply_to = re.sub(r"[\r\n\x00]+", " ", str(form.get("in_reply_to") or "")).strip()
+        references = re.sub(r"[\r\n\x00]+", " ", str(form.get("references") or "")).strip()
         draft_uid = str(form.get("draft_uid") or "").strip() or None
         for file_item in form.getlist("attachments"):
             if hasattr(file_item, "filename") and getattr(file_item, "filename", ""):
@@ -1279,14 +1307,14 @@ async def _build_email_from_request(request: Request, sender_address: str) -> tu
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Dữ liệu gửi thư không hợp lệ.") from exc
         body = data_json if isinstance(data_json, dict) else {}
-        to_raw = str(body.get("to") or "").strip()
-        cc_raw = str(body.get("cc") or "").strip()
-        bcc_raw = str(body.get("bcc") or "").strip()
-        subject = str(body.get("subject") or "").strip()
+        to_raw = re.sub(r"[\r\n\x00]+", " ", str(body.get("to") or "")).strip()
+        cc_raw = re.sub(r"[\r\n\x00]+", " ", str(body.get("cc") or "")).strip()
+        bcc_raw = re.sub(r"[\r\n\x00]+", " ", str(body.get("bcc") or "")).strip()
+        subject = re.sub(r"[\r\n\x00]+", " ", str(body.get("subject") or "")).strip()
         body_text = str(body.get("body_text") or "")
         body_html = str(body.get("body_html") or "")
-        in_reply_to = str(body.get("in_reply_to") or "").strip()
-        references = str(body.get("references") or "").strip()
+        in_reply_to = re.sub(r"[\r\n\x00]+", " ", str(body.get("in_reply_to") or "")).strip()
+        references = re.sub(r"[\r\n\x00]+", " ", str(body.get("references") or "")).strip()
         draft_uid = str(body.get("draft_uid") or "").strip() or None
 
     msg = EmailMessage()
@@ -1404,12 +1432,14 @@ async def api_save_draft(request: Request):
     conn = _open_imap(sess)
     try:
         _ensure_standard_folders(conn)
+        atyp, _ = conn.append('"Drafts"', "(\\Draft \\Seen)", imaplib.Time2Internaldate(time.time()), raw_bytes)
+        if atyp != "OK":
+            raise HTTPException(status_code=500, detail="Không thể lưu thư nháp (hộp thư có thể đã đầy).")
         if draft_uid and UID_RE.fullmatch(draft_uid):
             typ, _ = conn.select('"Drafts"', readonly=False)
             if typ == "OK":
                 conn.uid("STORE", draft_uid, "+FLAGS.SILENT", "(\\Deleted)")
                 conn.expunge()
-        conn.append('"Drafts"', "(\\Draft \\Seen)", imaplib.Time2Internaldate(time.time()), raw_bytes)
     finally:
         try:
             conn.logout()
@@ -2236,7 +2266,8 @@ WEBMAIL_HTML = r"""<!DOCTYPE html>
     }
 
     async function api(path, options = {}) {
-      const res = await fetch(path, { credentials: "same-origin", ...options });
+      const headers = { "X-Requested-With": "XMLHttpRequest", ...(options.headers || {}) };
+      const res = await fetch(path, { credentials: "same-origin", ...options, headers });
       let data = null;
       const ctype = res.headers.get("content-type") || "";
       if (ctype.includes("application/json")) {

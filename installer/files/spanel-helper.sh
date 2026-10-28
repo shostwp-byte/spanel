@@ -4515,6 +4515,10 @@ mail_configure() {
   # and Rspamd's configuration and reloads them. Which domain uses which relay
   # is mail-sync's.
   [[ -f "$MAIL_EXIM_CONF" ]] || deny "the Email addon is not installed"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/spanel-mail-install.lock
+    flock -w 120 9 || deny "another Email addon operation is currently running - wait for it to finish"
+  fi
   local payload status=0 previous
   payload="$(mktemp)"
   head -c 2000000 >"$payload"
@@ -4764,6 +4768,10 @@ mail_reconfigure() {
     echo "The Email addon is not installed; nothing to reconfigure."
     return 0
   fi
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/spanel-mail-install.lock
+    flock -w 120 9 || deny "another Email addon operation is currently running - wait for it to finish"
+  fi
   mail_ensure_maps
   mail_write_tls_script
   "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
@@ -4773,14 +4781,32 @@ mail_reconfigure() {
   mail_write_dovecot_conf
   mail_write_learn_service
   if [[ -f "$WEBMAIL_HOME/.spanel" ]]; then
-    local candidate
+    local candidate webmail_changed=0 req_changed=0
     for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
       if [[ -d "$candidate" && ! -L "$candidate" && "$(stat -c '%u' "$candidate" 2>/dev/null || echo 0)" == "0" ]] \
          && [[ -f "${candidate}/main.py" && ! -L "${candidate}/main.py" && -f "${candidate}/requirements.txt" && ! -L "${candidate}/requirements.txt" ]]; then
         install -d -o root -g root -m 0755 "$WEBMAIL_HOME/src" "$WEBMAIL_HOME/src/backend"
         if ! cmp -s "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py" 2>/dev/null; then
           install -m 0755 -o root -g root "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py"
+          webmail_changed=1
+        fi
+        if ! cmp -s "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt" 2>/dev/null; then
           install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
+          req_changed=1
+          webmail_changed=1
+        fi
+        if [[ "$req_changed" -eq 1 && -x "$WEBMAIL_HOME/venv/bin/python" ]]; then
+          chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
+          if command -v runuser >/dev/null 2>&1; then
+            runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+              -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 || true
+          else
+            "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+              -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 || true
+          fi
+          chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
+        fi
+        if [[ "$webmail_changed" -eq 1 ]]; then
           systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
         fi
         break
