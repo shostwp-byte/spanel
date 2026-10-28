@@ -4,6 +4,27 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
+## [v1.0.8] — 2026-10-28
+
+Các bản vá bảo mật, ổn định và hiệu năng theo đợt thẩm định độc lập lần 11 & 12:
+
+### Bảo mật & Phân tách đặc quyền
+- **Webmail & Helper (`P0-A`):** Gỡ bỏ hoàn toàn biến `WEBMAIL_REPO` trong `.env` và nhánh fallback sang `${APP_DIR}` khi cài đặt/cấu hình lại Webmail trong `spanel-helper.sh`, ngăn chặn leo thang đặc quyền từ user `spanel` sang `root`; đồng thời khóa cứng phiên bản phụ thuộc kèm `--only-binary :all:` trong `requirements.txt`.
+- **Webmail SSO & Session (`P1-1`):** Rút ngắn TTL của phiên SSO Master xuống 2 giờ, gắn mã định danh thế hệ hộp thư (`gen`) vào token SSO và bản đồ `mailbox_generations.json` để tự động thu hồi phiên cũ khi xóa hộp thư hoặc chuyển chủ tên miền.
+- **Chống Brute-force Webmail (`P1-2`):** Bổ sung giới hạn tốc độ đăng nhập theo cặp `(IP, email)` và theo IP từ `X-Forwarded-For` ngay trong `/api/auth/login` của Webmail, kết hợp `limit_req_zone` ở tầng Nginx.
+- **Hỗ trợ mật khẩu UTF-8 trong Webmail (`P1-3`):** Xác thực IMAP qua `AUTHENTICATE PLAIN` mã hóa UTF-8 thay vì `conn.login()` chỉ hỗ trợ ASCII.
+- **Webmail CSRF, Lưu nháp & Sanitization (`P2-5..P2-9`):** Bật `SameSite=Strict` kèm kiểm tra `Origin` / `X-Requested-With` cho các request thay đổi trạng thái; `APPEND` thư nháp mới thành công trước khi xóa bản nháp cũ; lọc bỏ ký tự `\r`/`\n` trong tên hiển thị và tiêu đề thư; bọc `flock` cho `mail-configure` và `mail-reconfigure`.
+- **WordPress Clone & Tenant File Operations (`P0-1`, `P2-3`, `P2-4`):** Mở file nguồn bằng `O_NOFOLLOW` kết hợp `fstat` kiểm tra regular file + `st_uid` khớp Linux user của khách; loại bỏ nhánh ghi/xóa file trực tiếp bằng quyền tiến trình panel khi `command_dry_run=False`.
+- **MariaDB Import (`P1-2`, `P1-3`, `P2-2`):** Bắt buộc dùng thông tin xác thực của tenant (`--defaults-file` tạm trong thư mục cùng phân vùng hoặc `/var/tmp`, `--binary-mode`), chỉ lọc mệnh đề `DEFINER=` trên các dòng DDL (`CREATE`, `ALTER`, `/*!50003`, `/*!50013`, `/*!50017`) mà không làm hỏng nội dung bài viết trong `INSERT`.
+
+### Đa Runtime, Quản trị Website & Giao diện
+- **Chuyển chủ sở hữu Website (`P1-5`):** Hoàn thiện API và giao diện Admin `POST /api/websites/{id}/transfer-owner` — kiểm tra hạn mức gói của chủ mới, chuyển đồng bộ `Website`, `DatabaseAccount`, `SftpAccount`, `SiteApp`, `DnsZone`, `MailDomain`, `MailAccount`, và tự động rollback thư mục runtime nếu ghi vhost hoặc commit DB gặp lỗi.
+- **Chặn PHP trong thư mục Uploads (`P0-2`, `P2-1`):** Bảo toàn đầy đủ cấu hình vhost khi bật bảo mật WordPress; hỗ trợ chặn thực thi `.php` cho cả WordPress cài đặt trong thư mục con (`subpath`) thông qua rule Nginx location riêng mà không làm đổi `app_type` của website gốc.
+- **Tự phục hồi khi cập nhật Frontend (`P1-4`):** Bọc `ChunkErrorBoundary` quanh `React.Suspense`, lắng nghe sự kiện `vite:preloadError` để tự tải lại trang 1 lần khi mã băm chunk thay đổi sau cập nhật, và đặt lại `_aceBundlePromise = null` khi tải trình sửa mã thất bại.
+- **Khắc phục đua trạng thái Role khi đăng nhập, CORS & GZip (`P2-12..P2-16`):** Đợi `loadCurrentUser()` hoàn tất trước khi tải dữ liệu trang; bổ sung `X-Access-Role` vào CORS `allow_headers`; khôi phục `App Installer` cho tài khoản End User; giảm mức nén GZip xuống `5` và bỏ qua nén đối với luồng tải về file nén/SQL dump.
+
+---
+
 ## [Chưa phát hành] — sau v1.0.7
 
 Các tính năng dưới đây đã có test tự động nhưng **chưa cài thử trên máy chủ thật**. Trước khi gắn tag, chạy hết [docs/STAGING_CHECKLIST.md](docs/STAGING_CHECKLIST.md).
