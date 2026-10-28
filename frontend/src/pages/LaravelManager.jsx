@@ -51,6 +51,15 @@ import {
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
+function LaravelBrandIcon({ size = 18 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false" className="lucide">
+      <rect x="3" y="3" width="18" height="18" rx="4" fill="none" stroke="currentColor" strokeWidth="2" />
+      <text x="12" y="16" textAnchor="middle" fontSize="11" fontWeight="700" fontFamily="Georgia, serif" fill="currentColor">L</text>
+    </svg>
+  );
+}
+
 const PHP_VERSIONS = ['8.4', '8.3', '8.2', '8.1'];
 const LARAVEL_VERSIONS = ['11.x', '10.x'];
 const CACHE_DRIVERS = ['file', 'redis', 'database', 'memcached', 'array'];
