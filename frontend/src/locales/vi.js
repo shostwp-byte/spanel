@@ -2867,6 +2867,9 @@ export const vi = {
   "Updates navigation tabs": "Các tab quản lý cập nhật",
   "new": "mới",
   "WordPress Manager": "Quản lý WordPress",
+  "Docker": "Docker",
+  "Node.js": "Node.js",
+  "Laravel": "Laravel",
 };
 
 /* Said in English by the people who run these servers. Translating them
