@@ -106,15 +106,11 @@ def _open_tenant_regular_file_fd(
         if not stat.S_ISREG(st.st_mode):
             raise PermissionError("Tenant file is not a regular file")
         if linux_user:
-            expected_uid: Optional[int] = None
             try:
                 expected_uid = pwd.getpwnam(linux_user).pw_uid
-            except KeyError:
-                if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules or "unittest" in sys.modules:
-                    expected_uid = os.getuid() if hasattr(os, "getuid") else st.st_uid
-                else:
-                    raise PermissionError(f"Unknown Linux user: {linux_user}")
-            if expected_uid is not None and st.st_uid != expected_uid:
+            except KeyError as exc:
+                raise PermissionError(f"Unknown Linux user: {linux_user}") from exc
+            if st.st_uid != expected_uid:
                 raise PermissionError(f"Tenant file UID mismatch ({st.st_uid} != {expected_uid})")
         return fd
     except Exception:
@@ -459,7 +455,7 @@ def write_wp_file_text(
         rel_to_root = f"public_html/{rel_path.lstrip('/')}"
     if not settings.command_dry_run:
         try:
-            res = shell.privileged(
+            shell.privileged(
                 "site-file-write",
                 helper_args=[linux_user, str(site_root), rel_to_root, safe_mode],
                 fallback=[
@@ -474,10 +470,9 @@ def write_wp_file_text(
                 sensitive=True,
                 check=False,
             )
-            if res.returncode == 0:
-                return
         except Exception as exc:
             logger.debug("write_wp_file_text helper warning: %s", exc)
+        return
     try:
         if _has_symlink_component(target, site_root):
             return
@@ -494,12 +489,6 @@ def delete_wp_path(
     rel_path: str,
 ) -> None:
     target = wp_dir / rel_path
-    try:
-        if not _has_symlink_component(target, site_root) and target.exists() and target.is_file():
-            target.unlink()
-            return
-    except Exception:
-        pass
     if not settings.command_dry_run:
         try:
             shell.privileged(
@@ -510,6 +499,12 @@ def delete_wp_path(
             )
         except Exception as exc:
             logger.debug("delete_wp_path warning: %s", exc)
+        return
+    try:
+        if not _has_symlink_component(target, site_root) and target.exists() and target.is_file():
+            target.unlink()
+    except Exception:
+        pass
 
 
 def wp_path_exists(

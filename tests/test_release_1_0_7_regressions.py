@@ -1105,7 +1105,8 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
         assert "old.alice.example.com" in (kw.get("redirects") or [])
         assert site.app_type == "wordpress"
 
-        # 2. Subpath WordPress on a non-wordpress site: site.app_type must NOT change
+        # 2. Subpath WordPress on a non-wordpress site: site.app_type must NOT change,
+        # and subpath Nginx location rule must be added to site.nginx_custom and applied via rewrite_vhost
         site.app_type = "php"
         db.commit()
         st = wordpress_manager._load_toolkit_state()
@@ -1138,7 +1139,8 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
             )
 
         assert site.app_type == "php", "Subpath WordPress must not overwrite parent site.app_type"
-        assert captured_vhost_calls == []
+        assert len(captured_vhost_calls) == 1
+        assert "location ~* ^/blog/wp-content/uploads/.*\\.php$ { deny all; }" in (site.nginx_custom or "")
         assert not (wp_dir / "blog" / "readme.html").exists()
     finally:
         settings.command_dry_run = orig_dry
@@ -1154,7 +1156,8 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
     try:
         sql_file = tmp_path / "dump_with_definer.sql"
         sql_file.write_text(
-            "CREATE TABLE `wp_posts` (`id` int PRIMARY KEY);\n"
+            "CREATE TABLE `wp_posts` (`id` int PRIMARY KEY, `post_content` text);\n"
+            "INSERT INTO `wp_posts` VALUES (1, 'Post mentioning DEFINER=`admin`@`localhost` inside body');\n"
             "/*!50003 CREATE*/ /*!50017 DEFINER=`u_src_site`@`localhost`*/ /*!50003 TRIGGER `wp_trg` BEFORE INSERT ON `wp_posts` FOR EACH ROW BEGIN END */;\n"
             "CREATE DEFINER=`other_user`@`%` TRIGGER `wp_trg2` AFTER INSERT ON `wp_posts` FOR EACH ROW BEGIN END;\n"
             "CREATE DEFINER=`admin`@`localhost` VIEW `v_posts` AS SELECT * FROM `wp_posts`;\n",
@@ -1184,7 +1187,7 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
                 assert "missing tenant database credentials" in str(exc)
             assert subproc_calls == [], "subprocess.run must never be called with ~/.my.cnf when tenant creds are missing"
 
-            # P1-2: With tenant credentials, DEFINER clauses are stripped before piping to mysql
+            # P1-2: With tenant credentials, DDL DEFINER clauses are stripped while INSERT data is preserved
             mariadb.import_database_as_tenant(
                 "wp_target_db",
                 str(sql_file),
@@ -1197,11 +1200,14 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
             assert "--binary-mode" in call["args"]
             assert call["args"][-1] == "wp_target_db"
             assert 'user="u_target_db"' in call["cnf"]
-            assert b"DEFINER" not in call["stdin"]
+            assert b"DEFINER=`u_src_site`" not in call["stdin"]
+            assert b"DEFINER=`other_user`" not in call["stdin"]
+            assert b"CREATE DEFINER=`admin`" not in call["stdin"]
+            assert b"Post mentioning DEFINER=`admin`@`localhost` inside body" in call["stdin"]
             assert b"TRIGGER `wp_trg`" in call["stdin"]
             assert b"TRIGGER `wp_trg2`" in call["stdin"]
 
-        # P1-3 remote backend: RemoteMySQLBackend.import_database_as_tenant uses tenant user/password and strips DEFINER
+        # P1-3 remote backend: RemoteMySQLBackend.import_database_as_tenant uses tenant user/password and strips DDL DEFINER
         remote_calls = []
 
         def fake_remote_subproc(args, stdin=None, **kwargs):
@@ -1241,7 +1247,8 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
             assert 'user="u_remote_tenant"' in rcall["cnf"]
             assert 'password="RemoteTenantPass!"' in rcall["cnf"]
             assert 'user="rdb_admin"' not in rcall["cnf"]
-            assert b"DEFINER" not in rcall["stdin"]
+            assert b"DEFINER=`u_src_site`" not in rcall["stdin"]
+            assert b"Post mentioning DEFINER=`admin`@`localhost` inside body" in rcall["stdin"]
 
         # Verify backup_verify.trial_restore_sql uses import_database_as_panel
         from app.services import backup_verify

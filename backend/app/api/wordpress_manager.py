@@ -511,16 +511,32 @@ def _detect_wp_version(
     return ""
 
 
+def _subpath_uploads_php_rule(subpath: str) -> str:
+    clean_sub = (subpath or "").strip("/")
+    return f"location ~* ^/{clean_sub}/wp-content/uploads/.*\\.php$ {{ deny all; }}"
+
+
 def _vhost_blocks_uploads_php(site: Optional[Website], subpath: str = "") -> bool:
     if site is None:
         return False
     clean_sub = (subpath or "").strip("/")
     expected_prefix = f"/{clean_sub}/wp-content/uploads/" if clean_sub else "/wp-content/uploads/"
+    custom_text = getattr(site, "nginx_custom", "") or ""
+    if expected_prefix in custom_text and "deny all" in custom_text:
+        return True
+    try:
+        custom_file = Path("/etc/nginx/spanel/custom") / f"{site.domain}.conf"
+        if custom_file.is_file():
+            cf_text = custom_file.read_text(encoding="utf-8", errors="replace")
+            if expected_prefix in cf_text and "deny all" in cf_text:
+                return True
+    except Exception:
+        pass
     try:
         vhost_file = Path(settings.nginx_sites_available) / f"{site.domain}.conf"
         if vhost_file.is_file():
             content = vhost_file.read_text(encoding="utf-8", errors="replace")
-            if expected_prefix in content and "deny all" in content:
+            if (expected_prefix in content or "/(?:uploads|files)/.*\\.php$" in content) and "deny all" in content:
                 return True
     except Exception:
         pass
@@ -552,7 +568,7 @@ def _evaluate_security_checks(
         ),
         "uploads_php_blocked": bool(
             _vhost_blocks_uploads_php(site, saved_inst.get("subpath") or "")
-            or ("php" in uploads_ht.lower())
+            or (settings.command_dry_run and ("php" in uploads_ht.lower()))
         ),
         "permissions_strict": bool(sec_overrides.get("permissions_strict", True)),
         "keys_salts_fresh": int(config_info.get("salts_count") or 0) >= 8 or bool(sec_overrides.get("keys_salts_fresh")),
@@ -2129,37 +2145,89 @@ def apply_wp_security(
                 "0644",
             )
             subpath_clean = (inst.get("subpath") or "").strip("/")
-            if not settings.command_dry_run and not subpath_clean and site.app_type != "wordpress":
+            if not settings.command_dry_run:
                 from app.api.websites import _rewrite_website_vhost
 
-                prev_app_type = site.app_type
-                prev_rewrite_mode = site.nginx_rewrite_mode
-                try:
-                    php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
-                    _rewrite_website_vhost(
-                        site,
-                        root_path=str(site_root),
-                        linux_user=linux_user,
-                        app_type="wordpress",
-                        php_version=php_ver,
-                        php_fpm_socket_override=php_socket,
-                        document_root=site.document_root or "public_html",
-                        rewrite_mode="front_controller",
-                    )
-                    site.app_type = "wordpress"
-                    site.nginx_rewrite_mode = "front_controller"
-                    db.commit()
-                except Exception as exc:
-                    site.app_type = prev_app_type
-                    site.nginx_rewrite_mode = prev_rewrite_mode
-                    db.rollback()
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Không thể cập nhật cấu hình Nginx vhost khi bật chặn PHP trong uploads: {exc}",
-                    ) from exc
+                if subpath_clean:
+                    rule_line = _subpath_uploads_php_rule(subpath_clean)
+                    prev_custom = site.nginx_custom or ""
+                    if rule_line not in prev_custom:
+                        next_custom = (prev_custom.rstrip() + "\n" + rule_line + "\n").lstrip("\n")
+                        try:
+                            site.nginx_custom = next_custom
+                            php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
+                            _rewrite_website_vhost(
+                                site,
+                                root_path=str(site_root),
+                                linux_user=linux_user,
+                                app_type=site.app_type,
+                                php_version=php_ver,
+                                php_fpm_socket_override=php_socket,
+                                document_root=site.document_root or "public_html",
+                                rewrite_mode=site.nginx_rewrite_mode or "none",
+                            )
+                            db.commit()
+                        except Exception as exc:
+                            site.nginx_custom = prev_custom
+                            db.rollback()
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Không thể cập nhật cấu hình Nginx vhost khi bật chặn PHP trong uploads: {exc}",
+                            ) from exc
+                elif site.app_type != "wordpress":
+                    prev_app_type = site.app_type
+                    prev_rewrite_mode = site.nginx_rewrite_mode
+                    try:
+                        php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
+                        _rewrite_website_vhost(
+                            site,
+                            root_path=str(site_root),
+                            linux_user=linux_user,
+                            app_type="wordpress",
+                            php_version=php_ver,
+                            php_fpm_socket_override=php_socket,
+                            document_root=site.document_root or "public_html",
+                            rewrite_mode="front_controller",
+                        )
+                        site.app_type = "wordpress"
+                        site.nginx_rewrite_mode = "front_controller"
+                        db.commit()
+                    except Exception as exc:
+                        site.app_type = prev_app_type
+                        site.nginx_rewrite_mode = prev_rewrite_mode
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Không thể cập nhật cấu hình Nginx vhost khi bật chặn PHP trong uploads: {exc}",
+                        ) from exc
         elif cid == "uploads_php_blocked" and not turn_on:
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.htaccess")
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/uploads/.spanel-no-php")
+            subpath_clean = (inst.get("subpath") or "").strip("/")
+            if not settings.command_dry_run and subpath_clean:
+                rule_line = _subpath_uploads_php_rule(subpath_clean)
+                prev_custom = site.nginx_custom or ""
+                if rule_line in prev_custom:
+                    from app.api.websites import _rewrite_website_vhost
+
+                    kept_lines = [ln for ln in prev_custom.splitlines() if ln.strip() != rule_line]
+                    site.nginx_custom = ("\n".join(kept_lines) + "\n") if kept_lines else ""
+                    try:
+                        php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
+                        _rewrite_website_vhost(
+                            site,
+                            root_path=str(site_root),
+                            linux_user=linux_user,
+                            app_type=site.app_type,
+                            php_version=php_ver,
+                            php_fpm_socket_override=php_socket,
+                            document_root=site.document_root or "public_html",
+                            rewrite_mode=site.nginx_rewrite_mode or "none",
+                        )
+                        db.commit()
+                    except Exception:
+                        site.nginx_custom = prev_custom
+                        db.rollback()
         elif cid == "sensitive_files_blocked":
             if turn_on:
                 wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "readme.html")

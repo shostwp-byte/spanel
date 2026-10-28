@@ -700,13 +700,8 @@ class RemoteMySQLBackend:
         eff_user, eff_pass = mariadb._resolve_tenant_import_credentials(
             safe_name, db_user=db_user, db_password=db_password
         )
-        if RemoteMySQLBackend.import_database is not _default_remote_import_database:
-            with mariadb.tenant_import_credentials(eff_user, eff_pass):
-                return self.import_database(db_name, input_file)
-        return self.import_database(db_name, input_file, db_user=eff_user, db_password=eff_pass)
-
-
-_default_remote_import_database = RemoteMySQLBackend.import_database
+        with mariadb.tenant_import_credentials(eff_user, eff_pass):
+            return self.import_database(db_name, input_file)
 
 
 # --- host records -------------------------------------------------------------

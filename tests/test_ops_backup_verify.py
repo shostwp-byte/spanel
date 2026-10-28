@@ -179,7 +179,7 @@ def test_throwaway_database_is_always_dropped(monkeypatch, tmp_path):
 
     def failing_import(name, path):
         raise RuntimeError("Database import failed: ERROR 1064")
-    monkeypatch.setattr(mariadb, "import_database", failing_import)
+    monkeypatch.setattr(mariadb, "import_database_as_panel", failing_import)
     sql = tmp_path / "d.sql"
     sql.write_text("garbage", encoding="utf-8")
     result = backup_verify.trial_restore_sql(sql)
@@ -189,7 +189,7 @@ def test_throwaway_database_is_always_dropped(monkeypatch, tmp_path):
     assert statements[0].split("`")[1] == statements[-1].split("`")[1]
 
     statements.clear()
-    monkeypatch.setattr(mariadb, "import_database", lambda name, path: None)
+    monkeypatch.setattr(mariadb, "import_database_as_panel", lambda name, path: None)
     monkeypatch.setattr(mariadb.shell, "run", lambda *a, **k: SimpleNamespace(stdout="3\n", stderr="", returncode=0))
     assert backup_verify.trial_restore_sql(sql) == {"ok": True, "tables": 3, "detail": "3 table(s) loaded"}
     assert statements[-1].startswith("DROP DATABASE")
