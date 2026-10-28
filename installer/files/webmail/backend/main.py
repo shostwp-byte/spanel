@@ -77,7 +77,8 @@ def _cfg_int(name: str, default: int) -> int:
 
 
 COOKIE_NAME = "spanel_webmail_session"
-SESSION_TTL_SECONDS = 86400 * 7  # 7 days
+SESSION_TTL_SECONDS = 86400 * 7  # 7 days (password login)
+MASTER_SESSION_TTL_SECONDS = 3600 * 2  # 2 hours (SSO master login)
 SSO_MAX_SKEW_SECONDS = 300
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+=-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$")
 FOLDER_NAME_RE = re.compile(r"^[A-Za-z0-9._ /+-]{1,128}$")
@@ -195,15 +196,120 @@ def _verify_session_cookie(cookie_val: str | None) -> str | None:
     return session_id
 
 
-def _create_session(address: str, *, mode: str = "master", password: str = "") -> str:
+def _generations_file() -> Path:
+    return _data_dir() / "mailbox_generations.json"
+
+
+def _expected_mailbox_generation(address: str) -> tuple[bool, str]:
+    path = _generations_file()
+    if not path.is_file():
+        return False, ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return True, str(raw.get(address.lower().strip()) or "").strip()
+    except Exception:
+        pass
+    return False, ""
+
+
+def _record_mailbox_generation(address: str, gen: str) -> None:
+    clean_addr = address.lower().strip()
+    clean_gen = str(gen or "").strip()
+    if not clean_addr or not clean_gen:
+        return
+    path = _generations_file()
+    mapping: dict[str, str] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                mapping = {str(k).lower().strip(): str(v).strip() for k, v in loaded.items()}
+        except Exception:
+            mapping = {}
+    if mapping.get(clean_addr) != clean_gen:
+        mapping[clean_addr] = clean_gen
+        try:
+            path.write_text(json.dumps(mapping), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _purge_expired_sessions(now: int | None = None) -> int:
+    current_ts = int(now if now is not None else time.time())
+    removed = 0
+    for path in _sessions_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if int(data.get("exp") or 0) < current_ts:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def purge_sessions_for_email(address: str) -> int:
+    target = (address or "").strip().lower()
+    if not target:
+        return 0
+    removed = 0
+    for path in _sessions_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if str(data.get("email") or "").strip().lower() == target:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def purge_sessions_for_domain(domain: str) -> int:
+    suffix = "@" + (domain or "").strip().lower().lstrip("@")
+    if suffix == "@":
+        return 0
+    removed = 0
+    for path in _sessions_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if str(data.get("email") or "").strip().lower().endswith(suffix):
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def _create_session(address: str, *, mode: str = "master", password: str = "", gen: str = "") -> str:
+    _purge_expired_sessions()
+    clean_addr = address.lower().strip()
+    clean_gen = str(gen or "").strip()
+    if not clean_gen:
+        _, clean_gen = _expected_mailbox_generation(clean_addr)
+    else:
+        # If a new generation is presented for this address, invalidate older generation sessions
+        for old_path in _sessions_dir().glob("*.json"):
+            try:
+                old_data = json.loads(old_path.read_text(encoding="utf-8"))
+                if str(old_data.get("email") or "").strip().lower() == clean_addr:
+                    old_gen = str(old_data.get("gen") or "").strip()
+                    if old_gen and old_gen != clean_gen:
+                        old_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        _record_mailbox_generation(clean_addr, clean_gen)
+
     session_id = secrets.token_urlsafe(24)
     now = int(time.time())
+    ttl = MASTER_SESSION_TTL_SECONDS if mode == "master" else SESSION_TTL_SECONDS
     payload = {
-        "email": address.lower().strip(),
+        "email": clean_addr,
         "mode": mode,
         "password_enc": _encrypt_secret(password) if password else "",
+        "gen": clean_gen,
         "created_at": now,
-        "exp": now + SESSION_TTL_SECONDS,
+        "exp": now + ttl,
     }
     path = _sessions_dir() / f"{session_id}.json"
     tmp = _sessions_dir() / f".{session_id}.tmp"
@@ -226,9 +332,17 @@ def _get_session(request: Request) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if int(data.get("exp") or 0) < int(time.time()):
+        now = int(time.time())
+        if int(data.get("exp") or 0) < now:
             path.unlink(missing_ok=True)
             return None
+        email_addr = str(data.get("email") or "").strip().lower()
+        sess_gen = str(data.get("gen") or "").strip()
+        has_gen_map, expected_gen = _expected_mailbox_generation(email_addr)
+        if has_gen_map:
+            if not expected_gen or (sess_gen and sess_gen != expected_gen):
+                path.unlink(missing_ok=True)
+                return None
         data["session_id"] = session_id
         return data
     except Exception:
@@ -242,8 +356,8 @@ def _require_session(request: Request) -> dict[str, Any]:
     return sess
 
 
-def _verify_sso_token(token: str, *, secret: str | None = None, now: int | None = None) -> str:
-    """Verify SPanel's HMAC-SHA256 SSO token (payload.signature in base64url)."""
+def _verify_sso_token_with_gen(token: str, *, secret: str | None = None, now: int | None = None) -> tuple[str, str]:
+    """Verify SPanel's HMAC-SHA256 SSO token and return (address, generation)."""
     sso_secret = (secret if secret is not None else _cfg("SSO_SECRET")).strip()
     if not sso_secret:
         raise ValueError("SSO_SECRET is not configured")
@@ -277,7 +391,14 @@ def _verify_sso_token(token: str, *, secret: str | None = None, now: int | None 
     address = str(payload.get("email") or "").strip().lower()
     if not EMAIL_RE.fullmatch(address):
         raise ValueError("Invalid email address in SSO token")
+    gen = str(payload.get("gen") or "").strip()
     _used_sso_nonces[nonce] = exp + 60
+    return address, gen
+
+
+def _verify_sso_token(token: str, *, secret: str | None = None, now: int | None = None) -> str:
+    """Verify SPanel's HMAC-SHA256 SSO token (payload.signature in base64url)."""
+    address, _ = _verify_sso_token_with_gen(token, secret=secret, now=now)
     return address
 
 
@@ -638,7 +759,7 @@ def api_auth_me(request: Request):
 def api_auth_sso(request: Request, token: str = Query(default="")):
     """Single sign-on from SPanel (`GET /api/auth/sso?token=<body.signature>`)."""
     try:
-        address = _verify_sso_token(token)
+        address, token_gen = _verify_sso_token_with_gen(token)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=f"Liên kết đăng nhập nhanh không hợp lệ hoặc đã hết hạn: {exc}") from exc
 
@@ -658,13 +779,13 @@ def api_auth_sso(request: Request, token: str = Query(default="")):
         except Exception:
             pass
 
-    cookie_val = _create_session(address, mode="master")
+    cookie_val = _create_session(address, mode="master", gen=token_gen)
     is_https = (request.headers.get("x-forwarded-proto") or request.url.scheme).lower() == "https"
     response = RedirectResponse(url="/", status_code=302)
     response.set_cookie(
         key=COOKIE_NAME,
         value=cookie_val,
-        max_age=SESSION_TTL_SECONDS,
+        max_age=MASTER_SESSION_TTL_SECONDS,
         path="/",
         httponly=True,
         samesite="lax",

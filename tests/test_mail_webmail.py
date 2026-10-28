@@ -341,3 +341,63 @@ def test_webmail_healthcheck_and_sso_flow(tmp_path, monkeypatch):
     detail = r_detail.json()
     assert "Xin chao, day la noi dung email thu nghiem." in detail["body_text"]
     assert detail["seen"] is True
+
+
+def test_sso_session_invalidated_on_domain_reownership_and_mailbox_deletion(tmp_path, monkeypatch):
+    import json
+    from app.services import mail as panel_mail
+
+    wm = load_webmail()
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("DATA_DIR", str(data_dir))
+    monkeypatch.setenv("AUTH_SECRET", "test-auth-secret-key-1234567890")
+    monkeypatch.setenv("SSO_SECRET", "shared-sso-secret-key-9876543210")
+    monkeypatch.setenv("SSO_MASTER_USER", "spanel-webmail")
+    monkeypatch.setenv("SSO_MASTER_PASSWORD", "master-pass-secret")
+    monkeypatch.setenv("SSO_MASTER_SEPARATOR", "*")
+
+    monkeypatch.setattr(wm, "_open_imap_with_creds", lambda u, p: FakeIMAP(u, p))
+
+    # Customer A signs in via SSO with mailbox generation "101:10:1730000000"
+    client_a = TestClient(wm.app)
+    token_a = panel_mail.sso_token(
+        "info@khach.vn",
+        now=time.time(),
+        key="shared-sso-secret-key-9876543210",
+        gen="101:10:1730000000",
+    )
+    r_sso_a = client_a.get(f"/api/auth/sso?token={token_a}", follow_redirects=False)
+    assert r_sso_a.status_code == 302
+    assert f"Max-Age={wm.MASTER_SESSION_TTL_SECONDS}" in r_sso_a.headers.get("set-cookie", "")
+    assert wm.MASTER_SESSION_TTL_SECONDS <= 7200
+
+    client_a.cookies.update(r_sso_a.cookies)
+    assert client_a.get("/api/messages?folder=INBOX").status_code == 200
+
+    # Customer A deletes domain, Customer B creates info@khach.vn (new generation "202:20:1730009999").
+    # Even before Customer B opens webmail, mail-sync writes mailbox_generations.json:
+    (data_dir / "mailbox_generations.json").write_text(
+        json.dumps({"info@khach.vn": "202:20:1730009999"}),
+        encoding="utf-8",
+    )
+    # Customer A's cookie is now rejected with 401 and its session file is deleted
+    r_stale = client_a.get("/api/messages?folder=INBOX")
+    assert r_stale.status_code == 401
+
+    # Customer B signs in with the new generation and can read their mailbox
+    client_b = TestClient(wm.app)
+    token_b = panel_mail.sso_token(
+        "info@khach.vn",
+        now=time.time(),
+        key="shared-sso-secret-key-9876543210",
+        gen="202:20:1730009999",
+    )
+    r_sso_b = client_b.get(f"/api/auth/sso?token={token_b}", follow_redirects=False)
+    assert r_sso_b.status_code == 302
+    client_b.cookies.update(r_sso_b.cookies)
+    assert client_b.get("/api/messages?folder=INBOX").status_code == 200
+
+    # Deleting the domain/mailbox purges active sessions immediately
+    removed = wm.purge_sessions_for_domain("khach.vn")
+    assert removed == 1
+    assert client_b.get("/api/messages?folder=INBOX").status_code == 401

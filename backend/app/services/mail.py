@@ -1942,6 +1942,7 @@ def build_state(db: Session) -> dict:
             # A suspended mailbox, or one of a suspended account, still
             # receives but cannot sign in.
             "enabled": bool(account.enabled) and bool(owner.is_active),
+            "gen": mailbox_generation(account),
         })
         state["senders"][account.address] = by_owner.get(account.owner_id, [])
     for row in db.query(MailForwarder).order_by(MailForwarder.domain, MailForwarder.local_part).all():
@@ -2591,7 +2592,14 @@ def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def sso_token(address: str, *, now: float | None = None, key: str | None = None) -> str:
+def mailbox_generation(account: MailAccount) -> str:
+    """Unique generation token for a mailbox row (id:owner_id:created_ts)."""
+    created_dt = getattr(account, "created_at", None)
+    ts = int(created_dt.timestamp()) if created_dt is not None else 0
+    return f"{account.id or 0}:{account.owner_id or 0}:{ts}"
+
+
+def sso_token(address: str, *, now: float | None = None, key: str | None = None, gen: str | None = None) -> str:
     """What the webmail's /api/auth/sso accepts: payload.signature, base64url."""
     if key is None:
         try:
@@ -2601,8 +2609,10 @@ def sso_token(address: str, *, now: float | None = None, key: str | None = None)
     if not key:
         raise MailError("The webmail is not set up on this server. Reinstall the Email addon.", status=503)
     issued = int(now if now is not None else time.time())
-    body = _b64(json.dumps({"email": address, "exp": issued + SSO_TOKEN_SECONDS,
-                            "nonce": secrets.token_urlsafe(16)}, separators=(",", ":")).encode())
+    payload: dict = {"email": address, "exp": issued + SSO_TOKEN_SECONDS, "nonce": secrets.token_urlsafe(16)}
+    if gen:
+        payload["gen"] = str(gen)
+    body = _b64(json.dumps(payload, separators=(",", ":")).encode())
     signature = _b64(hmac.new(key.encode(), body.encode(), hashlib.sha256).digest())
     return f"{body}.{signature}"
 
@@ -2613,7 +2623,7 @@ def sso_url(db: Session, actor: User, account_id: int) -> str:
     if not account.enabled:
         raise MailError("This mailbox is suspended.", status=409)
     row = _domain_row(db, account.domain)
-    return f"{webmail_url(row)}/api/auth/sso?token={sso_token(account.address)}"
+    return f"{webmail_url(row)}/api/auth/sso?token={sso_token(account.address, gen=mailbox_generation(account))}"
 
 
 # --- backups ---------------------------------------------------------------------------------------

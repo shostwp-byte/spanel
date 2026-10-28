@@ -3903,7 +3903,7 @@ for item in data.get("mailboxes") or []:
     boxes.append({
         "address": address, "local": local, "domain": domain, "user": account.pw_name,
         "uid": account.pw_uid, "gid": account.pw_gid, "hash": secret, "quota": quota,
-        "enabled": bool(item.get("enabled", True)),
+        "enabled": bool(item.get("enabled", True)), "gen": str(item.get("gen") or ""),
     })
 
 aliases = {}
@@ -4113,6 +4113,43 @@ for line in denied:
     address = line.split(":", 1)[0]
     if address not in previously_denied:
         subprocess.run(["doveadm", "kick", address], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+webmail_data = "/opt/SPanel-webmail/data"
+if os.path.isdir(webmail_data) and not os.path.islink(webmail_data):
+    gen_map = {box["address"]: box["gen"] for box in boxes if box.get("enabled") and box.get("gen")}
+    try:
+        webmail_gid = grp.getgrnam("SPanel-webmail").gr_gid
+    except KeyError:
+        webmail_gid = 0
+    gen_tmp = os.path.join(webmail_data, ".mailbox_generations.json.new")
+    gen_dst = os.path.join(webmail_data, "mailbox_generations.json")
+    try:
+        fd = os.open(gen_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o640)
+        try:
+            os.fchown(fd, 0, webmail_gid)
+            os.fchmod(fd, 0o640)
+            os.write(fd, json.dumps(gen_map).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(gen_tmp, gen_dst)
+    except OSError:
+        pass
+    sess_dir = os.path.join(webmail_data, "sessions")
+    if os.path.isdir(sess_dir) and not os.path.islink(sess_dir):
+        active_addrs = {box["address"] for box in boxes if box.get("enabled")}
+        for fname in os.listdir(sess_dir):
+            if not fname.endswith(".json"):
+                continue
+            spath = os.path.join(sess_dir, fname)
+            try:
+                with open(spath, encoding="utf-8") as sfh:
+                    sdata = json.load(sfh)
+                semail = str(sdata.get("email") or "").strip().lower()
+                sgen = str(sdata.get("gen") or "").strip()
+                if semail not in active_addrs or (sgen and gen_map.get(semail) and sgen != gen_map.get(semail)):
+                    os.unlink(spath)
+            except Exception:
+                pass
 
 print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim,
                   "autoresponders": len(vacations)}))
@@ -4918,6 +4955,33 @@ mail_rspamd_log() {
   tail -n "$lines" /var/log/rspamd/rspamd.log 2>/dev/null || true
 }
 
+mail_purge_webmail_sessions() {
+  local target="$1" sess_dir="${WEBMAIL_HOME}/data/sessions"
+  [[ -d "$sess_dir" && ! -L "$sess_dir" ]] || return 0
+  python3 - "$sess_dir" "$target" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+
+sess_dir, target = sys.argv[1], sys.argv[2].strip().lower()
+if not target or not os.path.isdir(sess_dir):
+    sys.exit(0)
+is_domain = "@" not in target
+for name in os.listdir(sess_dir):
+    if not name.endswith(".json"):
+        continue
+    path = os.path.join(sess_dir, name)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        email_addr = str(data.get("email") or "").strip().lower()
+        if (is_domain and email_addr.endswith("@" + target)) or (not is_domain and email_addr == target):
+            os.unlink(path)
+    except Exception:
+        pass
+PY
+}
+
 mail_purge_domain() {
   # A mail domain removed in the panel: its mail, from its owner's home, and
   # its DKIM key. mail/ and mail/<domain>/ are root's, so the path cannot be
@@ -4925,6 +4989,7 @@ mail_purge_domain() {
   local user="$1" domain="$2" dir
   require_linux_user "$user"
   require_domain "$domain"
+  mail_purge_webmail_sessions "$domain"
   dir="/home/${user}/mail/${domain}"
   if [[ -L "$dir" ]]; then
     rm -f -- "$dir"
@@ -4987,6 +5052,7 @@ mail_delete_box() {
   # cannot be redirected; rm does not follow links inside it.
   local box
   box="$(mail_box_path "$1" "$2" "$3")"
+  mail_purge_webmail_sessions "${3}@${2}"
   if [[ -L "$box" ]]; then
     rm -f -- "$box"
   elif [[ -d "$box" ]]; then
