@@ -2636,7 +2636,6 @@ MAIL_TLS_SCRIPT="/usr/local/sbin/spanel-mail-tls"
 MAIL_INSTALL_LOG="/var/log/spanel-mail-install.log"
 MAIL_MARKER="# Managed by SPanel (Email addon)."
 WEBMAIL_HOME="/opt/SPanel-webmail"
-WEBMAIL_REPO="https://github.com/shostwp-byte/spanel.git"
 WEBMAIL_BUNDLED_DIR="/usr/local/lib/spanel/webmail"
 WEBMAIL_ENV="/etc/SPanel-webmail.env"
 WEBMAIL_UNIT="/etc/systemd/system/spanel-webmail.service"
@@ -3462,11 +3461,7 @@ mail_env_value() {
 }
 
 mail_install_webmail() {
-  local ref custom_repo bundled_src="" candidate auth_secret sso_secret master_password
-  ref="$(env_get WEBMAIL_REF)"
-  ref="${ref:-main}"
-  [[ "$ref" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || deny "invalid WEBMAIL_REF: $ref"
-  custom_repo="$(env_get WEBMAIL_REPO)"
+  local bundled_src="" candidate auth_secret sso_secret master_password
   if [[ -d "$WEBMAIL_HOME" && ! -f "$WEBMAIL_HOME/.spanel" ]]; then
     deny "${WEBMAIL_HOME} already exists and was not set up by SPanel - the Email addon will not take it over"
   fi
@@ -3475,25 +3470,15 @@ mail_install_webmail() {
   install -d -o root -g root -m 0755 "$WEBMAIL_HOME"
   touch "$WEBMAIL_HOME/.spanel"
 
-  for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "${APP_DIR}/installer/files/webmail/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
-    if [[ -f "${candidate}/main.py" && -f "${candidate}/requirements.txt" ]]; then
+  for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
+    if [[ -d "$candidate" && ! -L "$candidate" && "$(stat -c '%u' "$candidate" 2>/dev/null || echo 0)" == "0" ]] \
+       && [[ -f "${candidate}/main.py" && ! -L "${candidate}/main.py" && -f "${candidate}/requirements.txt" && ! -L "${candidate}/requirements.txt" ]]; then
       bundled_src="$candidate"
       break
     fi
   done
 
-  if [[ -n "$custom_repo" && "$custom_repo" != *"shostwp-byte/spanel"* ]]; then
-    if [[ -d "$WEBMAIL_HOME/src/.git" ]]; then
-      git -C "$WEBMAIL_HOME/src" fetch --quiet --depth 1 origin "$ref" >>"$MAIL_INSTALL_LOG" 2>&1 \
-        || deny "could not fetch the webmail from ${custom_repo} (see ${MAIL_INSTALL_LOG})"
-      git -C "$WEBMAIL_HOME/src" reset --quiet --hard FETCH_HEAD >>"$MAIL_INSTALL_LOG" 2>&1 \
-        || deny "could not update the webmail checkout (see ${MAIL_INSTALL_LOG})"
-    else
-      rm -rf "$WEBMAIL_HOME/src"
-      git clone --quiet --depth 1 --branch "$ref" "$custom_repo" "$WEBMAIL_HOME/src" >>"$MAIL_INSTALL_LOG" 2>&1 \
-        || deny "could not download the webmail from ${custom_repo} (see ${MAIL_INSTALL_LOG})"
-    fi
-  elif [[ -n "$bundled_src" ]]; then
+  if [[ -n "$bundled_src" ]]; then
     # Remove any previous broken git checkout (e.g. spanel.git) before installing bundled webmail
     [[ -d "$WEBMAIL_HOME/src/.git" ]] && rm -rf "$WEBMAIL_HOME/src"
     install -d -o root -g root -m 0755 "$WEBMAIL_HOME/src" "$WEBMAIL_HOME/src/backend"
@@ -3512,9 +3497,17 @@ mail_install_webmail() {
   if ! "$WEBMAIL_HOME/venv/bin/python" -m pip --version >/dev/null 2>&1; then
     "$WEBMAIL_HOME/venv/bin/python" -m ensurepip --upgrade >>"$MAIL_INSTALL_LOG" 2>&1 || true
   fi
-  "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
-    -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 \
-    || deny "could not install the webmail's Python packages (see ${MAIL_INSTALL_LOG})"
+  chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+      -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 \
+      || deny "could not install the webmail's Python packages (see ${MAIL_INSTALL_LOG})"
+  else
+    "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+      -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 \
+      || deny "could not install the webmail's Python packages (see ${MAIL_INSTALL_LOG})"
+  fi
+  chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
   install -d -o SPanel-webmail -g SPanel-webmail -m 0750 "$WEBMAIL_HOME/data"
 
   # Secrets survive a reinstall: a new AUTH_SECRET would sign everybody out,
@@ -4733,8 +4726,9 @@ mail_reconfigure() {
   mail_write_learn_service
   if [[ -f "$WEBMAIL_HOME/.spanel" ]]; then
     local candidate
-    for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "${APP_DIR}/installer/files/webmail/backend"; do
-      if [[ -f "${candidate}/main.py" && -f "${candidate}/requirements.txt" ]]; then
+    for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
+      if [[ -d "$candidate" && ! -L "$candidate" && "$(stat -c '%u' "$candidate" 2>/dev/null || echo 0)" == "0" ]] \
+         && [[ -f "${candidate}/main.py" && ! -L "${candidate}/main.py" && -f "${candidate}/requirements.txt" && ! -L "${candidate}/requirements.txt" ]]; then
         install -d -o root -g root -m 0755 "$WEBMAIL_HOME/src" "$WEBMAIL_HOME/src/backend"
         if ! cmp -s "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py" 2>/dev/null; then
           install -m 0755 -o root -g root "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py"

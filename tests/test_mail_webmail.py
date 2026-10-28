@@ -93,10 +93,27 @@ class FakeIMAP:
         return "BYE", [b"Logging out"]
 
 
-def test_helper_locks_mail_install_and_repairs_broken_webmail_venv():
+def _find_bash() -> str | None:
+    import os
+    import shutil
+
+    if os.name == "nt":
+        gh_sh = Path(r"C:\Users\quang\AppData\Local\GitHubDesktop\app-3.6.10\resources\app\git\usr\bin\sh.exe")
+        if gh_sh.is_file():
+            return str(gh_sh)
+    found = shutil.which("bash")
+    if found and "windowsapps" not in found.lower() and "system32" not in found.lower():
+        return found
+    return shutil.which("sh") or found
+
+
+def test_helper_locks_mail_install_and_repairs_broken_webmail_venv(tmp_path):
+    import subprocess
+
     install_body = helper_function("install_mail")
     remove_body = helper_function("remove_mail")
     webmail_body = helper_function("mail_install_webmail")
+    reconfig_body = helper_function("mail_reconfigure")
     packages_body = helper_function("mail_install_packages")
 
     # Concurrent mail-install / mail-uninstall runs are serialized via flock
@@ -105,14 +122,158 @@ def test_helper_locks_mail_install_and_repairs_broken_webmail_venv():
     assert "/run/spanel-mail-install.lock" in remove_body
 
     # Broken/interrupted venv with missing pip is detected and recreated cleanly
-    assert 'python3-pip' in packages_body
+    assert "python3-pip" in packages_body
     assert '! -x "$WEBMAIL_HOME/venv/bin/pip"' in webmail_body
     assert 'rm -rf "$WEBMAIL_HOME/venv"' in webmail_body
-    assert '"$WEBMAIL_HOME/venv/bin/python" -m pip install' in webmail_body
+    assert "--only-binary :all:" in webmail_body
 
-    # Bundled SPanel Webmail is deployed instead of cloning spanel.git into webmail
-    assert "WEBMAIL_BUNDLED_DIR" in webmail_body
-    assert 'install -m 0755 -o root -g root "${bundled_src}/main.py" "$WEBMAIL_HOME/src/backend/main.py"' in webmail_body
+    # P0-A: WEBMAIL_REPO from .env and APP_DIR fallback are completely absent
+    assert "WEBMAIL_REPO" not in webmail_body
+    assert "git clone" not in webmail_body
+    assert "${APP_DIR}" not in webmail_body
+    assert "${APP_DIR}" not in reconfig_body
+
+    # Execute mail_install_webmail in bash with a malicious WEBMAIL_REPO in ENV_FILE
+    # and a planted payload in APP_DIR/installer/files/webmail/backend.
+    bash_bin = _find_bash()
+    assert bash_bin is not None, "bash/sh binary required to execute mail_install_webmail"
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("WEBMAIL_REPO=https://evil.example/pwn.git\nWEBMAIL_REF=main\n", encoding="utf-8")
+
+    app_dir = tmp_path / "app_dir"
+    evil_backend = app_dir / "installer" / "files" / "webmail" / "backend"
+    evil_backend.mkdir(parents=True)
+    (evil_backend / "main.py").write_text("# EVIL APP_DIR PAYLOAD\n", encoding="utf-8")
+    (evil_backend / "requirements.txt").write_text("evil-pkg==1.0.0\n", encoding="utf-8")
+
+    bundled_dir = tmp_path / "bundled_webmail"
+    trusted_backend = bundled_dir / "backend"
+    trusted_backend.mkdir(parents=True)
+    (trusted_backend / "main.py").write_text("# TRUSTED ROOT BUNDLED WEBMAIL\n", encoding="utf-8")
+    (trusted_backend / "requirements.txt").write_text("fastapi==0.141.1\n", encoding="utf-8")
+
+    webmail_home = tmp_path / "webmail_home"
+    git_marker = tmp_path / "git_called"
+    pip_args_file = tmp_path / "pip_args.txt"
+    log_file = tmp_path / "mail-install.log"
+    webmail_env = tmp_path / "SPanel-webmail.env"
+    sso_key = tmp_path / "webmail-sso.key"
+    unit_file = tmp_path / "spanel-webmail.service"
+    dovecot_dir = tmp_path / "dovecot"
+    dovecot_dir.mkdir(parents=True)
+    etc_spanel = tmp_path / "etc_spanel"
+
+    env_get_fn = helper_function("env_get")
+    mail_env_val_fn = helper_function("mail_env_value")
+
+    import textwrap
+
+    harness = (
+        textwrap.dedent(
+            f"""
+            export PATH="/usr/bin:/bin:$PATH"
+            set -euo pipefail
+            ENV_FILE={env_file.as_posix()!r}
+            APP_DIR={app_dir.as_posix()!r}
+            WEBMAIL_BUNDLED_DIR={bundled_dir.as_posix()!r}
+            WEBMAIL_HOME={webmail_home.as_posix()!r}
+            MAIL_INSTALL_LOG={log_file.as_posix()!r}
+            WEBMAIL_ENV={webmail_env.as_posix()!r}
+            WEBMAIL_SSO_KEY_FILE={sso_key.as_posix()!r}
+            WEBMAIL_UNIT={unit_file.as_posix()!r}
+            MAIL_DOVECOT_DIR={dovecot_dir.as_posix()!r}
+            WEBMAIL_PORT=8096
+            WEBMAIL_MASTER_USER="spanel-webmail"
+            MAIL_MARKER="# Managed by SPanel (Email addon)."
+
+            deny() {{ echo "DENY: $*" >&2; exit 42; }}
+            id() {{ return 0; }}
+            useradd() {{ return 0; }}
+            chown() {{ return 0; }}
+            stat() {{ echo "0"; }}
+            openssl() {{ echo "deadbeefcafebabe0123456789abcdef"; }}
+            systemctl() {{ return 0; }}
+            git() {{ touch {git_marker.as_posix()!r}; exit 99; }}
+            runuser() {{
+              shift 2
+              [[ "${{1:-}}" == "--" ]] && shift
+              "$@"
+            }}
+            install() {{
+              local dir_mode=0 args=() arg
+              while [[ $# -gt 0 ]]; do
+                case "$1" in
+                  -d) dir_mode=1; shift ;;
+                  -m|-o|-g) shift 2 ;;
+                  *)
+                    arg="$1"
+                    [[ "$arg" == "/etc/spanel" ]] && arg={etc_spanel.as_posix()!r}
+                    args+=("$arg")
+                    shift
+                    ;;
+                esac
+              done
+              if [[ "$dir_mode" -eq 1 ]]; then
+                mkdir -p "${{args[@]}}"
+              else
+                mkdir -p "$(dirname "${{args[1]}}")"
+                if [[ "${{args[0]}}" == "/dev/null" ]]; then
+                  : > "${{args[1]}}"
+                else
+                  cp "${{args[0]}}" "${{args[1]}}"
+                fi
+              fi
+            }}
+            python3() {{
+              if [[ "${{1:-}}" == "-m" && "${{2:-}}" == "venv" ]]; then
+                mkdir -p "$3/bin"
+                cat >"$3/bin/python" <<'PYEOF'
+            #!/bin/sh
+            if [ "${{1:-}}" = "-m" ] && [ "${{2:-}}" = "pip" ] && [ "${{3:-}}" = "--version" ]; then
+              echo "pip 24.0"
+              exit 0
+            fi
+            if [ "${{1:-}}" = "-m" ] && [ "${{2:-}}" = "pip" ] && [ "${{3:-}}" = "install" ]; then
+              printf '%s\\n' "$@" > {pip_args_file.as_posix()!r}
+              exit 0
+            fi
+            exit 0
+            PYEOF
+                chmod +x "$3/bin/python" 2>/dev/null || true
+                cp "$3/bin/python" "$3/bin/pip"
+                chmod +x "$3/bin/pip" 2>/dev/null || true
+              fi
+            }}
+            """
+        )
+        + "\n"
+        + env_get_fn
+        + "\n"
+        + mail_env_val_fn
+        + "\n"
+        + webmail_body
+        + "\nmail_install_webmail\n"
+    ).replace("\r\n", "\n")
+    script_path = tmp_path / "run_webmail_test.sh"
+    script_path.write_bytes(harness.encode("utf-8"))
+    res = subprocess.run([bash_bin, script_path.as_posix()], capture_output=True, text=True, timeout=15)
+    assert res.returncode == 0, f"mail_install_webmail failed: {res.stderr}\n{res.stdout}"
+    assert not git_marker.exists(), "git must never be invoked even when WEBMAIL_REPO is set in .env"
+    deployed_main = (webmail_home / "src" / "backend" / "main.py").read_text(encoding="utf-8")
+    assert deployed_main == "# TRUSTED ROOT BUNDLED WEBMAIL\n"
+    assert "--only-binary" in pip_args_file.read_text(encoding="utf-8")
+
+    # Now remove both bundled_dir and deployed main.py so only APP_DIR has main.py:
+    # mail_install_webmail must refuse (exit 42) and never copy from APP_DIR.
+    import shutil as _shutil
+
+    _shutil.rmtree(bundled_dir)
+    _shutil.rmtree(webmail_home / "src")
+    res_untrusted = subprocess.run([bash_bin, script_path.as_posix()], capture_output=True, text=True, timeout=15)
+    assert res_untrusted.returncode == 42
+    assert "bundled SPanel Webmail files not found" in res_untrusted.stderr
+    assert not (webmail_home / "src" / "backend" / "main.py").exists()
 
 
 def test_webmail_healthcheck_and_sso_flow(tmp_path, monkeypatch):
