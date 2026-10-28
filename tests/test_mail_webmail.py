@@ -401,3 +401,50 @@ def test_sso_session_invalidated_on_domain_reownership_and_mailbox_deletion(tmp_
     removed = wm.purge_sessions_for_domain("khach.vn")
     assert removed == 1
     assert client_b.get("/api/messages?folder=INBOX").status_code == 401
+
+
+def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    wm = load_webmail()
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AUTH_SECRET", "test-auth-secret-key-1234567890")
+
+    imap_attempts: list[tuple[str, str]] = []
+
+    def fake_open_imap(auth_user: str, auth_pass: str):
+        imap_attempts.append((auth_user, auth_pass))
+        if auth_pass != "correct-password-123":
+            raise HTTPException(status_code=401, detail="Sai mật khẩu")
+        return FakeIMAP(auth_user, auth_pass)
+
+    monkeypatch.setattr(wm, "_open_imap_with_creds", fake_open_imap)
+    client = TestClient(wm.app)
+
+    attacker_headers = {"X-Forwarded-For": "203.0.113.50"}
+    for _ in range(wm.LOGIN_MAX_FAILURES_PER_PAIR):
+        r = client.post(
+            "/api/auth/login",
+            json={"email": "info@khach.vn", "password": "wrong"},
+            headers=attacker_headers,
+        )
+        assert r.status_code == 401
+
+    count_before = len(imap_attempts)
+    r_blocked = client.post(
+        "/api/auth/login",
+        json={"email": "info@khach.vn", "password": "correct-password-123"},
+        headers=attacker_headers,
+    )
+    assert r_blocked.status_code == 429
+    assert len(imap_attempts) == count_before  # IMAP not even contacted while rate-limited
+
+    # Legitimate user from another IP can still sign in
+    owner_headers = {"X-Forwarded-For": "198.51.100.77"}
+    r_ok = client.post(
+        "/api/auth/login",
+        json={"email": "info@khach.vn", "password": "correct-password-123"},
+        headers=owner_headers,
+    )
+    assert r_ok.status_code == 200
+    assert r_ok.json()["authenticated"] is True

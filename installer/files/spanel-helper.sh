@@ -3590,6 +3590,16 @@ mail_webmail_proxy_block() {
     location ^~ /admin { return 404; }
     location ^~ /api/admin/ { return 404; }
 
+    location = /api/auth/login {
+        limit_req zone=spanel_webmail_login burst=5 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8096;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
@@ -3614,6 +3624,7 @@ mail_write_webmail_nginx() {
   {
     printf '%s Rewritten each time the addon is installed.\n' "$MAIL_MARKER"
     printf '# The webmail on the panel'"'"'s own name and certificate.\n'
+    printf 'limit_req_zone $binary_remote_addr zone=spanel_webmail_login:10m rate=10r/m;\n'
     printf 'server {\n'
     printf '    listen %s ssl;\n' "$WEBMAIL_PUBLIC_PORT"
     printf '    server_name _;\n'

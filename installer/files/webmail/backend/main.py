@@ -97,6 +97,70 @@ IMAP_SYSTEM_FOLDERS = ("INBOX", "Sent", "Drafts", "Junk", "Trash")
 # Replay cache for single-use SSO nonces: {nonce: exp_timestamp}
 _used_sso_nonces: dict[str, int] = {}
 
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_MAX_FAILURES_PER_PAIR = 5
+LOGIN_MAX_FAILURES_PER_IP = 15
+LOGIN_MAX_FAILURES_PER_EMAIL = 20
+_login_failures_pair: dict[tuple[str, str], list[float]] = {}
+_login_failures_ip: dict[str, list[float]] = {}
+_login_failures_email: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        # Nginx overwrites X-Forwarded-For with $remote_addr; take the last hop
+        last = xff.split(",")[-1].strip()
+        if last:
+            return last
+    xri = (request.headers.get("x-real-ip") or "").strip()
+    if xri:
+        return xri
+    if request.client and request.client.host:
+        return str(request.client.host)
+    return "127.0.0.1"
+
+
+def _prune_window(buckets: dict[Any, list[float]], key: Any, cutoff: float) -> list[float]:
+    entries = [ts for ts in buckets.get(key, []) if ts >= cutoff]
+    if entries:
+        buckets[key] = entries
+    else:
+        buckets.pop(key, None)
+    return entries
+
+
+def _check_login_rate_limit(client_ip: str, address: str, *, now: float | None = None) -> None:
+    current = float(now if now is not None else time.time())
+    cutoff = current - LOGIN_WINDOW_SECONDS
+    pair_key = (client_ip, address)
+    if (
+        len(_prune_window(_login_failures_pair, pair_key, cutoff)) >= LOGIN_MAX_FAILURES_PER_PAIR
+        or len(_prune_window(_login_failures_ip, client_ip, cutoff)) >= LOGIN_MAX_FAILURES_PER_IP
+        or len(_prune_window(_login_failures_email, address, cutoff)) >= LOGIN_MAX_FAILURES_PER_EMAIL
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Quá nhiều lần đăng nhập thất bại. Vui lòng thử lại sau vài phút.",
+            headers={"Retry-After": "60"},
+        )
+
+
+def _record_login_failure(client_ip: str, address: str, *, now: float | None = None) -> None:
+    current = float(now if now is not None else time.time())
+    cutoff = current - LOGIN_WINDOW_SECONDS
+    pair_key = (client_ip, address)
+    _prune_window(_login_failures_pair, pair_key, cutoff)
+    _login_failures_pair.setdefault(pair_key, []).append(current)
+    _prune_window(_login_failures_ip, client_ip, cutoff)
+    _login_failures_ip.setdefault(client_ip, []).append(current)
+    _prune_window(_login_failures_email, address, cutoff)
+    _login_failures_email.setdefault(address, []).append(current)
+
+
+def _clear_login_failures(client_ip: str, address: str) -> None:
+    _login_failures_pair.pop((client_ip, address), None)
+
 
 def _data_dir() -> Path:
     d = Path(_cfg("DATA_DIR", "/opt/SPanel-webmail/data"))
@@ -806,7 +870,17 @@ async def api_auth_login(request: Request, response: Response):
     if not EMAIL_RE.fullmatch(address) or not password:
         raise HTTPException(status_code=400, detail="Vui lòng nhập đầy đủ địa chỉ email và mật khẩu.")
 
-    conn = _open_imap_with_creds(address, password)
+    client_ip = _client_ip(request)
+    _check_login_rate_limit(client_ip, address)
+
+    try:
+        conn = _open_imap_with_creds(address, password)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            _record_login_failure(client_ip, address)
+        raise
+
+    _clear_login_failures(client_ip, address)
     try:
         _ensure_standard_folders(conn)
     finally:
