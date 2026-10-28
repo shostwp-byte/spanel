@@ -978,6 +978,8 @@ function AppContent() {
   // Auth is now cookie-based (HttpOnly spanel_session). The SPA does not see
   // the JWT at all. We track only whether the user is authenticated in memory.
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const currentUserRef = useRef(currentUser);
+  currentUserRef.current = currentUser;
   const [theme, toggleTheme] = useTheme();
   // Subscribed, not owned - the same shape as the theme. Reading it here
   // is what makes the whole tree render again when the language changes,
@@ -1461,7 +1463,11 @@ function AppContent() {
     : (currentUser?.username || username);
 
   const navigateToPage = useCallback((nextPage, options = {}) => {
-    const resolvedPage = currentUser && !isPageAllowedForRole(nextPage, effectiveRole)
+    const activeUser = currentUserRef.current || currentUser;
+    const activeRole = activeUser && activeUser !== currentUser
+      ? (activeUser.role === 'end_user' ? 'user' : (activeUser.role || 'user'))
+      : effectiveRole;
+    const resolvedPage = activeUser && !isPageAllowedForRole(nextPage, activeRole)
       ? 'dashboard'
       : nextPage;
     const route = routeForPage(resolvedPage);
@@ -1531,6 +1537,7 @@ function AppContent() {
     try { localStorage.removeItem('spanel-view-level'); } catch { }
     setViewLevel(null);
     clearReadableSessionCookies();
+    currentUserRef.current = null;
     setIsAuthenticated(false);
     setCurrentUser(null);
     setNeedsTwoFactor(false);
@@ -1604,8 +1611,12 @@ function AppContent() {
         'Content-Type': 'application/json',
         ...(fetchOptions.headers || {}),
       };
-      if (currentUser && effectiveRole && !headers['X-Access-Role']) {
-        headers['X-Access-Role'] = effectiveRole;
+      const activeUser = currentUserRef.current || currentUser;
+      const activeRole = activeUser && activeUser !== currentUser
+        ? (activeUser.role === 'end_user' ? 'user' : (activeUser.role || 'user'))
+        : effectiveRole;
+      if (activeUser && activeRole && !headers['X-Access-Role']) {
+        headers['X-Access-Role'] = activeRole;
       }
       // CSRF: echo the spanel_csrf cookie back in a header for mutating
       // requests. The backend rejects mismatches when the request was
@@ -1737,6 +1748,7 @@ function AppContent() {
           if (clearOnUnauthorized && !signedOutRef.current) clearSession('Session expired.');
           else {
             clearReadableSessionCookies();
+            currentUserRef.current = null;
             setCurrentUser(null);
             setIsAuthenticated(false);
           }
@@ -1748,17 +1760,20 @@ function AppContent() {
         if (clearOnUnauthorized && !signedOutRef.current) clearSession('Session expired.');
         else {
           clearReadableSessionCookies();
+          currentUserRef.current = null;
           setCurrentUser(null);
           setIsAuthenticated(false);
         }
         return null;
       }
+      currentUserRef.current = data.user;
       setCurrentUser(data.user);
       setAdminAccountForm(prev => ({ ...prev, email: data.user?.email || '' }));
       signedOutRef.current = false;
       setIsAuthenticated(true);
       return data.user;
     } catch {
+      currentUserRef.current = null;
       setCurrentUser(null);
       return null;
     }
@@ -1768,7 +1783,7 @@ function AppContent() {
     // Signed in, the panel tells us more than the login page is allowed to
     // know: the hostnames it answers for and the certificates on this server
     // only come back from the authenticated route.
-    const isAdminUser = currentUser?.role === 'admin';
+    const isAdminUser = (currentUserRef.current || currentUser)?.role === 'admin';
     const path = isAdminUser ? '/panel-settings' : '/panel-settings/public';
     try {
       const res = await fetch(`${API}${path}`, { credentials: 'include' });
@@ -1893,11 +1908,12 @@ function AppContent() {
     if (data) setDatabases(data);
   }
 
-  async function refreshAll({ skipUserReload = false } = {}) {
-    const knownRole = currentUser?.role;
+  async function refreshAll({ skipUserReload = false, userOverride = null } = {}) {
+    const latestUser = userOverride || currentUserRef.current || currentUser;
+    const knownRole = latestUser?.role;
     const canPreloadTenants = knownRole === 'admin' || knownRole === 'reseller';
     const [refreshedUser, siteData] = await Promise.all([
-      skipUserReload && currentUser ? Promise.resolve(currentUser) : loadCurrentUser(),
+      skipUserReload && latestUser ? Promise.resolve(latestUser) : loadCurrentUser(),
       request('/websites'),
       loadPhpVersions({ silent: true }),
       ...(canPreloadTenants ? [loadPackages(), loadUsers()] : []),
@@ -1915,6 +1931,7 @@ function AppContent() {
       }
     } else {
       setUsers([]);
+      setPackages([]);
     }
   }
 
@@ -1924,9 +1941,9 @@ function AppContent() {
     if (data?.access_token) {
       setNotice(`Returned to ${targetName}.`);
       setViewLevel(null);
-      await loadCurrentUser();
+      const nextUser = await loadCurrentUser();
       navigateToPage('users');
-      await refreshAll();
+      await refreshAll({ skipUserReload: true, userOverride: nextUser });
     }
   }
 
@@ -1935,6 +1952,11 @@ function AppContent() {
 
 
   async function loadPackages() {
+    const activeRole = (currentUserRef.current ?? currentUser)?.role;
+    if (activeRole !== 'admin' && activeRole !== 'reseller') {
+      setPackages([]);
+      return;
+    }
     const data = await request('/packages');
     if (data) setPackages(data);
   }
@@ -1951,6 +1973,8 @@ function AppContent() {
   // and the figures follow. Rows come back with storage_used_bytes = -1 when
   // the panel has not measured them recently; this fills those in.
   async function loadUserStorageUsage() {
+    const activeRole = (currentUserRef.current ?? currentUser)?.role;
+    if (activeRole !== 'admin' && activeRole !== 'reseller') return;
     const usage = await request('/users/storage-usage', { silent: true });
     if (!usage) return;
     setUsers(prev => prev.map(user => {
@@ -1960,6 +1984,11 @@ function AppContent() {
   }
 
   async function loadUsers() {
+    const activeRole = (currentUserRef.current ?? currentUser)?.role;
+    if (activeRole !== 'admin' && activeRole !== 'reseller') {
+      setUsers([]);
+      return;
+    }
     const data = await request('/users');
     if (data) {
       setUsers(data);

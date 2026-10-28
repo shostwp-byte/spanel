@@ -120,6 +120,7 @@ export function UsersPage({
   });
 
   React.useEffect(() => {
+    if (!isAdmin && !isReseller) return;
     if (loadUsers) loadUsers();
     if (loadPackages && packages.length === 0) loadPackages();
   }, []);
@@ -347,9 +348,8 @@ export function UsersPage({
         setNotice(`Logged in as ${user.username}.`);
         setViewLevel?.(null);
         const nextUser = await loadCurrentUser();
-        const nextRole = nextUser?.role || user.role;
-        navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');
-        await refreshAll();
+        navigateToPage('dashboard');
+        await refreshAll({ skipUserReload: true, userOverride: nextUser });
       }
       return;
     }
@@ -357,9 +357,8 @@ export function UsersPage({
       setNotice(`Logged in as ${user.username}.`);
       setViewLevel?.(null);
       const nextUser = await loadCurrentUser();
-      const nextRole = nextUser?.role || user.role;
-      navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');
-      await refreshAll();
+      navigateToPage('dashboard');
+      await refreshAll({ skipUserReload: true, userOverride: nextUser });
     }
   }
 
