@@ -476,6 +476,22 @@ def delete_domain(db: Session, actor: User, domain_id: int) -> str:
     return name
 
 
+def move_domain_maildirs(old_linux_user: str, new_linux_user: str, domain: str) -> None:
+    """Move /home/<old_user>/mail/<domain> to /home/<new_user>/mail/<domain> on website owner transfer."""
+    if not old_linux_user or not new_linux_user or old_linux_user == new_linux_user:
+        return
+    res = shell.privileged(
+        "mail-move-domain",
+        helper_args=[old_linux_user, new_linux_user, domain],
+        fallback=["true"],
+        check=False,
+        timeout=600,
+    )
+    if getattr(res, "returncode", 0) != 0:
+        err = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "mail-move-domain failed").strip()
+        raise MailError(f"Could not move mail directory for {domain}: {err}", status=500)
+
+
 def delete_for_owner(db: Session, owner: User) -> list[str]:
     """An account is being deleted: its mail goes with its home. The caller commits."""
     rows = db.query(MailDomain).filter(MailDomain.owner_id == owner.id).all()
@@ -724,17 +740,21 @@ def owner_mailbox_count(db: Session, owner_id: int) -> int:
     return db.query(MailAccount).filter(MailAccount.owner_id == owner_id).count()
 
 
-def _limit(user: User) -> int | None:
+def effective_mail_limit(user: User | None) -> int | None:
     """A customer's mailbox limit; None for an administrator or Unlimited (-1)."""
-    if _is_admin(user):
+    if user is None or _is_admin(user):
         return None
-    val = getattr(user, "mail_accounts_limit", None)
-    if val is None and getattr(user, "package", None) is not None:
-        val = getattr(user.package, "mail_accounts_limit", None)
+    pkg = getattr(user, "package", None)
+    val = getattr(pkg, "mail_accounts_limit", None) if pkg is not None else None
+    if val is None:
+        val = getattr(user, "mail_accounts_limit", None)
     if val is None:
         return None
     val_int = int(val)
     return None if val_int < 0 else val_int
+
+
+_limit = effective_mail_limit
 
 
 def create_account(db: Session, actor: User, domain_id: int, local_part: str, password: str, quota_mb=None) -> MailAccount:

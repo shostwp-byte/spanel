@@ -421,7 +421,15 @@ def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
     monkeypatch.setattr(wm, "_open_imap_with_creds", fake_open_imap)
     client = TestClient(wm.app)
 
-    attacker_headers = {"X-Forwarded-For": "203.0.113.50"}
+    # Login without Origin or X-Requested-With is rejected (403 Login CSRF protection)
+    r_login_no_csrf = client.post(
+        "/api/auth/login",
+        json={"email": "info@khach.vn", "password": "correct-password-123"},
+        headers={"X-Forwarded-For": "198.51.100.10"},
+    )
+    assert r_login_no_csrf.status_code == 403
+
+    attacker_headers = {"X-Forwarded-For": "203.0.113.50", "X-Requested-With": "XMLHttpRequest"}
     for _ in range(wm.LOGIN_MAX_FAILURES_PER_PAIR):
         r = client.post(
             "/api/auth/login",
@@ -439,11 +447,23 @@ def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
     assert r_blocked.status_code == 429
     assert len(imap_attempts) == count_before  # IMAP not even contacted while rate-limited
 
-    # Legitimate user from another IP can still sign in
-    owner_headers = {"X-Forwarded-For": "198.51.100.77"}
+    # Distributed attack across 20 distinct IPs: the 20th wrong password triggers 429,
+    # yet the legitimate owner from a clean IP can STILL log in with the right password (no Account Lockout DoS).
+    for idx in range(wm.LOGIN_MAX_FAILURES_PER_EMAIL):
+        r_dist = client.post(
+            "/api/auth/login",
+            json={"email": "victim@khach.vn", "password": "wrong"},
+            headers={"X-Forwarded-For": f"192.0.2.{idx + 1}", "X-Requested-With": "XMLHttpRequest"},
+        )
+        if idx + 1 < wm.LOGIN_MAX_FAILURES_PER_EMAIL:
+            assert r_dist.status_code == 401
+        else:
+            assert r_dist.status_code == 429
+
+    owner_headers = {"X-Forwarded-For": "198.51.100.77", "X-Requested-With": "XMLHttpRequest"}
     r_ok = client.post(
         "/api/auth/login",
-        json={"email": "info@khach.vn", "password": "correct-password-123"},
+        json={"email": "victim@khach.vn", "password": "correct-password-123"},
         headers=owner_headers,
     )
     assert r_ok.status_code == 200
@@ -492,7 +512,7 @@ def test_webmail_non_ascii_password_login_via_sasl_plain(tmp_path, monkeypatch):
     r_ok = client.post(
         "/api/auth/login",
         json={"email": "info@khach.vn", "password": "mậtkhẩu123"},
-        headers={"X-Forwarded-For": "198.51.100.88"},
+        headers={"X-Forwarded-For": "198.51.100.88", "X-Requested-With": "XMLHttpRequest"},
     )
     assert r_ok.status_code == 200
     assert r_ok.json()["authenticated"] is True
@@ -501,7 +521,7 @@ def test_webmail_non_ascii_password_login_via_sasl_plain(tmp_path, monkeypatch):
     r_bad = client.post(
         "/api/auth/login",
         json={"email": "info@khach.vn", "password": "sai-mậtkhẩu-999"},
-        headers={"X-Forwarded-For": "198.51.100.89"},
+        headers={"X-Forwarded-For": "198.51.100.89", "X-Requested-With": "XMLHttpRequest"},
     )
     assert r_bad.status_code == 401
 
@@ -553,15 +573,41 @@ def test_webmail_csrf_draft_safety_and_crlf_sanitization(tmp_path, monkeypatch):
     )
     assert r_csrf_ok.status_code == 200
 
-    # P2-9: Display name containing CR/LF is sanitized on save and never causes 500 when building emails
+    # P1-3: Port 2096 Origin with Host header lacking port (e.g. legacy proxy_set_header Host $host) succeeds,
+    # while a different hostname on port 2096 is still rejected with 403.
+    r_csrf_port2096_ok = client.post(
+        "/api/messages/action",
+        json={"action": "mark_read", "folder": "INBOX", "uids": ["101"]},
+        headers={
+            "Origin": "https://panel.example.com:2096",
+            "Host": "panel.example.com",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    assert r_csrf_port2096_ok.status_code == 200
+
+    r_csrf_port2096_evil = client.post(
+        "/api/messages/action",
+        json={"action": "mark_read", "folder": "INBOX", "uids": ["101"]},
+        headers={
+            "Origin": "https://evil.example.com:2096",
+            "Host": "panel.example.com",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    assert r_csrf_port2096_evil.status_code == 403
+
+    # P2-5 / P2-9: Display name containing CR/LF or ASCII control characters (\x0b, \x0c, \x1c-\x1e, \x7f)
+    # is sanitized on save and never causes 500 ValueError when building emails.
     r_prefs = client.put(
         "/api/settings",
-        json={"display_name": "Nguyen Van A\r\nBcc: victim@example.com", "reply_to": "info@khach.vn"},
+        json={"display_name": "Nguyen Van A\r\n\x0b\x0c\x1c\x1d\x1e\x7fBcc: victim@example.com", "reply_to": "info@khach.vn"},
         headers={"X-Requested-With": "XMLHttpRequest"},
     )
     assert r_prefs.status_code == 200
     saved_dn = r_prefs.json()["display_name"]
-    assert "\r" not in saved_dn and "\n" not in saved_dn
+    for ch in ("\r", "\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x7f"):
+        assert ch not in saved_dn
 
     # P2-8: Saving a draft appends the new draft BEFORE deleting the old draft;
     # if APPEND fails (e.g. quota full), the old draft UID is NOT marked \Deleted.
@@ -600,7 +646,14 @@ def test_webmail_csrf_draft_safety_and_crlf_sanitization(tmp_path, monkeypatch):
 def test_helper_locks_mail_configure_and_reconfigure():
     cfg_body = helper_function("mail_configure")
     reconfig_body = helper_function("mail_reconfigure")
+    proxy_body = helper_function("mail_webmail_proxy_block")
+    host_body = helper_function("mail_webmail_host")
     assert "/run/spanel-mail-install.lock" in cfg_body
     assert "/run/spanel-mail-install.lock" in reconfig_body
     assert "pip install" in reconfig_body
+    assert "pip_ok=1" in reconfig_body
+    assert "zone=spanel_webmail_login" in reconfig_body
+    assert "zone=spanel_webmail_login" in host_body
+    assert "prev_conf=" in host_body
+    assert "proxy_set_header Host $http_host;" in proxy_body
 

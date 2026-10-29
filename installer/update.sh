@@ -2210,8 +2210,6 @@ cat >/etc/systemd/system/spanel-api.service.d/10-spanel-helper.conf <<'SERVICE'
 [Service]
 NoNewPrivileges=false
 ProtectSystem=false
-PrivateDevices=false
-ProtectKernelModules=false
 RestrictSUIDSGID=false
 CapabilityBoundingSet=~
 SystemCallFilter=

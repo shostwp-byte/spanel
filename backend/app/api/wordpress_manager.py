@@ -513,6 +513,11 @@ def _detect_wp_version(
 
 def _subpath_uploads_php_rule(subpath: str) -> str:
     clean_sub = (subpath or "").strip("/")
+    return f"location ^~ /{clean_sub}/wp-content/uploads/ {{ location ~* \\.php$ {{ deny all; }} }}"
+
+
+def _legacy_subpath_uploads_php_rule(subpath: str) -> str:
+    clean_sub = (subpath or "").strip("/")
     return f"location ~* ^/{clean_sub}/wp-content/uploads/.*\\.php$ {{ deny all; }}"
 
 
@@ -2150,9 +2155,15 @@ def apply_wp_security(
 
                 if subpath_clean:
                     rule_line = _subpath_uploads_php_rule(subpath_clean)
+                    legacy_rule = _legacy_subpath_uploads_php_rule(subpath_clean)
                     prev_custom = site.nginx_custom or ""
-                    if rule_line not in prev_custom:
-                        next_custom = (prev_custom.rstrip() + "\n" + rule_line + "\n").lstrip("\n")
+                    if rule_line not in prev_custom or legacy_rule in prev_custom:
+                        cleaned_lines = [
+                            ln for ln in prev_custom.splitlines()
+                            if ln.strip() not in (rule_line, legacy_rule)
+                        ]
+                        cleaned_lines.append(rule_line)
+                        next_custom = ("\n".join(cleaned_lines) + "\n").lstrip("\n")
                         try:
                             site.nginx_custom = next_custom
                             php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
@@ -2206,11 +2217,15 @@ def apply_wp_security(
             subpath_clean = (inst.get("subpath") or "").strip("/")
             if not settings.command_dry_run and subpath_clean:
                 rule_line = _subpath_uploads_php_rule(subpath_clean)
+                legacy_rule = _legacy_subpath_uploads_php_rule(subpath_clean)
                 prev_custom = site.nginx_custom or ""
-                if rule_line in prev_custom:
+                if rule_line in prev_custom or legacy_rule in prev_custom:
                     from app.api.websites import _rewrite_website_vhost
 
-                    kept_lines = [ln for ln in prev_custom.splitlines() if ln.strip() != rule_line]
+                    kept_lines = [
+                        ln for ln in prev_custom.splitlines()
+                        if ln.strip() not in (rule_line, legacy_rule)
+                    ]
                     site.nginx_custom = ("\n".join(kept_lines) + "\n") if kept_lines else ""
                     try:
                         php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)

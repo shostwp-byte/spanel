@@ -3303,6 +3303,7 @@ login_greeting = Ready.
 
 # Passwords only over TLS; loopback (the webmail) counts as secure.
 disable_plaintext_auth = yes
+login_trusted_networks = 127.0.0.1/32 ::1/128
 auth_mechanisms = plain login
 auth_username_format = %Lu
 # The webmail's single sign-on: "mailbox*${WEBMAIL_MASTER_USER}" with the master password.
@@ -3595,7 +3596,7 @@ mail_webmail_proxy_block() {
         limit_req_status 429;
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
@@ -3603,7 +3604,7 @@ mail_webmail_proxy_block() {
     location / {
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
         # Overwritten, not appended: the webmail reads the last address.
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
@@ -4791,20 +4792,23 @@ mail_reconfigure() {
           webmail_changed=1
         fi
         if ! cmp -s "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt" 2>/dev/null; then
-          install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
-          req_changed=1
-          webmail_changed=1
-        fi
-        if [[ "$req_changed" -eq 1 && -x "$WEBMAIL_HOME/venv/bin/python" ]]; then
-          chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
-          if command -v runuser >/dev/null 2>&1; then
-            runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
-              -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 || true
-          else
-            "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
-              -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 || true
+          local pip_ok=0
+          if [[ -x "$WEBMAIL_HOME/venv/bin/python" ]]; then
+            chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
+            if command -v runuser >/dev/null 2>&1; then
+              runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+                -r "${candidate}/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 && pip_ok=1
+            else
+              "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+                -r "${candidate}/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 && pip_ok=1
+            fi
+            chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
           fi
-          chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
+          if [[ "$pip_ok" -eq 1 ]]; then
+            install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
+            req_changed=1
+            webmail_changed=1
+          fi
         fi
         if [[ "$webmail_changed" -eq 1 ]]; then
           systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
@@ -4812,6 +4816,9 @@ mail_reconfigure() {
         break
       fi
     done
+    if [[ -f "$WEBMAIL_NGINX" ]] && ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null; then
+      mail_write_webmail_nginx
+    fi
   fi
   if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
   if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
@@ -5037,6 +5044,34 @@ mail_purge_domain() {
   echo "mail data removed: ${domain}"
 }
 
+mail_move_domain() {
+  # Move a mail domain's maildirs from one Linux user's home to another's on
+  # website ownership transfer. mail/ and mail/<domain>/ are root:spanel 0751;
+  # each mailbox inside is owned by <new_user>:spanel.
+  local old_user="$1" new_user="$2" domain="$3" src_dir dst_dir
+  require_linux_user "$old_user"
+  require_linux_user "$new_user"
+  require_domain "$domain"
+  [[ "$old_user" != "$new_user" ]] || return 0
+  id -u "$new_user" >/dev/null 2>&1 || deny "no Linux user $new_user"
+  mail_purge_webmail_sessions "$domain"
+  src_dir="/home/${old_user}/mail/${domain}"
+  dst_dir="/home/${new_user}/mail/${domain}"
+  [[ -d "$src_dir" && ! -L "$src_dir" ]] || return 0
+  [[ ! -L "/home/${old_user}/mail" ]] || deny "/home/${old_user}/mail cannot be a symlink"
+  [[ ! -L "/home/${new_user}/mail" ]] || deny "/home/${new_user}/mail cannot be a symlink"
+  install -d -o root -g spanel -m 0751 "/home/${new_user}/mail"
+  if [[ -e "$dst_dir" || -L "$dst_dir" ]]; then
+    deny "destination mail directory already exists: ${dst_dir}"
+  fi
+  mv -- "$src_dir" "$dst_dir"
+  chown root:spanel "$dst_dir"
+  chmod 0751 "$dst_dir"
+  find "$dst_dir" \( -type l -o -type b -o -type c -o -type p -o -type s \) -delete 2>/dev/null || true
+  find "$dst_dir" -mindepth 1 -exec chown -h "${new_user}:spanel" {} +
+  echo "mail data moved: ${domain} (${old_user} -> ${new_user})"
+}
+
 mail_rspamd_answers() {
   local key
   key="$(tr -d '[:space:]' <"$MAIL_RSPAMD_KEY_FILE" 2>/dev/null)"
@@ -5146,6 +5181,14 @@ mail_webmail_host() {
   name="webmail.${domain}"
   conf="/etc/nginx/conf.d/00-spanel-webmail-${domain}.conf"
   [[ -f "$WEBMAIL_NGINX" ]] || deny "the Email addon is not installed"
+  if ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null; then
+    mail_write_webmail_nginx
+  fi
+  local prev_conf=""
+  if [[ -f "$conf" ]]; then
+    prev_conf="$(mktemp "${conf}.bak.XXXXXX")"
+    cp -p -- "$conf" "$prev_conf"
+  fi
   install -d -o root -g spanel -m 0755 /var/www/spanel-acme/.well-known/acme-challenge
   if [[ ! -f "/etc/letsencrypt/live/${name}/fullchain.pem" ]]; then
     cat >"$conf" <<NGINX
@@ -5163,7 +5206,7 @@ server {
 NGINX
     nginx_ipv6_apply >/dev/null 2>&1 || true
     if ! nginx -t >/dev/null 2>&1; then
-      rm -f "$conf"
+      if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
       deny "nginx refused the server block for ${name}"
     fi
     systemctl reload nginx
@@ -5177,7 +5220,7 @@ NGINX
     fi
     certbot "${args[@]}" >>"$MAIL_INSTALL_LOG" 2>&1 || rc=$?
     if [[ ! -f "/etc/letsencrypt/live/${name}/fullchain.pem" ]]; then
-      rm -f "$conf"
+      if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
       nginx -t >/dev/null 2>&1 && systemctl reload nginx
       deny "no certificate for ${name} (certbot exited ${rc}) - point ${name} at this server first"
     fi
@@ -5196,10 +5239,11 @@ NGINX
   } >"$conf"
   nginx_ipv6_apply >/dev/null 2>&1 || true
   if ! nginx -t >/dev/null 2>&1; then
-    rm -f "$conf"
+    if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
     nginx -t >/dev/null 2>&1 && systemctl reload nginx
     deny "nginx refused the server block for ${name}"
   fi
+  rm -f -- "$prev_conf"
   systemctl reload nginx
   echo "https://${name}"
 }
@@ -9620,26 +9664,22 @@ FSTAB_FILE="/etc/fstab"
 quota_mount_field() {
   # spanel-api.service's ReadWritePaths=/home creates a bind mount at /home
   # inside the service's mount namespace (SOURCE=/dev/...[/home], TARGET=/home)
-  # even when /home lives on the / filesystem in /etc/fstab. Resolve back to /
-  # when the detected mount is a bind mount or has no /etc/fstab entry while /
-  # does.
-  local target="$QUOTA_HOME" mp src
+  # when /home is a directory on the / filesystem. Resolve back to / only when
+  # findmnt reports a bind-mount subpath on the exact same block device
+  # (matching MAJ:MIN) as /.
+  local target="$QUOTA_HOME" mp src home_majmin root_majmin
   mp="$(findmnt -no TARGET -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
   src="$(findmnt -no SOURCE -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
-  if [[ -n "$mp" && "$mp" != "/" && -f "$FSTAB_FILE" ]]; then
-    if [[ -z "$(fstab_quota_options "$FSTAB_FILE" "$mp")" && -n "$(fstab_quota_options "$FSTAB_FILE" /)" ]]; then
+  if [[ -n "$mp" && "$mp" != "/" && "$src" == *"["*"]" ]]; then
+    home_majmin="$(findmnt -no MAJ:MIN -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    root_majmin="$(findmnt -no MAJ:MIN -T / 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    if [[ -n "$home_majmin" && "$home_majmin" == "$root_majmin" ]]; then
       if [[ "$1" == "TARGET" ]]; then
         echo "/"
         return 0
       fi
       target="/"
     fi
-  elif [[ -n "$mp" && "$mp" != "/" && "$src" == *"["*"]" ]]; then
-    if [[ "$1" == "TARGET" ]]; then
-      echo "/"
-      return 0
-    fi
-    target="/"
   fi
   findmnt -no "$1" -T "$target" 2>/dev/null | head -n1 | sed 's/\[.*\]$//' | tr -d '[:space:]' || true
 }
@@ -9758,13 +9798,19 @@ quota_enable() {
     ext4|xfs) ;;
     *) deny "kernel quota needs ext4 or xfs; ${mp} is ${fstype:-unknown}" ;;
   esac
-  if [[ -f /etc/systemd/system/spanel-api.service.d/10-spanel-helper.conf ]] && ! grep -q '^PrivateDevices=false' /etc/systemd/system/spanel-api.service.d/10-spanel-helper.conf 2>/dev/null; then
-    printf '\nPrivateDevices=false\nProtectKernelModules=false\n' >>/etc/systemd/system/spanel-api.service.d/10-spanel-helper.conf 2>/dev/null || true
-    systemctl daemon-reload >/dev/null 2>&1 || true
-  fi
   if ! command -v setquota >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y quota >/dev/null || deny "apt-get could not install the quota tools"
+  fi
+  # spanel-api.service runs with PrivateDevices=true and ProtectKernelModules=true,
+  # which attaches a cgroup BPF device filter (DevicePolicy=closed) and hides
+  # /dev/disk inside the service namespace. Run host-level verification and quota
+  # commands in a transient unit outside the restricted cgroup when available.
+  local -a host_run=()
+  if [[ "$(type -t findmnt)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+    host_run=(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no --)
+  elif [[ "$(type -t findmnt)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+    host_run=(nsenter -t 1 -m --)
   fi
   if ! quota_options_active "$options"; then
     if [[ "$fstype" == xfs && "$mp" == / ]]; then
@@ -9772,7 +9818,8 @@ quota_enable() {
       return 0
     fi
     if ! quota_options_active "$(fstab_quota_options "$FSTAB_FILE" "$mp")"; then
-      tmp="$(mktemp)"
+      tmp="$(mktemp "${FSTAB_FILE}.spanel.XXXXXX")"
+      cp -p -- "$FSTAB_FILE" "$tmp" 2>/dev/null || true
       local rc=0
       fstab_with_quota_options "$FSTAB_FILE" "$mp" "$fstype" >"$tmp" || rc=$?
       if (( rc != 0 )); then
@@ -9780,25 +9827,24 @@ quota_enable() {
         (( rc == 2 )) && deny "${mp} has no entry in ${FSTAB_FILE}; add the quota options by hand"
         deny "could not prepare ${FSTAB_FILE}"
       fi
-      # Refuse anything findmnt cannot parse: a broken fstab is a server that
-      # does not boot. When PrivateDevices=true hides /dev/disk inside the unit,
-      # findmnt --verify fails on UUID= resolution even for an untouched fstab;
-      # fall back to checking the edited fstab structure in that case.
-      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]] && ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
-        if [[ ! -d /dev/disk ]] && ! findmnt --verify --tab-file "$FSTAB_FILE" >/dev/null 2>&1; then
-          awk -v mp="$mp" '$1 !~ /^#/ && NF > 0 && NF < 4 { exit 1 } $1 !~ /^#/ && $2 == mp { ok=1 } END { if (!ok) exit 1 }' "$tmp" || {
-            rm -f -- "$tmp"
-            deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
-          }
-        else
-          rm -f -- "$tmp"
-          deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
-        fi
+      # Refuse anything findmnt or mount -fav cannot parse: a broken fstab is a
+      # server that does not boot.
+      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]] && ! "${host_run[@]}" findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+        rm -f -- "$tmp"
+        deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+      fi
+      if ! "${host_run[@]}" mount -fav --fstab "$tmp" >/dev/null 2>&1; then
+        rm -f -- "$tmp"
+        deny "the edited ${FSTAB_FILE} failed mount -fav check; nothing was changed"
       fi
       backup="${FSTAB_FILE}.spanel-$(date +%Y%m%d%H%M%S)"
       cp -p -- "$FSTAB_FILE" "$backup"
-      cat "$tmp" >"$FSTAB_FILE"
-      rm -f -- "$tmp"
+      sync "$tmp" 2>/dev/null || true
+      if ! mv -f -- "$tmp" "$FSTAB_FILE"; then
+        rm -f -- "$tmp"
+        cp -p -- "$backup" "$FSTAB_FILE" 2>/dev/null || true
+        deny "could not atomically replace ${FSTAB_FILE}"
+      fi
       systemctl daemon-reload >/dev/null 2>&1 || true
       logger -t spanel-helper -- "quota: added user quota options for ${mp} to ${FSTAB_FILE} (backup ${backup})" 2>/dev/null || true
       echo "backup=${backup}"
@@ -9809,29 +9855,13 @@ quota_enable() {
   if [[ "$fstype" == ext4 ]]; then
     # Journaled quota: build the quota file once, then switch it on. -m keeps
     # the filesystem mounted read-write while it is counted.
-    # spanel-api.service's PrivateDevices=true attaches a cgroup BPF device
-    # filter (DevicePolicy=closed) that rejects open("/dev/sda1") with EPERM
-    # (errno 1) even inside PID 1's mount namespace. Run quotacheck/quotaon in
-    # a transient unit with PrivateDevices=no so it executes outside the
-    # restricted cgroup.
-    local -a host_run=()
-    if [[ "$(type -t quotacheck)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
-      host_run=(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no --)
-    elif [[ "$(type -t quotacheck)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
-      host_run=(nsenter -t 1 -m --)
-    fi
     if [[ ! -s "${mp%/}/aquota.user" ]]; then
       "${host_run[@]}" quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
     fi
     if [[ "$("${host_run[@]}" quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
       if ! "${host_run[@]}" quotaon -u "$mp" 2>/dev/null; then
-        export DEBIAN_FRONTEND=noninteractive
         "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
-        if ! "${host_run[@]}" quotaon -u "$mp" 2>/dev/null; then
-          apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
-          "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
-          "${host_run[@]}" quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
-        fi
+        "${host_run[@]}" quotaon -u "$mp" || deny "quotaon failed on ${mp}; install linux-modules-extra-$(uname -r) so the quota_v2 kernel module is available"
       fi
     fi
   fi
@@ -10402,6 +10432,11 @@ case "$cmd" in
   mail-purge-domain)
     [[ $# -eq 2 ]] || deny "usage: mail-purge-domain <site-user> <domain>"
     mail_purge_domain "$1" "$2"
+    ;;
+
+  mail-move-domain)
+    [[ $# -eq 3 ]] || deny "usage: mail-move-domain <old-user> <new-user> <domain>"
+    mail_move_domain "$1" "$2" "$3"
     ;;
 
   mail-relay-test)
