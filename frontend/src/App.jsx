@@ -1923,7 +1923,18 @@ function AppContent() {
 
   async function loadSiteApps(options = { silent: true }) {
     const data = await request('/site-apps', options, '');
-    if (data) setSiteApps({ items: data.items || [], limit: data.limit || 0 });
+    if (data) {
+      setSiteApps({
+        items: data.items || [],
+        limit: data.limit ?? 0,
+        used: data.used ?? (data.items || []).length,
+        memory_ceiling_mb: data.memory_ceiling_mb,
+        port_range: data.port_range,
+        max_total_websites: data.max_total_websites,
+        occupied_websites_count: data.occupied_websites_count,
+        website_quota_reached: !!data.website_quota_reached,
+      });
+    }
   }
 
   async function loadSiteRuntimes() {

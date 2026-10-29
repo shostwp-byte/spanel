@@ -1117,6 +1117,111 @@ class LaravelSecurityPayload(BaseModel):
     check_ids: List[str] = Field(default_factory=list)
 
 
+def _load_wp_state_readonly() -> Dict[str, Any]:
+    wp_path = Path("/etc/spanel/wp_toolkit.json")
+    if wp_path.is_file():
+        try:
+            data = json.loads(wp_path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {"instances": {}}
+
+
+def _is_website_occupied(
+    site: Any,
+    lv_state: Dict[str, Any],
+    wp_state: Dict[str, Any],
+    active_lv_ids: Optional[set] = None,
+) -> bool:
+    sid = getattr(site, "id", None)
+    inst_key = str(sid)
+    lv_inst = (lv_state.get("instances") or {}).get(inst_key) or {}
+    wp_inst = (wp_state.get("instances") or {}).get(inst_key) or {}
+    docroot_rel = (getattr(site, "document_root", "") or "").strip().rstrip("/")
+    is_lv = (
+        (active_lv_ids is not None and sid in active_lv_ids)
+        or getattr(site, "nginx_rewrite_mode", None) == "laravel"
+        or docroot_rel.endswith("/public")
+        or docroot_rel == "public"
+        or (bool(lv_inst.get("installed")) and not bool(lv_inst.get("detached")))
+    )
+    is_wp = (
+        getattr(site, "app_type", None) == "wordpress"
+        or (bool(wp_inst.get("installed")) and not bool(wp_inst.get("detached")))
+    )
+    is_app = getattr(site, "app_id", None) is not None or getattr(site, "app_type", None) in {
+        "application",
+        "node",
+        "python",
+        "docker",
+        "compose",
+    }
+    return bool(is_lv or is_wp or is_app)
+
+
+def _evaluate_user_app_quota(
+    db: Session,
+    user: Any,
+    websites: List[Any],
+    lv_state: Dict[str, Any],
+    active_lv_ids: Optional[set] = None,
+) -> Tuple[Dict[str, Any], set]:
+    from app.api.databases import effective_database_limit
+    from app.api.websites import effective_website_limit
+
+    wp_state = _load_wp_state_readonly()
+    occupied_ids: set = set()
+    for w in websites or []:
+        if _is_website_occupied(w, lv_state, wp_state, active_lv_ids):
+            occupied_ids.add(getattr(w, "id", None))
+
+    w_limit = effective_website_limit(user)
+    if w_limit < 0:
+        s_limit = -1
+        max_total_websites = -1
+    else:
+        pkg = getattr(user, "package", None)
+        raw_sub = (
+            getattr(pkg, "subdomain_limit", None)
+            if pkg is not None and getattr(pkg, "subdomain_limit", None) is not None
+            else getattr(user, "subdomain_limit", None)
+        )
+        s_limit = int(0 if raw_sub is None else raw_sub)
+        max_total_websites = -1 if s_limit < 0 else (max(0, w_limit) + max(0, s_limit))
+
+    occupied_count = len(occupied_ids)
+    available_websites_count = sum(
+        1 for w in (websites or []) if getattr(w, "id", None) not in occupied_ids
+    )
+    db_limit = effective_database_limit(user)
+    try:
+        raw_db_cnt = db.query(DatabaseAccount).filter(
+            DatabaseAccount.owner_id == getattr(user, "id", 0)
+        ).count()
+        databases_used = raw_db_cnt if isinstance(raw_db_cnt, int) else 0
+    except Exception:
+        databases_used = 0
+
+    website_quota_ok = (max_total_websites < 0) or (
+        max_total_websites > 0 and occupied_count < max_total_websites
+    )
+    db_quota_ok = db_limit != 0
+    can_install = bool(website_quota_ok and db_quota_ok and available_websites_count > 0)
+    quota = {
+        "website_limit": w_limit,
+        "subdomain_limit": s_limit,
+        "max_total_websites": max_total_websites,
+        "occupied_websites_count": occupied_count,
+        "available_websites_count": available_websites_count,
+        "database_limit": db_limit,
+        "databases_used": databases_used,
+        "can_install": can_install,
+    }
+    return quota, occupied_ids
+
+
 # ── API Endpoints ────────────────────────────────────────────────────────────
 
 @router.get("/instances")
@@ -1147,9 +1252,14 @@ def list_laravel_instances(
             )
     _save_toolkit_state(state)
 
+    active_lv_ids = {inst.get("website_id") or inst.get("id") for inst in instances}
+    quota, occupied_ids = _evaluate_user_app_quota(
+        db, current_user, websites, state, active_lv_ids
+    )
     return {
         "instances": instances,
         "curated_packages": CURATED_COMPOSER_PACKAGES,
+        "quota": quota,
         "websites": [
             {
                 "id": w.id,
@@ -1158,6 +1268,7 @@ def list_laravel_instances(
                 "ssl_enabled": bool(w.ssl_enabled),
                 "app_type": w.app_type,
                 "document_root": w.document_root or "public_html",
+                "occupied": w.id in occupied_ids,
             }
             for w in websites
         ],
@@ -1238,7 +1349,35 @@ def install_laravel_instance(
 
     from app.api.databases import enforce_user_database_limit
 
-    site_owner = db.query(User).filter(User.id == site.owner_id).first() or current_user
+    site_owner = db.query(User).filter(User.id == site.owner_id).first()
+    if site_owner is None or not hasattr(site_owner, "role"):
+        site_owner = current_user
+    subpath_clean = (payload.subpath or "").strip("/")
+    if not subpath_clean:
+        try:
+            owner_websites = db.query(Website).filter(Website.owner_id == site.owner_id).all()
+            if not isinstance(owner_websites, list) or not owner_websites:
+                owner_websites = [site]
+        except Exception:
+            owner_websites = [site]
+        state_check = _load_toolkit_state()
+        quota_check, occupied_ids_check = _evaluate_user_app_quota(
+            db, site_owner, owner_websites, state_check
+        )
+        if getattr(site, "id", None) in occupied_ids_check:
+            raise HTTPException(
+                status_code=403,
+                detail="Tên miền này đã được cài đặt ứng dụng. Vui lòng chọn tên miền khác hoặc gỡ ứng dụng hiện tại.",
+            )
+        max_total_sites = quota_check.get("max_total_websites", -1)
+        if max_total_sites == 0 or (
+            max_total_sites > 0 and len(occupied_ids_check) >= max_total_sites
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Đã đạt giới hạn số lượng website cho phép của gói dịch vụ.",
+            )
+
     reusing_existing_db = False
     existing_check: Optional[DatabaseAccount] = None
     if payload.db_mode == "existing":

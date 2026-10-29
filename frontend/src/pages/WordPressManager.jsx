@@ -44,7 +44,7 @@ import { useAppContext, WordPressIcon } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
 export function WordPressManagerPage({ request, websites = [], openWebsiteFileManager, navigateToPage }) {
-  const { loading, setError, setNotice, phpVersions, loadPhpVersions } = useAppContext();
+  const { loading, setError, setNotice, phpVersions, loadPhpVersions, currentUser, packages } = useAppContext();
   const installedPhpList = phpVersions?.installed?.length ? phpVersions.installed : ['8.4', '8.3', '8.2', '8.1'];
 
   // Global tabs: 'instances' | 'plugins' | 'themes' | 'sets'
@@ -56,6 +56,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   const [instances, setInstances] = useState([]);
   const [packageSets, setPackageSets] = useState([]);
   const [allWebsites, setAllWebsites] = useState(websites || []);
+  const [quotaInfo, setQuotaInfo] = useState(null);
   const [busyAction, setBusyAction] = useState('');
 
   // Selection & expansion states
@@ -171,7 +172,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
         setInstancePluginsMap(nextPlugins);
         setInstanceThemesMap(nextThemes);
         if (Array.isArray(data.sets)) setPackageSets(data.sets);
-        if (Array.isArray(data.websites) && data.websites.length > 0) {
+        if (data.quota) setQuotaInfo(data.quota);
+        if (Array.isArray(data.websites)) {
           setAllWebsites(data.websites);
         }
       }
@@ -245,8 +247,39 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     }
   }
 
+  const installableWebsites = useMemo(() => {
+    const installedIds = new Set(instances.map(inst => Number(inst.website_id || inst.id)));
+    return (allWebsites || []).filter(w => !w.occupied && !installedIds.has(Number(w.id)));
+  }, [allWebsites, instances]);
+
+  const userPkg = useMemo(
+    () =>
+      (packages || []).find(
+        p => p.id === currentUser?.package_id || (currentUser?.package_name && p.name === currentUser.package_name)
+      ),
+    [packages, currentUser]
+  );
+
+  const canInstallWp = useMemo(() => {
+    if (quotaInfo && typeof quotaInfo.can_install === 'boolean') {
+      return quotaInfo.can_install && installableWebsites.length > 0;
+    }
+    if (installableWebsites.length === 0) return false;
+    if (currentUser?.role === 'admin') return true;
+    const wLimit = Number(currentUser?.website_limit ?? userPkg?.website_limit ?? -1);
+    const sLimit = Number(currentUser?.subdomain_limit ?? userPkg?.subdomain_limit ?? 0);
+    if (wLimit >= 0 && sLimit >= 0) {
+      const maxTotal = wLimit + sLimit;
+      const occupiedCount = (allWebsites || []).filter(w => w.occupied).length || instances.length;
+      if (maxTotal === 0 || occupiedCount >= maxTotal) return false;
+    }
+    return true;
+  }, [quotaInfo, installableWebsites, currentUser, userPkg, allWebsites, instances]);
+
   function openInstallDialog() {
-    const firstSite = allWebsites[0] || websites[0];
+    if (!canInstallWp) return;
+    const firstSite = installableWebsites[0];
+    if (!firstSite) return;
     const randSuffix = Math.random().toString(36).substring(2, 6);
     setInstallForm({
       website_id: firstSite ? String(firstSite.id) : '',
@@ -937,6 +970,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
 
             <button
               type="button"
+              disabled={!canInstallWp || !!busyAction}
               onClick={openInstallDialog}
               style={{
                 height: '34px',
@@ -948,6 +982,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 color: '#fff',
                 border: 'none',
                 borderRadius: '7px',
+                opacity: !canInstallWp || !!busyAction ? 0.5 : 1,
+                cursor: !canInstallWp || !!busyAction ? 'not-allowed' : 'pointer',
               }}
             >
               <Plus size={14} /> Install
@@ -1091,6 +1127,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               <div style={{ display: 'inline-flex', gap: '10px' }}>
                 <button
                   type="button"
+                  disabled={!canInstallWp || !!busyAction}
                   onClick={openInstallDialog}
                   style={{
                     height: '38px',
@@ -1100,6 +1137,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                     border: 'none',
                     borderRadius: '8px',
                     fontWeight: 600,
+                    opacity: !canInstallWp || !!busyAction ? 0.5 : 1,
+                    cursor: !canInstallWp || !!busyAction ? 'not-allowed' : 'pointer',
                   }}
                 >
                   <Plus size={15} /> Cài đặt WordPress ngay
@@ -2967,7 +3006,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                     required
                   >
                     <option value="">-- Chọn tên miền --</option>
-                    {allWebsites.map(w => (
+                    {installableWebsites.map(w => (
                       <option key={w.id} value={w.id}>
                         {w.domain}
                       </option>
