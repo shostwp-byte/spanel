@@ -131,6 +131,7 @@ export function LaravelManagerPage({
   // Core data state
   const [instances, setInstances] = useState([]);
   const [availableWebsites, setAvailableWebsites] = useState([]);
+  const [quotaInfo, setQuotaInfo] = useState(null);
   const [curatedPackages, setCuratedPackages] = useState([]);
   const [initialLoading, setInitialLoading] = useState(true);
   const [busyMap, setBusyMap] = useState({});
@@ -244,6 +245,7 @@ export function LaravelManagerPage({
         if (data) {
           const list = Array.isArray(data.instances) ? data.instances : [];
           setInstances(list);
+          if (data.quota) setQuotaInfo(data.quota);
           if (Array.isArray(data.websites)) setAvailableWebsites(data.websites);
           if (Array.isArray(data.curated_packages)) setCuratedPackages(data.curated_packages);
           syncInstanceDrafts(list);
@@ -312,6 +314,41 @@ export function LaravelManagerPage({
     return availableWebsites.length > 0 ? availableWebsites : websites;
   }, [availableWebsites, websites]);
 
+  const installableWebsites = useMemo(() => {
+    const installedIds = new Set(instances.map(inst => Number(inst.website_id || inst.id)));
+    return (allWebsitesList || []).filter(
+      w => !w.occupied && w.app_type !== 'wordpress' && !installedIds.has(Number(w.id))
+    );
+  }, [allWebsitesList, instances]);
+
+  const userPkg = useMemo(
+    () =>
+      (ctx.packages || []).find(
+        p =>
+          p.id === ctx.currentUser?.package_id ||
+          (ctx.currentUser?.package_name && p.name === ctx.currentUser.package_name)
+      ),
+    [ctx.packages, ctx.currentUser]
+  );
+
+  const canInstallLaravel = useMemo(() => {
+    if (quotaInfo && typeof quotaInfo.can_install === 'boolean') {
+      return quotaInfo.can_install && installableWebsites.length > 0;
+    }
+    if (installableWebsites.length === 0) return false;
+    if (ctx.currentUser?.role === 'admin') return true;
+    const wLimit = Number(ctx.currentUser?.website_limit ?? userPkg?.website_limit ?? -1);
+    const sLimit = Number(ctx.currentUser?.subdomain_limit ?? userPkg?.subdomain_limit ?? 0);
+    if (wLimit >= 0 && sLimit >= 0) {
+      const maxTotal = wLimit + sLimit;
+      const occupiedCount =
+        (allWebsitesList || []).filter(w => w.occupied || w.app_type === 'wordpress').length ||
+        instances.length;
+      if (maxTotal === 0 || occupiedCount >= maxTotal) return false;
+    }
+    return true;
+  }, [quotaInfo, installableWebsites, ctx.currentUser, userPkg, allWebsitesList, instances]);
+
   // ── Actions ────────────────────────────────────────────────────────────────
 
   async function handleScanSites() {
@@ -332,7 +369,9 @@ export function LaravelManagerPage({
   }
 
   function openInstallModal() {
-    const firstSite = allWebsitesList[0];
+    if (!canInstallLaravel) return;
+    const firstSite = installableWebsites[0];
+    if (!firstSite) return;
     setInstallForm(prev => ({
       ...prev,
       website_id: firstSite ? String(firstSite.id) : '',
@@ -2499,6 +2538,7 @@ export function LaravelManagerPage({
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
           <button
             type="button"
+            disabled={!canInstallLaravel || isBusy('install')}
             onClick={openInstallModal}
             style={{
               height: '34px',
@@ -2510,6 +2550,8 @@ export function LaravelManagerPage({
               color: '#fff',
               border: 'none',
               borderRadius: '7px',
+              opacity: !canInstallLaravel || isBusy('install') ? 0.5 : 1,
+              cursor: !canInstallLaravel || isBusy('install') ? 'not-allowed' : 'pointer',
             }}
           >
             <Plus size={14} /> Install
@@ -2709,6 +2751,7 @@ export function LaravelManagerPage({
           <div style={{ display: 'inline-flex', gap: '10px', flexWrap: 'wrap' }}>
             <button
               type="button"
+              disabled={!canInstallLaravel || isBusy('install')}
               onClick={openInstallModal}
               style={{
                 height: '38px',
@@ -2718,6 +2761,8 @@ export function LaravelManagerPage({
                 border: 'none',
                 borderRadius: '8px',
                 fontWeight: 600,
+                opacity: !canInstallLaravel || isBusy('install') ? 0.5 : 1,
+                cursor: !canInstallLaravel || isBusy('install') ? 'not-allowed' : 'pointer',
               }}
             >
               <Plus size={15} /> Cài đặt Laravel ngay
@@ -2937,7 +2982,7 @@ export function LaravelManagerPage({
                     required
                   >
                     <option value="">-- Chọn tên miền --</option>
-                    {allWebsitesList.map(w => (
+                    {installableWebsites.map(w => (
                       <option key={w.id} value={w.id}>
                         {w.domain} (PHP {w.php_version || '8.3'})
                       </option>

@@ -416,6 +416,107 @@ def test_composer_and_security_hardening_endpoints(tmp_path):
     assert sec_res["instance"]["security_passed"] == sec_res["instance"]["security_total"]
 
 
+def test_package_website_quota_enforcement_across_application_modules():
+    from app.api import site_apps as sa
+    from app.api import wordpress_manager as wm
+
+    pkg_one_site = SimpleNamespace(
+        id=1,
+        name="Starter 1 Site",
+        website_limit=1,
+        subdomain_limit=0,
+        database_limit=1,
+        node_apps_limit=2,
+    )
+    user_one = SimpleNamespace(
+        id=10,
+        username="shostc",
+        role="end_user",
+        package=pkg_one_site,
+        website_limit=1,
+        subdomain_limit=0,
+        database_limit=1,
+    )
+    wp_site = SimpleNamespace(
+        id=101,
+        owner_id=10,
+        domain="shost.com.vn",
+        app_type="wordpress",
+        nginx_rewrite_mode="front_controller",
+        document_root="public_html",
+        app_id=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.count.return_value = 1
+    db.query.return_value.filter.return_value.all.return_value = [wp_site]
+
+    wp_quota, wp_occ = wm._evaluate_user_app_quota(db, user_one, [wp_site], {"instances": {}}, {101})
+    assert 101 in wp_occ
+    assert wp_quota["max_total_websites"] == 1
+    assert wp_quota["occupied_websites_count"] == 1
+    assert wp_quota["available_websites_count"] == 0
+    assert wp_quota["can_install"] is False
+
+    lv_quota, lv_occ = lm._evaluate_user_app_quota(db, user_one, [wp_site], {"instances": {}}, set())
+    assert 101 in lv_occ
+    assert lv_quota["max_total_websites"] == 1
+    assert lv_quota["occupied_websites_count"] == 1
+    assert lv_quota["available_websites_count"] == 0
+    assert lv_quota["can_install"] is False
+
+    sa_quota = sa._website_quota_status(db, user_one, [])
+    assert sa_quota["max_total_websites"] == 1
+    assert sa_quota["occupied_websites_count"] == 1
+    assert sa_quota["website_quota_reached"] is True
+
+    # Upgrade package to allow 1 subdomain (max_total_websites = 2) and add an unoccupied subdomain
+    pkg_two_sites = SimpleNamespace(
+        id=2,
+        name="Pro 1+1",
+        website_limit=1,
+        subdomain_limit=1,
+        database_limit=2,
+        node_apps_limit=2,
+    )
+    user_two = SimpleNamespace(
+        id=10,
+        username="shostc",
+        role="end_user",
+        package=pkg_two_sites,
+        website_limit=1,
+        subdomain_limit=1,
+        database_limit=2,
+    )
+    sub_site = SimpleNamespace(
+        id=102,
+        owner_id=10,
+        domain="app.shost.com.vn",
+        app_type="php",
+        nginx_rewrite_mode="none",
+        document_root="public_html",
+        app_id=None,
+    )
+    db.query.return_value.filter.return_value.all.return_value = [wp_site, sub_site]
+
+    wp_quota2, wp_occ2 = wm._evaluate_user_app_quota(
+        db, user_two, [wp_site, sub_site], {"instances": {}}, {101}
+    )
+    assert wp_occ2 == {101}
+    assert wp_quota2["max_total_websites"] == 2
+    assert wp_quota2["occupied_websites_count"] == 1
+    assert wp_quota2["available_websites_count"] == 1
+    assert wp_quota2["can_install"] is True
+
+    lv_quota2, lv_occ2 = lm._evaluate_user_app_quota(
+        db, user_two, [wp_site, sub_site], {"instances": {}}, set()
+    )
+    assert lv_occ2 == {101}
+    assert lv_quota2["can_install"] is True
+
+    sa_quota2 = sa._website_quota_status(db, user_two, [])
+    assert sa_quota2["website_quota_reached"] is False
+
+
 if __name__ == "__main__":
     test_require_end_user_laravel_access_blocks_admin_without_user_view_header()
     test_parse_and_update_env_preserves_comments_and_quotes_special_values()
@@ -429,4 +530,5 @@ if __name__ == "__main__":
         test_update_laravel_env_creates_backup_and_clears_config_cache(Path(_d4))
     with tempfile.TemporaryDirectory() as _d5:
         test_composer_and_security_hardening_endpoints(Path(_d5))
+    test_package_website_quota_enforcement_across_application_modules()
     print("ALL LARAVEL MANAGER TESTS PASSED")
