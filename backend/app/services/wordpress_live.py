@@ -454,24 +454,27 @@ def write_wp_file_text(
     except ValueError:
         rel_to_root = f"public_html/{rel_path.lstrip('/')}"
     if not settings.command_dry_run:
-        try:
-            shell.privileged(
-                "site-file-write",
-                helper_args=[linux_user, str(site_root), rel_to_root, safe_mode],
-                fallback=[
-                    "sh",
-                    "-c",
-                    'mkdir -p "$(dirname "$1")" && cat >"$1" && chmod "$2" "$1"',
-                    "sh",
-                    str(target),
-                    safe_mode,
-                ],
-                input=content,
-                sensitive=True,
-                check=False,
+        res = shell.privileged(
+            "site-file-write",
+            helper_args=[linux_user, str(site_root), rel_to_root, safe_mode],
+            fallback=[
+                "sh",
+                "-c",
+                'mkdir -p "$(dirname "$1")" && cat >"$1" && chmod "$2" "$1"',
+                "sh",
+                str(target),
+                safe_mode,
+            ],
+            input=content,
+            sensitive=True,
+            check=False,
+        )
+        if getattr(res, "returncode", 1) != 0:
+            err = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "site-file-write failed").strip()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể ghi tệp cấu hình WordPress ({rel_path}): {err[:200]}",
             )
-        except Exception as exc:
-            logger.debug("write_wp_file_text helper warning: %s", exc)
         return
     try:
         if _has_symlink_component(target, site_root):

@@ -1140,8 +1140,24 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
 
         assert site.app_type == "php", "Subpath WordPress must not overwrite parent site.app_type"
         assert len(captured_vhost_calls) == 1
-        assert "location ~* ^/blog/wp-content/uploads/.*\\.php$ { deny all; }" in (site.nginx_custom or "")
+        assert "location ^~ /blog/wp-content/uploads/ { location ~* \\.php$ { deny all; } }" in (site.nginx_custom or "")
         assert not (wp_dir / "blog" / "readme.html").exists()
+
+        # Verify custom_include_path appears BEFORE location ~ \.php$ in both php.conf.j2 and wordpress.conf.j2
+        for tpl_name in ("php.conf.j2", "wordpress.conf.j2"):
+            tpl_text = (REPO_ROOT / "backend" / "app" / "templates" / "nginx" / tpl_name).read_text(encoding="utf-8")
+            assert tpl_text.index("# SPANEL CUSTOM INCLUDE") < tpl_text.index("location ~ \\.php$")
+
+        # Verify write_wp_file_text raises HTTPException(500) when site-file-write fails (P2-14)
+        from fastapi import HTTPException
+
+        with patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("write", 1, "", "permission denied")):
+            try:
+                wordpress_live.write_wp_file_text("alice", site_root, wp_dir, "wp-config.php", "<?php\n", "0640")
+                raise AssertionError("Expected HTTPException(500) when site-file-write returns non-zero")
+            except HTTPException as exc:
+                assert exc.status_code == 500
+                assert "permission denied" in exc.detail
     finally:
         settings.command_dry_run = orig_dry
 
