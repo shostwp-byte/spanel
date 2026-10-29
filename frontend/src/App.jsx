@@ -49,11 +49,11 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
 class ChunkErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
-    this.state = { error: null };
+    this.state = { error: null, isChunkError: false };
   }
 
   static getDerivedStateFromError(error) {
-    return { error };
+    return { error, isChunkError: isChunkLoadError(error) };
   }
 
   componentDidCatch(error) {
@@ -64,27 +64,44 @@ class ChunkErrorBoundary extends React.Component {
 
   componentDidUpdate(prevProps) {
     if (this.state.error && prevProps.resetKey !== this.props.resetKey) {
-      this.setState({ error: null });
+      this.setState({ error: null, isChunkError: false });
     }
   }
 
   render() {
     if (this.state.error) {
+      if (this.state.isChunkError) {
+        return (
+          <div className="section" style={{ padding: '24px', textAlign: 'center' }}>
+            <h3>{t('Page update available')}</h3>
+            <p className="hint" style={{ marginBottom: '12px' }}>
+              {t('A newer panel build was deployed. Please reload the page to continue.')}
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                try { sessionStorage.removeItem(CHUNK_RELOAD_KEY); } catch {}
+                window.location.reload();
+              }}
+            >
+              <RefreshCw size={14} />
+              {t('Reload page')}
+            </button>
+          </div>
+        );
+      }
       return (
         <div className="section" style={{ padding: '24px', textAlign: 'center' }}>
-          <h3>{t('Page update available')}</h3>
+          <h3>{t('Something went wrong on this page')}</h3>
           <p className="hint" style={{ marginBottom: '12px' }}>
-            {t('A newer panel build was deployed. Please reload the page to continue.')}
+            {String(this.state.error?.message || this.state.error || t('An unexpected rendering error occurred.'))}
           </p>
           <button
             type="button"
-            onClick={() => {
-              try { sessionStorage.removeItem(CHUNK_RELOAD_KEY); } catch {}
-              window.location.reload();
-            }}
+            onClick={() => this.setState({ error: null, isChunkError: false })}
           >
             <RefreshCw size={14} />
-            {t('Reload page')}
+            {t('Try again')}
           </button>
         </div>
       );
@@ -141,7 +158,7 @@ const AddonsPage = lazyNamed(() => import('./pages/Addons.jsx'), 'AddonsPage');
 const MailForwardersPage = lazyNamed(() => import('./pages/MailForwarders.jsx'), 'MailForwardersPage');
 const MailAutorespondersPage = lazyNamed(() => import('./pages/MailAutoresponders.jsx'), 'MailAutorespondersPage');
 const McpPage = lazyNamed(() => import('./pages/Mcp.jsx'), 'McpPage');
-const MessageTemplates = React.lazy(() => import('./pages/MessageTemplates.jsx'));
+const MessageTemplates = lazyNamed(() => import('./pages/MessageTemplates.jsx'), 'default');
 const CustomHttpdPage = lazyNamed(() => import('./pages/CustomHttpd.jsx'), 'CustomHttpdPage');
 const CustomBuildPage = lazyNamed(() => import('./pages/CustomBuild.jsx'), 'CustomBuildPage');
 const MaintenancePage = lazyNamed(() => import('./pages/Maintenance.jsx'), 'MaintenancePage');
@@ -936,7 +953,7 @@ function CodeEditor({ value, mode, disabled, onChange, onCursorChange }) {
         editorRef.current = null;
         if (hostRef.current) hostRef.current.textContent = '';
       };
-    });
+    }).catch(() => {});
 
     return () => {
       cancelled = true;
@@ -1941,9 +1958,8 @@ function AppContent() {
     if (data?.access_token) {
       setNotice(`Returned to ${targetName}.`);
       setViewLevel(null);
-      const nextUser = await loadCurrentUser();
+      await loadCurrentUser();
       navigateToPage('users');
-      await refreshAll({ skipUserReload: true, userOverride: nextUser });
     }
   }
 

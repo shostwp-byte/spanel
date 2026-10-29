@@ -146,23 +146,52 @@ def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
     gzip_opts = gzip_mw.kwargs if hasattr(gzip_mw, "kwargs") else gzip_mw.options
     assert gzip_opts.get("compresslevel") == 5
 
-    # Also execute SelectiveGZipMiddleware against a /download path and a JSON path
+    # Also execute SelectiveGZipMiddleware against a /download path and verify EXCLUDED_CONTENT_TYPES (P2-10)
     import asyncio
 
     called_inner = []
 
     async def dummy_app(scope, receive, send):
         called_inner.append(scope.get("path"))
+        ctype = b"application/sql" if scope.get("path") == "/api/backups/sql-stream" else b"application/json"
+        body = b"SELECT * FROM wp_posts WHERE id > 0;\n" * 60
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", ctype), (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body, "more_body": False})
 
-    mw = panel_main.SelectiveGZipMiddleware(dummy_app, minimum_size=1000, compresslevel=5)
-    asyncio.run(mw({"type": "http", "path": "/api/files/download", "headers": [(b"accept-encoding", b"gzip")]}, None, None))
+    sent_messages = []
+
+    async def capture_send(msg):
+        sent_messages.append(msg)
+
+    mw = panel_main.SelectiveGZipMiddleware(dummy_app, minimum_size=100, compresslevel=5)
+    for excluded_ct in panel_main.SelectiveGZipMiddleware.EXCLUDED_CONTENT_TYPES:
+        assert excluded_ct in mw.gzip_app.exclude_content_types
+
+    asyncio.run(mw({"type": "http", "path": "/api/files/download", "headers": [(b"accept-encoding", b"gzip")]}, None, capture_send))
     assert called_inner == ["/api/files/download"]
 
-    # P2-15 & P2-12: App.jsx includes app_installer in USER_ALLOWED_PAGES and awaits loadCurrentUser before refreshAll
+    # Content-Type: application/sql on a non-/download path is bypassed by exclude_content_types (not gzipped)
+    sent_messages.clear()
+    asyncio.run(mw({"type": "http", "path": "/api/backups/sql-stream", "headers": [(b"accept-encoding", b"gzip")]}, None, capture_send))
+    sql_start = next(m for m in sent_messages if m["type"] == "http.response.start")
+    sql_hdrs = {k.decode().lower(): v.decode() for k, v in sql_start["headers"]}
+    assert "content-encoding" not in sql_hdrs
+
+    # Content-Type: application/json IS gzipped
+    sent_messages.clear()
+    asyncio.run(mw({"type": "http", "path": "/api/websites", "headers": [(b"accept-encoding", b"gzip")]}, None, capture_send))
+    json_start = next(m for m in sent_messages if m["type"] == "http.response.start")
+    json_hdrs = {k.decode().lower(): v.decode() for k, v in json_start["headers"]}
+    assert json_hdrs.get("content-encoding") == "gzip"
+
+    # P2-15, P2-12, P2-8, P2-9: App.jsx includes app_installer in USER_ALLOWED_PAGES, uses activeUser/activeRole,
+    # and distinguishes chunk errors from runtime errors in ChunkErrorBoundary
     app_src = APP_JSX.read_text(encoding="utf-8")
     user_pages_block = app_src.split("const USER_ALLOWED_PAGES = new Set([", 1)[1].split("]);", 1)[0]
     assert "'app_installer'" in user_pages_block
     assert "['app_installer', 'App Installer', Boxes]" in app_src
     assert "if (isAuthenticated && currentUser)" in app_src
-    assert "if (currentUser && effectiveRole && !headers['X-Access-Role'])" in app_src
+    assert "if (activeUser && activeRole && !headers['X-Access-Role'])" in app_src
+    assert "isChunkError: isChunkLoadError(error)" in app_src
+    assert "const MessageTemplates = lazyNamed(() => import('./pages/MessageTemplates.jsx'), 'default');" in app_src
 

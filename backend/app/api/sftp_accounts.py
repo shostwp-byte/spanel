@@ -78,13 +78,21 @@ def _sftp_host() -> str:
     return ""
 
 
-def _limit_for(user: User) -> int:
+def effective_sftp_limit(user: User | None) -> int:
+    if user is None or is_admin_role(getattr(user, "role", None)):
+        return -1
+    pkg = getattr(user, "package", None)
+    if pkg is not None:
+        pkg_val = getattr(pkg, "sftp_accounts_limit", None)
+        if pkg_val is None:
+            pkg_val = getattr(pkg, "ftp_accounts_limit", None)
+        if pkg_val is not None:
+            return int(pkg_val)
     val = getattr(user, "sftp_accounts_limit", None)
-    if val is None and getattr(user, "package", None) is not None:
-        val = getattr(user.package, "sftp_accounts_limit", None)
-        if val is None:
-            val = getattr(user.package, "ftp_accounts_limit", None)
     return int(0 if val is None else val)
+
+
+_limit_for = effective_sftp_limit
 
 
 def _owned_website(db: Session, website_id: int, current_user: User) -> Website:

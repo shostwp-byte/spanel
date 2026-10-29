@@ -1405,7 +1405,11 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
 
     # 3. If vhost rewrite fails after runtime move, runtime is rolled back to old path/owner
     move_calls = []
+    mail_move_calls = []
+    from app.services import mail as mail_service
+
     with patch.object(websites.site_users, "move_site_runtime", side_effect=lambda o, n, u, p=None: move_calls.append((o, n, u))), \
+         patch.object(mail_service, "move_domain_maildirs", side_effect=lambda o, n, d: mail_move_calls.append((o, n, d))), \
          patch.object(websites, "_ensure_default_waf_file"), \
          patch.object(websites, "_rewrite_website_vhost", side_effect=[HTTPException(status_code=500, detail="nginx failed"), None]):
         try:
@@ -1426,9 +1430,11 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     db.refresh(legacy_site)
     assert legacy_site.owner_id == reseller.id
 
-    # 4. Transferring ownership to End User moves site + DB + SFTP + SiteApp + DNS + Mail
+    # 4. Transferring ownership to End User moves site + DB + SFTP + SiteApp + DNS + Mail (including physical maildir move)
     sftp_ensured = []
+    mail_move_calls.clear()
     with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs", side_effect=lambda o, n, d: mail_move_calls.append((o, n, d))), \
          patch.object(websites, "_ensure_default_waf_file"), \
          patch.object(websites, "_rewrite_website_vhost"), \
          patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: (sftp_ensured.append((owner_u, sub_u, root)) or f"/var/lib/spanel-sftp/{sub_u}")):
@@ -1443,6 +1449,7 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     assert updated.linux_user == "alice"
     assert updated.root_path == expected_alice_root
     assert sftp_ensured == [("alice", "sftp_res1_deploy_a1b2c3", expected_alice_root)]
+    assert mail_move_calls == [("res1", "alice", "legacy-admin.example.com")]
 
     db.refresh(legacy_db)
     db.refresh(legacy_sftp)

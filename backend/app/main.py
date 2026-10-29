@@ -132,6 +132,8 @@ class SelectiveGZipMiddleware:
         self.minimum_size = minimum_size
         self.compresslevel = compresslevel
         self.gzip_app = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=compresslevel)
+        existing_excluded = tuple(getattr(self.gzip_app, "exclude_content_types", ()))
+        self.gzip_app.exclude_content_types = tuple(dict.fromkeys([*existing_excluded, *sorted(self.EXCLUDED_CONTENT_TYPES)]))
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":

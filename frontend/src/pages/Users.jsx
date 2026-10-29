@@ -347,18 +347,16 @@ export function UsersPage({
       if (retryData?.access_token) {
         setNotice(`Logged in as ${user.username}.`);
         setViewLevel?.(null);
-        const nextUser = await loadCurrentUser();
+        await loadCurrentUser();
         navigateToPage('dashboard');
-        await refreshAll({ skipUserReload: true, userOverride: nextUser });
       }
       return;
     }
     if (data?.access_token) {
       setNotice(`Logged in as ${user.username}.`);
       setViewLevel?.(null);
-      const nextUser = await loadCurrentUser();
+      await loadCurrentUser();
       navigateToPage('dashboard');
-      await refreshAll({ skipUserReload: true, userOverride: nextUser });
     }
   }
 

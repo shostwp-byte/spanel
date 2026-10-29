@@ -5044,6 +5044,34 @@ mail_purge_domain() {
   echo "mail data removed: ${domain}"
 }
 
+mail_move_domain() {
+  # Move a mail domain's maildirs from one Linux user's home to another's on
+  # website ownership transfer. mail/ and mail/<domain>/ are root:spanel 0751;
+  # each mailbox inside is owned by <new_user>:spanel.
+  local old_user="$1" new_user="$2" domain="$3" src_dir dst_dir
+  require_linux_user "$old_user"
+  require_linux_user "$new_user"
+  require_domain "$domain"
+  [[ "$old_user" != "$new_user" ]] || return 0
+  id -u "$new_user" >/dev/null 2>&1 || deny "no Linux user $new_user"
+  mail_purge_webmail_sessions "$domain"
+  src_dir="/home/${old_user}/mail/${domain}"
+  dst_dir="/home/${new_user}/mail/${domain}"
+  [[ -d "$src_dir" && ! -L "$src_dir" ]] || return 0
+  [[ ! -L "/home/${old_user}/mail" ]] || deny "/home/${old_user}/mail cannot be a symlink"
+  [[ ! -L "/home/${new_user}/mail" ]] || deny "/home/${new_user}/mail cannot be a symlink"
+  install -d -o root -g spanel -m 0751 "/home/${new_user}/mail"
+  if [[ -e "$dst_dir" || -L "$dst_dir" ]]; then
+    deny "destination mail directory already exists: ${dst_dir}"
+  fi
+  mv -- "$src_dir" "$dst_dir"
+  chown root:spanel "$dst_dir"
+  chmod 0751 "$dst_dir"
+  find "$dst_dir" \( -type l -o -type b -o -type c -o -type p -o -type s \) -delete 2>/dev/null || true
+  find "$dst_dir" -mindepth 1 -exec chown -h "${new_user}:spanel" {} +
+  echo "mail data moved: ${domain} (${old_user} -> ${new_user})"
+}
+
 mail_rspamd_answers() {
   local key
   key="$(tr -d '[:space:]' <"$MAIL_RSPAMD_KEY_FILE" 2>/dev/null)"
@@ -10404,6 +10432,11 @@ case "$cmd" in
   mail-purge-domain)
     [[ $# -eq 2 ]] || deny "usage: mail-purge-domain <site-user> <domain>"
     mail_purge_domain "$1" "$2"
+    ;;
+
+  mail-move-domain)
+    [[ $# -eq 3 ]] || deny "usage: mail-move-domain <old-user> <new-user> <domain>"
+    mail_move_domain "$1" "$2" "$3"
     ;;
 
   mail-relay-test)
