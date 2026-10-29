@@ -184,12 +184,16 @@ def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
     json_hdrs = {k.decode().lower(): v.decode() for k, v in json_start["headers"]}
     assert json_hdrs.get("content-encoding") == "gzip"
 
-    # P2-15, P2-12, P2-8, P2-9: App.jsx includes app_installer in USER_ALLOWED_PAGES, uses activeUser/activeRole,
-    # and distinguishes chunk errors from runtime errors in ChunkErrorBoundary
+    # Application menu group (Docker, Node.js, Laravel, WordPress Manager), App Installer removed,
+    # activeUser/activeRole ordering, and ChunkErrorBoundary chunk vs runtime error distinction
     app_src = APP_JSX.read_text(encoding="utf-8")
     user_pages_block = app_src.split("const USER_ALLOWED_PAGES = new Set([", 1)[1].split("]);", 1)[0]
-    assert "'app_installer'" in user_pages_block
-    assert "['app_installer', 'App Installer', Boxes]" in app_src
+    for app_key in ("docker_manager", "nodejs_manager", "laravel_manager", "wordpress_manager"):
+        assert f"'{app_key}'" in user_pages_block
+    assert "'app_installer'" not in user_pages_block
+    assert "['app_installer', 'App Installer', Boxes]" not in app_src
+    assert "{ key: 'application', title: 'Application', items: [" in app_src
+    assert "['laravel_manager', 'Laravel', LaravelIcon]" in app_src
     assert "if (isAuthenticated && currentUser)" in app_src
     assert "if (activeUser && activeRole && !headers['X-Access-Role'])" in app_src
     assert "isChunkError: isChunkLoadError(error)" in app_src
