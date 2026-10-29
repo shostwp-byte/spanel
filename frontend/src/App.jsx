@@ -110,7 +110,6 @@ const Packages = lazyNamed(() => import('./pages/Packages.jsx'), 'Packages');
 const IpManager = lazyNamed(() => import('./pages/IpManager.jsx'), 'IpManager');
 const AppInstallerPage = lazyNamed(() => import('./pages/AppInstaller.jsx'), 'AppInstallerPage');
 const WordPressManagerPage = lazyNamed(() => import('./pages/WordPressManager.jsx'), 'WordPressManagerPage');
-const LaravelManagerPage = lazyNamed(() => import('./pages/LaravelManager.jsx'), 'LaravelManagerPage');
 const ResellerSettingsPage = lazyNamed(() => import('./pages/ResellerSettings.jsx'), 'ResellerSettingsPage');
 const UsersPage = lazyNamed(() => import('./pages/Users.jsx'), 'UsersPage');
 const MoveUsersPage = lazyNamed(() => import('./pages/MoveUsers.jsx'), 'MoveUsersPage');
@@ -286,9 +285,6 @@ const PAGE_ROUTES = {
   mail_forwarders: '/mail-forwarders',
   mail_auto: '/mail-autoresponders',
   app_installer: '/app-installer',
-  docker_manager: '/docker-manager',
-  nodejs_manager: '/nodejs-manager',
-  laravel_manager: '/laravel-manager',
   wordpress_manager: '/wordpress-manager',
   reseller_settings: '/reseller-settings',
   ipmanager: '/ipmanager',
@@ -383,9 +379,6 @@ const USER_ALLOWED_PAGES = new Set([
   'mail_auto',
   'applications',
   'app_installer',
-  'docker_manager',
-  'nodejs_manager',
-  'laravel_manager',
   'wordpress_manager',
   'waf',
   'waf-site',
@@ -526,15 +519,6 @@ function WordPressIcon({ size = 14 }) {
     <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false" className="lucide">
       <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2" />
       <text x="12" y="16" textAnchor="middle" fontSize="11" fontWeight="700" fontFamily="Georgia, serif" fill="currentColor">W</text>
-    </svg>
-  );
-}
-
-function LaravelIcon({ size = 14 }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false" className="lucide">
-      <rect x="3" y="3" width="18" height="18" rx="4" fill="none" stroke="currentColor" strokeWidth="2" />
-      <text x="12" y="16" textAnchor="middle" fontSize="11" fontWeight="700" fontFamily="Georgia, serif" fill="currentColor">L</text>
     </svg>
   );
 }
@@ -3301,15 +3285,10 @@ function AppContent() {
         ['mail_auto', 'Autoresponders', Mail],
         ['mail_spam', 'Spam Filters', Shield],
       ]}] : []),
-      { key: 'application', title: 'Application', items: [
-        ['docker_manager', 'Docker', Boxes],
-        ['nodejs_manager', 'Node.js', Cpu],
-        ['laravel_manager', 'Laravel', LaravelIcon],
-        ['wordpress_manager', 'WordPress Manager', WordPressIcon],
-      ]},
       { key: 'advanced_features', title: 'Advanced Features', items: [
         ...(appsFeatureEnabled ? [['applications', 'Applications (Node/Python/Docker)', Cpu]] : []),
         ['app_installer', 'App Installer', Boxes],
+        ['wordpress_manager', 'WordPress Manager', WordPressIcon],
         ['waf', 'Web Application Firewall', ShieldAlert],
         ['cron', 'Cron Jobs', Clock],
         ['backups', 'Create/Restore Backups', Archive],
@@ -4546,8 +4525,6 @@ function AppContent() {
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
     if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
-    if (page === 'laravel_manager') return <LaravelManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
-    if (page === 'docker_manager' || page === 'nodejs_manager') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'app_installer') return <AppInstallerPage request={request} websites={roleScopedWebsites} navigateToPage={navigateToPage} />;
     if (page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;
