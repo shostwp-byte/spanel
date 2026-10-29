@@ -517,6 +517,18 @@ def test_package_website_quota_enforcement_across_application_modules():
     assert sa_quota2["website_quota_reached"] is False
 
 
+def test_python312_eager_annotation_compatibility():
+    import inspect
+    from typing import get_type_hints
+    from app.api import auth, laravel_manager, site_apps, wordpress_manager
+
+    for mod in (auth, laravel_manager, site_apps, wordpress_manager):
+        for _, obj in inspect.getmembers(mod):
+            if inspect.isfunction(obj) and getattr(obj, "__module__", None) == mod.__name__:
+                hints = get_type_hints(obj)
+                assert isinstance(hints, dict)
+
+
 if __name__ == "__main__":
     test_require_end_user_laravel_access_blocks_admin_without_user_view_header()
     test_parse_and_update_env_preserves_comments_and_quotes_special_values()
@@ -531,4 +543,5 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as _d5:
         test_composer_and_security_hardening_endpoints(Path(_d5))
     test_package_website_quota_enforcement_across_application_modules()
+    test_python312_eager_annotation_compatibility()
     print("ALL LARAVEL MANAGER TESTS PASSED")
