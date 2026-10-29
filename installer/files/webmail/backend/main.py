@@ -13,6 +13,7 @@ Reads configuration from /etc/SPanel-webmail.env (or environment variables):
 from __future__ import annotations
 
 import base64
+import contextvars
 import email
 import email.header
 import email.policy
@@ -104,6 +105,7 @@ LOGIN_MAX_FAILURES_PER_EMAIL = 20
 _login_failures_pair: dict[tuple[str, str], list[float]] = {}
 _login_failures_ip: dict[str, list[float]] = {}
 _login_failures_email: dict[str, list[float]] = {}
+_client_ip_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("webmail_client_ip", default="")
 
 
 def _client_ip(request: Request) -> str:
@@ -121,6 +123,9 @@ def _client_ip(request: Request) -> str:
     return "127.0.0.1"
 
 
+LOGIN_RATE_MAX_BUCKETS = 4096
+
+
 def _prune_window(buckets: dict[Any, list[float]], key: Any, cutoff: float) -> list[float]:
     entries = [ts for ts in buckets.get(key, []) if ts >= cutoff]
     if entries:
@@ -130,14 +135,25 @@ def _prune_window(buckets: dict[Any, list[float]], key: Any, cutoff: float) -> l
     return entries
 
 
+def _sweep_rate_buckets(cutoff: float) -> None:
+    for bucket in (_login_failures_pair, _login_failures_ip, _login_failures_email):
+        if len(bucket) <= 1024:
+            continue
+        for k in list(bucket.keys()):
+            _prune_window(bucket, k, cutoff)
+        while len(bucket) > LOGIN_RATE_MAX_BUCKETS:
+            oldest_key = next(iter(bucket))
+            bucket.pop(oldest_key, None)
+
+
 def _check_login_rate_limit(client_ip: str, address: str, *, now: float | None = None) -> None:
     current = float(now if now is not None else time.time())
     cutoff = current - LOGIN_WINDOW_SECONDS
+    _sweep_rate_buckets(cutoff)
     pair_key = (client_ip, address)
     if (
         len(_prune_window(_login_failures_pair, pair_key, cutoff)) >= LOGIN_MAX_FAILURES_PER_PAIR
         or len(_prune_window(_login_failures_ip, client_ip, cutoff)) >= LOGIN_MAX_FAILURES_PER_IP
-        or len(_prune_window(_login_failures_email, address, cutoff)) >= LOGIN_MAX_FAILURES_PER_EMAIL
     ):
         raise HTTPException(
             status_code=429,
@@ -149,6 +165,7 @@ def _check_login_rate_limit(client_ip: str, address: str, *, now: float | None =
 def _record_login_failure(client_ip: str, address: str, *, now: float | None = None) -> None:
     current = float(now if now is not None else time.time())
     cutoff = current - LOGIN_WINDOW_SECONDS
+    _sweep_rate_buckets(cutoff)
     pair_key = (client_ip, address)
     _prune_window(_login_failures_pair, pair_key, cutoff)
     _login_failures_pair.setdefault(pair_key, []).append(current)
@@ -156,6 +173,12 @@ def _record_login_failure(client_ip: str, address: str, *, now: float | None = N
     _login_failures_ip.setdefault(client_ip, []).append(current)
     _prune_window(_login_failures_email, address, cutoff)
     _login_failures_email.setdefault(address, []).append(current)
+    if len(_login_failures_email.get(address, [])) >= LOGIN_MAX_FAILURES_PER_EMAIL:
+        raise HTTPException(
+            status_code=429,
+            detail="Quá nhiều lần đăng nhập thất bại. Vui lòng thử lại sau vài phút.",
+            headers={"Retry-After": "60"},
+        )
 
 
 def _clear_login_failures(client_ip: str, address: str) -> None:
@@ -413,6 +436,16 @@ def _get_session(request: Request) -> dict[str, Any] | None:
         return None
 
 
+def _extract_hostname(host_header: str) -> str:
+    val = (host_header or "").strip().lower()
+    if not val:
+        return ""
+    try:
+        return (urlsplit(f"//{val}").hostname or "").strip().lower()
+    except Exception:
+        return val.split(":", 1)[0].strip().lower()
+
+
 def _verify_csrf_request(request: Request) -> None:
     if request.method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
         return
@@ -429,8 +462,9 @@ def _verify_csrf_request(request: Request) -> None:
         if origin.lower() == "null":
             raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (CSRF Origin không hợp lệ).")
         parsed_origin = urlsplit(origin)
-        origin_host = (parsed_origin.netloc or "").strip().lower()
-        if not origin_host or (expected_host and origin_host != expected_host):
+        origin_hostname = (parsed_origin.hostname or "").strip().lower()
+        expected_hostname = _extract_hostname(expected_host)
+        if not origin_hostname or (expected_hostname and origin_hostname != expected_hostname):
             raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (CSRF Origin không khớp).")
         return
 
@@ -512,6 +546,15 @@ def _imap_authenticate(conn: imaplib.IMAP4, auth_user: str, auth_pass: str) -> N
     conn._encoding = "utf-8"
     if "\x00" in auth_user or "\x00" in auth_pass or "\r" in auth_user or "\n" in auth_user:
         raise imaplib.IMAP4.error("Invalid credentials")
+    orig_ip = (_client_ip_ctx.get("") or "").strip()
+    if orig_ip and orig_ip not in ("127.0.0.1", "::1") and hasattr(conn, "_simple_command"):
+        try:
+            parsed_ip = str(ipaddress.ip_address(orig_ip))
+            if "ID" not in imaplib.Commands:
+                imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
+            conn._simple_command("ID", f'("name" "SPanel-Webmail" "x-originating-ip" "{parsed_ip}")')
+        except Exception:
+            pass
     if hasattr(conn, "authenticate"):
         auth_bytes = f"\x00{auth_user}\x00{auth_pass}".encode("utf-8")
         conn.authenticate("PLAIN", lambda _: auth_bytes)
@@ -688,10 +731,10 @@ def _load_user_prefs(address: str) -> dict[str, Any]:
 def _save_user_prefs(address: str, updates: dict[str, Any]) -> dict[str, Any]:
     prefs = _load_user_prefs(address)
     if "display_name" in updates:
-        clean_dn = re.sub(r"[\r\n\x00]+", " ", str(updates["display_name"] or "")).strip()[:120]
+        clean_dn = re.sub(r"[\x00-\x1f\x7f]+", " ", str(updates["display_name"] or "")).strip()[:120]
         prefs["display_name"] = clean_dn
     if "reply_to" in updates:
-        rt = re.sub(r"[\r\n\x00]+", "", str(updates["reply_to"] or "")).strip()
+        rt = re.sub(r"[\x00-\x1f\x7f]+", "", str(updates["reply_to"] or "")).strip()
         if rt and not EMAIL_RE.fullmatch(rt):
             raise HTTPException(status_code=400, detail="Địa chỉ Reply-To không hợp lệ.")
         prefs["reply_to"] = rt
@@ -906,6 +949,10 @@ def api_auth_sso(request: Request, token: str = Query(default="")):
 
 @app.post("/api/auth/login")
 async def api_auth_login(request: Request, response: Response):
+    _verify_csrf_request(request)
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" not in ctype:
+        raise HTTPException(status_code=400, detail="Dữ liệu đăng nhập không hợp lệ.")
     try:
         body = await request.json()
     except Exception as exc:
@@ -919,12 +966,15 @@ async def api_auth_login(request: Request, response: Response):
     client_ip = _client_ip(request)
     _check_login_rate_limit(client_ip, address)
 
+    ip_token = _client_ip_ctx.set(client_ip)
     try:
         conn = _open_imap_with_creds(address, password)
     except HTTPException as exc:
         if exc.status_code == 401:
             _record_login_failure(client_ip, address)
         raise
+    finally:
+        _client_ip_ctx.reset(ip_token)
 
     _clear_login_failures(client_ip, address)
     try:
@@ -1276,21 +1326,21 @@ def api_download_attachment(
 
 async def _build_email_from_request(request: Request, sender_address: str) -> tuple[EmailMessage, list[str], str | None]:
     prefs = _load_user_prefs(sender_address)
-    display_name = re.sub(r"[\r\n\x00]+", " ", str(prefs.get("display_name") or "")).strip()
-    reply_to_pref = re.sub(r"[\r\n\x00]+", "", str(prefs.get("reply_to") or "")).strip()
+    display_name = re.sub(r"[\x00-\x1f\x7f]+", " ", str(prefs.get("display_name") or "")).strip()
+    reply_to_pref = re.sub(r"[\x00-\x1f\x7f]+", "", str(prefs.get("reply_to") or "")).strip()
 
     ctype = (request.headers.get("content-type") or "").lower()
     uploads: list[tuple[str, str, bytes]] = []
     if "multipart/form-data" in ctype:
         form = await request.form()
-        to_raw = re.sub(r"[\r\n\x00]+", " ", str(form.get("to") or "")).strip()
-        cc_raw = re.sub(r"[\r\n\x00]+", " ", str(form.get("cc") or "")).strip()
-        bcc_raw = re.sub(r"[\r\n\x00]+", " ", str(form.get("bcc") or "")).strip()
-        subject = re.sub(r"[\r\n\x00]+", " ", str(form.get("subject") or "")).strip()
+        to_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("to") or "")).strip()
+        cc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("cc") or "")).strip()
+        bcc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("bcc") or "")).strip()
+        subject = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("subject") or "")).strip()
         body_text = str(form.get("body_text") or "")
         body_html = str(form.get("body_html") or "")
-        in_reply_to = re.sub(r"[\r\n\x00]+", " ", str(form.get("in_reply_to") or "")).strip()
-        references = re.sub(r"[\r\n\x00]+", " ", str(form.get("references") or "")).strip()
+        in_reply_to = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("in_reply_to") or "")).strip()
+        references = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("references") or "")).strip()
         draft_uid = str(form.get("draft_uid") or "").strip() or None
         for file_item in form.getlist("attachments"):
             if hasattr(file_item, "filename") and getattr(file_item, "filename", ""):
@@ -1307,14 +1357,14 @@ async def _build_email_from_request(request: Request, sender_address: str) -> tu
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Dữ liệu gửi thư không hợp lệ.") from exc
         body = data_json if isinstance(data_json, dict) else {}
-        to_raw = re.sub(r"[\r\n\x00]+", " ", str(body.get("to") or "")).strip()
-        cc_raw = re.sub(r"[\r\n\x00]+", " ", str(body.get("cc") or "")).strip()
-        bcc_raw = re.sub(r"[\r\n\x00]+", " ", str(body.get("bcc") or "")).strip()
-        subject = re.sub(r"[\r\n\x00]+", " ", str(body.get("subject") or "")).strip()
+        to_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("to") or "")).strip()
+        cc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("cc") or "")).strip()
+        bcc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("bcc") or "")).strip()
+        subject = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("subject") or "")).strip()
         body_text = str(body.get("body_text") or "")
         body_html = str(body.get("body_html") or "")
-        in_reply_to = re.sub(r"[\r\n\x00]+", " ", str(body.get("in_reply_to") or "")).strip()
-        references = re.sub(r"[\r\n\x00]+", " ", str(body.get("references") or "")).strip()
+        in_reply_to = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("in_reply_to") or "")).strip()
+        references = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("references") or "")).strip()
         draft_uid = str(body.get("draft_uid") or "").strip() or None
 
     msg = EmailMessage()

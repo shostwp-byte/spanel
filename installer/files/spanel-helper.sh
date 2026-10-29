@@ -3303,6 +3303,7 @@ login_greeting = Ready.
 
 # Passwords only over TLS; loopback (the webmail) counts as secure.
 disable_plaintext_auth = yes
+login_trusted_networks = 127.0.0.1/32 ::1/128
 auth_mechanisms = plain login
 auth_username_format = %Lu
 # The webmail's single sign-on: "mailbox*${WEBMAIL_MASTER_USER}" with the master password.
@@ -3595,7 +3596,7 @@ mail_webmail_proxy_block() {
         limit_req_status 429;
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
@@ -3603,7 +3604,7 @@ mail_webmail_proxy_block() {
     location / {
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
         # Overwritten, not appended: the webmail reads the last address.
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
@@ -4791,20 +4792,23 @@ mail_reconfigure() {
           webmail_changed=1
         fi
         if ! cmp -s "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt" 2>/dev/null; then
-          install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
-          req_changed=1
-          webmail_changed=1
-        fi
-        if [[ "$req_changed" -eq 1 && -x "$WEBMAIL_HOME/venv/bin/python" ]]; then
-          chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
-          if command -v runuser >/dev/null 2>&1; then
-            runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
-              -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 || true
-          else
-            "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
-              -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 || true
+          local pip_ok=0
+          if [[ -x "$WEBMAIL_HOME/venv/bin/python" ]]; then
+            chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
+            if command -v runuser >/dev/null 2>&1; then
+              runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+                -r "${candidate}/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 && pip_ok=1
+            else
+              "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+                -r "${candidate}/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 && pip_ok=1
+            fi
+            chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
           fi
-          chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
+          if [[ "$pip_ok" -eq 1 ]]; then
+            install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
+            req_changed=1
+            webmail_changed=1
+          fi
         fi
         if [[ "$webmail_changed" -eq 1 ]]; then
           systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
@@ -4812,6 +4816,9 @@ mail_reconfigure() {
         break
       fi
     done
+    if [[ -f "$WEBMAIL_NGINX" ]] && ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null; then
+      mail_write_webmail_nginx
+    fi
   fi
   if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
   if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
@@ -5146,6 +5153,14 @@ mail_webmail_host() {
   name="webmail.${domain}"
   conf="/etc/nginx/conf.d/00-spanel-webmail-${domain}.conf"
   [[ -f "$WEBMAIL_NGINX" ]] || deny "the Email addon is not installed"
+  if ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null; then
+    mail_write_webmail_nginx
+  fi
+  local prev_conf=""
+  if [[ -f "$conf" ]]; then
+    prev_conf="$(mktemp "${conf}.bak.XXXXXX")"
+    cp -p -- "$conf" "$prev_conf"
+  fi
   install -d -o root -g spanel -m 0755 /var/www/spanel-acme/.well-known/acme-challenge
   if [[ ! -f "/etc/letsencrypt/live/${name}/fullchain.pem" ]]; then
     cat >"$conf" <<NGINX
@@ -5163,7 +5178,7 @@ server {
 NGINX
     nginx_ipv6_apply >/dev/null 2>&1 || true
     if ! nginx -t >/dev/null 2>&1; then
-      rm -f "$conf"
+      if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
       deny "nginx refused the server block for ${name}"
     fi
     systemctl reload nginx
@@ -5177,7 +5192,7 @@ NGINX
     fi
     certbot "${args[@]}" >>"$MAIL_INSTALL_LOG" 2>&1 || rc=$?
     if [[ ! -f "/etc/letsencrypt/live/${name}/fullchain.pem" ]]; then
-      rm -f "$conf"
+      if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
       nginx -t >/dev/null 2>&1 && systemctl reload nginx
       deny "no certificate for ${name} (certbot exited ${rc}) - point ${name} at this server first"
     fi
@@ -5196,10 +5211,11 @@ NGINX
   } >"$conf"
   nginx_ipv6_apply >/dev/null 2>&1 || true
   if ! nginx -t >/dev/null 2>&1; then
-    rm -f "$conf"
+    if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
     nginx -t >/dev/null 2>&1 && systemctl reload nginx
     deny "nginx refused the server block for ${name}"
   fi
+  rm -f -- "$prev_conf"
   systemctl reload nginx
   echo "https://${name}"
 }
