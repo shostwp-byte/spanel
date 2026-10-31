@@ -40,7 +40,7 @@ SPANEL_SITES_GROUP="spanel-sites"
 SITE_FILE_MODE="0644"
 SITE_DIR_MODE="0755"
 # Files that carry database credentials are kept off the default mode.
-SITE_SECRET_FILES=(wp-config.php .env .my.cnf)
+SITE_SECRET_FILES=(wp-config.php .env .env.bak .my.cnf)
 SPANEL_SFTP_GROUP="spanel-sftp"
 # Per-website SFTP sub-accounts. A separate group because they get a different
 # sshd Match block: the panel user's own account chroots to its whole home,
@@ -11488,6 +11488,70 @@ PY
       chmod "$mode_arg" "$tmp"
     fi
     mv -f -- "$tmp" "$target"
+    ;;
+
+  site-file-delete)
+    [[ $# -eq 3 ]] || deny "usage: site-file-delete <site-user> <site-root> <relative-path>"
+    user="$1"; root_arg="$2"; rel_arg="$3"
+    require_linux_user "$user"
+    expected_uid=$(id -u "$user" 2>/dev/null) || deny "panel Linux user does not exist: $user"
+    root_target=$(require_managed_path "$root_arg" "$user")
+    case "$rel_arg" in
+      ""|"/"|/*|*$'\n'*|"."|".."|"./"*|"../"*|*"/."|*"/.."|*"/./"*|*"/../"*) deny "unsafe relative path: $rel_arg" ;;
+    esac
+    python3 - "$HOME_ROOT" "$user" "$expected_uid" "$root_target" "$rel_arg" <<'PY'
+import os
+import stat
+import sys
+
+home_root, user, expected_uid_raw, root_target, rel_arg = sys.argv[1:6]
+expected_uid = int(expected_uid_raw)
+base = os.path.normpath(os.path.join(home_root, user))
+root = os.path.normpath(root_target)
+target = os.path.normpath(os.path.join(root, rel_arg))
+
+if os.path.dirname(root) not in (base, os.path.join(base, "apps")):
+    raise SystemExit("invalid site root")
+if not target.startswith(root + os.sep):
+    raise SystemExit("target outside site root")
+
+rel = os.path.relpath(target, base)
+if rel.startswith("..") or rel == ".":
+    raise SystemExit("target outside site root")
+
+parts = [p for p in rel.split(os.sep) if p]
+if not parts:
+    raise SystemExit("refusing to delete base directory")
+
+def open_child_dir(parent_fd, name):
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+parent_fd = base_fd
+try:
+    for part in parts[:-1]:
+        next_fd = open_child_dir(parent_fd, part)
+        if parent_fd != base_fd:
+            os.close(parent_fd)
+        parent_fd = next_fd
+
+    leaf = parts[-1]
+    try:
+        st = os.lstat(leaf, dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"refusing to delete directory via site-file-delete: {target}")
+    if st.st_uid != expected_uid:
+        raise SystemExit(f"refusing to delete file not owned by {user} (uid={st.st_uid}): {target}")
+    os.unlink(leaf, dir_fd=parent_fd)
+finally:
+    try:
+        if parent_fd != base_fd:
+            os.close(parent_fd)
+    finally:
+        os.close(base_fd)
+PY
     ;;
 
   site-file-install)

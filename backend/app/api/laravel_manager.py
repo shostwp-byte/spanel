@@ -308,7 +308,7 @@ def _save_toolkit_state(state: Dict[str, Any]) -> None:
             finally:
                 if os.path.exists(tmp_name):
                     try:
-                        os.unlink(tmp_name)
+                        os.remove(tmp_name)
                     except OSError:
                         pass
         except Exception as exc:
@@ -401,6 +401,90 @@ def _write_app_file(
     wordpress_live.write_wp_file_text(
         linux_user, site_root, app_dir, rel_path, content, mode=mode
     )
+
+
+def _delete_app_file(
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    rel_path: str,
+    *,
+    strict: bool = False,
+) -> bool:
+    """Safely delete a single file inside `app_dir` via `site-file-delete` (`O_NOFOLLOW` + `st_uid`),
+    never unlinking paths directly from the panel (`spanel`) user across symlinks."""
+    clean_rel = (rel_path or "").strip().lstrip("/\\")
+    if not clean_rel or ".." in Path(clean_rel).parts or "\x00" in clean_rel or "\n" in clean_rel:
+        if strict:
+            raise HTTPException(status_code=400, detail=f"Đường dẫn tệp không hợp lệ: {rel_path}")
+        return False
+
+    target = app_dir / clean_rel
+    try:
+        rel_to_root = str(target.relative_to(site_root)).replace("\\", "/")
+    except ValueError:
+        if strict:
+            raise HTTPException(
+                status_code=400, detail=f"Đường dẫn nằm ngoài thư mục gốc của website: {rel_path}"
+            )
+        return False
+
+    if ".." in rel_to_root.split("/") or not rel_to_root:
+        if strict:
+            raise HTTPException(status_code=400, detail=f"Đường dẫn không an toàn: {rel_path}")
+        return False
+
+    if not settings.command_dry_run:
+        res = shell.privileged(
+            "site-file-delete",
+            helper_args=[linux_user, str(site_root), rel_to_root],
+            check=False,
+        )
+        if int(getattr(res, "returncode", 1) or 0) != 0:
+            err = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "site-file-delete failed").strip()
+            logger.warning("site-file-delete refused for %s (%s): %s", linux_user, rel_to_root, err)
+            if strict:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Không thể xóa tệp {clean_rel} an toàn: {err[:200]}",
+                )
+            return False
+        return True
+
+    # Dry-run / local unit test guard: refuse if any path component is a symlink or escapes site_root.
+    if wordpress_live._has_symlink_component(target, site_root) or target.is_symlink():
+        if strict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Từ chối xóa tệp qua liên kết tượng trưng (symlink): {clean_rel}",
+            )
+        return False
+    try:
+        resolved_root = site_root.resolve(strict=False)
+        resolved_parent = target.parent.resolve(strict=False)
+        resolved_parent.relative_to(resolved_root)
+    except Exception:
+        if strict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Đường dẫn cha thoát khỏi thư mục website: {clean_rel}",
+            )
+        return False
+    try:
+        if target.exists():
+            if target.is_dir():
+                if strict:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Từ chối xóa thư mục qua _delete_app_file: {clean_rel}",
+                    )
+                return False
+            os.remove(target)
+        return True
+    except OSError as exc:
+        if strict:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return False
 
 
 def _app_path_exists(
@@ -1488,13 +1572,8 @@ def install_laravel_instance(
 
     db.commit()
 
-    # Remove default placeholder index.html if present
-    try:
-        placeholder = app_dir / "index.html"
-        if placeholder.exists():
-            placeholder.unlink()
-    except Exception:
-        pass
+    # Remove default placeholder index.html safely via helper (never as panel user across symlinks)
+    _delete_app_file(linux_user, site_root, app_dir, "index.html")
 
     php_cli = _php_cli_for_version(php_ver)
     install_logs: List[Dict[str, Any]] = []
@@ -1706,12 +1785,7 @@ def run_artisan_command(
         )
     elif cmd_key == "up":
         saved["maintenance_mode"] = False
-        try:
-            down_file = app_dir / "storage" / "framework" / "down"
-            if down_file.exists() and not down_file.is_symlink():
-                down_file.unlink()
-        except Exception:
-            pass
+        _delete_app_file(linux_user, site_root, app_dir, "storage/framework/down")
     elif cmd_key == "storage:link":
         saved["storage_linked"] = True
     elif cmd_key == "key:generate":
@@ -1972,7 +2046,7 @@ def update_laravel_env(
 
     current_env = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
     if current_env:
-        _write_app_file(linux_user, site_root, app_dir, ".env.bak", current_env, "0600")
+        _write_app_file(linux_user, site_root, app_dir, ".env.bak", current_env, "0640")
 
     if payload.raw_env is not None:
         if "\x00" in payload.raw_env:
@@ -2311,13 +2385,8 @@ def remove_laravel_instance(
 
     _remove_scheduler_cron(site, linux_user)
 
-    for rel in ("artisan", ".env"):
-        try:
-            target = app_dir / rel
-            if target.exists() and not target.is_symlink():
-                target.unlink()
-        except Exception:
-            pass
+    for rel in ("artisan", ".env", ".env.bak"):
+        _delete_app_file(linux_user, site_root, app_dir, rel)
 
     if drop_database:
         db_acc = wordpress_live.resolve_owned_wp_database(db, site, saved.get("db_name"))
