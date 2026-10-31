@@ -29,7 +29,7 @@ from app.services.shell import shell
 _WP_ACCESS_ROLE_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("wp_access_role", default="")
 
 
-def _capture_wp_access_role(request: Request):
+async def _capture_wp_access_role(request: Request):
     token = _WP_ACCESS_ROLE_CTX.set((request.headers.get("x-access-role") or "").strip().lower())
     try:
         yield
@@ -1067,14 +1067,25 @@ class WpApplySetPayload(BaseModel):
 
 
 def _load_laravel_state_readonly() -> Dict[str, Any]:
-    lv_path = Path("/etc/spanel/laravel_toolkit.json")
-    if lv_path.is_file():
+    try:
+        from app.api.laravel_manager import _load_toolkit_state as _load_lv_state
+
+        data = _load_lv_state()
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    for cand in (
+        Path("/var/lib/spanel/laravel_toolkit_state.json"),
+        Path("/etc/spanel/laravel_toolkit.json"),
+    ):
         try:
-            data = json.loads(lv_path.read_text(encoding="utf-8", errors="ignore"))
-            if isinstance(data, dict):
-                return data
+            if cand.is_file() and not cand.is_symlink():
+                data = json.loads(cand.read_text(encoding="utf-8", errors="ignore"))
+                if isinstance(data, dict):
+                    return data
         except Exception:
-            pass
+            continue
     return {"instances": {}}
 
 

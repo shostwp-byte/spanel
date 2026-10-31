@@ -689,6 +689,64 @@ class WordPressManagerOverhaulTests(unittest.TestCase):
     def test_5_wp_cron_sync_checksums_security_revert_and_clone_self_guard(self):
         test_wp_cron_sync_checksums_security_revert_and_clone_self_guard()
 
+    def test_6_asgi_router_contextvar_lifecycle_no_500(self):
+        import asyncio
+        from unittest.mock import MagicMock
+        from fastapi import FastAPI
+
+        admin_user = SimpleNamespace(id=1, username="admin", role="admin")
+        end_user = SimpleNamespace(id=2, username="shostc", role="end_user", package=None, website_limit=5, subdomain_limit=5, database_limit=5)
+        active_user = [admin_user]
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.count.return_value = 0
+
+        app = FastAPI()
+        app.include_router(wordpress_manager.router, prefix="/api")
+        app.dependency_overrides[wordpress_manager.get_current_user] = lambda: active_user[0]
+        app.dependency_overrides[wordpress_manager.get_db] = lambda: db
+
+        async def _call(headers=None):
+            hdrs = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in (headers or {}).items()]
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/wordpress-manager/instances",
+                "raw_path": b"/api/wordpress-manager/instances",
+                "query_string": b"",
+                "headers": hdrs,
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 8000),
+            }
+            sent = False
+            status_holder = [0]
+
+            async def _recv():
+                nonlocal sent
+                if not sent:
+                    sent = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def _send(msg):
+                if msg["type"] == "http.response.start":
+                    status_holder[0] = msg["status"]
+
+            await app(scope, _recv, _send)
+            return status_holder[0]
+
+        with patch.object(wordpress_manager, "_load_toolkit_state", return_value={"instances": {}}), \
+                patch.object(wordpress_manager, "_load_laravel_state_readonly", return_value={"instances": {}}):
+            self.assertEqual(asyncio.run(_call()), 403)
+            self.assertEqual(asyncio.run(_call({"X-Access-Role": "user"})), 200)
+            active_user[0] = end_user
+            self.assertEqual(asyncio.run(_call()), 200)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

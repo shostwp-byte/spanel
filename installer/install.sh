@@ -541,6 +541,27 @@ install_wp_cli() {
   fi
 }
 
+install_composer_cli() {
+  if [[ -x /usr/local/bin/composer ]] && php -d error_reporting=8191 /usr/local/bin/composer --version 2>/dev/null | grep -qE 'Composer version (2\.(8|9|[1-9][0-9])|[3-9]\.)'; then
+    return 0
+  fi
+  local tmp_dir expected_sha actual_sha
+  tmp_dir="$(mktemp -d)" || return 0
+  if curl -fsSL --connect-timeout 10 --max-time 180 -o "${tmp_dir}/composer.phar" https://getcomposer.org/download/latest-stable/composer.phar \
+    && curl -fsSL --connect-timeout 10 --max-time 30 -o "${tmp_dir}/composer.phar.sha256sum" https://getcomposer.org/download/latest-stable/composer.phar.sha256sum; then
+    expected_sha="$(awk '{print $1}' "${tmp_dir}/composer.phar.sha256sum" 2>/dev/null || true)"
+    actual_sha="$(sha256sum "${tmp_dir}/composer.phar" 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -n "$expected_sha" && "$expected_sha" == "$actual_sha" ]]; then
+      install -o root -g root -m 0755 "${tmp_dir}/composer.phar" /usr/local/bin/composer
+    else
+      echo "WARNING: Composer PHAR SHA-256 mismatch; falling back to system composer." >&2
+    fi
+  else
+    echo "WARNING: Could not download latest Composer PHAR; falling back to system composer." >&2
+  fi
+  rm -rf "$tmp_dir"
+}
+
 copy_sources() {
   mkdir -p "$APP_DIR" "$BACKUP_ROOT"
   if [[ "${PROJECT_ROOT}" != "${APP_DIR}" ]]; then
@@ -1522,8 +1543,9 @@ main() {
     echo "WARNING: WAF engine installation failed; continuing without ModSecurity."
   fi
 
-  log "Installing WP-CLI"
+  log "Installing WP-CLI and Composer"
   install_wp_cli
+  install_composer_cli
 
   log "Copying source to ${APP_DIR}"
   copy_sources

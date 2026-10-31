@@ -922,6 +922,23 @@ ensure_terminal_tools() {
     DEBIAN_FRONTEND=noninteractive apt-get update --allow-releaseinfo-change
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
   fi
+  # Ensure Composer 2.8+ PHAR at /usr/local/bin/composer for full PHP 8.4/8.5 compatibility
+  if ! ( [[ -x /usr/local/bin/composer ]] && php -d error_reporting=8191 /usr/local/bin/composer --version 2>/dev/null | grep -qE 'Composer version (2\.(8|9|[1-9][0-9])|[3-9]\.)' ); then
+    local tmp_dir expected_sha actual_sha
+    tmp_dir="$(mktemp -d)" || tmp_dir=""
+    if [[ -n "$tmp_dir" ]]; then
+      if curl -fsSL --connect-timeout 10 --max-time 180 -o "${tmp_dir}/composer.phar" https://getcomposer.org/download/latest-stable/composer.phar \
+        && curl -fsSL --connect-timeout 10 --max-time 30 -o "${tmp_dir}/composer.phar.sha256sum" https://getcomposer.org/download/latest-stable/composer.phar.sha256sum; then
+        expected_sha="$(awk '{print $1}' "${tmp_dir}/composer.phar.sha256sum" 2>/dev/null || true)"
+        actual_sha="$(sha256sum "${tmp_dir}/composer.phar" 2>/dev/null | awk '{print $1}' || true)"
+        if [[ -n "$expected_sha" && "$expected_sha" == "$actual_sha" ]]; then
+          install -o root -g root -m 0755 "${tmp_dir}/composer.phar" /usr/local/bin/composer
+          log "Installed Composer 2.8+ PHAR to /usr/local/bin/composer"
+        fi
+      fi
+      rm -rf "$tmp_dir"
+    fi
+  fi
 }
 
 harden_existing_panel_users() {
