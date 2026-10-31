@@ -1998,6 +1998,17 @@ def test_asgi_router_contextvar_lifecycle_and_php85_deploy_flow(tmp_path):
     assert 'error_reporting=8191' in helper_text
 
 
+def test_frontend_laravel_manager_no_unstable_effect_reload_loop():
+    jsx_path = REPO_ROOT / "frontend" / "src" / "pages" / "LaravelManager.jsx"
+    jsx_text = jsx_path.read_text(encoding="utf-8")
+    assert "useRef" in jsx_text
+    assert "const requestRef = useRef(request);" in jsx_text
+    assert "const loadPhpVersionsRef = useRef(loadPhpVersions);" in jsx_text
+    assert "const hasLoadedOnceRef = useRef(false);" in jsx_text
+    assert "[request," not in jsx_text
+    assert "loadPhpVersions]" not in jsx_text
+
+
 def test_python312_eager_annotation_compatibility():
     import inspect
     from typing import get_type_hints
@@ -2033,5 +2044,6 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory() as _td:
             _fn(Path(_td))
     test_package_website_quota_enforcement_across_application_modules()
+    test_frontend_laravel_manager_no_unstable_effect_reload_loop()
     test_python312_eager_annotation_compatibility()
     print("ALL LARAVEL MANAGER TESTS PASSED")

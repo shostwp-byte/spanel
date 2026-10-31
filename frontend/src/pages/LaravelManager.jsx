@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Zap,
   RefreshCw,
@@ -133,6 +133,7 @@ const ARTISAN_EXTENDED_COMMANDS = [
 export function LaravelManagerPage({
   request: propRequest,
   websites: propWebsites,
+  phpVersions: propPhpVersions,
   openWebsiteFileManager: propOpenFileManager,
   navigateToPage: propNavigate,
 }) {
@@ -140,7 +141,12 @@ export function LaravelManagerPage({
   const request = propRequest || ctx.request;
   const websites = propWebsites || ctx.websites || [];
   const loadPhpVersions = ctx.loadPhpVersions;
-  const ctxPhpInstalled = ctx.phpVersions?.installed;
+  const ctxPhpInstalled = (propPhpVersions || ctx.phpVersions)?.installed;
+  const requestRef = useRef(request);
+  requestRef.current = request;
+  const loadPhpVersionsRef = useRef(loadPhpVersions);
+  loadPhpVersionsRef.current = loadPhpVersions;
+  const hasLoadedOnceRef = useRef(false);
   const openWebsiteFileManager = propOpenFileManager || ctx.openWebsiteFileManager;
   const navigateToPage = propNavigate || ctx.navigateToPage;
   const setNotice = ctx.setNotice || (() => {});
@@ -263,10 +269,16 @@ export function LaravelManagerPage({
 
   const loadInstances = useCallback(
     async (silent = false) => {
-      if (!request) return;
-      if (!silent) setInitialLoading(true);
+      const req = requestRef.current;
+      if (!req) {
+        setInitialLoading(false);
+        return;
+      }
+      if (!silent && !hasLoadedOnceRef.current) {
+        setInitialLoading(true);
+      }
       try {
-        const data = await request('/laravel-manager/instances', { silent });
+        const data = await req('/laravel-manager/instances', { silent });
         if (data) {
           const list = Array.isArray(data.instances) ? data.instances : [];
           setInstances(list);
@@ -287,18 +299,22 @@ export function LaravelManagerPage({
           });
         }
       } finally {
-        if (!silent) setInitialLoading(false);
+        hasLoadedOnceRef.current = true;
+        setInitialLoading(false);
       }
     },
-    [request, syncInstanceDrafts]
+    [syncInstanceDrafts]
   );
 
+  const activeUserKey = `${ctx.currentUser?.id ?? 'init'}:${ctx.currentUser?.role ?? ''}`;
+
   useEffect(() => {
+    hasLoadedOnceRef.current = false;
     loadInstances(false);
-    if (loadPhpVersions) {
-      loadPhpVersions({ silent: true });
+    if (loadPhpVersionsRef.current) {
+      loadPhpVersionsRef.current({ silent: true });
     }
-  }, [loadInstances, loadPhpVersions]);
+  }, [activeUserKey, loadInstances]);
 
   const updateSingleInstance = useCallback(
     updated => {
@@ -347,27 +363,22 @@ export function LaravelManagerPage({
 
   // System-installed PHP versions compatible with Laravel (>= 8.1), sorted newest-first
   const installedLaravelPhpVersions = useMemo(() => {
-    const merged = new Set();
-    const hasAuthoritativeSource =
-      Array.isArray(serverPhpVersions) || Array.isArray(ctxPhpInstalled);
     if (Array.isArray(serverPhpVersions)) {
-      serverPhpVersions.forEach(v => {
-        if (LARAVEL_SUPPORTED_PHP.includes(v)) merged.add(v);
-      });
+      const fromServer = serverPhpVersions.filter(v => LARAVEL_SUPPORTED_PHP.includes(v));
+      return Array.from(new Set(fromServer)).sort((a, b) => comparePhpVersion(b, a));
     }
+    const merged = new Set();
     if (Array.isArray(ctxPhpInstalled)) {
       ctxPhpInstalled.forEach(v => {
         if (LARAVEL_SUPPORTED_PHP.includes(v)) merged.add(v);
       });
     }
-    if (!hasAuthoritativeSource) {
-      (allWebsitesList || []).forEach(w => {
-        if (w?.php_version && LARAVEL_SUPPORTED_PHP.includes(w.php_version)) {
-          merged.add(w.php_version);
-        }
-      });
-      if (merged.size === 0) merged.add('8.4');
-    }
+    (allWebsitesList || []).forEach(w => {
+      if (w?.php_version && LARAVEL_SUPPORTED_PHP.includes(w.php_version)) {
+        merged.add(w.php_version);
+      }
+    });
+    if (merged.size === 0) merged.add('8.4');
     return Array.from(merged).sort((a, b) => comparePhpVersion(b, a));
   }, [serverPhpVersions, ctxPhpInstalled, allWebsitesList]);
 
