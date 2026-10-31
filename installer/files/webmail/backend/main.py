@@ -30,6 +30,7 @@ import os
 import re
 import secrets
 import smtplib
+import socket
 import ssl
 import threading
 import time
@@ -598,13 +599,65 @@ def _session_credentials(session: dict[str, Any]) -> tuple[str, str]:
     raise HTTPException(status_code=503, detail="Chưa cấu hình thông tin xác thực hộp thư.")
 
 
+_ORIG_IMAP4 = imaplib.IMAP4
+_ORIG_IMAP4_SSL = imaplib.IMAP4_SSL
+
+
+class _BoundIMAP4(_ORIG_IMAP4):
+    """IMAP4 client that binds outbound TCP connections to a dedicated loopback source IP."""
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = imaplib.IMAP4_PORT,
+        timeout: float | None = None,
+        *,
+        source_ip: str = "",
+    ):
+        self._source_ip = source_ip.strip()
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout: float | None = None) -> socket.socket:
+        if not self._source_ip:
+            return super()._create_socket(timeout)
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+        host = None if not self.host else self.host
+        address = (host, self.port)
+        source_address = (self._source_ip, 0)
+        return socket.create_connection(address, timeout, source_address=source_address)
+
+
+class _BoundIMAP4_SSL(_ORIG_IMAP4_SSL):
+    """IMAP4_SSL client that binds outbound TCP connections to a dedicated loopback source IP."""
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = imaplib.IMAP4_SSL_PORT,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        timeout: float | None = None,
+        source_ip: str = "",
+    ):
+        self._source_ip = source_ip.strip()
+        super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
+
+    def _create_socket(self, timeout: float | None = None) -> socket.socket:
+        if not self._source_ip:
+            return super()._create_socket(timeout)
+        sock = _BoundIMAP4._create_socket(self, timeout)
+        assert self.ssl_context is not None
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
 def _imap_authenticate(conn: imaplib.IMAP4, auth_user: str, auth_pass: str) -> None:
     """Authenticate over IMAP using UTF-8 SASL PLAIN so non-ASCII passwords work."""
     conn._encoding = "utf-8"
     if "\x00" in auth_user or "\x00" in auth_pass or "\r" in auth_user or "\n" in auth_user:
         raise imaplib.IMAP4.error("Invalid credentials")
     orig_ip = (_client_ip_ctx.get("") or "").strip()
-    if orig_ip and orig_ip not in ("127.0.0.1", "::1") and hasattr(conn, "_simple_command"):
+    if orig_ip and orig_ip not in ("127.0.0.1", "127.0.0.96", "::1") and hasattr(conn, "_simple_command"):
         try:
             parsed_ip = str(ipaddress.ip_address(orig_ip))
             if "ID" not in imaplib.Commands:
@@ -623,14 +676,23 @@ def _open_imap_with_creds(auth_user: str, auth_pass: str) -> imaplib.IMAP4:
     host = _cfg("IMAP_HOST", "127.0.0.1")
     port = _cfg_int("IMAP_PORT", 143)
     secure = _cfg_bool("IMAP_SECURE", False)
+    source_ip = _cfg("IMAP_SOURCE_IP")
+    if not source_ip and host == "127.0.0.96":
+        source_ip = "127.0.0.96"
     try:
         if secure:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
+            if source_ip and imaplib.IMAP4_SSL is _ORIG_IMAP4_SSL:
+                conn: imaplib.IMAP4 = _BoundIMAP4_SSL(host, port, ssl_context=ctx, timeout=15, source_ip=source_ip)
+            else:
+                conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
         else:
-            conn = imaplib.IMAP4(host, port, timeout=15)
+            if source_ip and imaplib.IMAP4 is _ORIG_IMAP4:
+                conn = _BoundIMAP4(host, port, timeout=15, source_ip=source_ip)
+            else:
+                conn = imaplib.IMAP4(host, port, timeout=15)
         try:
             _imap_authenticate(conn, auth_user, auth_pass)
         except Exception:

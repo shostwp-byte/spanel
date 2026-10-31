@@ -805,3 +805,246 @@ def test_helper_locks_mail_configure_and_reconfigure(tmp_path):
     assert 'proxy_set_header X-Forwarded-Host "";' in rendered
     assert list(tmp_path.glob("00-spanel-webmail.conf.bak.*")) == []
 
+
+def test_p2_4_dovecot_trusted_channel_and_bound_source_ip(tmp_path, monkeypatch):
+    import os
+    import socket
+    import subprocess
+    import textwrap
+    import threading
+
+    bash_bin = _find_bash()
+    assert bash_bin is not None
+
+    dovecot_fn = helper_function("mail_write_dovecot_conf")
+    lo_guard_fn = helper_function("mail_apply_webmail_lo_guard")
+    lo_remove_fn = helper_function("mail_remove_webmail_lo_guard")
+    reconfig_fn = helper_function("mail_reconfigure")
+    mail_env_val_fn = helper_function("mail_env_value")
+
+    dovecot_conf = tmp_path / "dovecot.conf"
+    dovecot_dir = tmp_path / "dovecot_dir"
+    dovecot_dir.mkdir(parents=True)
+    log_file = tmp_path / "mail-install.log"
+    ipt_log = tmp_path / "iptables.log"
+    svc_log = tmp_path / "systemctl.log"
+    exim_conf = tmp_path / "exim4.conf"
+    exim_conf.write_text("# Managed by SPanel (Email addon).\n", encoding="utf-8")
+    webmail_home = tmp_path / "webmail_home"
+    (webmail_home / "src" / "backend").mkdir(parents=True)
+    (webmail_home / ".spanel").write_text("", encoding="utf-8")
+    bundled_dir = tmp_path / "bundled_webmail"
+    (bundled_dir / "backend").mkdir(parents=True)
+    (bundled_dir / "backend" / "main.py").write_text("# webmail v2\n", encoding="utf-8")
+    (bundled_dir / "backend" / "requirements.txt").write_text("fastapi==0.141.1\n", encoding="utf-8")
+    (webmail_home / "src" / "backend" / "main.py").write_text("# webmail v2\n", encoding="utf-8")
+    (webmail_home / "src" / "backend" / "requirements.txt").write_text("fastapi==0.141.1\n", encoding="utf-8")
+    webmail_env = tmp_path / "SPanel-webmail.env"
+    webmail_env.write_text(
+        "# Managed by SPanel (Email addon).\n"
+        "AUTH_SECRET=keep-existing-auth-secret\n"
+        "IMAP_HOST=127.0.0.1\n"
+        "IMAP_PORT=143\n"
+        "SSO_SECRET=keep-existing-sso-secret\n"
+        "SSO_MASTER_PASSWORD=keep-existing-master-pass\n",
+        encoding="utf-8",
+    )
+    webmail_unit = tmp_path / "spanel-webmail.service"
+    webmail_unit.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
+
+    harness = (
+        textwrap.dedent(
+            f"""
+            export PATH="/usr/bin:/bin:$PATH"
+            set -euo pipefail
+            MAIL_MARKER="# Managed by SPanel (Email addon)."
+            MAIL_DOVECOT_CONF={dovecot_conf.as_posix()!r}
+            MAIL_DOVECOT_DIR={dovecot_dir.as_posix()!r}
+            MAIL_TLS_DIR="/etc/spanel-mail-tls"
+            MAIL_SIEVE_DIR="/etc/dovecot/spanel-sieve"
+            MAIL_VACATION_SCRIPT="spanel-vacation.sieve"
+            MAIL_QUOTA_WARNING="/usr/local/lib/spanel/mail-quota-warning"
+            MAIL_INSTALL_LOG={log_file.as_posix()!r}
+            MAIL_EXIM_CONF={exim_conf.as_posix()!r}
+            MAIL_TLS_SCRIPT="/bin/true"
+            WEBMAIL_MASTER_USER="spanel-webmail"
+            WEBMAIL_IMAP_HOST="127.0.0.96"
+            WEBMAIL_IMAP_PORT="14143"
+            WEBMAIL_LO_CHAIN="SPANEL_WEBMAIL_LO"
+            WEBMAIL_HOME={webmail_home.as_posix()!r}
+            WEBMAIL_BUNDLED_DIR={bundled_dir.as_posix()!r}
+            WEBMAIL_ENV={webmail_env.as_posix()!r}
+            WEBMAIL_UNIT={webmail_unit.as_posix()!r}
+            WEBMAIL_PORT="8096"
+            WEBMAIL_NGINX={(tmp_path / "missing-nginx.conf").as_posix()!r}
+
+            chmod() {{ return 0; }}
+            chown() {{ return 0; }}
+            command() {{
+              if [[ "${{1:-}}" == "-v" && "${{2:-}}" == "flock" ]]; then return 1; fi
+              builtin command "$@"
+            }}
+            stat() {{ echo "0"; }}
+            doveconf() {{ return 0; }}
+            deny() {{ echo "DENY: $*" >&2; exit 42; }}
+            id() {{ echo "991"; }}
+            ip() {{ echo "    inet 127.0.0.1/8 scope host lo"; }}
+            ss() {{ echo "LISTEN 0 100 127.0.0.96:14143 0.0.0.0:*"; }}
+            iptables() {{
+              printf '%s\\n' "$*" >> {ipt_log.as_posix()!r}
+              if [[ " $* " == *" -C "* ]]; then return 1; fi
+              return 0
+            }}
+            systemctl() {{
+              printf '%s\\n' "$*" >> {svc_log.as_posix()!r}
+              return 0
+            }}
+            install() {{
+              local dir_mode=0 args=()
+              while [[ $# -gt 0 ]]; do
+                case "$1" in
+                  -d) dir_mode=1; shift ;;
+                  -m|-o|-g) shift 2 ;;
+                  *) args+=("$1"); shift ;;
+                esac
+              done
+              if [[ "$dir_mode" -eq 1 ]]; then
+                mkdir -p "${{args[@]}}"
+              else
+                mkdir -p "$(dirname "${{args[1]}}")"
+                if [[ "${{args[0]}}" == "/dev/null" ]]; then : > "${{args[1]}}"; else cp "${{args[0]}}" "${{args[1]}}"; fi
+              fi
+            }}
+            mail_ensure_maps() {{ return 0; }}
+            mail_write_tls_script() {{ return 0; }}
+            mail_write_exim_conf() {{ return 0; }}
+            mail_write_sieve() {{ return 0; }}
+            mail_write_quota_warning() {{ return 0; }}
+            mail_write_learn_service() {{ return 0; }}
+            """
+        )
+        + "\n"
+        + mail_env_val_fn
+        + "\n"
+        + dovecot_fn
+        + "\n"
+        + lo_guard_fn
+        + "\n"
+        + lo_remove_fn
+        + "\n"
+        + reconfig_fn
+        + "\nmail_reconfigure\nmail_remove_webmail_lo_guard\n"
+    ).replace("\r\n", "\n")
+
+    script_path = tmp_path / "test_p2_4.sh"
+    script_path.write_bytes(harness.encode("utf-8"))
+    res = subprocess.run([bash_bin, script_path.as_posix()], env={**os.environ}, capture_output=True, text=True, timeout=15)
+    assert res.returncode == 0, f"P2-4 bash test failed (rc={res.returncode}): {res.stderr[-1500:]}\n{res.stdout}"
+
+    # 1. Dovecot only trusts 127.0.0.96/32 (not 127.0.0.1 or ::1) and exposes 127.0.0.96:14143
+    rendered_dovecot = dovecot_conf.read_text(encoding="utf-8")
+    assert "login_trusted_networks = 127.0.0.96/32" in rendered_dovecot
+    assert "127.0.0.1" not in rendered_dovecot
+    assert "::1" not in rendered_dovecot
+    assert "inet_listener imap_webmail" in rendered_dovecot
+    assert "address = 127.0.0.96" in rendered_dovecot
+    assert "port = 14143" in rendered_dovecot
+
+    # 2. Loopback UID guard isolates 127.0.0.96 to UID 991 (SPanel-webmail) and cleans up on remove
+    ipt_calls = ipt_log.read_text(encoding="utf-8")
+    assert "-A SPANEL_WEBMAIL_LO -p tcp --syn -s 127.0.0.96/32 -m owner ! --uid-owner 991 -j REJECT --reject-with tcp-reset" in ipt_calls
+    assert "-A SPANEL_WEBMAIL_LO -p tcp --syn -d 127.0.0.96/32 --dport 14143 -m owner ! --uid-owner 991 -j REJECT --reject-with tcp-reset" in ipt_calls
+    assert "-I OUTPUT 1 -o lo -j SPANEL_WEBMAIL_LO" in ipt_calls
+    assert "-X SPANEL_WEBMAIL_LO" in ipt_calls
+
+    # 3. mail_reconfigure upgrades SPanel-webmail.env + unit preserving secrets, reloading dovecot BEFORE restarting spanel-webmail
+    upgraded_env = webmail_env.read_text(encoding="utf-8")
+    assert "IMAP_HOST=127.0.0.96" in upgraded_env
+    assert "IMAP_PORT=14143" in upgraded_env
+    assert "IMAP_SOURCE_IP=127.0.0.96" in upgraded_env
+    assert "AUTH_SECRET=keep-existing-auth-secret" in upgraded_env
+    assert "SSO_SECRET=keep-existing-sso-secret" in upgraded_env
+    assert "SSO_MASTER_PASSWORD=keep-existing-master-pass" in upgraded_env
+    assert "ExecStartPre=+/usr/local/sbin/spanel-helper mail-webmail-lo-guard" in webmail_unit.read_text(encoding="utf-8")
+
+    svc_lines = svc_log.read_text(encoding="utf-8").splitlines()
+    dovecot_reload_idx = next(i for i, l in enumerate(svc_lines) if "reload dovecot" in l)
+    webmail_restart_idx = next(i for i, l in enumerate(svc_lines) if "restart spanel-webmail" in l)
+    assert dovecot_reload_idx < webmail_restart_idx, f"dovecot must reload before spanel-webmail restarts: {svc_lines}"
+
+    # 4. Real loopback TCP test: _BoundIMAP4 binds source IP 127.0.0.96 and sends x-originating-ip only for real external IPs
+    wm = load_webmail()
+    observed_peers: list[str] = []
+    observed_commands: list[str] = []
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.96", 0))
+    srv.listen(2)
+    _, srv_port = srv.getsockname()
+
+    def _serve_one():
+        conn, peer = srv.accept()
+        observed_peers.append(peer[0])
+        with conn:
+            conn.sendall(b"* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN ID] Ready.\r\n")
+            buf = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\r\n" in buf:
+                    line_bytes, buf = buf.split(b"\r\n", 1)
+                    line = line_bytes.decode("utf-8", errors="replace")
+                    observed_commands.append(line)
+                    parts = line.split(" ", 2)
+                    tag = parts[0]
+                    verb = parts[1].upper() if len(parts) > 1 else ""
+                    if verb == "CAPABILITY":
+                        conn.sendall(f"* CAPABILITY IMAP4rev1 AUTH=PLAIN ID\r\n{tag} OK CAPABILITY\r\n".encode())
+                    elif verb == "ID":
+                        conn.sendall(f'* ID ("name" "Dovecot")\r\n{tag} OK ID completed\r\n'.encode())
+                    elif verb == "AUTHENTICATE":
+                        conn.sendall(b"+ \r\n")
+                        sasl_line = b""
+                        while b"\r\n" not in sasl_line:
+                            sasl_line += conn.recv(1024)
+                        conn.sendall(f"{tag} OK Logged in\r\n".encode())
+                    elif verb == "LOGOUT":
+                        conn.sendall(f"* BYE Logging out\r\n{tag} OK Logout\r\n".encode())
+                        return
+
+    try:
+        monkeypatch.setenv("IMAP_HOST", "127.0.0.96")
+        monkeypatch.setenv("IMAP_PORT", str(srv_port))
+        monkeypatch.setenv("IMAP_SOURCE_IP", "127.0.0.96")
+        monkeypatch.setenv("IMAP_SECURE", "false")
+
+        t1 = threading.Thread(target=_serve_one, daemon=True)
+        t1.start()
+        tok = wm._client_ip_ctx.set("198.51.100.42")
+        try:
+            imap_conn = wm._open_imap_with_creds("info@khach.vn", "secret")
+            imap_conn.logout()
+        finally:
+            wm._client_ip_ctx.reset(tok)
+        t1.join(timeout=5)
+
+        assert observed_peers == ["127.0.0.96"]
+        assert any('ID ("name" "SPanel-Webmail" "x-originating-ip" "198.51.100.42")' in cmd for cmd in observed_commands)
+
+        observed_commands.clear()
+        t2 = threading.Thread(target=_serve_one, daemon=True)
+        t2.start()
+        tok2 = wm._client_ip_ctx.set("127.0.0.96")
+        try:
+            imap_conn2 = wm._open_imap_with_creds("info@khach.vn", "secret")
+            imap_conn2.logout()
+        finally:
+            wm._client_ip_ctx.reset(tok2)
+        t2.join(timeout=5)
+        assert not any("x-originating-ip" in cmd for cmd in observed_commands)
+    finally:
+        srv.close()
+
+

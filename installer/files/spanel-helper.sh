@@ -2641,6 +2641,9 @@ WEBMAIL_ENV="/etc/SPanel-webmail.env"
 WEBMAIL_UNIT="/etc/systemd/system/spanel-webmail.service"
 WEBMAIL_PORT="8096"
 WEBMAIL_PUBLIC_PORT="2096"
+WEBMAIL_IMAP_HOST="127.0.0.96"
+WEBMAIL_IMAP_PORT="14143"
+WEBMAIL_LO_CHAIN="SPANEL_WEBMAIL_LO"
 WEBMAIL_NGINX="/etc/nginx/conf.d/00-spanel-webmail.conf"
 WEBMAIL_SSO_KEY_FILE="/etc/spanel/webmail-sso.key"
 WEBMAIL_MASTER_USER="spanel-webmail"
@@ -2667,12 +2670,12 @@ MAIL_QUOTA_WARNING="${MAIL_TOOL_DIR}/mail-quota-warning"
 
 mail_port_taken() {
   # "<port> (<program>)" for each mail port some other program already holds.
-  local port owner
-  for port in 25 465 587 143 993 110 995 "$WEBMAIL_PUBLIC_PORT" "$WEBMAIL_PORT"; do
+  local port owner wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
+  for port in 25 465 587 143 993 110 995 "$wm_imap_port" "$WEBMAIL_PUBLIC_PORT" "$WEBMAIL_PORT"; do
     owner="$(ss -H -lntp "sport = :${port}" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1 | sed 's/^users:(("//; s/"$//' || true)"
     [[ -n "$owner" ]] || continue
     case "${port}:${owner}" in
-      25:exim4|465:exim4|587:exim4|143:dovecot|993:dovecot|110:dovecot|995:dovecot) continue ;;
+      25:exim4|465:exim4|587:exim4|143:dovecot|993:dovecot|110:dovecot|995:dovecot|"${wm_imap_port}:dovecot") continue ;;
       "${WEBMAIL_PUBLIC_PORT}:nginx") continue ;;
       "${WEBMAIL_PORT}:python"*) systemctl is-active --quiet spanel-webmail && continue ;;
     esac
@@ -3284,7 +3287,7 @@ EOF
 }
 
 mail_write_dovecot_conf() {
-  local tmp listen="*"
+  local tmp listen="*" wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
   # "::" on a machine without IPv6 stops Dovecot from starting at all.
   if [[ -s /proc/net/if_inet6 ]]; then listen="*, ::"; fi
   if [[ -f "$MAIL_DOVECOT_CONF" && ! -f "${MAIL_DOVECOT_CONF}.spanel-orig" ]] \
@@ -3301,9 +3304,9 @@ protocols = imap pop3 lmtp
 listen = ${listen}
 login_greeting = Ready.
 
-# Passwords only over TLS; loopback (the webmail) counts as secure.
+# Passwords only over TLS; only the SPanel-webmail loopback channel counts as trusted.
 disable_plaintext_auth = yes
-login_trusted_networks = 127.0.0.1/32 ::1/128
+login_trusted_networks = ${wm_imap_host}/32
 auth_mechanisms = plain login
 auth_username_format = %Lu
 # The webmail's single sign-on: "mailbox*${WEBMAIL_MASTER_USER}" with the master password.
@@ -3429,6 +3432,10 @@ service imap-login {
   inet_listener imap {
     port = 143
   }
+  inet_listener imap_webmail {
+    address = ${wm_imap_host}
+    port = ${wm_imap_port}
+  }
   inet_listener imaps {
     port = 993
     ssl = yes
@@ -3459,6 +3466,35 @@ EOF
 mail_env_value() {
   [[ -f "$WEBMAIL_ENV" ]] || return 0
   sed -nE "s/^$1=//p" "$WEBMAIL_ENV" | tail -n1
+}
+
+mail_apply_webmail_lo_guard() {
+  # Isolate the trusted 127.0.0.96 loopback channel so only UID SPanel-webmail
+  # can initiate TCP connections from or to 127.0.0.96 (preventing local tenant
+  # PHP/cron/terminal processes from spoofing IMAP ID x-originating-ip).
+  local wm_uid wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}" chain="${WEBMAIL_LO_CHAIN:-SPANEL_WEBMAIL_LO}"
+  if command -v ip >/dev/null 2>&1 && ! ip -4 addr show dev lo 2>/dev/null | grep -qE "inet 127\\.0\\.0\\.1/8|inet ${wm_imap_host//./\\.}/"; then
+    ip addr add "${wm_imap_host}/32" dev lo 2>/dev/null || true
+  fi
+  wm_uid="$(id -u SPanel-webmail 2>/dev/null || true)"
+  if [[ "$wm_uid" =~ ^[0-9]+$ ]] && command -v iptables >/dev/null 2>&1; then
+    iptables -w -N "$chain" 2>/dev/null || true
+    iptables -w -F "$chain"
+    iptables -w -A "$chain" -p tcp --syn -s "${wm_imap_host}/32" -m owner ! --uid-owner "$wm_uid" -j REJECT --reject-with tcp-reset
+    iptables -w -A "$chain" -p tcp --syn -d "${wm_imap_host}/32" --dport "$wm_imap_port" -m owner ! --uid-owner "$wm_uid" -j REJECT --reject-with tcp-reset
+    iptables -w -A "$chain" -p tcp --syn -d "${wm_imap_host}/32" -m owner ! --uid-owner "$wm_uid" -j REJECT --reject-with tcp-reset
+    iptables -w -C OUTPUT -o lo -j "$chain" 2>/dev/null || iptables -w -I OUTPUT 1 -o lo -j "$chain"
+  fi
+}
+
+mail_remove_webmail_lo_guard() {
+  local chain="${WEBMAIL_LO_CHAIN:-SPANEL_WEBMAIL_LO}"
+  command -v iptables >/dev/null 2>&1 || return 0
+  while iptables -w -C OUTPUT -o lo -j "$chain" 2>/dev/null; do
+    iptables -w -D OUTPUT -o lo -j "$chain" || break
+  done
+  iptables -w -F "$chain" 2>/dev/null || true
+  iptables -w -X "$chain" 2>/dev/null || true
 }
 
 mail_install_webmail() {
@@ -3521,13 +3557,15 @@ mail_install_webmail() {
   [[ -n "$master_password" ]] || master_password="$(openssl rand -hex 24)"
 
   # Each file is made with its final mode while still empty, then filled.
+  local wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
   install -m 0640 -o root -g SPanel-webmail /dev/null "${WEBMAIL_ENV}.new"
   cat >"${WEBMAIL_ENV}.new" <<EOF
 ${MAIL_MARKER} Rewritten each time the addon is installed.
 AUTH_SECRET=${auth_secret}
-# Dovecot and Exim on this server, over loopback.
-IMAP_HOST=127.0.0.1
-IMAP_PORT=143
+# Dovecot and Exim on this server, over dedicated loopback channel.
+IMAP_HOST=${wm_imap_host}
+IMAP_PORT=${wm_imap_port}
+IMAP_SOURCE_IP=${wm_imap_host}
 IMAP_SECURE=false
 SMTP_HOST=127.0.0.1
 SMTP_PORT=587
@@ -3551,6 +3589,10 @@ EOF
     "$(printf '%s\n' "$master_password" | openssl passwd -6 -stdin)" >"${MAIL_DOVECOT_DIR}/masters.new"
   mv -f "${MAIL_DOVECOT_DIR}/masters.new" "${MAIL_DOVECOT_DIR}/masters"
 
+  if declare -F mail_apply_webmail_lo_guard >/dev/null 2>&1; then
+    mail_apply_webmail_lo_guard
+  fi
+
   cat >"$WEBMAIL_UNIT" <<UNIT
 [Unit]
 Description=SPanel Webmail (Email addon)
@@ -3567,6 +3609,7 @@ Environment=DATA_DIR=${WEBMAIL_HOME}/data
 Environment=HOST=127.0.0.1
 Environment=PORT=${WEBMAIL_PORT}
 Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=+/usr/local/sbin/spanel-helper mail-webmail-lo-guard
 ExecStart=${WEBMAIL_HOME}/venv/bin/python ${WEBMAIL_HOME}/src/backend/main.py
 Restart=always
 RestartSec=5
@@ -3761,6 +3804,7 @@ remove_mail() {
   done
   if nginx -t >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 || true; fi
   rm -f "$FIREWALL_ADDON_PORTS_DIR/mail.ports"
+  mail_remove_webmail_lo_guard
   firewall_apply >/dev/null
   echo "Email stopped: Exim, Dovecot, Rspamd and the webmail are off and the mail ports are closed. Mail, mailboxes, DKIM keys and settings are kept."
 }
@@ -4799,10 +4843,86 @@ mail_reconfigure() {
   mail_write_exim_conf
   mail_write_sieve
   mail_write_quota_warning
+  if [[ -f "$WEBMAIL_HOME/.spanel" ]]; then
+    mail_apply_webmail_lo_guard
+  fi
   mail_write_dovecot_conf
   mail_write_learn_service
+  if systemctl is-active --quiet dovecot; then
+    systemctl reload dovecot 2>/dev/null || systemctl restart dovecot
+    if command -v ss >/dev/null 2>&1 && ! ss -H -lnt "sport = :${WEBMAIL_IMAP_PORT:-14143}" 2>/dev/null | grep -q .; then
+      systemctl restart dovecot 2>/dev/null || true
+    fi
+  fi
   if [[ -f "$WEBMAIL_HOME/.spanel" ]]; then
     local candidate webmail_changed=0 req_changed=0
+    local wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
+    if [[ -f "$WEBMAIL_ENV" ]] && (
+      [[ "$(mail_env_value IMAP_HOST)" != "$wm_imap_host" ]] ||
+      [[ "$(mail_env_value IMAP_PORT)" != "$wm_imap_port" ]] ||
+      [[ "$(mail_env_value IMAP_SOURCE_IP)" != "$wm_imap_host" ]]
+    ); then
+      local auth_secret sso_secret master_password
+      auth_secret="$(mail_env_value AUTH_SECRET)"
+      [[ -n "$auth_secret" ]] || auth_secret="$(openssl rand -hex 32)"
+      sso_secret="$(mail_env_value SSO_SECRET)"
+      [[ -n "$sso_secret" ]] || sso_secret="$(openssl rand -hex 32)"
+      master_password="$(mail_env_value SSO_MASTER_PASSWORD)"
+      [[ -n "$master_password" ]] || master_password="$(openssl rand -hex 24)"
+      install -m 0640 -o root -g SPanel-webmail /dev/null "${WEBMAIL_ENV}.new"
+      cat >"${WEBMAIL_ENV}.new" <<EOF
+${MAIL_MARKER} Rewritten each time the addon is installed.
+AUTH_SECRET=${auth_secret}
+# Dovecot and Exim on this server, over dedicated loopback channel.
+IMAP_HOST=${wm_imap_host}
+IMAP_PORT=${wm_imap_port}
+IMAP_SOURCE_IP=${wm_imap_host}
+IMAP_SECURE=false
+SMTP_HOST=127.0.0.1
+SMTP_PORT=587
+SMTP_SECURE=false
+ENABLE_CADDY_AUTOMATION=false
+# Single sign-on from SPanel.
+SSO_SECRET=${sso_secret}
+SSO_MASTER_USER=${WEBMAIL_MASTER_USER}
+SSO_MASTER_PASSWORD=${master_password}
+SSO_MASTER_SEPARATOR=*
+EOF
+      mv -f "${WEBMAIL_ENV}.new" "$WEBMAIL_ENV"
+      webmail_changed=1
+    fi
+    if [[ -f "$WEBMAIL_UNIT" ]] && ! grep -q 'mail-webmail-lo-guard' "$WEBMAIL_UNIT" 2>/dev/null; then
+      cat >"$WEBMAIL_UNIT" <<UNIT
+[Unit]
+Description=SPanel Webmail (Email addon)
+After=network-online.target dovecot.service exim4.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=SPanel-webmail
+Group=SPanel-webmail
+WorkingDirectory=${WEBMAIL_HOME}/src/backend
+EnvironmentFile=${WEBMAIL_ENV}
+Environment=DATA_DIR=${WEBMAIL_HOME}/data
+Environment=HOST=127.0.0.1
+Environment=PORT=${WEBMAIL_PORT}
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=+/usr/local/sbin/spanel-helper mail-webmail-lo-guard
+ExecStart=${WEBMAIL_HOME}/venv/bin/python ${WEBMAIL_HOME}/src/backend/main.py
+Restart=always
+RestartSec=5
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+ReadWritePaths=${WEBMAIL_HOME}/data
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+      systemctl daemon-reload
+      webmail_changed=1
+    fi
     for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
       if [[ -d "$candidate" && ! -L "$candidate" && "$(stat -c '%u' "$candidate" 2>/dev/null || echo 0)" == "0" ]] \
          && [[ -f "${candidate}/main.py" && ! -L "${candidate}/main.py" && -f "${candidate}/requirements.txt" && ! -L "${candidate}/requirements.txt" ]]; then
@@ -4830,12 +4950,12 @@ mail_reconfigure() {
             webmail_changed=1
           fi
         fi
-        if [[ "$webmail_changed" -eq 1 ]]; then
-          systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
-        fi
         break
       fi
     done
+    if [[ "$webmail_changed" -eq 1 ]]; then
+      systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
+    fi
     if [[ -f "$WEBMAIL_NGINX" ]] && (
       ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null ||
       ! grep -q 'spanel_webmail_login_key' "$WEBMAIL_NGINX" 2>/dev/null ||
@@ -4844,7 +4964,6 @@ mail_reconfigure() {
       mail_write_webmail_nginx
     fi
   fi
-  if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
   if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
   echo "Mail configuration rewritten."
 }
@@ -6533,6 +6652,9 @@ firewall_apply() {
   firewall_write_boot_unit
   # Never let a Docker guard failure abort the main firewall apply.
   install_docker_firewall_guard || echo "WARNING: could not apply the Docker inbound guard" >&2
+  if declare -F mail_apply_webmail_lo_guard >/dev/null 2>&1 && [[ -f "${FIREWALL_ADDON_PORTS_DIR:-}/mail.ports" ]]; then
+    mail_apply_webmail_lo_guard || true
+  fi
   if [[ "$state" == "enabled" ]]; then
     firewall_kill_blocked_connections || true
   fi
@@ -10398,6 +10520,11 @@ case "$cmd" in
   mail-reconfigure)
     [[ $# -eq 0 ]] || deny "usage: mail-reconfigure"
     mail_reconfigure
+    ;;
+
+  mail-webmail-lo-guard)
+    [[ $# -eq 0 ]] || deny "usage: mail-webmail-lo-guard"
+    mail_apply_webmail_lo_guard
     ;;
 
   mail-dkim)
