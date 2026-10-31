@@ -705,26 +705,8 @@ def session_status(
     jwt_payload = getattr(request.state, "jwt_payload", None) or {}
     impersonated = bool(jwt_payload.get("imp"))
     impersonated_by = jwt_payload.get("imp_user") if impersonated else None
-    from app.api.databases import effective_database_limit
+    from app.services import quota
 
-    effective_website_limit = (
-        0
-        if is_admin_role(current_user.role)
-        else (
-            int(getattr(current_user.package, "website_limit", 0) or 0)
-            if current_user.package and getattr(current_user.package, "website_limit", None) is not None
-            else (current_user.website_limit if current_user.website_limit is not None else 0)
-        )
-    )
-    effective_subdomain_limit = (
-        0
-        if is_admin_role(current_user.role)
-        else (
-            int(getattr(current_user.package, "subdomain_limit", 0) or 0)
-            if current_user.package and getattr(current_user.package, "subdomain_limit", None) is not None
-            else int(getattr(current_user, "subdomain_limit", 0) or 0)
-        )
-    )
     effective_node_apps_limit = (
         -1
         if is_admin_role(current_user.role)
@@ -742,9 +724,11 @@ def session_status(
         "is_active": current_user.is_active,
         "package_id": getattr(current_user, "package_id", None),
         "package_name": current_user.package.name if current_user.package else None,
-        "website_limit": effective_website_limit,
-        "subdomain_limit": effective_subdomain_limit,
-        "database_limit": effective_database_limit(current_user),
+        "website_limit": quota.effective_limit(current_user, "website_limit"),
+        "subdomain_limit": quota.effective_limit(current_user, "subdomain_limit"),
+        "database_limit": quota.effective_limit(current_user, "database_limit"),
+        "sftp_accounts_limit": quota.effective_limit(current_user, "sftp_accounts_limit"),
+        "mail_accounts_limit": quota.effective_limit(current_user, "mail_accounts_limit"),
         "node_apps_limit": effective_node_apps_limit,
         "storage_limit_mb": current_user.storage_limit_mb,
         "totp_enabled": current_user.totp_enabled,

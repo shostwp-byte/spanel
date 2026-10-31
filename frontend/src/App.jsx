@@ -1260,8 +1260,8 @@ function AppContent() {
           );
         }
       }
-      const siteLimit = Number(currentUser.website_limit || 0);
-      if (siteLimit > 0 && ownSites.total >= siteLimit) {
+      const siteLimit = Number(currentUser.website_limit ?? -1);
+      if (siteLimit >= 0 && ownSites.total >= siteLimit) {
         flag('info', t('Quota'), t('You have reached your website limit ({used} / {limit}).', { used: ownSites.total, limit: siteLimit }), 'websites', t('Websites'), Globe);
       }
     }
@@ -3684,7 +3684,8 @@ function AppContent() {
     const dbCount = sum.databases?.total ?? databases.length;
 
     const storageLimit = currentUser ? storageLimitBytes(currentUser) : 0;
-    const siteLimit = currentUser ? (Number(currentUser.website_limit) || 0) : 0;
+    const siteLimit = currentUser ? Number(currentUser.website_limit ?? -1) : -1;
+    const hasSiteLimit = siteLimit >= 0;
     const usedBytes = currentUser ? (Number(currentUser.storage_used_bytes) || 0) : 0;
     const pct = (used, limit) => limit > 0 ? (used / limit) * 100 : null;
 
@@ -3745,7 +3746,7 @@ function AppContent() {
           <ResourceCard icon={Network} label={t('Network')} value={`${formatBytes(networkTotal)}/s`} detail={t('Down {down}/s · Up {up}/s', { down: formatBytes(network.rx_per_sec), up: formatBytes(network.tx_per_sec) })} />
         </> : currentUser ? <>
           <ResourceCard icon={HardDrive} label={t('Storage')} value={storageLimit ? formatPercent(pct(usedBytes, storageLimit)) : formatBytes(usedBytes)} percent={storageLimit ? pct(usedBytes, storageLimit) : null} detail={storageLimit ? t('{used} of {limit}', { used: formatBytes(usedBytes), limit: formatBytes(storageLimit) }) : t('unlimited')} />
-          <ResourceCard icon={Globe} label={t('Websites')} value={siteLimit ? `${websites.length} / ${siteLimit}` : String(websites.length)} percent={pct(websites.length, siteLimit)} detail={siteLimit ? t('{used} of {limit}', { used: websites.length, limit: siteLimit }) : t('unlimited')} />
+          <ResourceCard icon={Globe} label={t('Websites')} value={hasSiteLimit ? `${websites.length} / ${siteLimit}` : String(websites.length)} percent={siteLimit > 0 ? pct(websites.length, siteLimit) : (siteLimit === 0 ? 100 : null)} detail={hasSiteLimit ? t('{used} of {limit}', { used: websites.length, limit: siteLimit }) : t('unlimited')} />
           <ResourceCard icon={Database} label={t('Databases')} value={String(databases.length)} percent={null} detail={t('in your account')} />
         </> : null}
       </div>

@@ -7,7 +7,7 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.models.entities import DatabaseAccount, User, UserPackage, Website
-from app.services import db_backends, disk_quota, resource_monitor, storage_quota
+from app.services import db_backends, disk_quota, quota, resource_monitor, storage_quota
 from app.services.remote_mysql import RemoteDatabaseError
 from app.services.audit import log_action
 
@@ -20,7 +20,7 @@ class UserResourceLimitsUpdate(BaseModel):
     storage_limit_mb: Optional[int] = Field(default=None, ge=0, le=1048576)
     bandwidth_limit_mb: Optional[int] = Field(default=None, ge=0, le=104857600)
     inode_limit: Optional[int] = Field(default=None, ge=0, le=100000000)
-    database_limit: Optional[int] = Field(default=None, ge=0, le=10000)
+    database_limit: Optional[int] = Field(default=None, ge=-1, le=10000)
     cpu_quota_percent: Optional[int] = Field(default=None, ge=0, le=6400)
     io_read_mbps: Optional[int] = Field(default=None, ge=0, le=100000)
     io_write_mbps: Optional[int] = Field(default=None, ge=0, le=100000)
@@ -121,13 +121,9 @@ def _build_user_resource_row(
         "under_attack_since": attack_info["activated_at"],
         "high_load_streak": attack_info["high_load_streak"],
         "websites_count": len(sites),
-        "website_limit": int(user.website_limit or 0),
+        "website_limit": quota.effective_limit(user, "website_limit"),
         "databases_count": len(dbs),
-        "database_limit": int(
-            getattr(user.package, "database_limit", getattr(user, "database_limit", 5))
-            if getattr(user, "package", None) is not None
-            else (getattr(user, "database_limit", 5) or 0)
-        ),
+        "database_limit": quota.effective_limit(user, "database_limit"),
         "locked_databases_count": locked_dbs_count,
         "cpu_percent": live["cpu_percent"],
         "php_cpu_percent": float(live.get("php_cpu_percent") or 0.0),
@@ -395,6 +391,8 @@ def update_user_resource_limits(
         user.website_limit = pkg.website_limit
         user.storage_limit_mb = pkg.storage_limit_mb
         user.database_limit = getattr(pkg, "database_limit", 5)
+        user.sftp_accounts_limit = getattr(pkg, "sftp_accounts_limit", 3)
+        user.mail_accounts_limit = getattr(pkg, "mail_accounts_limit", 10)
         user.bandwidth_limit_mb = getattr(pkg, "bandwidth_limit_mb", 0)
         user.inode_limit = getattr(pkg, "inode_limit", 0)
         user.cpu_quota_percent = getattr(pkg, "cpu_quota_percent", 100)

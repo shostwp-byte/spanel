@@ -102,21 +102,17 @@ def _load_json_dict(path_str: str) -> dict:
 
 
 def _website_quota_status(db: Session, owner: User, owner_apps: list | None = None) -> dict:
-    from app.api.websites import effective_website_limit
     from app.models.entities import Website
+    from app.services import quota
 
-    w_limit = effective_website_limit(owner)
+    w_limit = quota.effective_limit(owner, "website_limit")
+    s_limit = quota.effective_limit(owner, "subdomain_limit")
     if w_limit < 0:
         max_total_websites = -1
+    elif w_limit == 0:
+        max_total_websites = 0
     else:
-        pkg = getattr(owner, "package", None)
-        raw_sub = (
-            getattr(pkg, "subdomain_limit", None)
-            if pkg is not None and getattr(pkg, "subdomain_limit", None) is not None
-            else getattr(owner, "subdomain_limit", None)
-        )
-        s_limit = int(0 if raw_sub is None else raw_sub)
-        max_total_websites = -1 if s_limit < 0 else (max(0, w_limit) + max(0, s_limit))
+        max_total_websites = -1 if s_limit < 0 else (w_limit + s_limit)
 
     try:
         websites = db.query(Website).filter(Website.owner_id == owner.id).all()

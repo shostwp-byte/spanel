@@ -79,17 +79,9 @@ def _sftp_host() -> str:
 
 
 def effective_sftp_limit(user: User | None) -> int:
-    if user is None or is_admin_role(getattr(user, "role", None)):
-        return -1
-    pkg = getattr(user, "package", None)
-    if pkg is not None:
-        pkg_val = getattr(pkg, "sftp_accounts_limit", None)
-        if pkg_val is None:
-            pkg_val = getattr(pkg, "ftp_accounts_limit", None)
-        if pkg_val is not None:
-            return int(pkg_val)
-    val = getattr(user, "sftp_accounts_limit", None)
-    return int(0 if val is None else val)
+    from app.services import quota
+
+    return quota.effective_limit(user, "sftp_accounts_limit")
 
 
 _limit_for = effective_sftp_limit
@@ -296,8 +288,10 @@ def account_limits(
     current_user: User = Depends(get_current_user),
 ):
     """What the UI needs to decide whether to offer the button at all."""
+    from app.services import quota
+
     limit = _limit_for(current_user)
     used = db.query(SftpAccount).filter(SftpAccount.owner_id == current_user.id).count()
-    if is_admin_role(current_user.role) or limit == 0:
-        return {"limit": None if is_admin_role(current_user.role) else 0, "used": used, "unlimited": True}
+    if is_admin_role(current_user.role) or quota.is_quota_unlimited(limit):
+        return {"limit": None if is_admin_role(current_user.role) else -1, "used": used, "unlimited": True}
     return {"limit": limit, "used": used, "unlimited": False}

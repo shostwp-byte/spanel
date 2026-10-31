@@ -1008,8 +1008,7 @@ def _evaluate_user_app_quota(
     wp_state: Dict[str, Any],
     active_wp_ids: Optional[set] = None,
 ) -> Tuple[Dict[str, Any], set]:
-    from app.api.databases import effective_database_limit
-    from app.api.websites import effective_website_limit
+    from app.services import quota
 
     lv_state = _load_laravel_state_readonly()
     occupied_ids: set = set()
@@ -1017,25 +1016,20 @@ def _evaluate_user_app_quota(
         if _is_website_occupied(w, wp_state, lv_state, active_wp_ids):
             occupied_ids.add(getattr(w, "id", None))
 
-    w_limit = effective_website_limit(user)
+    w_limit = quota.effective_limit(user, "website_limit")
+    s_limit = quota.effective_limit(user, "subdomain_limit")
     if w_limit < 0:
-        s_limit = -1
         max_total_websites = -1
+    elif w_limit == 0:
+        max_total_websites = 0
     else:
-        pkg = getattr(user, "package", None)
-        raw_sub = (
-            getattr(pkg, "subdomain_limit", None)
-            if pkg is not None and getattr(pkg, "subdomain_limit", None) is not None
-            else getattr(user, "subdomain_limit", None)
-        )
-        s_limit = int(0 if raw_sub is None else raw_sub)
-        max_total_websites = -1 if s_limit < 0 else (max(0, w_limit) + max(0, s_limit))
+        max_total_websites = -1 if s_limit < 0 else (w_limit + s_limit)
 
     occupied_count = len(occupied_ids)
     available_websites_count = sum(
         1 for w in (websites or []) if getattr(w, "id", None) not in occupied_ids
     )
-    db_limit = effective_database_limit(user)
+    db_limit = quota.effective_limit(user, "database_limit")
     try:
         raw_db_cnt = db.query(DatabaseAccount).filter(
             DatabaseAccount.owner_id == getattr(user, "id", 0)

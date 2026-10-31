@@ -61,21 +61,10 @@ def get_accessible_database(database_id: int, db: Session, current_user: User) -
 
 
 def effective_database_limit(user: User | None) -> int:
-    """Return the effective database quota for ``user`` (-1 = unlimited, 0 = disabled, >0 = max DBs).
+    """Return the effective database quota for ``user`` (-1 = unlimited, 0 = disabled, >0 = max DBs)."""
+    from app.services import quota
 
-    When the user belongs to a hosting package, the package's ``database_limit``
-    is authoritative so legacy accounts whose ``users.database_limit`` column
-    defaulted to 5 in SQLite cannot bypass their package limit.
-    """
-    if user is None or is_admin_role(getattr(user, "role", None)):
-        return -1
-    pkg = getattr(user, "package", None)
-    if pkg is not None:
-        pkg_lim = getattr(pkg, "database_limit", None)
-        if pkg_lim is not None:
-            return int(pkg_lim)
-    raw_db_lim = getattr(user, "database_limit", None)
-    return int(-1 if raw_db_lim is None else raw_db_lim)
+    return quota.effective_limit(user, "database_limit")
 
 
 def enforce_user_database_limit(db: Session, owner: User | None, *, creating_count: int = 1) -> None:

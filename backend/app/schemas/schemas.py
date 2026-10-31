@@ -204,7 +204,7 @@ class UserPackageCreate(BaseModel):
 
     bandwidth_limit_mb: int = Field(default=0, ge=-1)
     inode_limit: int = Field(default=0, ge=-1)
-    subdomain_limit: int = Field(default=0, ge=-1)
+    subdomain_limit: int = Field(default=20, ge=-1)
     email_forwarders_limit: int = Field(default=0, ge=-1)
     mailing_lists_limit: int = Field(default=0, ge=-1)
     autoresponders_limit: int = Field(default=0, ge=-1)
@@ -340,7 +340,7 @@ class UserPackageOut(BaseModel):
     name: str
     slug: Optional[str] = None
     website_limit: int
-    subdomain_limit: int = 0
+    subdomain_limit: int = 20
     storage_limit_mb: int
     database_limit: int = 5
     alias_limit: int = 0
@@ -375,7 +375,7 @@ class UserPackageOut(BaseModel):
 
     bandwidth_limit_mb: int = Field(default=0, ge=-1)
     inode_limit: int = Field(default=0, ge=-1)
-    subdomain_limit: int = Field(default=0, ge=-1)
+    subdomain_limit: int = Field(default=20, ge=-1)
     email_forwarders_limit: int = Field(default=0, ge=-1)
     mailing_lists_limit: int = Field(default=0, ge=-1)
     autoresponders_limit: int = Field(default=0, ge=-1)

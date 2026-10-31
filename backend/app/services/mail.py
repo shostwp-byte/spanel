@@ -742,16 +742,10 @@ def owner_mailbox_count(db: Session, owner_id: int) -> int:
 
 def effective_mail_limit(user: User | None) -> int | None:
     """A customer's mailbox limit; None for an administrator or Unlimited (-1)."""
-    if user is None or _is_admin(user):
-        return None
-    pkg = getattr(user, "package", None)
-    val = getattr(pkg, "mail_accounts_limit", None) if pkg is not None else None
-    if val is None:
-        val = getattr(user, "mail_accounts_limit", None)
-    if val is None:
-        return None
-    val_int = int(val)
-    return None if val_int < 0 else val_int
+    from app.services import quota
+
+    eff = quota.effective_limit(user, "mail_accounts_limit")
+    return None if quota.is_quota_unlimited(eff) else eff
 
 
 _limit = effective_mail_limit
