@@ -1779,6 +1779,225 @@ def test_package_website_quota_enforcement_across_application_modules():
     assert sa_quota2["website_quota_reached"] is False
 
 
+def test_asgi_router_contextvar_lifecycle_and_php85_deploy_flow(tmp_path):
+    """Regression test for live ASGI HTTP requests through FastAPI's dependency injector:
+    1. Proves `async def _capture_laravel_access_role` propagates `x-access-role` into sync
+       threadpool endpoints and resets `ContextVar` token cleanly without HTTP 500 `ValueError`.
+    2. Verifies dynamic `installed_php_versions` mapping (including PHP 8.5), Laravel 12.x/11.x
+       vs PHP 8.1 compatibility guard, `--no-scripts` + `artisan package:discover` sequencing,
+       PHP 8.5 `--ignore-platform-req=php+` retry, and helper CLI `open_basedir` paths.
+    """
+    import asyncio
+    from fastapi import FastAPI
+
+    site_root = tmp_path / "home" / "shostc" / "shost.com.vn"
+    app_dir = site_root / "public_html"
+    app_dir.mkdir(parents=True)
+
+    site = SimpleNamespace(
+        id=77,
+        owner_id=2,
+        domain="shost.com.vn",
+        root_path=str(site_root),
+        document_root="public_html",
+        linux_user="shostc",
+        php_version="8.5",
+        app_type="php",
+        app_id=None,
+        ssl_enabled=True,
+        waf_enabled=True,
+        nginx_rewrite_mode="none",
+        nginx_custom="",
+        created_at=None,
+    )
+    end_user = SimpleNamespace(
+        id=2,
+        username="shostc",
+        role="end_user",
+        package=None,
+        website_limit=5,
+        subdomain_limit=5,
+        database_limit=5,
+    )
+    admin_user = SimpleNamespace(
+        id=1,
+        username="admin",
+        role="admin",
+        package=None,
+        website_limit=-1,
+        subdomain_limit=-1,
+        database_limit=-1,
+    )
+
+    def _mock_query(model):
+        q = MagicMock()
+        if model is lm.Website:
+            q.filter.return_value.all.return_value = [site]
+            q.filter.return_value.order_by.return_value.all.return_value = [site]
+            q.filter.return_value.first.return_value = site
+            q.filter.return_value.count.return_value = 1
+        elif model is lm.User:
+            q.filter.return_value.first.return_value = end_user
+        else:
+            q.filter.return_value.first.return_value = None
+            q.filter.return_value.all.return_value = []
+            q.filter.return_value.count.return_value = 0
+        return q
+
+    db = MagicMock()
+    db.query.side_effect = _mock_query
+
+    active_user_ref = [admin_user]
+    app = FastAPI()
+    app.include_router(lm.router, prefix="/api")
+    app.dependency_overrides[lm.get_current_user] = lambda: active_user_ref[0]
+    app.dependency_overrides[lm.get_db] = lambda: db
+
+    async def _asgi_call(method: str, path: str, headers=None, body_obj=None):
+        raw_body = json.dumps(body_obj).encode("utf-8") if body_obj is not None else b""
+        hdrs = [(b"content-type", b"application/json")]
+        for k, v in (headers or {}).items():
+            hdrs.append((k.lower().encode("latin-1"), v.encode("latin-1")))
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method.upper(),
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": hdrs,
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 8000),
+        }
+        sent = False
+        out_status = 0
+        out_chunks: List[bytes] = []
+
+        async def _recv():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": raw_body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def _send(msg):
+            nonlocal out_status
+            if msg["type"] == "http.response.start":
+                out_status = msg["status"]
+            elif msg["type"] == "http.response.body":
+                out_chunks.append(msg.get("body", b""))
+
+        await app(scope, _recv, _send)
+        raw_resp = b"".join(out_chunks).decode("utf-8")
+        return out_status, (json.loads(raw_resp) if raw_resp else {})
+
+    state_holder: Dict[str, Any] = {"instances": {}}
+    executed_cmds: List[List[str]] = []
+    attempt_counter = [0]
+
+    def _fake_php85_exec(linux_user, target_dir, cmd_args, **kwargs):
+        executed_cmds.append(list(cmd_args))
+        if "create-project" in cmd_args:
+            assert "--no-scripts" in cmd_args
+            attempt_counter[0] += 1
+            if attempt_counter[0] == 1:
+                return 2, "Your PHP version (8.5.0) does not satisfy that requirement."
+            assert "--ignore-platform-req=php+" in cmd_args
+            (target_dir / "public").mkdir(parents=True, exist_ok=True)
+            (target_dir / "storage" / "logs").mkdir(parents=True, exist_ok=True)
+            (target_dir / "bootstrap" / "cache").mkdir(parents=True, exist_ok=True)
+            (target_dir / "artisan").write_text("#!/usr/bin/env php\n<?php\n", encoding="utf-8")
+            (target_dir / "composer.json").write_text(
+                json.dumps({"require": {"php": "^8.2", "laravel/framework": "^12.0"}}),
+                encoding="utf-8",
+            )
+            (target_dir / "public" / "index.php").write_text("<?php\n", encoding="utf-8")
+            return 0, "Created Laravel 12.x project on PHP 8.5"
+        if cmd_args[:2] == ["artisan", "package:discover"]:
+            # .env must already be written BEFORE package:discover runs!
+            assert (target_dir / ".env").is_file()
+            return 0, "Discovered packages."
+        return 0, "OK"
+
+    with patch.object(lm.php, "list_installed_php", return_value=["7.4", "8.4", "8.5"]), \
+            patch.object(lm, "_load_toolkit_state", side_effect=lambda: state_holder), \
+            patch.object(lm, "_load_wp_state_readonly", return_value={"instances": {}}), \
+            patch.object(lm, "_save_toolkit_state"), \
+            patch("app.api.databases.enforce_user_database_limit"), \
+            patch("app.api.websites._rewrite_website_vhost"), \
+            patch.object(lm.site_users, "ensure_site_runtime", return_value="shostc"), \
+            patch.object(
+                lm.mariadb,
+                "create_database",
+                return_value={
+                    "db_name": "lv_shost_85",
+                    "db_user": "u_shost_85",
+                    "db_password": "StrongPass85!",
+                },
+            ), \
+            patch.object(lm, "_run_as_site_user", side_effect=_fake_php85_exec), \
+            patch.object(lm.cron, "list_cron_entries", return_value=[]), \
+            patch.object(lm.cron, "add_cron"):
+        # 1. Admin without X-Access-Role -> clean 403 (never 500 ContextVar crash)
+        st_403, _ = asyncio.run(_asgi_call("GET", "/api/laravel-manager/instances"))
+        assert st_403 == 403
+
+        # 2. Admin WITH X-Access-Role: user -> clean 200 and installed_php_versions == ['8.5', '8.4']
+        st_200, body_list = asyncio.run(
+            _asgi_call("GET", "/api/laravel-manager/instances", headers={"X-Access-Role": "user"})
+        )
+        assert st_200 == 200
+        assert body_list["installed_php_versions"] == ["8.5", "8.4"]
+        assert body_list["websites"][0]["php_version"] == "8.5"
+
+        # 3. End user attempting Laravel 12.x on PHP 8.1 -> clean 400 compatibility guard
+        active_user_ref[0] = end_user
+        st_400, body_400 = asyncio.run(
+            _asgi_call(
+                "POST",
+                "/api/laravel-manager/install",
+                body_obj={
+                    "website_id": 77,
+                    "laravel_version": "12.x",
+                    "php_version": "8.1",
+                    "install_source": "composer",
+                },
+            )
+        )
+        assert st_400 == 400
+        assert "8.2" in body_400["detail"]
+
+        # 4. End user deploying Laravel 12.x on shost.com.vn (PHP 8.5) via ASGI -> 200 OK
+        st_inst, body_inst = asyncio.run(
+            _asgi_call(
+                "POST",
+                "/api/laravel-manager/install",
+                body_obj={
+                    "website_id": 77,
+                    "app_name": "shost.com.vn App",
+                    "laravel_version": "12.x",
+                    "php_version": "8.5",
+                    "install_source": "composer",
+                    "enable_scheduler": True,
+                    "enable_queue_worker": True,
+                },
+            )
+        )
+        assert st_inst == 200, body_inst
+        assert site.php_version == "8.5"
+        assert site.document_root == "public_html/public"
+        assert attempt_counter[0] == 2
+        assert any(cmd[:2] == ["artisan", "package:discover"] for cmd in executed_cmds)
+
+    # 5. Verify spanel-helper.sh CLI open_basedir includes Composer & SSL CA paths while site_open_basedir stays strict
+    helper_text = HELPER_PATH.read_text(encoding="utf-8")
+    assert 'terminal_cli_open_basedir="${terminal_open_basedir}:/usr/local/bin:/usr/share/composer:/run/mysqld:/var/run/mysqld:/etc/ssl/certs:/usr/share/ca-certificates:/dev"' in helper_text
+    assert 'COMPOSER_MEMORY_LIMIT=-1' in helper_text
+    assert 'error_reporting=8191' in helper_text
+
+
 def test_python312_eager_annotation_compatibility():
     import inspect
     from typing import get_type_hints
@@ -1809,6 +2028,7 @@ if __name__ == "__main__":
         test_p1_b5_remove_purges_app_syncs_vhost_and_protects_sibling_wp_database,
         test_p1_b6_blocks_subpath_occupied_sites_non_empty_dirs_and_cross_app_security,
         test_p2_b_php_version_validation_readonly_get_and_concurrent_state_updates,
+        test_asgi_router_contextvar_lifecycle_and_php85_deploy_flow,
     ):
         with tempfile.TemporaryDirectory() as _td:
             _fn(Path(_td))

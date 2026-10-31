@@ -7665,7 +7665,7 @@ sync_laravel_worker_unit() {
   install -d -o "$user" -g "$user" -m 0700 "/var/lib/php/sessions/${user}" "/var/lib/php/uploads/${user}"
   install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
 
-  open_basedir="$(site_open_basedir "$user")"
+  open_basedir="$(site_open_basedir "$user"):/usr/local/bin:/usr/share/composer:/run/mysqld:/var/run/mysqld:/etc/ssl/certs:/usr/share/ca-certificates:/dev"
   base="$(laravel_worker_unit_base "$user" "$root_target")"
   unit_file="${SYSTEMD_UNIT_DIR}/${base}@.service"
   tmp_file="${unit_file}.spanel-tmp-$$"
@@ -12667,18 +12667,21 @@ EOF
 
     # Whitelist of allowed commands for terminal access. Keep this in sync with
     # ALLOWED_COMMANDS in backend/app/services/terminal.py.
+    terminal_cli_open_basedir="${terminal_open_basedir}:/usr/local/bin:/usr/share/composer:/run/mysqld:/var/run/mysqld:/etc/ssl/certs:/usr/share/ca-certificates:/dev"
     case "$cmd" in
       php)
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir" "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_cli_open_basedir" "$@"
         ;;
       composer)
         composer_bin="$(command -v composer || true)"
         [[ -n "$composer_bin" ]] || deny "composer not found"
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir:$(dirname "$composer_bin")" "$composer_bin" "$@"
+        composer_real="$(readlink -f "$composer_bin" 2>/dev/null || echo "$composer_bin")"
+        composer_basedir="${terminal_cli_open_basedir}:$(dirname "$composer_bin"):$(dirname "$composer_real")"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "COMPOSER_MEMORY_LIMIT=-1" "COMPOSER_DISABLE_XDEBUG_WARN=1" "COMPOSER_NO_INTERACTION=1" "$php_bin" -d memory_limit=-1 -d error_reporting=8191 -d open_basedir="$composer_basedir" "$composer_bin" "$@"
         ;;
       wp)
         [[ -f /usr/local/bin/wp ]] || deny "wp-cli not found"
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" WP_CLI_PHP_ARGS="-d pcre.jit=0 -d open_basedir=$terminal_open_basedir:/usr/local/bin" "$php_bin" -d pcre.jit=0 -d open_basedir="$terminal_open_basedir:/usr/local/bin" /usr/local/bin/wp "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" WP_CLI_PHP_ARGS="-d pcre.jit=0 -d open_basedir=$terminal_cli_open_basedir" "$php_bin" -d pcre.jit=0 -d open_basedir="$terminal_cli_open_basedir" /usr/local/bin/wp "$@"
         ;;
       phpunit)
         phpunit_bin="$(command -v phpunit || true)"
@@ -12687,7 +12690,7 @@ EOF
           phpunit_bin="$target/vendor/bin/phpunit"
         fi
         [[ -n "$phpunit_bin" ]] || deny "phpunit not found (install it globally or with composer)"
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir:$(dirname "$phpunit_bin")" "$phpunit_bin" "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="${terminal_cli_open_basedir}:$(dirname "$phpunit_bin")" "$phpunit_bin" "$@"
         ;;
       node|npm|npx|yarn|git)
         exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$cmd" "$@"
@@ -12709,7 +12712,7 @@ EOF
         if [[ ! -f artisan ]]; then
           deny "artisan not found in $target (Laravel keeps it in the site root; try 'cd ..' first)"
         fi
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir" artisan "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_cli_open_basedir" artisan "$@"
         ;;
       *)
         echo "Command not allowed: $cmd" >&2

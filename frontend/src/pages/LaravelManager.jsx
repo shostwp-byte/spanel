@@ -60,8 +60,30 @@ function LaravelBrandIcon({ size = 18 }) {
   );
 }
 
-const PHP_VERSIONS = ['8.4', '8.3', '8.2', '8.1'];
+const LARAVEL_SUPPORTED_PHP = ['8.5', '8.4', '8.3', '8.2', '8.1'];
+const LARAVEL_MIN_PHP_MAP = {
+  '12.x': '8.2',
+  '11.x': '8.2',
+  '10.x': '8.1',
+};
 const LARAVEL_VERSIONS = ['12.x', '11.x', '10.x'];
+
+function comparePhpVersion(a, b) {
+  const pa = String(a || '0.0').split('.').map(Number);
+  const pb = String(b || '0.0').split('.').map(Number);
+  if ((pa[0] || 0) !== (pb[0] || 0)) return (pa[0] || 0) - (pb[0] || 0);
+  return (pa[1] || 0) - (pb[1] || 0);
+}
+
+function pickBestPhpForSite(sitePhp, lvVersion, installSource, installedList) {
+  const minPhp = installSource === 'git' ? '8.1' : (LARAVEL_MIN_PHP_MAP[lvVersion] || '8.1');
+  const eligible = (installedList || []).filter(v => comparePhpVersion(v, minPhp) >= 0);
+  const cleanSite = String(sitePhp || '').trim();
+  if (cleanSite && eligible.includes(cleanSite)) {
+    return cleanSite;
+  }
+  return eligible[0] || '';
+}
 const CACHE_DRIVERS = ['file', 'redis', 'database', 'memcached', 'array'];
 const QUEUE_CONNECTIONS = ['database', 'redis', 'sync'];
 const SESSION_DRIVERS = ['file', 'cookie', 'database', 'redis'];
@@ -117,6 +139,8 @@ export function LaravelManagerPage({
   const ctx = useAppContext() || {};
   const request = propRequest || ctx.request;
   const websites = propWebsites || ctx.websites || [];
+  const loadPhpVersions = ctx.loadPhpVersions;
+  const ctxPhpInstalled = ctx.phpVersions?.installed;
   const openWebsiteFileManager = propOpenFileManager || ctx.openWebsiteFileManager;
   const navigateToPage = propNavigate || ctx.navigateToPage;
   const setNotice = ctx.setNotice || (() => {});
@@ -131,6 +155,7 @@ export function LaravelManagerPage({
   // Core data state
   const [instances, setInstances] = useState([]);
   const [availableWebsites, setAvailableWebsites] = useState([]);
+  const [serverPhpVersions, setServerPhpVersions] = useState(null);
   const [quotaInfo, setQuotaInfo] = useState(null);
   const [curatedPackages, setCuratedPackages] = useState([]);
   const [initialLoading, setInitialLoading] = useState(true);
@@ -172,8 +197,8 @@ export function LaravelManagerPage({
     website_id: '',
     subpath: '',
     app_name: 'My Laravel Application',
-    laravel_version: '11.x',
-    php_version: '8.3',
+    laravel_version: '12.x',
+    php_version: '8.4',
     install_source: 'composer',
     git_repo: '',
     git_branch: 'main',
@@ -241,12 +266,15 @@ export function LaravelManagerPage({
       if (!request) return;
       if (!silent) setInitialLoading(true);
       try {
-        const data = await request('/laravel-manager/instances', { silent: true });
+        const data = await request('/laravel-manager/instances', { silent });
         if (data) {
           const list = Array.isArray(data.instances) ? data.instances : [];
           setInstances(list);
           if (data.quota) setQuotaInfo(data.quota);
           if (Array.isArray(data.websites)) setAvailableWebsites(data.websites);
+          if (Array.isArray(data.installed_php_versions)) {
+            setServerPhpVersions(data.installed_php_versions);
+          }
           if (Array.isArray(data.curated_packages)) setCuratedPackages(data.curated_packages);
           syncInstanceDrafts(list);
           setSelectedId(prev => {
@@ -267,7 +295,10 @@ export function LaravelManagerPage({
 
   useEffect(() => {
     loadInstances(false);
-  }, [loadInstances]);
+    if (loadPhpVersions) {
+      loadPhpVersions({ silent: true });
+    }
+  }, [loadInstances, loadPhpVersions]);
 
   const updateSingleInstance = useCallback(
     updated => {
@@ -314,6 +345,40 @@ export function LaravelManagerPage({
     return availableWebsites.length > 0 ? availableWebsites : websites;
   }, [availableWebsites, websites]);
 
+  // System-installed PHP versions compatible with Laravel (>= 8.1), sorted newest-first
+  const installedLaravelPhpVersions = useMemo(() => {
+    const merged = new Set();
+    const hasAuthoritativeSource =
+      Array.isArray(serverPhpVersions) || Array.isArray(ctxPhpInstalled);
+    if (Array.isArray(serverPhpVersions)) {
+      serverPhpVersions.forEach(v => {
+        if (LARAVEL_SUPPORTED_PHP.includes(v)) merged.add(v);
+      });
+    }
+    if (Array.isArray(ctxPhpInstalled)) {
+      ctxPhpInstalled.forEach(v => {
+        if (LARAVEL_SUPPORTED_PHP.includes(v)) merged.add(v);
+      });
+    }
+    if (!hasAuthoritativeSource) {
+      (allWebsitesList || []).forEach(w => {
+        if (w?.php_version && LARAVEL_SUPPORTED_PHP.includes(w.php_version)) {
+          merged.add(w.php_version);
+        }
+      });
+      if (merged.size === 0) merged.add('8.4');
+    }
+    return Array.from(merged).sort((a, b) => comparePhpVersion(b, a));
+  }, [serverPhpVersions, ctxPhpInstalled, allWebsitesList]);
+
+  const compatibleInstallPhpVersions = useMemo(() => {
+    const minPhp =
+      installForm.install_source === 'git'
+        ? '8.1'
+        : LARAVEL_MIN_PHP_MAP[installForm.laravel_version] || '8.1';
+    return installedLaravelPhpVersions.filter(v => comparePhpVersion(v, minPhp) >= 0);
+  }, [installedLaravelPhpVersions, installForm.laravel_version, installForm.install_source]);
+
   const installableWebsites = useMemo(() => {
     const installedIds = new Set(instances.map(inst => Number(inst.website_id || inst.id)));
     return (allWebsitesList || []).filter(
@@ -323,6 +388,40 @@ export function LaravelManagerPage({
         !installedIds.has(Number(w.id))
     );
   }, [allWebsitesList, instances]);
+
+  const selectedInstallSite = useMemo(
+    () => installableWebsites.find(w => String(w.id) === String(installForm.website_id)) || null,
+    [installableWebsites, installForm.website_id]
+  );
+
+  useEffect(() => {
+    if (!installModalOpen) return;
+    if (compatibleInstallPhpVersions.length === 0) {
+      if (installForm.php_version !== '') {
+        setInstallForm(prev => ({ ...prev, php_version: '' }));
+      }
+      return;
+    }
+    if (!compatibleInstallPhpVersions.includes(installForm.php_version)) {
+      const nextPhp = pickBestPhpForSite(
+        selectedInstallSite?.php_version,
+        installForm.laravel_version,
+        installForm.install_source,
+        installedLaravelPhpVersions
+      );
+      if (nextPhp !== installForm.php_version) {
+        setInstallForm(prev => ({ ...prev, php_version: nextPhp }));
+      }
+    }
+  }, [
+    installModalOpen,
+    compatibleInstallPhpVersions,
+    installForm.php_version,
+    installForm.laravel_version,
+    installForm.install_source,
+    selectedInstallSite,
+    installedLaravelPhpVersions,
+  ]);
 
   const userPkg = useMemo(
     () =>
@@ -375,13 +474,23 @@ export function LaravelManagerPage({
     if (!canInstallLaravel) return;
     const firstSite = installableWebsites[0];
     if (!firstSite) return;
-    setInstallForm(prev => ({
-      ...prev,
-      subpath: '',
-      website_id: firstSite ? String(firstSite.id) : '',
-      app_name: firstSite ? `${firstSite.domain} App` : 'My Laravel Application',
-      php_version: firstSite?.php_version || '8.3',
-    }));
+    setInstallForm(prev => {
+      const lvVer = prev.laravel_version || '12.x';
+      const srcMode = prev.install_source || 'composer';
+      return {
+        ...prev,
+        subpath: '',
+        laravel_version: lvVer,
+        website_id: String(firstSite.id),
+        app_name: `${firstSite.domain} App`,
+        php_version: pickBestPhpForSite(
+          firstSite.php_version,
+          lvVer,
+          srcMode,
+          installedLaravelPhpVersions
+        ),
+      };
+    });
     setInstallModalOpen(true);
   }
 
@@ -389,6 +498,10 @@ export function LaravelManagerPage({
     e?.preventDefault?.();
     if (!installForm.website_id) {
       setError('Vui lòng chọn tên miền để cài đặt dự án Laravel.');
+      return;
+    }
+    if (!installForm.php_version || compatibleInstallPhpVersions.length === 0) {
+      setError('Máy chủ chưa có phiên bản PHP tương thích để cài đặt dự án Laravel này.');
       return;
     }
     markBusy('install', true);
@@ -528,7 +641,7 @@ export function LaravelManagerPage({
         setEnvDraft({
           raw_env: res.raw_env || '',
           parsed: res.parsed || {},
-          php_version: inst.php_version || '8.3',
+          php_version: inst.php_version || installedLaravelPhpVersions[0] || '8.4',
         });
       }
     } finally {
@@ -2980,15 +3093,41 @@ export function LaravelManagerPage({
                   <span>Tên miền cài đặt (Website)</span>
                   <select
                     value={installForm.website_id}
-                    onChange={e =>
-                      setInstallForm(prev => ({ ...prev, website_id: e.target.value }))
-                    }
+                    onChange={e => {
+                      const nextId = e.target.value;
+                      const chosenSite = installableWebsites.find(
+                        w => String(w.id) === String(nextId)
+                      );
+                      setInstallForm(prev => {
+                        const prevSite = installableWebsites.find(
+                          w => String(w.id) === String(prev.website_id)
+                        );
+                        const wasAutoAppName =
+                          !prev.app_name ||
+                          prev.app_name === 'My Laravel Application' ||
+                          (prevSite && prev.app_name === `${prevSite.domain} App`);
+                        return {
+                          ...prev,
+                          website_id: nextId,
+                          app_name:
+                            wasAutoAppName && chosenSite
+                              ? `${chosenSite.domain} App`
+                              : prev.app_name,
+                          php_version: pickBestPhpForSite(
+                            chosenSite?.php_version,
+                            prev.laravel_version,
+                            prev.install_source,
+                            installedLaravelPhpVersions
+                          ),
+                        };
+                      });
+                    }}
                     required
                   >
                     <option value="">-- Chọn tên miền --</option>
                     {installableWebsites.map(w => (
                       <option key={w.id} value={w.id}>
-                        {w.domain} (PHP {w.php_version || '8.3'})
+                        {w.domain} (PHP {w.php_version || installedLaravelPhpVersions[0] || '8.4'})
                       </option>
                     ))}
                   </select>
@@ -3026,9 +3165,32 @@ export function LaravelManagerPage({
                   <span>Phiên bản Laravel</span>
                   <select
                     value={installForm.laravel_version}
-                    onChange={e =>
-                      setInstallForm(prev => ({ ...prev, laravel_version: e.target.value }))
-                    }
+                    disabled={installForm.install_source === 'git'}
+                    onChange={e => {
+                      const nextLv = e.target.value;
+                      setInstallForm(prev => {
+                        const minPhp =
+                          prev.install_source === 'git'
+                            ? '8.1'
+                            : LARAVEL_MIN_PHP_MAP[nextLv] || '8.1';
+                        const stillValid =
+                          prev.php_version &&
+                          installedLaravelPhpVersions.includes(prev.php_version) &&
+                          comparePhpVersion(prev.php_version, minPhp) >= 0;
+                        return {
+                          ...prev,
+                          laravel_version: nextLv,
+                          php_version: stillValid
+                            ? prev.php_version
+                            : pickBestPhpForSite(
+                                selectedInstallSite?.php_version,
+                                nextLv,
+                                prev.install_source,
+                                installedLaravelPhpVersions
+                              ),
+                        };
+                      });
+                    }}
                   >
                     {LARAVEL_VERSIONS.map(v => (
                       <option key={v} value={v}>
@@ -3041,18 +3203,61 @@ export function LaravelManagerPage({
                   <span>Phiên bản PHP-FPM</span>
                   <select
                     value={installForm.php_version}
+                    disabled={compatibleInstallPhpVersions.length === 0}
                     onChange={e =>
                       setInstallForm(prev => ({ ...prev, php_version: e.target.value }))
                     }
                   >
-                    {PHP_VERSIONS.map(v => (
-                      <option key={v} value={v}>
-                        PHP {v}
-                      </option>
-                    ))}
+                    {compatibleInstallPhpVersions.length === 0 ? (
+                      <option value="">Chưa cài PHP tương thích</option>
+                    ) : (
+                      compatibleInstallPhpVersions.map(v => (
+                        <option key={v} value={v}>
+                          PHP {v}
+                          {selectedInstallSite?.php_version === v ? ' (Đang dùng)' : ''}
+                        </option>
+                      ))
+                    )}
                   </select>
                 </label>
               </div>
+
+              {compatibleInstallPhpVersions.length === 0 ? (
+                <div
+                  style={{
+                    padding: '10px 12px',
+                    borderRadius: '8px',
+                    background: 'rgba(239, 68, 68, 0.1)',
+                    border: '1px solid rgba(239, 68, 68, 0.3)',
+                    color: '#dc2626',
+                    fontSize: '12.5px',
+                  }}
+                >
+                  Máy chủ hiện chưa cài đặt phiên bản PHP tương thích (Laravel{' '}
+                  {installForm.laravel_version} yêu cầu PHP &gt;={' '}
+                  {LARAVEL_MIN_PHP_MAP[installForm.laravel_version] || '8.1'}). Vui lòng cài đặt
+                  thêm phiên bản PHP trong mục CustomBuild.
+                </div>
+              ) : (
+                selectedInstallSite?.php_version &&
+                installForm.php_version &&
+                selectedInstallSite.php_version !== installForm.php_version && (
+                  <div
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: '8px',
+                      background: 'rgba(245, 158, 11, 0.1)',
+                      border: '1px solid rgba(245, 158, 11, 0.3)',
+                      color: '#b45309',
+                      fontSize: '12px',
+                    }}
+                  >
+                    Tên miền <strong>{selectedInstallSite.domain}</strong> đang dùng PHP{' '}
+                    {selectedInstallSite.php_version} — hệ thống sẽ tự động chuyển sang{' '}
+                    <strong>PHP {installForm.php_version}</strong> khi triển khai dự án Laravel.
+                  </div>
+                )
+              )}
 
               {/* Source Picker: Composer vs Git */}
               <div
@@ -3225,7 +3430,10 @@ export function LaravelManagerPage({
                 >
                   Hủy
                 </button>
-                <button type="submit" disabled={isBusy('install')}>
+                <button
+                  type="submit"
+                  disabled={isBusy('install') || compatibleInstallPhpVersions.length === 0}
+                >
                   <Zap size={14} />
                   <span>{isBusy('install') ? 'Đang cài đặt...' : 'Cài đặt Laravel ngay'}</span>
                 </button>
@@ -3316,7 +3524,7 @@ export function LaravelManagerPage({
               </div>
             ) : envModalTab === 'visual' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '10px' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1.8fr 1fr 1fr 1fr', gap: '10px' }}>
                   <label>
                     <span>APP_NAME</span>
                     <input
@@ -3359,6 +3567,31 @@ export function LaravelManagerPage({
                     >
                       <option value="false">false (Khuyên dùng)</option>
                       <option value="true">true (Debug)</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>PHP-FPM</span>
+                    <select
+                      value={envDraft.php_version || envModalSite.php_version || ''}
+                      onChange={e =>
+                        setEnvDraft(prev => ({
+                          ...prev,
+                          php_version: e.target.value,
+                        }))
+                      }
+                    >
+                      {Array.from(
+                        new Set([
+                          ...(installedLaravelPhpVersions || []),
+                          ...(envDraft.php_version ? [envDraft.php_version] : []),
+                        ])
+                      )
+                        .sort((a, b) => comparePhpVersion(b, a))
+                        .map(v => (
+                          <option key={v} value={v}>
+                            PHP {v}
+                          </option>
+                        ))}
                     </select>
                   </label>
                 </div>

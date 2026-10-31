@@ -32,7 +32,7 @@ _LARAVEL_ACCESS_ROLE_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
-def _capture_laravel_access_role(request: Request):
+async def _capture_laravel_access_role(request: Request):
     token = _LARAVEL_ACCESS_ROLE_CTX.set(
         (request.headers.get("x-access-role") or "").strip().lower()
     )
@@ -234,6 +234,7 @@ def _ensure_toolkit_state_table() -> None:
 def _load_toolkit_state() -> Dict[str, Any]:
     with _LARAVEL_STATE_LOCK:
         try:
+            _ensure_toolkit_state_table()
             with engine.connect() as conn:
                 row = conn.execute(
                     text("SELECT payload FROM laravel_toolkit_state WHERE id = 1")
@@ -250,14 +251,14 @@ def _load_toolkit_state() -> Dict[str, Any]:
             return {"instances": {}}
 
         path = _toolkit_state_path()
-        if path.exists() and not path.is_symlink():
-            try:
+        try:
+            if path.exists() and not path.is_symlink():
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     data.setdefault("instances", {})
                     return data
-            except Exception as exc:
-                logger.warning("Failed to load Laravel toolkit state file: %s", exc)
+        except Exception as exc:
+            logger.warning("Failed to load Laravel toolkit state file: %s", exc)
         return {"instances": {}}
 
 
@@ -338,9 +339,62 @@ def _pop_instance_state(inst_key: str) -> Dict[str, Any]:
 
 
 LARAVEL_SUPPORTED_PHP_VERSIONS = {"8.1", "8.2", "8.3", "8.4", "8.5"}
+LARAVEL_PHP_MIN_BY_VERSION: Dict[str, str] = {
+    "12.x": "8.2",
+    "11.x": "8.2",
+    "10.x": "8.1",
+}
 
 
-def _validate_laravel_php_version(raw_ver: Optional[str]) -> str:
+def _php_ver_tuple(ver: str) -> Tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in (ver or "0.0").strip().split("."))
+    except ValueError:
+        return (0, 0)
+
+
+def _normalize_laravel_version_key(raw_lv_ver: Optional[str]) -> str:
+    raw = (raw_lv_ver or "11.x").strip()
+    if "12" in raw:
+        return "12.x"
+    if "10" in raw:
+        return "10.x"
+    return "11.x"
+
+
+def _list_installed_laravel_php_versions() -> List[str]:
+    try:
+        installed_raw = php.list_installed_php() or []
+    except Exception:
+        installed_raw = []
+    compatible = [v for v in installed_raw if v in LARAVEL_SUPPORTED_PHP_VERSIONS]
+    return sorted(set(compatible), key=_php_ver_tuple, reverse=True)
+
+
+def _pick_default_laravel_php_version(
+    site_php: Optional[str], laravel_version: Optional[str] = None
+) -> str:
+    installed_lv = _list_installed_laravel_php_versions()
+    min_php = (
+        LARAVEL_PHP_MIN_BY_VERSION.get(_normalize_laravel_version_key(laravel_version), "8.1")
+        if laravel_version
+        else "8.1"
+    )
+    eligible = [v for v in installed_lv if _php_ver_tuple(v) >= _php_ver_tuple(min_php)]
+    clean_site = (site_php or "").strip()
+    if clean_site in LARAVEL_SUPPORTED_PHP_VERSIONS and _php_ver_tuple(clean_site) >= _php_ver_tuple(min_php):
+        if not eligible or clean_site in eligible:
+            return clean_site
+    if eligible:
+        return eligible[0]
+    if installed_lv:
+        return installed_lv[0]
+    return clean_site or "8.4"
+
+
+def _validate_laravel_php_version(
+    raw_ver: Optional[str], laravel_version: Optional[str] = None
+) -> str:
     clean = (raw_ver or "8.3").strip()
     try:
         clean = site_users.validate_php_version(clean)
@@ -354,6 +408,17 @@ def _validate_laravel_php_version(raw_ver: Optional[str]) -> str:
             status_code=400,
             detail=f"Laravel yêu cầu phiên bản PHP từ 8.1 trở lên (nhận được: PHP {clean}).",
         )
+    if laravel_version:
+        norm_lv = _normalize_laravel_version_key(laravel_version)
+        min_php = LARAVEL_PHP_MIN_BY_VERSION.get(norm_lv, "8.1")
+        if _php_ver_tuple(clean) < _php_ver_tuple(min_php):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Laravel {norm_lv} yêu cầu phiên bản PHP từ {min_php} trở lên "
+                    f"(nhận được: PHP {clean})."
+                ),
+            )
     check_host_installed = (
         not settings.command_dry_run
         and (
@@ -1731,14 +1796,23 @@ class LaravelSecurityPayload(BaseModel):
 
 
 def _load_wp_state_readonly() -> Dict[str, Any]:
-    wp_path = Path("/etc/spanel/wp_toolkit.json")
-    if wp_path.is_file():
+    try:
+        data = wordpress_live.load_toolkit_state_safe()
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    for cand in (
+        Path("/var/lib/spanel/wordpress_toolkit_state.json"),
+        Path("/etc/spanel/wp_toolkit.json"),
+    ):
         try:
-            data = json.loads(wp_path.read_text(encoding="utf-8", errors="ignore"))
-            if isinstance(data, dict):
-                return data
+            if cand.is_file() and not cand.is_symlink():
+                data = json.loads(cand.read_text(encoding="utf-8", errors="ignore"))
+                if isinstance(data, dict):
+                    return data
         except Exception:
-            pass
+            continue
     return {"instances": {}}
 
 
@@ -1862,15 +1936,19 @@ def list_laravel_instances(
     quota, occupied_ids = _evaluate_user_app_quota(
         db, current_user, websites, state, active_lv_ids
     )
+    installed_php_versions = _list_installed_laravel_php_versions()
+    default_php = installed_php_versions[0] if installed_php_versions else "8.4"
     return {
         "instances": instances,
         "curated_packages": CURATED_COMPOSER_PACKAGES,
+        "installed_php_versions": installed_php_versions,
+        "php_compatibility": LARAVEL_PHP_MIN_BY_VERSION,
         "quota": quota,
         "websites": [
             {
                 "id": w.id,
                 "domain": w.domain,
-                "php_version": w.php_version or "8.3",
+                "php_version": w.php_version or default_php,
                 "ssl_enabled": bool(w.ssl_enabled),
                 "app_type": w.app_type,
                 "document_root": w.document_root or "public_html",
@@ -1977,7 +2055,11 @@ def install_laravel_instance(
         if not GIT_BRANCH_RE.fullmatch(clean_branch):
             raise HTTPException(status_code=400, detail="Tên nhánh Git không hợp lệ.")
 
-    php_ver = _validate_laravel_php_version(payload.php_version or site.php_version or "8.3")
+    target_lv_ver = payload.laravel_version if payload.install_source != "git" else None
+    raw_php_choice = (payload.php_version or "").strip() or _pick_default_laravel_php_version(
+        site.php_version, target_lv_ver
+    )
+    php_ver = _validate_laravel_php_version(raw_php_choice, laravel_version=target_lv_ver)
 
     from app.api.databases import enforce_user_database_limit
 
@@ -2194,13 +2276,31 @@ def install_laravel_instance(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
+        git_comp_cmd = [
+            "composer",
+            "install",
+            "--no-dev",
+            "--optimize-autoloader",
+            "--no-interaction",
+            "--no-scripts",
+        ]
         rc2, out2 = _run_as_site_user(
             linux_user,
             app_dir,
-            ["composer", "install", "--no-dev", "--optimize-autoloader", "--no-interaction"],
+            git_comp_cmd,
             php_version=php_ver,
             timeout=600,
         )
+        if rc2 != 0 and php_ver == "8.5":
+            low_out2 = (out2 or "").lower()
+            if "your php version (8.5" in low_out2 or "does not satisfy that requirement" in low_out2:
+                rc2, out2 = _run_as_site_user(
+                    linux_user,
+                    app_dir,
+                    [*git_comp_cmd, "--ignore-platform-req=php+"],
+                    php_version=php_ver,
+                    timeout=600,
+                )
         if rc2 != 0:
             _rollback_failed_install(purge_files=True)
             raise HTTPException(
@@ -2209,7 +2309,7 @@ def install_laravel_instance(
             )
         install_logs.append(
             {
-                "cmd": "composer install --no-dev --optimize-autoloader",
+                "cmd": "composer install --no-dev --optimize-autoloader --no-scripts",
                 "output": out2 or "Composer dependencies installed.",
                 "status": "ok",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2232,21 +2332,34 @@ def install_laravel_instance(
             ver_constraint = "^10.0"
         else:
             ver_constraint = "^11.0"
+        create_cmd = [
+            "composer",
+            "create-project",
+            "--prefer-dist",
+            "--no-interaction",
+            "--no-scripts",
+            "laravel/laravel",
+            ".",
+            ver_constraint,
+        ]
         rc, out = _run_as_site_user(
             linux_user,
             app_dir,
-            [
-                "composer",
-                "create-project",
-                "--prefer-dist",
-                "--no-interaction",
-                "laravel/laravel",
-                ".",
-                ver_constraint,
-            ],
+            create_cmd,
             php_version=php_ver,
             timeout=600,
         )
+        if rc != 0 and php_ver == "8.5":
+            low_out = (out or "").lower()
+            if "your php version (8.5" in low_out or "does not satisfy that requirement" in low_out:
+                _purge_app_dir_contents(linux_user, site_root, app_dir)
+                rc, out = _run_as_site_user(
+                    linux_user,
+                    app_dir,
+                    [*create_cmd, "--ignore-platform-req=php+"],
+                    php_version=php_ver,
+                    timeout=600,
+                )
         if rc != 0:
             _rollback_failed_install(purge_files=True)
             raise HTTPException(
@@ -2255,7 +2368,7 @@ def install_laravel_instance(
             )
         install_logs.append(
             {
-                "cmd": f"composer create-project --prefer-dist laravel/laravel . {ver_constraint}",
+                "cmd": f"composer create-project --prefer-dist --no-scripts laravel/laravel . {ver_constraint}",
                 "output": out or f"Created Laravel {raw_lv_ver} project.",
                 "status": "ok",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2288,6 +2401,23 @@ def install_laravel_instance(
         session_driver=payload.session_driver or "file",
     )
     _write_app_file(linux_user, site_root, app_dir, ".env", env_content, "0640")
+
+    # Run package discovery now that the real production MySQL .env is in place
+    rc_disc, out_disc = _run_as_site_user(
+        linux_user,
+        app_dir,
+        ["artisan", "package:discover", "--ansi", "--no-interaction"],
+        php_version=php_ver,
+        timeout=120,
+    )
+    install_logs.append(
+        {
+            "cmd": f"{Path(php_cli).name} artisan package:discover --ansi --no-interaction",
+            "output": out_disc or ("OK" if rc_disc == 0 else "Package discovery warning"),
+            "status": "ok" if rc_disc == 0 else "error",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
 
     # Generate canonical APP_KEY via real Artisan when live, then link storage & migrate
     rc_key, out_key = _run_as_site_user(
@@ -2919,6 +3049,10 @@ def update_laravel_env(
             _sync_laravel_worker_unit(
                 linux_user, site_root, app_dir, validated_php, q_saved, strict=False
             )
+        try:
+            cron.retarget_php_binary(site)
+        except Exception as exc:
+            logger.debug("retarget_php_binary warning on Laravel PHP switch: %s", exc)
 
     active_php = (site.php_version or "8.3").strip()
     php_cli = _php_cli_for_version(active_php)
