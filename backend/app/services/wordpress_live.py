@@ -1,4 +1,6 @@
 import hashlib
+import hmac
+import html
 import json
 import logging
 import os
@@ -220,6 +222,15 @@ def save_toolkit_state_safe(state: Dict[str, Any]) -> None:
                         pass
         except Exception as exc:
             logger.debug("save_toolkit_state_safe file mirror warning: %s", exc)
+
+
+def update_toolkit_state_atomic(mutator_fn: Callable[[Dict[str, Any]], Any]) -> Any:
+    """Atomically load, mutate, and persist the WordPress Toolkit state under a single re-entrant lock."""
+    with _TOOLKIT_STATE_LOCK:
+        state = load_toolkit_state_safe()
+        result = mutator_fn(state)
+        save_toolkit_state_safe(state)
+        return result
 
 
 def is_authorized_wp_database(
@@ -504,8 +515,101 @@ def delete_wp_path(
             logger.debug("delete_wp_path warning: %s", exc)
         return
     try:
-        if not _has_symlink_component(target, site_root) and target.exists() and target.is_file():
-            target.unlink()
+        if not _has_symlink_component(target, site_root) and target.exists():
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink()
+    except Exception:
+        pass
+
+
+def purge_wp_directory(
+    linux_user: str,
+    site_root: Path,
+    wp_dir: Path,
+    *,
+    recreate_empty_docroot: bool = True,
+) -> None:
+    """Completely delete a WordPress installation directory inside site_root via O_NOFOLLOW rm-site,
+    and optionally recreate an empty document_root with proper site ownership."""
+    resolved_root = site_root.resolve(strict=False)
+    resolved_wp = wp_dir.resolve(strict=False)
+    try:
+        rel_dir_path = resolved_wp.relative_to(resolved_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Đường dẫn thư mục cài đặt WordPress không thuộc phạm vi website.",
+        ) from exc
+    if not rel_dir_path.parts or ".." in rel_dir_path.parts:
+        raise HTTPException(
+            status_code=400,
+            detail="Từ chối xóa thư mục gốc ngoài phạm vi public_html của website.",
+        )
+    rel_dir = rel_dir_path.as_posix()
+
+    if not settings.command_dry_run:
+        res = shell.privileged(
+            "rm-site",
+            helper_args=[linux_user, str(site_root), str(wp_dir)],
+            fallback=["rm", "-rf", "--", str(wp_dir)],
+            check=False,
+        )
+        if getattr(res, "returncode", 0) != 0 and wp_dir.exists():
+            err_msg = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "rm-site failed").strip()[:220]
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể xóa sạch mã nguồn WordPress tại {rel_dir}: {err_msg}",
+            )
+        if recreate_empty_docroot:
+            shell.privileged(
+                "site-document-root-ensure",
+                helper_args=[linux_user, str(site_root), rel_dir],
+                fallback=["mkdir", "-p", str(wp_dir)],
+                check=False,
+            )
+        return
+
+    if _has_symlink_component(wp_dir, site_root):
+        raise HTTPException(
+            status_code=400,
+            detail="Phát hiện liên kết tượng trưng (symlink) không an toàn trong thư mục WordPress.",
+        )
+    if wp_dir.exists():
+        for child in list(wp_dir.iterdir()):
+            if child.is_symlink():
+                child.unlink(missing_ok=True)
+            elif child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        if not recreate_empty_docroot:
+            try:
+                wp_dir.rmdir()
+            except OSError:
+                shutil.rmtree(wp_dir, ignore_errors=True)
+    elif recreate_empty_docroot:
+        wp_dir.mkdir(parents=True, exist_ok=True)
+
+
+def purge_wp_snapshots_directory(linux_user: str, site_root: Path) -> None:
+    """Delete site_root/wp-snapshots safely when tearing down a root WordPress instance."""
+    snap_dir = site_root / "wp-snapshots"
+    if not settings.command_dry_run:
+        try:
+            shell.privileged(
+                "rm-site",
+                helper_args=[linux_user, str(site_root), str(snap_dir)],
+                fallback=["rm", "-rf", "--", str(snap_dir)],
+                check=False,
+            )
+        except Exception as exc:
+            logger.debug("purge_wp_snapshots_directory warning: %s", exc)
+        return
+    try:
+        if not _has_symlink_component(snap_dir, site_root) and snap_dir.exists():
+            shutil.rmtree(snap_dir, ignore_errors=True)
     except Exception:
         pass
 
@@ -1189,23 +1293,25 @@ def delete_live_snapshot(
     snapshot_id: Optional[str],
 ) -> str:
     snap_id = Path((snapshot_id or "").strip()).name
-    if snap_id and not settings.command_dry_run:
+    if snap_id:
         for fname in (snap_id, f"{snap_id}.sql"):
             snap_file = site_root / "wp-snapshots" / fname
-            try:
-                if snap_file.exists() and not snap_file.is_symlink():
-                    snap_file.unlink()
-            except Exception:
-                pass
-            try:
-                shell.privileged(
-                    "rm-site",
-                    helper_args=[linux_user, str(site_root), str(snap_file)],
-                    fallback=["rm", "-f", "--", str(snap_file)],
-                    check=False,
-                )
-            except Exception:
-                pass
+            if not settings.command_dry_run:
+                try:
+                    shell.privileged(
+                        "rm-site",
+                        helper_args=[linux_user, str(site_root), str(snap_file)],
+                        fallback=["rm", "-f", "--", str(snap_file)],
+                        check=False,
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    if not _has_symlink_component(snap_file, site_root) and snap_file.exists() and snap_file.is_file():
+                        snap_file.unlink()
+                except Exception:
+                    pass
     inst["snapshots"] = [s for s in (inst.get("snapshots") or []) if s.get("id") != snap_id]
     return snap_id
 
@@ -1628,3 +1734,479 @@ def apply_wp_password_protection(
             wp_dir,
             "wp-content/mu-plugins/spanel-password-protect.php",
         )
+    clear_nginx_fastcgi_cache()
+
+
+def clear_nginx_fastcgi_cache() -> None:
+    """Flush Nginx FastCGI page cache so visitor-facing mode/config changes take effect immediately."""
+    if settings.command_dry_run:
+        return
+    try:
+        shell.privileged(
+            "fastcgi-cache-clear",
+            fallback=["sh", "-c", "rm -rf /var/cache/nginx/spanel-fastcgi/* 2>/dev/null || true"],
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("clear_nginx_fastcgi_cache warning: %s", exc)
+
+
+def sync_wordpress_fastcgi_cache_vhost(domain: str, enabled: bool) -> bool:
+    """Enable or disable the SPANEL FASTCGI CACHE blocks in the website's Nginx vhost."""
+    if settings.command_dry_run:
+        return True
+    try:
+        target = nginx._vhost_path(domain)
+        if not target.exists():
+            return False
+        existing = target.read_text(encoding="utf-8")
+        new_content = nginx._replace_fastcgi_cache_blocks(existing, enabled=bool(enabled))
+        if new_content != existing:
+            nginx._write_backup(target, existing)
+            target.write_text(new_content, encoding="utf-8")
+            nginx._test_and_reload(target, existing)
+        if not enabled:
+            clear_nginx_fastcgi_cache()
+        return True
+    except Exception as exc:
+        logger.debug("sync_wordpress_fastcgi_cache_vhost(%s, %s) skipped: %s", domain, enabled, exc)
+        return False
+
+
+MAINTENANCE_BG_PRESETS: Dict[str, str] = {
+    "emerald_ocean": "linear-gradient(135deg, #064e3b 0%, #0f172a 55%, #022c22 100%)",
+    "midnight_nebula": "linear-gradient(135deg, #1e1b4b 0%, #0f172a 52%, #3b0764 100%)",
+    "warm_sunrise": "linear-gradient(135deg, #7c2d12 0%, #1e293b 55%, #0f172a 100%)",
+}
+MAX_MAINTENANCE_BG_BYTES = 5 * 1024 * 1024
+DEFAULT_MAINTENANCE_TITLE = "Website đang bảo trì nâng cấp"
+DEFAULT_MAINTENANCE_MESSAGE = "Website đang được bảo trì và nâng cấp định kỳ. Vui lòng quay lại sau ít phút!"
+
+
+def detect_safe_image_extension(raw_bytes: bytes) -> Optional[str]:
+    """Inspect magic bytes to confirm genuine raster image content (JPG, PNG, WEBP, GIF)."""
+    if not raw_bytes:
+        return None
+    if raw_bytes.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if len(raw_bytes) >= 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
+        return "webp"
+    if raw_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    return None
+
+
+def sanitize_maintenance_bg_url(raw_url: Optional[str]) -> str:
+    """Validate and normalize a maintenance background image URL (site-relative /... or https://...)."""
+    clean = (raw_url or "").strip()
+    if not clean:
+        return ""
+    if len(clean) > 500 or any(ord(ch) < 32 or ch in "'\"()\\;<>" for ch in clean):
+        raise HTTPException(
+            status_code=400,
+            detail="Đường dẫn hình nền bảo trì chứa ký tự không hợp lệ hoặc quá dài.",
+        )
+    if clean.startswith("/"):
+        if clean.startswith("//") or ".." in clean:
+            raise HTTPException(
+                status_code=400,
+                detail="Đường dẫn hình nền nội bộ không hợp lệ.",
+            )
+        return clean
+    if re.match(r"^https://[A-Za-z0-9.\-]+(?::\d{1,5})?(?:/[^\s]*)?$", clean):
+        return clean
+    raise HTTPException(
+        status_code=400,
+        detail="Đường dẫn hình nền bảo trì phải bắt đầu bằng https:// hoặc tải ảnh trực tiếp từ máy tính.",
+    )
+
+
+def maintenance_bypass_token_for_secret(secret_hex: str) -> str:
+    clean_secret = (secret_hex or "").strip()
+    if not clean_secret:
+        return ""
+    return hmac.new(clean_secret.encode("ascii", errors="ignore"), b"wp_maint_admin", hashlib.sha256).hexdigest()
+
+
+def ensure_maintenance_bypass_secret(inst: Dict[str, Any]) -> str:
+    existing = str(inst.get("maintenance_bypass_secret") or "").strip()
+    if re.fullmatch(r"^[0-9a-f]{32,64}$", existing):
+        return existing
+    fresh = secrets.token_hex(24)
+    inst["maintenance_bypass_secret"] = fresh
+    return fresh
+
+
+def remove_maintenance_background_image(
+    linux_user: str,
+    site_root: Path,
+    wp_dir: Path,
+    inst: Dict[str, Any],
+) -> None:
+    old_rel = str(inst.get("maintenance_bg_rel_path") or "").strip()
+    if old_rel and not (".." in old_rel or old_rel.startswith("/")):
+        delete_wp_path(linux_user, site_root, wp_dir, old_rel)
+    inst["maintenance_bg_rel_path"] = ""
+    inst["maintenance_bg_url"] = ""
+
+
+def install_maintenance_background_image(
+    linux_user: str,
+    site_root: Path,
+    wp_dir: Path,
+    subpath: str,
+    raw_bytes: bytes,
+    inst: Dict[str, Any],
+) -> Dict[str, str]:
+    """Validate magic bytes, stage securely, and install a maintenance background image into wp-content/maintenance-assets/."""
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Tệp ảnh tải lên đang rỗng.")
+    if len(raw_bytes) > MAX_MAINTENANCE_BG_BYTES:
+        raise HTTPException(status_code=400, detail="Kích thước ảnh nền vượt quá giới hạn tối đa 5 MB.")
+    ext = detect_safe_image_extension(raw_bytes)
+    if not ext:
+        raise HTTPException(
+            status_code=400,
+            detail="Định dạng ảnh không hợp lệ. Chỉ chấp nhận tệp ảnh thật JPG, PNG, WEBP hoặc GIF.",
+        )
+
+    fname = f"maintenance-bg-{secrets.token_hex(8)}.{ext}"
+    rel_inside_wp = f"wp-content/maintenance-assets/{fname}"
+    target_abs = wp_dir / rel_inside_wp
+    try:
+        rel_to_root = str(target_abs.relative_to(site_root)).replace("\\", "/")
+    except ValueError:
+        rel_to_root = f"public_html/{rel_inside_wp}"
+
+    if not settings.command_dry_run:
+        stage_dir = "/tmp" if os.name != "nt" and Path("/tmp").is_dir() else None
+        fd, tmp_upload_str = tempfile.mkstemp(prefix="spanel-upload-", suffix=f".{ext}", dir=stage_dir)
+        tmp_upload = Path(tmp_upload_str)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(raw_bytes)
+            os.chmod(tmp_upload, 0o600)
+            res = shell.privileged(
+                "site-file-install",
+                helper_args=[linux_user, str(site_root), rel_to_root, str(tmp_upload)],
+                fallback=[
+                    "sh",
+                    "-c",
+                    'mkdir -p "$(dirname "$2")" && cp -- "$1" "$2" && chmod 0644 "$2"',
+                    "sh",
+                    str(tmp_upload),
+                    str(target_abs),
+                ],
+                check=False,
+            )
+            if getattr(res, "returncode", 1) != 0:
+                err_msg = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "site-file-install failed").strip()[:220]
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Không thể lưu ảnh nền trang bảo trì: {err_msg}",
+                )
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                tmp_upload.unlink(missing_ok=True)
+            except OSError:
+                pass
+    else:
+        if not _has_symlink_component(target_abs, site_root):
+            target_abs.parent.mkdir(parents=True, exist_ok=True)
+            target_abs.write_bytes(raw_bytes)
+
+    old_rel = str(inst.get("maintenance_bg_rel_path") or "").strip()
+    if old_rel and old_rel != rel_inside_wp and not (".." in old_rel or old_rel.startswith("/")):
+        delete_wp_path(linux_user, site_root, wp_dir, old_rel)
+
+    clean_sub = (subpath or "").strip().strip("/")
+    url_prefix = f"/{clean_sub}" if clean_sub else ""
+    bg_url = f"{url_prefix}/{rel_inside_wp}"
+    inst["maintenance_bg_rel_path"] = rel_inside_wp
+    inst["maintenance_bg_url"] = bg_url
+    return {"bg_rel_path": rel_inside_wp, "bg_url": bg_url}
+
+
+def render_maintenance_dropin_php(
+    site_title: str,
+    title: str,
+    message: str,
+    bg_url: str = "",
+    bg_preset: str = "emerald_ocean",
+    overlay_opacity: int = 55,
+) -> str:
+    """Render wp-content/maintenance.php so WordPress Core serves an HTTP 503 page with the exact user-configured message & background."""
+    safe_site_title = html.escape((site_title or "Website").strip()[:160], quote=True)
+    safe_heading = html.escape((title or DEFAULT_MAINTENANCE_TITLE).strip()[:200], quote=True)
+    raw_msg = (message or DEFAULT_MAINTENANCE_MESSAGE).strip()[:2000]
+    safe_msg_html = "<br>\n".join(html.escape(line, quote=True) for line in raw_msg.splitlines()) or html.escape(
+        DEFAULT_MAINTENANCE_MESSAGE, quote=True
+    )
+
+    preset_css = MAINTENANCE_BG_PRESETS.get(bg_preset or "", MAINTENANCE_BG_PRESETS["emerald_ocean"])
+    safe_bg = sanitize_maintenance_bg_url(bg_url) if bg_url else ""
+    clamped_overlay = max(20, min(90, int(overlay_opacity if overlay_opacity is not None else 55)))
+    alpha_top = round(clamped_overlay / 100.0, 2)
+    alpha_bottom = round(min(0.95, (clamped_overlay + 12) / 100.0), 2)
+
+    if safe_bg:
+        body_bg_css = (
+            f"background-color: #0f172a;\n"
+            f"            background-image: linear-gradient(180deg, rgba(15, 23, 42, {alpha_top}) 0%, rgba(2, 6, 23, {alpha_bottom}) 100%), url('{safe_bg}');\n"
+            f"            background-size: cover;\n"
+            f"            background-position: center center;\n"
+            f"            background-repeat: no-repeat;\n"
+            f"            background-attachment: fixed;"
+        )
+    else:
+        body_bg_css = f"background: {preset_css};"
+
+    return (
+        "<?php\n"
+        "$protocol = (isset($_SERVER['SERVER_PROTOCOL']) && in_array($_SERVER['SERVER_PROTOCOL'], array('HTTP/1.1', 'HTTP/2', 'HTTP/2.0', 'HTTP/3'), true))\n"
+        "    ? $_SERVER['SERVER_PROTOCOL']\n"
+        "    : 'HTTP/1.0';\n"
+        "header(\"$protocol 503 Service Unavailable\", true, 503);\n"
+        "header('Content-Type: text/html; charset=utf-8');\n"
+        "header('Retry-After: 3600');\n"
+        "header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');\n"
+        "header('Pragma: no-cache');\n"
+        "?>\n"
+        "<!DOCTYPE html>\n"
+        "<html lang=\"vi\">\n"
+        "<head>\n"
+        "    <meta charset=\"utf-8\">\n"
+        "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "    <meta name=\"robots\" content=\"noindex, nofollow\">\n"
+        f"    <title>{safe_heading} — {safe_site_title}</title>\n"
+        "    <style>\n"
+        "        * { box-sizing: border-box; margin: 0; padding: 0; }\n"
+        "        body {\n"
+        "            min-height: 100vh;\n"
+        "            display: flex;\n"
+        "            align-items: center;\n"
+        "            justify-content: center;\n"
+        "            padding: 24px;\n"
+        "            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;\n"
+        "            color: #f8fafc;\n"
+        f"            {body_bg_css}\n"
+        "        }\n"
+        "        .maint-card {\n"
+        "            width: 100%;\n"
+        "            max-width: 640px;\n"
+        "            padding: 44px 40px;\n"
+        "            border-radius: 24px;\n"
+        "            background: rgba(15, 23, 42, 0.72);\n"
+        "            backdrop-filter: blur(18px);\n"
+        "            -webkit-backdrop-filter: blur(18px);\n"
+        "            border: 1px solid rgba(255, 255, 255, 0.16);\n"
+        "            box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.55);\n"
+        "            text-align: center;\n"
+        "        }\n"
+        "        .maint-badge {\n"
+        "            display: inline-flex;\n"
+        "            align-items: center;\n"
+        "            gap: 8px;\n"
+        "            padding: 6px 14px;\n"
+        "            border-radius: 999px;\n"
+        "            background: rgba(16, 185, 129, 0.18);\n"
+        "            border: 1px solid rgba(52, 211, 153, 0.35);\n"
+        "            color: #6ee7b7;\n"
+        "            font-size: 12px;\n"
+        "            font-weight: 700;\n"
+        "            letter-spacing: 0.06em;\n"
+        "            text-transform: uppercase;\n"
+        "            margin-bottom: 22px;\n"
+        "        }\n"
+        "        .maint-dot {\n"
+        "            width: 8px;\n"
+        "            height: 8px;\n"
+        "            border-radius: 50%;\n"
+        "            background: #34d399;\n"
+        "            box-shadow: 0 0 10px #34d399;\n"
+        "            animation: maintPulse 1.8s ease-in-out infinite;\n"
+        "        }\n"
+        "        @keyframes maintPulse {\n"
+        "            0%, 100% { opacity: 1; transform: scale(1); }\n"
+        "            50% { opacity: 0.45; transform: scale(0.85); }\n"
+        "        }\n"
+        "        h1 {\n"
+        "            font-size: clamp(24px, 4vw, 34px);\n"
+        "            font-weight: 800;\n"
+        "            line-height: 1.28;\n"
+        "            color: #ffffff;\n"
+        "            margin-bottom: 16px;\n"
+        "            letter-spacing: -0.02em;\n"
+        "        }\n"
+        "        .maint-message {\n"
+        "            font-size: 16px;\n"
+        "            line-height: 1.7;\n"
+        "            color: #cbd5e1;\n"
+        "            margin-bottom: 28px;\n"
+        "            word-break: break-word;\n"
+        "        }\n"
+        "        .maint-footer {\n"
+        "            padding-top: 20px;\n"
+        "            border-top: 1px solid rgba(255, 255, 255, 0.1);\n"
+        "            font-size: 13px;\n"
+        "            color: #94a3b8;\n"
+        "        }\n"
+        "        @media (max-width: 480px) {\n"
+        "            .maint-card { padding: 32px 24px; border-radius: 20px; }\n"
+        "        }\n"
+        "    </style>\n"
+        "</head>\n"
+        "<body>\n"
+        "    <main class=\"maint-card\" role=\"main\">\n"
+        "        <div class=\"maint-badge\"><span class=\"maint-dot\"></span>Đang bảo trì hệ thống</div>\n"
+        f"        <h1>{safe_heading}</h1>\n"
+        f"        <div class=\"maint-message\">{safe_msg_html}</div>\n"
+        f"        <div class=\"maint-footer\">&copy; <?php echo gmdate('Y'); ?> {safe_site_title}</div>\n"
+        "    </main>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def render_maintenance_flag_php(bypass_sig: str) -> str:
+    """Render .maintenance with dynamic time() so it never auto-expires after 10 minutes,
+    while allowing verified 1-Click SSO / admin HMAC cookie / wp-login.php through."""
+    safe_sig = re.sub(r"[^0-9a-f]", "", (bypass_sig or "").lower())
+    return (
+        "<?php\n"
+        "// Managed by SPanel WordPress Manager\n"
+        "$__spanel_bypass = false;\n"
+        f"if ('{safe_sig}' !== '' && isset($_COOKIE['spanel_maint_bypass']) && is_string($_COOKIE['spanel_maint_bypass']) && hash_equals('{safe_sig}', $_COOKIE['spanel_maint_bypass'])) {{\n"
+        "    $__spanel_bypass = true;\n"
+        "} elseif (isset($_GET['spanel_sso']) && is_string($_GET['spanel_sso']) && is_file(__DIR__ . '/wp-content/mu-plugins/spanel-sso-login.php')) {\n"
+        "    $__spanel_bypass = true;\n"
+        "} elseif (isset($_SERVER['SCRIPT_NAME']) && strpos((string)$_SERVER['SCRIPT_NAME'], 'wp-login.php') !== false) {\n"
+        "    $__spanel_bypass = true;\n"
+        "}\n"
+        "$upgrading = $__spanel_bypass ? 0 : time();\n"
+    )
+
+
+def render_maintenance_bypass_mu_plugin_php(bypass_sig: str) -> str:
+    """Grant and revoke the HMAC maintenance bypass cookie automatically for authenticated WP administrators."""
+    safe_sig = re.sub(r"[^0-9a-f]", "", (bypass_sig or "").lower())
+    return (
+        "<?php\n"
+        "/**\n"
+        " * Plugin Name: SPanel Maintenance Admin Bypass\n"
+        " * Description: Allows authenticated WordPress administrators to access wp-admin and preview the site while Maintenance Mode is active.\n"
+        " */\n"
+        "if (defined('WP_CLI') && WP_CLI) { return; }\n"
+        "add_action('wp_login', function($user_login, $user) {\n"
+        "    if (is_object($user) && function_exists('user_can') && user_can($user, 'manage_options')) {\n"
+        f"        @setcookie('spanel_maint_bypass', '{safe_sig}', time() + 43200, '/', '', is_ssl(), true);\n"
+        "    }\n"
+        "}, 10, 2);\n"
+        "add_action('init', function() {\n"
+        "    if (function_exists('is_user_logged_in') && is_user_logged_in() && function_exists('current_user_can') && current_user_can('manage_options')) {\n"
+        f"        if (!isset($_COOKIE['spanel_maint_bypass']) || $_COOKIE['spanel_maint_bypass'] !== '{safe_sig}') {{\n"
+        f"            @setcookie('spanel_maint_bypass', '{safe_sig}', time() + 43200, '/', '', is_ssl(), true);\n"
+        "        }\n"
+        "    }\n"
+        "}, 1);\n"
+        "add_action('wp_logout', function() {\n"
+        "    @setcookie('spanel_maint_bypass', '', time() - 3600, '/', '', is_ssl(), true);\n"
+        "});\n"
+    )
+
+
+def apply_wp_maintenance_mode(
+    linux_user: str,
+    site_root: Path,
+    wp_dir: Path,
+    *,
+    php_ver: str,
+    site_title: str,
+    inst: Dict[str, Any],
+    enabled: Optional[bool] = None,
+    title: Optional[str] = None,
+    message: Optional[str] = None,
+    bg_url: Optional[str] = None,
+    bg_preset: Optional[str] = None,
+    overlay_opacity: Optional[int] = None,
+) -> None:
+    """Persist maintenance configuration, render wp-content/maintenance.php, toggle .maintenance, and flush Nginx FastCGI cache."""
+    if title is not None:
+        clean_title = title.strip()[:200]
+        inst["maintenance_title"] = clean_title or DEFAULT_MAINTENANCE_TITLE
+    elif not inst.get("maintenance_title"):
+        inst["maintenance_title"] = DEFAULT_MAINTENANCE_TITLE
+
+    if message is not None:
+        clean_msg = message.strip()[:2000]
+        inst["maintenance_message"] = clean_msg or DEFAULT_MAINTENANCE_MESSAGE
+    elif not inst.get("maintenance_message"):
+        inst["maintenance_message"] = DEFAULT_MAINTENANCE_MESSAGE
+
+    if bg_preset is not None:
+        inst["maintenance_bg_preset"] = (
+            bg_preset if bg_preset in MAINTENANCE_BG_PRESETS else "emerald_ocean"
+        )
+    elif inst.get("maintenance_bg_preset") not in MAINTENANCE_BG_PRESETS:
+        inst["maintenance_bg_preset"] = "emerald_ocean"
+
+    if overlay_opacity is not None:
+        inst["maintenance_bg_overlay"] = max(20, min(90, int(overlay_opacity)))
+    elif inst.get("maintenance_bg_overlay") is None:
+        inst["maintenance_bg_overlay"] = 55
+
+    if bg_url is not None:
+        sanitized_url = sanitize_maintenance_bg_url(bg_url)
+        old_rel = str(inst.get("maintenance_bg_rel_path") or "").strip()
+        # If the user cleared bg_url or switched to an external https:// URL, clean up any old uploaded file
+        if old_rel and (not sanitized_url or sanitized_url.startswith("https://")):
+            if not (".." in old_rel or old_rel.startswith("/")):
+                delete_wp_path(linux_user, site_root, wp_dir, old_rel)
+            inst["maintenance_bg_rel_path"] = ""
+        inst["maintenance_bg_url"] = sanitized_url
+
+    toggles = inst.setdefault("toggles", {})
+    if enabled is not None:
+        toggles["maintenance_mode"] = bool(enabled)
+    is_active = bool(toggles.get("maintenance_mode", False))
+
+    secret = ensure_maintenance_bypass_secret(inst)
+    bypass_sig = maintenance_bypass_token_for_secret(secret)
+
+    dropin_php = render_maintenance_dropin_php(
+        site_title=site_title or inst.get("site_title") or "Website",
+        title=inst.get("maintenance_title") or DEFAULT_MAINTENANCE_TITLE,
+        message=inst.get("maintenance_message") or DEFAULT_MAINTENANCE_MESSAGE,
+        bg_url=inst.get("maintenance_bg_url") or "",
+        bg_preset=inst.get("maintenance_bg_preset") or "emerald_ocean",
+        overlay_opacity=int(inst.get("maintenance_bg_overlay") or 55),
+    )
+    write_wp_file_text(linux_user, site_root, wp_dir, "wp-content/maintenance.php", dropin_php, "0644")
+
+    if is_active:
+        mu_bypass = render_maintenance_bypass_mu_plugin_php(bypass_sig)
+        write_wp_file_text(
+            linux_user,
+            site_root,
+            wp_dir,
+            "wp-content/mu-plugins/spanel-maintenance-bypass.php",
+            mu_bypass,
+            "0640",
+        )
+        maint_flag = render_maintenance_flag_php(bypass_sig)
+        write_wp_file_text(linux_user, site_root, wp_dir, ".maintenance", maint_flag, "0644")
+    else:
+        delete_wp_path(linux_user, site_root, wp_dir, ".maintenance")
+        delete_wp_path(linux_user, site_root, wp_dir, "wp-content/mu-plugins/spanel-maintenance-bypass.php")
+        run_wp_cli(linux_user, php_ver, wp_dir, ["maintenance-mode", "deactivate"])
+
+    clear_nginx_fastcgi_cache()
+
