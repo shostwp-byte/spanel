@@ -22,8 +22,8 @@ from app.core.config import settings
 from app.core.database import engine, get_db
 from app.core.permissions import Role, is_admin_role, normalize_role
 from app.core.secrets import decrypt, encrypt
-from app.models.entities import DatabaseAccount, User, Website
-from app.services import cron, mariadb, nginx, site_users, wordpress_live
+from app.models.entities import DatabaseAccount, SiteApp, User, Website
+from app.services import cron, mariadb, nginx, php, site_users, teardown, wordpress_live
 from app.services.shell import shell
 
 _LARAVEL_ACCESS_ROLE_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -506,32 +506,123 @@ def _php_cli_for_version(php_version: str) -> str:
     return "php"
 
 
+def _short_cmd_err(output: str, fallback: str = "Lệnh thực thi trả về mã lỗi khác 0.") -> str:
+    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", (output or "")).strip()
+    if not cleaned:
+        return fallback
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    tail = " | ".join(lines[-4:]) if lines else cleaned
+    return tail[-420:]
+
+
+def _purge_app_dir_contents(
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+) -> None:
+    """Safely remove files inside `app_dir` via helper `rm-site` (`delete_no_follow`) and
+    re-ensure an empty `public_html` directory when `app_dir` is `site_root / 'public_html'`."""
+    try:
+        rel_dir = str(app_dir.relative_to(site_root)).replace("\\", "/").strip("/")
+    except ValueError:
+        return
+    if not rel_dir or ".." in rel_dir.split("/"):
+        return
+
+    if not settings.command_dry_run:
+        shell.privileged(
+            "rm-site",
+            helper_args=[linux_user, str(site_root), str(app_dir)],
+            check=False,
+        )
+        shell.privileged(
+            "site-document-root-ensure",
+            helper_args=[linux_user, str(site_root), rel_dir],
+            check=False,
+        )
+        return
+
+    if wordpress_live._has_symlink_component(app_dir, site_root) or app_dir.is_symlink():
+        return
+    if not app_dir.exists() or not app_dir.is_dir():
+        return
+
+    def _clean_dir_no_symlink(d: Path) -> None:
+        for child in list(d.iterdir()):
+            if child.is_symlink():
+                continue
+            if child.is_dir():
+                _clean_dir_no_symlink(child)
+                try:
+                    os.rmdir(child)
+                except OSError:
+                    pass
+            else:
+                try:
+                    os.remove(child)
+                except OSError:
+                    pass
+
+    _clean_dir_no_symlink(app_dir)
+
+
+def _extract_php_version_hint(token: str) -> Optional[str]:
+    base = Path(token or "").name
+    m = re.fullmatch(r"php(\d\.\d)", base)
+    return m.group(1) if m else None
+
+
 def _run_as_site_user(
     linux_user: str,
     app_dir: Path,
     cmd_args: List[str],
     *,
-    timeout: int = 120,
+    php_version: Optional[str] = None,
+    timeout: int = 180,
 ) -> tuple[int, str]:
-    """Execute a command list inside `app_dir` as `linux_user` safely."""
-    quoted_cmd = " ".join(shlex.quote(str(a)) for a in cmd_args)
-    inner = f"cd {shlex.quote(str(app_dir))} && {quoted_cmd}"
+    """Execute a whitelisted command (`artisan`, `composer`, `php`, `git`) inside `app_dir`
+    as `linux_user` via SPanel's mount-namespaced `terminal-exec` helper verb."""
+    if not cmd_args:
+        return 1, "Empty command argument list"
+
+    bounded_timeout = max(5, min(1800, int(timeout or 180)))
+    normalized = [str(a) for a in cmd_args]
+    resolved_php = (php_version or "").strip()
+
+    first_hint = _extract_php_version_hint(normalized[0])
+    if first_hint and not resolved_php:
+        resolved_php = first_hint
+
+    first_base = Path(normalized[0]).name
+    if first_base.startswith("php"):
+        if len(normalized) >= 2 and normalized[1] == "artisan":
+            normalized = ["artisan", *normalized[2:]]
+        else:
+            normalized = ["php", *normalized[1:]]
+
+    quoted_cmd = " ".join(shlex.quote(a) for a in normalized)
     if settings.command_dry_run:
-        return 0, f"[DRY-RUN] $ {quoted_cmd}\nOK"
+        return 0, f"[DRY-RUN] $ {quoted_cmd}"
+
+    helper_args: List[str] = [
+        linux_user,
+        str(app_dir),
+        f"--timeout={bounded_timeout}",
+    ]
+    if resolved_php and re.fullmatch(r"\d\.\d", resolved_php):
+        helper_args.append(f"--php-version={resolved_php}")
+    helper_args.extend(normalized)
+
     try:
         res = shell.privileged(
-            "run-as-user",
-            helper_args=[linux_user],
-            input=inner,
-            fallback=[
-                "bash",
-                "-lc",
-                f"su -s /bin/bash {shlex.quote(linux_user)} -c {shlex.quote(inner)}",
-            ],
+            "terminal-exec",
+            helper_args=helper_args,
             check=False,
+            timeout=bounded_timeout + 15,
         )
         out = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
-        return int(res.returncode or 0), out
+        rc = res.returncode if res.returncode is not None else 1
+        return int(rc), out
     except Exception as exc:
         return 1, str(exc)
 
@@ -718,95 +809,7 @@ def _update_env_text(env_text: str, updates: Dict[str, Any]) -> str:
     return "\n".join(out_lines).rstrip() + "\n"
 
 
-# ── Composer & Project Scaffolding ───────────────────────────────────────────
-
-def _scaffold_laravel_skeleton(
-    linux_user: str,
-    site_root: Path,
-    app_dir: Path,
-    site_domain: str,
-    laravel_version: str = "11.x",
-) -> None:
-    """Ensure core Laravel project structure (`artisan`, `composer.json`, `public/index.php`,
-    `storage/logs/laravel.log`) exists when Composer create-project is unavailable or in dry-run."""
-    if not _app_path_exists(app_dir, "composer.json", linux_user, site_root):
-        composer_json = {
-            "name": "laravel/laravel",
-            "type": "project",
-            "description": f"The skeleton application for {site_domain} managed by SPanel.",
-            "keywords": ["laravel", "framework"],
-            "license": "MIT",
-            "require": {
-                "php": "^8.2",
-                "laravel/framework": "^11.0" if "11" in laravel_version else "^10.0",
-                "laravel/sanctum": "^4.0",
-                "laravel/tinker": "^2.9",
-            },
-            "require-dev": {
-                "fakerphp/faker": "^1.23",
-                "laravel/pint": "^1.13",
-                "nunomaduro/collision": "^8.0",
-                "phpunit/phpunit": "^11.0.1",
-            },
-        }
-        _write_app_file(
-            linux_user,
-            site_root,
-            app_dir,
-            "composer.json",
-            json.dumps(composer_json, indent=4, ensure_ascii=False) + "\n",
-            "0644",
-        )
-
-    if not _app_path_exists(app_dir, "artisan", linux_user, site_root):
-        artisan_code = (
-            "#!/usr/bin/env php\n"
-            "<?php\n"
-            "// SPanel Managed Laravel Artisan Bootstrap\n"
-            "define('LARAVEL_START', microtime(true));\n"
-            "if (file_exists(__DIR__.'/vendor/autoload.php')) {\n"
-            "    require __DIR__.'/vendor/autoload.php';\n"
-            "    $app = require_once __DIR__.'/bootstrap/app.php';\n"
-            "    exit(0);\n"
-            "}\n"
-            "$cmd = $argv[1] ?? 'list';\n"
-            "echo \"Laravel Framework 11.42.0 - Executed artisan {$cmd} successfully.\\n\";\n"
-            "exit(0);\n"
-        )
-        _write_app_file(linux_user, site_root, app_dir, "artisan", artisan_code, "0755")
-
-    if not _app_path_exists(app_dir, "public/index.php", linux_user, site_root):
-        index_php = (
-            "<?php\n"
-            "define('LARAVEL_START', microtime(true));\n"
-            "if (file_exists($maintenance = __DIR__.'/../storage/framework/maintenance.php')) {\n"
-            "    require $maintenance;\n"
-            "}\n"
-            "if (file_exists(__DIR__.'/../vendor/autoload.php')) {\n"
-            "    require __DIR__.'/../vendor/autoload.php';\n"
-            "    $app = require_once __DIR__.'/../bootstrap/app.php';\n"
-            "    $app->handleRequest(Illuminate\\Http\\Request::capture());\n"
-            "    exit;\n"
-            "}\n"
-            "?>\n"
-            "<!DOCTYPE html><html lang='vi'><head><meta charset='utf-8'>"
-            f"<title>{site_domain} — Laravel Application</title></head>"
-            "<body style='font-family:system-ui,sans-serif;padding:48px;text-align:center'>"
-            f"<h1>Laravel {laravel_version} Ready on {site_domain}</h1>"
-            "<p>Managed by SPanel Laravel Manager (/public Document Root active).</p>"
-            "</body></html>\n"
-        )
-        _write_app_file(linux_user, site_root, app_dir, "public/index.php", index_php, "0644")
-
-    if not _app_path_exists(app_dir, "storage/logs/laravel.log", linux_user, site_root):
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        init_log = (
-            f"[{now_str}] production.INFO: SPanel Laravel Manager initialized application for {site_domain}. {{}}\n"
-        )
-        _write_app_file(
-            linux_user, site_root, app_dir, "storage/logs/laravel.log", init_log, "0644"
-        )
-
+# ── Composer Metadata Detection ──────────────────────────────────────────────
 
 def _detect_composer_metadata(
     app_dir: Path,
@@ -1049,21 +1052,6 @@ def _build_instance_summary(
     clean_sub = f"/{subpath.strip('/')}" if subpath.strip("/") else ""
     doc_root_rel = site.document_root or "public_html/public"
 
-    default_logs = [
-        {
-            "cmd": f"php{site.php_version or '8.3'} artisan migrate --force",
-            "output": "INFO  Nothing to migrate.",
-            "status": "ok",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-        {
-            "cmd": f"php{site.php_version or '8.3'} artisan optimize:clear",
-            "output": "[OK] config, route, view, cache, event cleared.",
-            "status": "ok",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
-    ]
-
     return {
         "id": site.id,
         "website_id": site.id,
@@ -1083,7 +1071,7 @@ def _build_instance_summary(
         "app_env": env_info["app_env"] if env_text else (saved.get("app_env") or "production"),
         "app_debug": bool(env_info["app_debug"]) if env_text else bool(saved.get("app_debug", False)),
         "app_url": env_info["app_url"] or f"{url_scheme}://{site.domain}{clean_sub}",
-        "app_key_set": bool(env_info["app_key"]) or bool(saved.get("app_key_set", True)),
+        "app_key_set": bool(env_info["app_key"]) or bool(saved.get("app_key_set", False)),
         "laravel_version": comp_meta["laravel_version"],
         "composer_version": comp_meta["composer_version"],
         "cache_driver": env_info["cache_driver"],
@@ -1107,7 +1095,7 @@ def _build_instance_summary(
         "packages": comp_meta["packages"],
         "packages_count": len(comp_meta["packages"]),
         "failed_jobs": list(saved.get("failed_jobs") or []),
-        "last_artisan_logs": list(saved.get("last_artisan_logs") or default_logs),
+        "last_artisan_logs": list(saved.get("last_artisan_logs") or []),
         "security_status": security_status,
         "security_passed": passed_count,
         "security_total": len(sec_checks),
@@ -1493,6 +1481,13 @@ def install_laravel_instance(
     except Exception as exc:
         logger.warning("ensure_site_runtime warning on Laravel install: %s", exc)
 
+    orig_app_type = site.app_type
+    orig_php_version = site.php_version
+    orig_linux_user = site.linux_user
+    orig_root_path = site.root_path
+    orig_document_root = site.document_root
+    orig_rewrite_mode = site.nginx_rewrite_mode
+
     subpath_clean = (payload.subpath or "").strip("/")
     new_docroot = f"public_html/{subpath_clean}/public" if subpath_clean else "public_html/public"
     site.app_type = "php"
@@ -1504,6 +1499,8 @@ def install_laravel_instance(
 
     # Provision or bind MySQL Database
     db_acc: Optional[DatabaseAccount] = None
+    created_new_db_acc: Optional[DatabaseAccount] = None
+    prev_existing_db_website_id: Optional[int] = None
     if payload.db_mode == "existing" and existing_check is not None:
         try:
             stored_db_pass = decrypt(existing_check.db_password)
@@ -1526,6 +1523,7 @@ def install_laravel_instance(
             "db_user": existing_check.db_user,
             "db_password": stored_db_pass,
         }
+        prev_existing_db_website_id = existing_check.website_id
         existing_check.website_id = site.id
         db_acc = existing_check
     else:
@@ -1533,22 +1531,11 @@ def install_laravel_instance(
         try:
             db_info = mariadb.create_database(seed, prefix="lv")
         except Exception as exc:
-            logger.warning("Auto database creation fallback on Laravel install: %s", exc)
-            fallback_name = mariadb.safe_db_identifier(seed, "lv")
-            db_info = {
-                "db_name": fallback_name,
-                "db_user": mariadb.safe_db_identifier(fallback_name, "u"),
-                "db_password": mariadb.random_password(20),
-            }
-            try:
-                mariadb.create_database_credentials(
-                    db_info["db_name"],
-                    db_info["db_user"],
-                    db_info["db_password"],
-                    allow_existing_user=False,
-                )
-            except Exception:
-                pass
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể khởi tạo cơ sở dữ liệu MySQL cho dự án Laravel: {exc}",
+            ) from exc
 
         existing_acc = (
             db.query(DatabaseAccount)
@@ -1569,26 +1556,73 @@ def install_laravel_instance(
                 db_password=encrypt(db_info["db_password"]),
             )
             db.add(db_acc)
+            created_new_db_acc = db_acc
 
     db.commit()
 
-    # Remove default placeholder index.html safely via helper (never as panel user across symlinks)
+    def _rollback_failed_install(*, purge_files: bool = False) -> None:
+        if purge_files:
+            try:
+                _purge_app_dir_contents(linux_user, site_root, app_dir)
+            except Exception as purge_exc:
+                logger.warning("Failed to purge partial Laravel install dir: %s", purge_exc)
+        if created_new_db_acc is not None:
+            try:
+                teardown.drop_database_record(db, created_new_db_acc)
+            except Exception as db_exc:
+                logger.warning("Failed to rollback auto-created Laravel DB: %s", db_exc)
+        elif existing_check is not None:
+            existing_check.website_id = prev_existing_db_website_id
+        site.app_type = orig_app_type
+        site.php_version = orig_php_version
+        site.linux_user = orig_linux_user
+        site.root_path = orig_root_path
+        site.document_root = orig_document_root
+        site.nginx_rewrite_mode = orig_rewrite_mode
+        db.commit()
+
+    # Remove default placeholder files safely via helper (never as panel user across symlinks)
     _delete_app_file(linux_user, site_root, app_dir, "index.html")
+    _delete_app_file(linux_user, site_root, app_dir, ".htaccess")
 
     php_cli = _php_cli_for_version(php_ver)
     install_logs: List[Dict[str, Any]] = []
+    git_commit_sha = ""
 
     if payload.install_source == "git" and payload.git_repo:
+        clean_branch = (payload.git_branch or "main").strip()
+        clean_repo = payload.git_repo.strip()
         rc, out = _run_as_site_user(
             linux_user,
             app_dir,
-            ["git", "clone", "-b", payload.git_branch or "main", payload.git_repo.strip(), "."],
+            [
+                "git",
+                "-c",
+                "credential.interactive=never",
+                "-c",
+                "core.askPass=",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                clean_branch,
+                clean_repo,
+                ".",
+            ],
+            php_version=php_ver,
+            timeout=300,
         )
+        if rc != 0:
+            _rollback_failed_install(purge_files=False)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Không thể clone Git repository ({clean_repo}): {_short_cmd_err(out)}",
+            )
         install_logs.append(
             {
-                "cmd": f"git clone -b {payload.git_branch or 'main'} {payload.git_repo.strip()} .",
+                "cmd": f"git clone --depth 1 -b {clean_branch} {clean_repo} .",
                 "output": out or "Cloned repository.",
-                "status": "ok" if rc == 0 else "error",
+                "status": "ok",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -1596,19 +1630,40 @@ def install_laravel_instance(
             linux_user,
             app_dir,
             ["composer", "install", "--no-dev", "--optimize-autoloader", "--no-interaction"],
+            php_version=php_ver,
+            timeout=600,
         )
+        if rc2 != 0:
+            _rollback_failed_install(purge_files=True)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Lỗi chạy `composer install` sau khi clone Git: {_short_cmd_err(out2)}",
+            )
         install_logs.append(
             {
                 "cmd": "composer install --no-dev --optimize-autoloader",
                 "output": out2 or "Composer dependencies installed.",
-                "status": "ok" if rc2 == 0 else "error",
+                "status": "ok",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
-    else:
-        ver_constraint = "^11.0" if "11" in (payload.laravel_version or "11.x") else (
-            "^10.0" if "10" in (payload.laravel_version or "") else "^11.0"
+        rc_sha, sha_out = _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["git", "rev-parse", "--short", "HEAD"],
+            php_version=php_ver,
+            timeout=30,
         )
+        if rc_sha == 0 and sha_out and not sha_out.startswith("[DRY-RUN]"):
+            git_commit_sha = sha_out.splitlines()[-1].strip()[:16]
+    else:
+        raw_lv_ver = (payload.laravel_version or "11.x").strip()
+        if "12" in raw_lv_ver:
+            ver_constraint = "^12.0"
+        elif "10" in raw_lv_ver:
+            ver_constraint = "^10.0"
+        else:
+            ver_constraint = "^11.0"
         rc, out = _run_as_site_user(
             linux_user,
             app_dir,
@@ -1616,25 +1671,37 @@ def install_laravel_instance(
                 "composer",
                 "create-project",
                 "--prefer-dist",
+                "--no-interaction",
                 "laravel/laravel",
                 ".",
                 ver_constraint,
-                "--no-interaction",
             ],
+            php_version=php_ver,
+            timeout=600,
         )
+        if rc != 0:
+            _rollback_failed_install(purge_files=True)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Lỗi cài đặt Laravel qua Composer ({ver_constraint}): {_short_cmd_err(out)}",
+            )
         install_logs.append(
             {
                 "cmd": f"composer create-project --prefer-dist laravel/laravel . {ver_constraint}",
-                "output": out or f"Created Laravel {payload.laravel_version} project.",
-                "status": "ok" if rc == 0 else "error",
+                "output": out or f"Created Laravel {raw_lv_ver} project.",
+                "status": "ok",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
 
-    # Ensure core skeleton files exist (also covers dry-run & offline environments)
-    _scaffold_laravel_skeleton(
-        linux_user, site_root, app_dir, site.domain, payload.laravel_version or "11.x"
-    )
+    if not settings.command_dry_run and not _app_path_exists(
+        app_dir, "artisan", linux_user, site_root
+    ):
+        _rollback_failed_install(purge_files=True)
+        raise HTTPException(
+            status_code=502,
+            detail="Mã nguồn vừa tải về không chứa tệp `artisan` hợp lệ của Laravel. Đã hoàn tác cài đặt.",
+        )
 
     url_scheme = "https" if site.ssl_enabled else "http"
     app_url = f"{url_scheme}://{site.domain}{('/' + subpath_clean) if subpath_clean else ''}"
@@ -1654,13 +1721,38 @@ def install_laravel_instance(
     )
     _write_app_file(linux_user, site_root, app_dir, ".env", env_content, "0640")
 
-    # Run post-install Artisan commands
+    # Generate canonical APP_KEY via real Artisan when live, then link storage & migrate
+    rc_key, out_key = _run_as_site_user(
+        linux_user,
+        app_dir,
+        ["artisan", "key:generate", "--force", "--no-interaction"],
+        php_version=php_ver,
+        timeout=60,
+    )
+    if rc_key != 0:
+        _rollback_failed_install(purge_files=True)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Không thể khởi tạo khóa ứng dụng (`artisan key:generate`): {_short_cmd_err(out_key)}",
+        )
+    live_env_after_key = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
+    if live_env_after_key:
+        parsed_after_key = _parse_env_details(live_env_after_key)
+        if parsed_after_key.get("app_key"):
+            generated_key = parsed_after_key["app_key"]
+
     for art_cmd in (["storage:link", "--no-interaction"], ["migrate", "--force", "--no-interaction"]):
-        rc_a, out_a = _run_as_site_user(linux_user, app_dir, [php_cli, "artisan", *art_cmd])
+        rc_a, out_a = _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["artisan", *art_cmd],
+            php_version=php_ver,
+            timeout=180,
+        )
         install_logs.append(
             {
-                "cmd": f"{php_cli} artisan {' '.join(art_cmd)}",
-                "output": out_a or "INFO  Completed successfully.",
+                "cmd": f"{Path(php_cli).name} artisan {' '.join(art_cmd)}",
+                "output": out_a or ("OK" if rc_a == 0 else "Command failed"),
                 "status": "ok" if rc_a == 0 else "error",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -1707,6 +1799,7 @@ def install_laravel_instance(
         "db_user": db_info["db_user"],
         "git_repo": payload.git_repo.strip() if payload.install_source == "git" else "",
         "git_branch": payload.git_branch or "main",
+        "git_commit": git_commit_sha,
         "storage_linked": True,
         "scheduler_enabled": bool(payload.enable_scheduler),
         "queue_worker": {
@@ -1761,9 +1854,11 @@ def run_artisan_command(
     inst_key = str(site.id)
     saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
     linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
-    php_cli = _php_cli_for_version(site.php_version or "8.3")
+    php_ver = (site.php_version or "8.3").strip()
+    php_cli = _php_cli_for_version(php_ver)
 
     art_args = list(ALLOWED_ARTISAN_COMMANDS[cmd_key])
+    secret = ""
     if cmd_key == "down":
         secret = (payload.maintenance_secret or "").strip()
         if secret:
@@ -1773,63 +1868,97 @@ def run_artisan_command(
                     detail="Mã bí mật Bypass Bảo trì chỉ được chứa chữ, số, gạch ngang (4-64 ký tự).",
                 )
             art_args.append(f"--secret={secret}")
-            saved["maintenance_secret"] = secret
-        saved["maintenance_mode"] = True
-        _write_app_file(
-            linux_user,
-            site_root,
-            app_dir,
-            "storage/framework/down",
-            json.dumps({"time": int(datetime.now(timezone.utc).timestamp()), "secret": secret}),
-            "0644",
-        )
-    elif cmd_key == "up":
-        saved["maintenance_mode"] = False
-        _delete_app_file(linux_user, site_root, app_dir, "storage/framework/down")
-    elif cmd_key == "storage:link":
-        saved["storage_linked"] = True
-    elif cmd_key == "key:generate":
+
+    was_down_on_disk = (
+        _app_path_exists(app_dir, "storage/framework/down", linux_user, site_root)
+        or _app_path_exists(app_dir, "storage/framework/maintenance.php", linux_user, site_root)
+        or bool(saved.get("maintenance_mode", False))
+    )
+
+    if cmd_key == "key:generate":
         env_text = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
-        new_key = _generate_laravel_app_key()
-        updated_env = _update_env_text(env_text, {"APP_KEY": new_key})
-        _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
-        saved["app_key_set"] = True
-    elif cmd_key in {"queue:flush", "queue:retry"}:
-        saved["failed_jobs"] = []
+        if not env_text:
+            url_scheme = "https" if site.ssl_enabled else "http"
+            env_text = _render_default_env(
+                app_name=saved.get("app_name") or site.domain,
+                app_url=f"{url_scheme}://{site.domain}",
+                db_name=saved.get("db_name") or "",
+                db_user=saved.get("db_user") or "",
+                db_password="",
+            )
+            _write_app_file(linux_user, site_root, app_dir, ".env", env_text, "0640")
+        elif settings.command_dry_run:
+            updated_env = _update_env_text(env_text, {"APP_KEY": _generate_laravel_app_key()})
+            _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
 
-    rc, out = _run_as_site_user(linux_user, app_dir, [php_cli, "artisan", *art_args])
-    friendly_defaults = {
-        "migrate": "INFO  Nothing to migrate.",
-        "migrate:status": "Migration table created & all migrations Ran [Batch 1].",
-        "optimize": "INFO  Caching framework bootstrap, configuration, events, routes, and views.",
-        "optimize:clear": "[OK] config, route, view, cache, event cleared.",
-        "config:cache": "INFO  Configuration cached successfully.",
-        "config:clear": "INFO  Configuration cache cleared successfully.",
-        "route:cache": "INFO  Routes cached successfully.",
-        "route:clear": "INFO  Route cache cleared successfully.",
-        "view:cache": "INFO  Blade templates cached successfully.",
-        "view:clear": "INFO  Compiled views cleared successfully.",
-        "cache:clear": "INFO  Application cache cleared successfully.",
-        "storage:link": "INFO  The [public/storage] link has been connected to [storage/app/public].",
-        "queue:restart": "INFO  Broadcasting queue restart signal.",
-        "queue:retry": "INFO  All failed queue jobs pushed back onto the queue.",
-        "queue:flush": "INFO  All failed queue jobs deleted from failed_jobs table.",
-        "schedule:run": "INFO  Running scheduled tasks... No scheduled commands are ready to run.",
-        "key:generate": "INFO  Application key set successfully.",
-        "down": "INFO  Application is now in maintenance mode.",
-        "up": "INFO  Application is now live.",
-    }
-    if settings.command_dry_run or not out or "DRY-RUN" in out:
-        out = friendly_defaults.get(cmd_key, f"INFO  Executed artisan {cmd_key} successfully.")
-
+    rc, out = _run_as_site_user(
+        linux_user,
+        app_dir,
+        ["artisan", *art_args],
+        php_version=php_ver,
+        timeout=180,
+    )
     cmd_display = f"{Path(php_cli).name} artisan {' '.join(art_args)}"
-    _append_artisan_log(saved, cmd_display, out, ok=(rc == 0))
+
+    if cmd_key == "up":
+        # Always attempt safe helper deletion of leftover maintenance files so a broken
+        # vendor autoloader cannot permanently trap the site in HTTP 503.
+        del_down_ok = _delete_app_file(
+            linux_user, site_root, app_dir, "storage/framework/down", strict=False
+        )
+        _delete_app_file(
+            linux_user, site_root, app_dir, "storage/framework/maintenance.php", strict=False
+        )
+        still_down = _app_path_exists(
+            app_dir, "storage/framework/down", linux_user, site_root
+        ) or _app_path_exists(
+            app_dir, "storage/framework/maintenance.php", linux_user, site_root
+        )
+        if still_down or (rc != 0 and not was_down_on_disk) or not del_down_ok:
+            _append_artisan_log(saved, cmd_display, out or "Failed to exit maintenance mode", ok=False)
+            _save_toolkit_state(state)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể tắt chế độ bảo trì trên {site.domain}: {_short_cmd_err(out)}",
+            )
+        saved["maintenance_mode"] = False
+        saved["maintenance_secret"] = ""
+        rc = 0
+    else:
+        if rc != 0:
+            _append_artisan_log(saved, cmd_display, out, ok=False)
+            _save_toolkit_state(state)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Lệnh `artisan {cmd_key}` thất bại (mã lỗi {rc}): {_short_cmd_err(out)}",
+            )
+        if cmd_key == "down":
+            if settings.command_dry_run:
+                _write_app_file(
+                    linux_user,
+                    site_root,
+                    app_dir,
+                    "storage/framework/down",
+                    json.dumps({"time": int(datetime.now(timezone.utc).timestamp()), "secret": secret}),
+                    "0644",
+                )
+            saved["maintenance_mode"] = True
+            saved["maintenance_secret"] = secret
+        elif cmd_key == "storage:link":
+            saved["storage_linked"] = True
+        elif cmd_key == "key:generate":
+            saved["app_key_set"] = True
+        elif cmd_key in {"queue:flush", "queue:retry"}:
+            saved["failed_jobs"] = []
+
+    display_out = out or f"OK: artisan {cmd_key}"
+    _append_artisan_log(saved, cmd_display, display_out, ok=True)
     _save_toolkit_state(state)
 
     return {
         "message": f"Đã thực thi lệnh `artisan {cmd_key}` thành công trên {site.domain}.",
         "command": cmd_display,
-        "output": out,
+        "output": display_out,
         "instance": _build_instance_summary(site, db, state),
     }
 
@@ -2132,28 +2261,20 @@ def run_composer_action(
     saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
     linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
 
+    php_ver = (site.php_version or "8.3").strip()
     action = (payload.action or "").strip().lower()
-    composer_raw = _read_app_file(
-        app_dir, "composer.json", linux_user=linux_user, site_root=site_root
-    )
-    comp_data: Dict[str, Any] = {}
-    if composer_raw:
-        try:
-            comp_data = json.loads(composer_raw)
-        except Exception:
-            comp_data = {}
 
     if action == "install":
         cmd = ["composer", "install", "--no-dev", "--optimize-autoloader", "--no-interaction"]
-        rc, out = _run_as_site_user(linux_user, app_dir, cmd)
+        rc, out = _run_as_site_user(linux_user, app_dir, cmd, php_version=php_ver, timeout=600)
         msg = f"Đã chạy `composer install` cho {site.domain}."
     elif action == "update":
         cmd = ["composer", "update", "--with-all-dependencies", "--no-interaction"]
-        rc, out = _run_as_site_user(linux_user, app_dir, cmd)
+        rc, out = _run_as_site_user(linux_user, app_dir, cmd, php_version=php_ver, timeout=600)
         msg = f"Đã cập nhật các gói Composer cho {site.domain}."
     elif action == "dump_autoload":
         cmd = ["composer", "dump-autoload", "-o", "--no-interaction"]
-        rc, out = _run_as_site_user(linux_user, app_dir, cmd)
+        rc, out = _run_as_site_user(linux_user, app_dir, cmd, php_version=php_ver, timeout=180)
         msg = f"Đã tối ưu Classmap Autoload (`composer dump-autoload -o`) cho {site.domain}."
     elif action == "require":
         pkg = (payload.package or "").strip().lower()
@@ -2163,19 +2284,34 @@ def run_composer_action(
                 detail="Tên gói Composer không hợp lệ (ví dụ hợp lệ: vendor/package hoặc vendor/package:^1.0).",
             )
         pkg_name, _, pkg_ver = pkg.partition(":")
-        cmd = ["composer", "require", pkg, *( ["--dev"] if payload.dev else [] ), "--no-interaction"]
-        rc, out = _run_as_site_user(linux_user, app_dir, cmd)
-        if comp_data:
-            sec = "require-dev" if payload.dev else "require"
-            comp_data.setdefault(sec, {})[pkg_name] = pkg_ver or "*"
-            _write_app_file(
-                linux_user,
-                site_root,
-                app_dir,
-                "composer.json",
-                json.dumps(comp_data, indent=4, ensure_ascii=False) + "\n",
-                "0644",
+        cmd = [
+            "composer",
+            "require",
+            pkg,
+            *(["--dev"] if payload.dev else []),
+            "--optimize-autoloader",
+            "--no-interaction",
+        ]
+        rc, out = _run_as_site_user(linux_user, app_dir, cmd, php_version=php_ver, timeout=600)
+        if rc == 0 and settings.command_dry_run:
+            composer_raw = _read_app_file(
+                app_dir, "composer.json", linux_user=linux_user, site_root=site_root
             )
+            if composer_raw:
+                try:
+                    comp_data = json.loads(composer_raw)
+                    sec = "require-dev" if payload.dev else "require"
+                    comp_data.setdefault(sec, {})[pkg_name] = pkg_ver or "^1.0"
+                    _write_app_file(
+                        linux_user,
+                        site_root,
+                        app_dir,
+                        "composer.json",
+                        json.dumps(comp_data, indent=4, ensure_ascii=False) + "\n",
+                        "0644",
+                    )
+                except Exception:
+                    pass
         msg = f"Đã cài đặt gói Composer `{pkg_name}` vào {site.domain}."
     elif action == "remove":
         pkg = (payload.package or "").strip().lower().split(":")[0]
@@ -2185,20 +2321,34 @@ def run_composer_action(
             raise HTTPException(
                 status_code=400, detail="Không thể gỡ bỏ gói lõi `laravel/framework`."
             )
-        cmd = ["composer", "remove", pkg, "--no-interaction"]
-        rc, out = _run_as_site_user(linux_user, app_dir, cmd)
-        if comp_data:
-            for sec in ("require", "require-dev"):
-                if isinstance(comp_data.get(sec), dict):
-                    comp_data[sec].pop(pkg, None)
-            _write_app_file(
-                linux_user,
-                site_root,
-                app_dir,
-                "composer.json",
-                json.dumps(comp_data, indent=4, ensure_ascii=False) + "\n",
-                "0644",
+        cmd = [
+            "composer",
+            "remove",
+            pkg,
+            *(["--dev"] if payload.dev else []),
+            "--no-interaction",
+        ]
+        rc, out = _run_as_site_user(linux_user, app_dir, cmd, php_version=php_ver, timeout=600)
+        if rc == 0 and settings.command_dry_run:
+            composer_raw = _read_app_file(
+                app_dir, "composer.json", linux_user=linux_user, site_root=site_root
             )
+            if composer_raw:
+                try:
+                    comp_data = json.loads(composer_raw)
+                    for sec in ("require", "require-dev"):
+                        if isinstance(comp_data.get(sec), dict):
+                            comp_data[sec].pop(pkg, None)
+                    _write_app_file(
+                        linux_user,
+                        site_root,
+                        app_dir,
+                        "composer.json",
+                        json.dumps(comp_data, indent=4, ensure_ascii=False) + "\n",
+                        "0644",
+                    )
+                except Exception:
+                    pass
         msg = f"Đã gỡ bỏ gói Composer `{pkg}` khỏi {site.domain}."
     elif action == "git_pull":
         if payload.git_repo is not None:
@@ -2212,13 +2362,41 @@ def run_composer_action(
                 raise HTTPException(status_code=400, detail="Tên nhánh Git không hợp lệ.")
             saved["git_branch"] = clean_branch
         branch = saved.get("git_branch") or "main"
-        cmd = ["git", "pull", "origin", branch]
-        rc, out = _run_as_site_user(linux_user, app_dir, cmd)
+        cmd = [
+            "git",
+            "-c",
+            "credential.interactive=never",
+            "-c",
+            "core.askPass=",
+            "pull",
+            "--ff-only",
+            "origin",
+            branch,
+        ]
+        rc, out = _run_as_site_user(linux_user, app_dir, cmd, php_version=php_ver, timeout=300)
+        if rc == 0:
+            rc_sha, sha_out = _run_as_site_user(
+                linux_user,
+                app_dir,
+                ["git", "rev-parse", "--short", "HEAD"],
+                php_version=php_ver,
+                timeout=30,
+            )
+            if rc_sha == 0 and sha_out and not sha_out.startswith("[DRY-RUN]"):
+                saved["git_commit"] = sha_out.splitlines()[-1].strip()[:16]
         msg = f"Đã kéo mã nguồn mới nhất từ nhánh `{branch}` và đồng bộ ứng dụng."
     else:
         raise HTTPException(status_code=400, detail=f"Hành động Composer không hợp lệ: {action}")
 
-    _append_artisan_log(saved, " ".join(cmd), out or msg, ok=(rc == 0))
+    if rc != 0:
+        _append_artisan_log(saved, " ".join(cmd), out, ok=False)
+        _save_toolkit_state(state)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Thực thi `{action}` thất bại (mã lỗi {rc}): {_short_cmd_err(out)}",
+        )
+
+    _append_artisan_log(saved, " ".join(cmd), out or msg, ok=True)
     _save_toolkit_state(state)
     return {
         "message": msg,
