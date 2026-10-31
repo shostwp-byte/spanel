@@ -209,3 +209,35 @@ def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
     assert "isChunkError: isChunkLoadError(error)" in app_src
     assert "const MessageTemplates = lazyNamed(() => import('./pages/MessageTemplates.jsx'), 'default');" in app_src
 
+
+def test_all_frontend_modules_import_every_react_hook_they_call():
+    """Guard against ReferenceError like `useMemo is not defined` that Vite/Rollup
+    does not fail on at build time."""
+    src_root = ROOT / "frontend" / "src"
+    hooks = (
+        "useState",
+        "useEffect",
+        "useMemo",
+        "useCallback",
+        "useRef",
+        "useContext",
+        "useReducer",
+        "useLayoutEffect",
+        "useId",
+        "createPortal",
+    )
+    missing: list[str] = []
+    for path in sorted(src_root.rglob("*")):
+        if path.suffix not in {".js", ".jsx"}:
+            continue
+        txt = path.read_text(encoding="utf-8")
+        for hook in hooks:
+            if re.search(rf"(?<![.\w]){hook}\s*\(", txt):
+                has_import = bool(re.search(rf"import\b[^;]*\b{hook}\b", txt))
+                has_local = bool(re.search(rf"(?:function|const|let|var)\s+{hook}\b", txt))
+                if not has_import and not has_local:
+                    rel = path.relative_to(src_root).as_posix()
+                    missing.append(f"{rel}: missing import for `{hook}`")
+    assert missing == [], f"Unimported React hooks/helpers found: {missing}"
+
+
