@@ -311,6 +311,7 @@ def test_build_instance_summary_reads_composer_and_env_metadata(tmp_path):
         "SESSION_HTTP_ONLY=true\n",
         encoding="utf-8",
     )
+    os.chmod(app_dir / ".env", 0o640)
 
     site = SimpleNamespace(
         id=10,

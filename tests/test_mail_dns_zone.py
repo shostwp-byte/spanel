@@ -169,6 +169,8 @@ def test_import_refuses_a_file_with_bad_records_or_cname_clashes(pdns):
     from app.services import dns
 
     with pytest.raises(dns.DnsInputError, match="cannot be imported"):
+        dns.import_zone("example.com", f"@ IN DS 12345 13 2 {'c' * 64}\n", "merge", admin=True)
+    with pytest.raises(dns.DnsInputError, match="cannot be imported|could not be read"):
         dns.import_zone("example.com", "bad IN TLSA 3 1 1 abcd\n", "merge", admin=True)
     with pytest.raises(dns.DnsInputError, match="CNAME beside other records"):
         dns.import_zone("example.com", "www IN A 192.0.2.30\n", "merge", admin=True)
