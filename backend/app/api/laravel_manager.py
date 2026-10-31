@@ -961,6 +961,168 @@ def _has_scheduler_cron(site: Website, linux_user: str) -> bool:
     return False
 
 
+def _parse_kv_output(raw: str) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            parsed[k.strip()] = v.strip()
+    return parsed
+
+
+def _sync_laravel_worker_unit(
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    php_version: str,
+    q_cfg: Dict[str, Any],
+    *,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    workers = max(1, min(8, int(q_cfg.get("workers") or 2)))
+    queue_name = re.sub(r"[^a-zA-Z0-9_,-]", "", str(q_cfg.get("queue") or "default").strip()) or "default"
+    tries = max(1, min(10, int(q_cfg.get("tries") or 3)))
+    timeout_sec = max(15, min(3600, int(q_cfg.get("timeout") or 90)))
+    memory_mb = max(64, min(1024, int(q_cfg.get("memory") or 128)))
+    enabled = bool(q_cfg.get("enabled", False))
+    clean_php = (php_version or "8.3").strip()
+
+    if settings.command_dry_run:
+        return {
+            "status": "running" if enabled else "stopped",
+            "active_workers": workers if enabled else 0,
+            "state": "active" if enabled else "inactive",
+        }
+
+    res = shell.privileged(
+        "laravel-worker-sync",
+        helper_args=[
+            linux_user,
+            str(site_root),
+            str(app_dir),
+            clean_php,
+            str(workers),
+            queue_name,
+            str(tries),
+            str(timeout_sec),
+            str(memory_mb),
+            "1" if enabled else "0",
+        ],
+        check=False,
+        timeout=60,
+    )
+    out = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+    if int(getattr(res, "returncode", 1) or 0) != 0:
+        if strict:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể cấu hình dịch vụ systemd Laravel Queue Worker: {_short_cmd_err(out)}",
+            )
+        logger.warning("laravel-worker-sync warning for %s: %s", linux_user, out)
+        return {"status": "error", "active_workers": 0, "state": "failed"}
+    kv = _parse_kv_output(res.stdout or "")
+    return {
+        "status": kv.get("status", "running" if enabled else "stopped"),
+        "active_workers": int(kv.get("active_workers") or (workers if enabled else 0)),
+        "unit": kv.get("unit", ""),
+        "state": "active" if enabled else "inactive",
+    }
+
+
+def _query_laravel_worker_status(
+    linux_user: str,
+    site_root: Path,
+    q_saved: Dict[str, Any],
+) -> Dict[str, Any]:
+    configured_workers = max(1, min(8, int(q_saved.get("workers") or 2)))
+    if settings.command_dry_run:
+        enabled = bool(q_saved.get("enabled", False))
+        return {
+            "enabled": enabled,
+            "workers": configured_workers,
+            "active_workers": configured_workers if enabled else 0,
+            "failed_workers": 0,
+            "state": "active" if enabled else "inactive",
+        }
+    try:
+        res = shell.privileged(
+            "laravel-worker-status",
+            helper_args=[linux_user, str(site_root)],
+            check=False,
+            timeout=15,
+        )
+        if int(getattr(res, "returncode", 1) or 0) == 0:
+            kv = _parse_kv_output(res.stdout or "")
+            live_enabled = kv.get("enabled") == "1"
+            active_w = int(kv.get("active_workers") or 0)
+            cfg_w = int(kv.get("configured_workers") or 0) or configured_workers
+            failed_w = int(kv.get("failed_workers") or 0)
+            return {
+                "enabled": live_enabled,
+                "workers": max(1, min(8, cfg_w)),
+                "active_workers": active_w,
+                "failed_workers": failed_w,
+                "state": kv.get("state") or ("active" if live_enabled else "inactive"),
+            }
+    except Exception as exc:
+        logger.debug("laravel-worker-status check warning: %s", exc)
+    return {
+        "enabled": False,
+        "workers": configured_workers,
+        "active_workers": 0,
+        "failed_workers": 0,
+        "state": "inactive",
+    }
+
+
+def _delete_laravel_worker_unit(linux_user: str, site_root: Path) -> None:
+    if settings.command_dry_run:
+        return
+    try:
+        shell.privileged(
+            "laravel-worker-delete",
+            helper_args=[linux_user, str(site_root)],
+            check=False,
+            timeout=30,
+        )
+    except Exception as exc:
+        logger.warning("laravel-worker-delete warning for %s: %s", linux_user, exc)
+
+
+def _fetch_live_failed_jobs(
+    linux_user: str,
+    app_dir: Path,
+    php_version: str,
+) -> Optional[List[Dict[str, Any]]]:
+    if settings.command_dry_run:
+        return None
+    rc, out = _run_as_site_user(
+        linux_user,
+        app_dir,
+        ["artisan", "queue:failed", "--json", "--no-interaction"],
+        php_version=php_version,
+        timeout=20,
+    )
+    if rc != 0 or not out:
+        return None
+    parsed = wordpress_live.extract_wp_cli_json(out)
+    if isinstance(parsed, list):
+        normalized_jobs: List[Dict[str, Any]] = []
+        for row in parsed[:50]:
+            if isinstance(row, dict):
+                normalized_jobs.append(
+                    {
+                        "id": str(row.get("id") or row.get("uuid") or ""),
+                        "connection": str(row.get("connection") or ""),
+                        "queue": str(row.get("queue") or "default"),
+                        "failed_at": str(row.get("failed_at") or ""),
+                        "exception": str(row.get("exception") or "")[:300],
+                    }
+                )
+        return normalized_jobs
+    return None
+
+
 def _build_instance_summary(
     site: Website, db: Session, state: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
@@ -1013,15 +1175,26 @@ def _build_instance_summary(
                 db_size_mb = round(float(db_acc.size_bytes) / (1024 * 1024), 2)
 
     q_saved = saved.get("queue_worker") or {}
+    live_q = _query_laravel_worker_status(linux_user, site_root, q_saved)
+    live_failed_jobs = list(saved.get("failed_jobs") or [])
+    if live_q["enabled"] and not settings.command_dry_run:
+        fetched_failed = _fetch_live_failed_jobs(
+            linux_user, app_dir, (site.php_version or "8.3").strip()
+        )
+        if fetched_failed is not None:
+            live_failed_jobs = fetched_failed
     queue_worker = {
-        "enabled": bool(q_saved.get("enabled", False)),
-        "workers": max(1, min(8, int(q_saved.get("workers") or 1))),
+        "enabled": bool(live_q["enabled"]),
+        "workers": max(1, min(8, int(live_q["workers"] or q_saved.get("workers") or 1))),
+        "active_workers": int(live_q["active_workers"]),
+        "failed_workers": int(live_q["failed_workers"]),
+        "state": str(live_q["state"]),
         "queue": str(q_saved.get("queue") or "default"),
         "tries": max(1, min(10, int(q_saved.get("tries") or 3))),
         "timeout": max(15, min(3600, int(q_saved.get("timeout") or 90))),
         "memory": max(64, min(1024, int(q_saved.get("memory") or 128))),
         "connection": env_info.get("queue_connection") or "database",
-        "failed_count": len(saved.get("failed_jobs") or []),
+        "failed_count": len(live_failed_jobs),
     }
 
     scheduler_live = _has_scheduler_cron(site, linux_user)
@@ -1094,7 +1267,7 @@ def _build_instance_summary(
         "git_commit": saved.get("git_commit") or "",
         "packages": comp_meta["packages"],
         "packages_count": len(comp_meta["packages"]),
-        "failed_jobs": list(saved.get("failed_jobs") or []),
+        "failed_jobs": live_failed_jobs,
         "last_artisan_logs": list(saved.get("last_artisan_logs") or []),
         "security_status": security_status,
         "security_passed": passed_count,
@@ -1783,6 +1956,29 @@ def install_laravel_instance(
         except Exception as exc:
             logger.warning("Scheduler setup warning on Laravel install: %s", exc)
 
+    init_queue_cfg = {
+        "enabled": bool(payload.enable_queue_worker),
+        "workers": payload.queue_workers,
+        "queue": "default",
+        "tries": 3,
+        "timeout": 90,
+        "memory": 128,
+    }
+    if payload.enable_queue_worker:
+        worker_res = _sync_laravel_worker_unit(
+            linux_user, site_root, app_dir, php_ver, init_queue_cfg, strict=False
+        )
+        if worker_res.get("status") == "error":
+            init_queue_cfg["enabled"] = False
+            install_logs.append(
+                {
+                    "cmd": "laravel-worker-sync",
+                    "output": "Queue Worker unit could not start automatically; please verify queue driver & start from Queue tab.",
+                    "status": "error",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
     state = _load_toolkit_state()
     inst_key = str(site.id)
     state.setdefault("instances", {})[inst_key] = {
@@ -1802,14 +1998,7 @@ def install_laravel_instance(
         "git_commit": git_commit_sha,
         "storage_linked": True,
         "scheduler_enabled": bool(payload.enable_scheduler),
-        "queue_worker": {
-            "enabled": bool(payload.enable_queue_worker),
-            "workers": payload.queue_workers,
-            "queue": "default",
-            "tries": 3,
-            "timeout": 90,
-            "memory": 128,
-        },
+        "queue_worker": init_queue_cfg,
         "last_artisan_logs": install_logs[-12:],
         "security_overrides": {
             "public_docroot": True,
@@ -1975,7 +2164,8 @@ def manage_queue_worker(
     inst_key = str(site.id)
     saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
     linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
-    php_cli = _php_cli_for_version(site.php_version or "8.3")
+    php_ver = (site.php_version or "8.3").strip()
+    php_cli = _php_cli_for_version(php_ver)
 
     q_cfg = saved.setdefault(
         "queue_worker",
@@ -2002,47 +2192,121 @@ def manage_queue_worker(
         q_cfg["memory"] = payload.memory
 
     action = (payload.action or "toggle").strip().lower()
+    if action in {"retry_failed", "retry_all"}:
+        rc, out = _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["artisan", "queue:retry", "all", "--no-interaction"],
+            php_version=php_ver,
+            timeout=120,
+        )
+        if rc != 0:
+            _append_artisan_log(
+                saved, f"{Path(php_cli).name} artisan queue:retry all", out, ok=False
+            )
+            _save_toolkit_state(state)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể chạy lại Failed Jobs: {_short_cmd_err(out)}",
+            )
+        fetched = _fetch_live_failed_jobs(linux_user, app_dir, php_ver)
+        saved["failed_jobs"] = fetched if fetched is not None else []
+        _append_artisan_log(
+            saved,
+            f"{Path(php_cli).name} artisan queue:retry all",
+            out or "Retried all failed queue jobs.",
+            ok=True,
+        )
+        _save_toolkit_state(state)
+        return {
+            "message": f"Đã đẩy lại các Failed Jobs vào hàng đợi trên {site.domain}.",
+            "output": out,
+            "instance": _build_instance_summary(site, db, state),
+        }
+
+    if action == "flush_failed":
+        rc, out = _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["artisan", "queue:flush", "--no-interaction"],
+            php_version=php_ver,
+            timeout=120,
+        )
+        if rc != 0:
+            _append_artisan_log(
+                saved, f"{Path(php_cli).name} artisan queue:flush", out, ok=False
+            )
+            _save_toolkit_state(state)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể xóa danh sách Failed Jobs: {_short_cmd_err(out)}",
+            )
+        saved["failed_jobs"] = []
+        _append_artisan_log(
+            saved,
+            f"{Path(php_cli).name} artisan queue:flush",
+            out or "Flushed all failed queue jobs.",
+            ok=True,
+        )
+        _save_toolkit_state(state)
+        return {
+            "message": f"Đã xóa sạch danh sách Failed Jobs trên {site.domain}.",
+            "output": out,
+            "instance": _build_instance_summary(site, db, state),
+        }
+
     if action == "start":
         q_cfg["enabled"] = True
     elif action == "stop":
         q_cfg["enabled"] = False
     elif action == "restart":
         q_cfg["enabled"] = True
+    elif action == "update_config":
+        if payload.enabled is not None:
+            q_cfg["enabled"] = bool(payload.enabled)
     elif action == "toggle":
         q_cfg["enabled"] = (
             bool(payload.enabled)
             if payload.enabled is not None
             else not bool(q_cfg.get("enabled", False))
         )
-    elif action == "retry_failed":
-        saved["failed_jobs"] = []
-        _run_as_site_user(linux_user, app_dir, [php_cli, "artisan", "queue:retry", "all", "--no-interaction"])
-    elif action == "flush_failed":
-        saved["failed_jobs"] = []
-        _run_as_site_user(linux_user, app_dir, [php_cli, "artisan", "queue:flush", "--no-interaction"])
+    else:
+        raise HTTPException(status_code=400, detail=f"Hành động Queue không hợp lệ: {action}")
 
+    sync_res = _sync_laravel_worker_unit(
+        linux_user, site_root, app_dir, php_ver, q_cfg, strict=True
+    )
     if q_cfg["enabled"]:
-        _run_as_site_user(linux_user, app_dir, [php_cli, "artisan", "queue:restart", "--no-interaction"])
+        _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["artisan", "queue:restart", "--no-interaction"],
+            php_version=php_ver,
+            timeout=60,
+        )
+        fetched = _fetch_live_failed_jobs(linux_user, app_dir, php_ver)
+        if fetched is not None:
+            saved["failed_jobs"] = fetched
         cmd_str = (
+            f"systemd ({sync_res.get('unit') or 'laravel-worker'}) -> "
             f"{Path(php_cli).name} artisan queue:work --queue={q_cfg['queue']} "
             f"--tries={q_cfg['tries']} --timeout={q_cfg['timeout']} --memory={q_cfg['memory']}"
         )
         _append_artisan_log(
             saved,
             cmd_str,
-            f"[OK] Queue Worker active ({q_cfg['workers']} tiến trình chạy nền · Tự khởi động lại khi lỗi).",
+            f"[OK] Started {sync_res.get('active_workers', q_cfg['workers'])} systemd worker(s) under {linux_user}.",
             ok=True,
         )
-        msg = f"Đã bật Laravel Queue Worker ({q_cfg['workers']} workers) cho {site.domain}."
+        msg = f"Đã bật dịch vụ Laravel Queue Worker ({q_cfg['workers']} tiến trình systemd) cho {site.domain}."
     else:
-        _run_as_site_user(linux_user, app_dir, [php_cli, "artisan", "queue:restart", "--no-interaction"])
         _append_artisan_log(
             saved,
-            f"{Path(php_cli).name} artisan queue:restart",
-            "[OK] Queue Worker stopped gracefully.",
+            "laravel-worker-sync (stop)",
+            "[OK] Stopped and removed systemd Laravel Queue Worker unit.",
             ok=True,
         )
-        msg = f"Đã dừng Laravel Queue Worker trên {site.domain}."
+        msg = f"Đã dừng dịch vụ Laravel Queue Worker trên {site.domain}."
 
     _save_toolkit_state(state)
     return {
@@ -2089,7 +2353,9 @@ def _install_scheduler_cron(
         )
 
 
-def _remove_scheduler_cron(site: Website, linux_user: str) -> None:
+def _remove_scheduler_cron(
+    site: Website, linux_user: str, site_root: Optional[Path] = None
+) -> None:
     try:
         entries = cron.list_cron_entries(site.domain, linux_user)
         for item in reversed(entries):
@@ -2098,6 +2364,9 @@ def _remove_scheduler_cron(site: Website, linux_user: str) -> None:
                 cron.delete_cron(site.domain, int(item["index"]), linux_user)
     except Exception as exc:
         logger.debug("remove_scheduler_cron warning: %s", exc)
+    if site_root is not None:
+        public_html = Path(site_users.document_root(site.root_path or str(site_root)))
+        _delete_app_file(linux_user, site_root, public_html, "spanel-schedule-cron.php")
 
 
 @router.post("/instances/{website_id}/scheduler")
@@ -2121,7 +2390,7 @@ def toggle_laravel_scheduler(
         saved["scheduler_enabled"] = True
         msg = f"Đã bật Laravel Scheduler (`* * * * * php{site.php_version or '8.3'} artisan schedule:run`) cho {site.domain}."
     else:
-        _remove_scheduler_cron(site, linux_user)
+        _remove_scheduler_cron(site, linux_user, site_root)
         saved["scheduler_enabled"] = False
         msg = f"Đã tắt Laravel Scheduler (Cron) trên {site.domain}."
 
@@ -2509,10 +2778,24 @@ def get_laravel_logs(
         app_dir, "storage/logs/laravel.log", linux_user=linux_user, site_root=site_root
     )
     log_lines = raw_log.splitlines()[-lines:] if raw_log else []
+    worker_logs = ""
+    if not settings.command_dry_run:
+        try:
+            w_res = shell.privileged(
+                "laravel-worker-logs",
+                helper_args=[linux_user, str(site_root), str(min(lines, 200))],
+                check=False,
+                timeout=15,
+            )
+            if int(getattr(w_res, "returncode", 1) or 0) == 0:
+                worker_logs = (w_res.stdout or "").strip()
+        except Exception:
+            worker_logs = ""
     return {
         "log_path": str(app_dir / "storage" / "logs" / "laravel.log"),
         "content": "\n".join(log_lines),
         "lines_count": len(log_lines),
+        "worker_logs": worker_logs,
         "artisan_history": list(saved.get("last_artisan_logs") or []),
     }
 
@@ -2561,7 +2844,8 @@ def remove_laravel_instance(
     saved = (state.get("instances") or {}).get(inst_key) or {}
     linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
 
-    _remove_scheduler_cron(site, linux_user)
+    _delete_laravel_worker_unit(linux_user, site_root)
+    _remove_scheduler_cron(site, linux_user, site_root)
 
     for rel in ("artisan", ".env", ".env.bak"):
         _delete_app_file(linux_user, site_root, app_dir, rel)
