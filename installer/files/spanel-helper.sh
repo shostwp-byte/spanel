@@ -40,7 +40,7 @@ SPANEL_SITES_GROUP="spanel-sites"
 SITE_FILE_MODE="0644"
 SITE_DIR_MODE="0755"
 # Files that carry database credentials are kept off the default mode.
-SITE_SECRET_FILES=(wp-config.php .env .my.cnf)
+SITE_SECRET_FILES=(wp-config.php .env .env.bak .my.cnf)
 SPANEL_SFTP_GROUP="spanel-sftp"
 # Per-website SFTP sub-accounts. A separate group because they get a different
 # sshd Match block: the panel user's own account chroots to its whole home,
@@ -7544,6 +7544,226 @@ app_directory() {
   printf '%s/%s/apps/%s' "$HOME_ROOT" "$user" "$name"
 }
 
+laravel_worker_unit_base() {
+  local user="$1" site_root="$2" root_target site_hash
+  require_linux_user "$user"
+  root_target=$(require_managed_path "$site_root" "$user")
+  site_hash=$(printf '%s' "$root_target" | sha256sum | awk '{print substr($1, 1, 12)}')
+  printf 'spanel-laravel-%s-%s' "$user" "$site_hash"
+}
+
+verify_laravel_app_artisan() {
+  local user="$1" expected_uid="$2" root_target="$3" app_target="$4"
+  python3 - "$HOME_ROOT" "$user" "$expected_uid" "$root_target" "$app_target" <<'PY'
+import os
+import stat
+import sys
+
+home_root, user, expected_uid_raw, root_target, app_target = sys.argv[1:6]
+expected_uid = int(expected_uid_raw)
+base = os.path.normpath(os.path.join(home_root, user))
+root = os.path.normpath(root_target)
+app = os.path.normpath(app_target)
+
+if os.path.dirname(root) not in (base, os.path.join(base, "apps")):
+    raise SystemExit("invalid site root")
+if app != root and not app.startswith(root + os.sep):
+    raise SystemExit("laravel app directory outside site root")
+
+rel = os.path.relpath(app, base)
+if rel.startswith("..") or rel == ".":
+    raise SystemExit("laravel app directory outside user home")
+
+parts = [p for p in rel.split(os.sep) if p]
+base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+cur_fd = base_fd
+try:
+    for part in parts:
+        nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+        if cur_fd != base_fd:
+            os.close(cur_fd)
+        cur_fd = nxt
+    st = os.lstat("artisan", dir_fd=cur_fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise SystemExit("artisan must be a regular file (symlinks refused)")
+    if st.st_uid != expected_uid:
+        raise SystemExit(f"artisan is not owned by {user} (uid={st.st_uid})")
+except FileNotFoundError:
+    raise SystemExit(f"artisan not found in {app}")
+finally:
+    try:
+        if cur_fd != base_fd:
+            os.close(cur_fd)
+    finally:
+        os.close(base_fd)
+PY
+}
+
+delete_laravel_worker_units() {
+  local user="$1" site_root="$2" base unit_file i
+  base="$(laravel_worker_unit_base "$user" "$site_root")" || return 0
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}@.service"
+  for i in 1 2 3 4 5 6 7 8; do
+    systemctl disable --now "${base}@${i}.service" >/dev/null 2>&1 || true
+  done
+  if [[ -f "$unit_file" ]]; then
+    rm -f -- "$unit_file"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+delete_laravel_worker_units_for_user() {
+  local user="$1" unit_file unit_base i removed=0
+  require_linux_user "$user"
+  shopt -s nullglob
+  for unit_file in "${SYSTEMD_UNIT_DIR}/spanel-laravel-${user}-"*@.service; do
+    [[ -f "$unit_file" ]] || continue
+    unit_base="$(basename "$unit_file" "@.service")"
+    for i in 1 2 3 4 5 6 7 8; do
+      systemctl disable --now "${unit_base}@${i}.service" >/dev/null 2>&1 || true
+    done
+    rm -f -- "$unit_file"
+    removed=1
+  done
+  shopt -u nullglob
+  if (( removed == 1 )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+sync_laravel_worker_unit() {
+  local user="$1" site_root="$2" app_dir="$3" php_ver="$4"
+  local workers="$5" queue_name="$6" tries="$7" timeout_sec="$8" memory_mb="$9" enabled_flag="${10}"
+  local uid root_target app_target php_bin base unit_file tmp_file open_basedir mem_cap i
+
+  require_linux_user "$user"
+  uid="$(id -u "$user" 2>/dev/null)" || deny "panel Linux user does not exist: $user"
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 1000 ]] || deny "refusing privileged uid for laravel worker: $uid"
+  root_target="$(require_managed_path "$site_root" "$user")"
+  app_target="$(require_bound_managed_path "$user" "$root_target" "$app_dir")"
+  require_php_version "$php_ver"
+  [[ "$workers" =~ ^[1-8]$ ]] || deny "invalid worker count: $workers"
+  [[ "$queue_name" =~ ^[A-Za-z0-9_,-]{1,120}$ ]] || deny "invalid queue name: $queue_name"
+  [[ "$tries" =~ ^([1-9]|10)$ ]] || deny "invalid tries count: $tries"
+  [[ "$timeout_sec" =~ ^[0-9]{2,4}$ ]] && (( 10#$timeout_sec >= 15 && 10#$timeout_sec <= 3600 )) \
+    || deny "invalid worker timeout: $timeout_sec"
+  [[ "$memory_mb" =~ ^[0-9]{2,4}$ ]] && (( 10#$memory_mb >= 64 && 10#$memory_mb <= 1024 )) \
+    || deny "invalid worker memory limit: $memory_mb"
+  [[ "$enabled_flag" == "0" || "$enabled_flag" == "1" ]] || deny "invalid enabled flag: $enabled_flag"
+
+  if [[ "$enabled_flag" == "0" ]]; then
+    delete_laravel_worker_units "$user" "$root_target"
+    echo "status=stopped"
+    echo "active_workers=0"
+    return 0
+  fi
+
+  php_bin="$(command -v "php${php_ver}" || true)"
+  [[ -n "$php_bin" ]] || deny "PHP CLI is not installed: php${php_ver}"
+  verify_laravel_app_artisan "$user" "$uid" "$root_target" "$app_target"
+
+  install -d -o "$user" -g "$user" -m 0700 "/var/lib/php/sessions/${user}" "/var/lib/php/uploads/${user}"
+  install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
+
+  open_basedir="$(site_open_basedir "$user")"
+  base="$(laravel_worker_unit_base "$user" "$root_target")"
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}@.service"
+  tmp_file="${unit_file}.spanel-tmp-$$"
+  mem_cap=$(( 10#$memory_mb + 64 ))
+
+  cat >"$tmp_file" <<UNIT
+[Unit]
+Description=SPanel Laravel Queue Worker (%i) for ${user} (${root_target})
+After=network.target mariadb.service redis-server.service
+
+[Service]
+Type=simple
+User=${user}
+Group=${user}
+Slice=user-${uid}.slice
+WorkingDirectory=${app_target}
+UMask=0027
+Environment=HOME=${HOME_ROOT}/${user}
+Environment=APP_RUNNING_IN_CONSOLE=true
+ExecStart=${php_bin} -d open_basedir=${open_basedir} ${app_target}/artisan queue:work --queue=${queue_name} --tries=${tries} --timeout=${timeout_sec} --memory=${memory_mb} --sleep=3 --no-interaction
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+MemoryAccounting=yes
+MemoryMax=${mem_cap}M
+TasksMax=64
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${app_target} /var/lib/php/sessions/${user} /var/lib/php/uploads/${user}
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${base}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chown root:root "$tmp_file"
+  chmod 0644 "$tmp_file"
+  mv -f -- "$tmp_file" "$unit_file"
+
+  systemctl daemon-reload
+  for (( i = 1; i <= 10#$workers; i++ )); do
+    systemctl enable "${base}@${i}.service" >/dev/null 2>&1 || true
+    systemctl restart "${base}@${i}.service"
+  done
+  for (( i = 10#$workers + 1; i <= 8; i++ )); do
+    systemctl disable --now "${base}@${i}.service" >/dev/null 2>&1 || true
+  done
+
+  echo "status=running"
+  echo "unit=${base}@.service"
+  echo "active_workers=${workers}"
+}
+
+status_laravel_worker_unit() {
+  local user="$1" site_root="$2" base unit_file i
+  local unit_present=0 enabled_count=0 active_count=0 failed_count=0 state="inactive"
+  base="$(laravel_worker_unit_base "$user" "$site_root")"
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}@.service"
+  if [[ -f "$unit_file" ]]; then
+    unit_present=1
+    for i in 1 2 3 4 5 6 7 8; do
+      if systemctl is-enabled --quiet "${base}@${i}.service" 2>/dev/null; then
+        enabled_count=$((enabled_count + 1))
+      fi
+      if systemctl is-active --quiet "${base}@${i}.service" 2>/dev/null; then
+        active_count=$((active_count + 1))
+      elif systemctl is-failed --quiet "${base}@${i}.service" 2>/dev/null; then
+        failed_count=$((failed_count + 1))
+      fi
+    done
+    if (( active_count > 0 && failed_count == 0 )); then
+      state="active"
+    elif (( active_count > 0 && failed_count > 0 )); then
+      state="degraded"
+    elif (( failed_count > 0 )); then
+      state="failed"
+    elif (( enabled_count > 0 )); then
+      state="starting"
+    fi
+  fi
+  echo "unit_present=${unit_present}"
+  echo "enabled=$(( enabled_count > 0 || active_count > 0 ? 1 : 0 ))"
+  echo "configured_workers=${enabled_count}"
+  echo "active_workers=${active_count}"
+  echo "failed_workers=${failed_count}"
+  echo "state=${state}"
+}
+
 ipv6_available() {
   # A global address, not the loopback and not a link-local one: those cannot
   # carry traffic from outside, so listening on them would prove nothing.
@@ -8741,6 +8961,7 @@ delete_panel_user_runtime() {
     rmdir -- "$(dirname "$user_fpm_dir")" 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || true
   done
+  delete_laravel_worker_units_for_user "$user"
   crontab -r -u "$user" 2>/dev/null || true
   rm -f "/etc/cron.d/spanel-user-${user}" 2>/dev/null || true
   local old_uid
@@ -11490,6 +11711,70 @@ PY
     mv -f -- "$tmp" "$target"
     ;;
 
+  site-file-delete)
+    [[ $# -eq 3 ]] || deny "usage: site-file-delete <site-user> <site-root> <relative-path>"
+    user="$1"; root_arg="$2"; rel_arg="$3"
+    require_linux_user "$user"
+    expected_uid=$(id -u "$user" 2>/dev/null) || deny "panel Linux user does not exist: $user"
+    root_target=$(require_managed_path "$root_arg" "$user")
+    case "$rel_arg" in
+      ""|"/"|/*|*$'\n'*|"."|".."|"./"*|"../"*|*"/."|*"/.."|*"/./"*|*"/../"*) deny "unsafe relative path: $rel_arg" ;;
+    esac
+    python3 - "$HOME_ROOT" "$user" "$expected_uid" "$root_target" "$rel_arg" <<'PY'
+import os
+import stat
+import sys
+
+home_root, user, expected_uid_raw, root_target, rel_arg = sys.argv[1:6]
+expected_uid = int(expected_uid_raw)
+base = os.path.normpath(os.path.join(home_root, user))
+root = os.path.normpath(root_target)
+target = os.path.normpath(os.path.join(root, rel_arg))
+
+if os.path.dirname(root) not in (base, os.path.join(base, "apps")):
+    raise SystemExit("invalid site root")
+if not target.startswith(root + os.sep):
+    raise SystemExit("target outside site root")
+
+rel = os.path.relpath(target, base)
+if rel.startswith("..") or rel == ".":
+    raise SystemExit("target outside site root")
+
+parts = [p for p in rel.split(os.sep) if p]
+if not parts:
+    raise SystemExit("refusing to delete base directory")
+
+def open_child_dir(parent_fd, name):
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+parent_fd = base_fd
+try:
+    for part in parts[:-1]:
+        next_fd = open_child_dir(parent_fd, part)
+        if parent_fd != base_fd:
+            os.close(parent_fd)
+        parent_fd = next_fd
+
+    leaf = parts[-1]
+    try:
+        st = os.lstat(leaf, dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"refusing to delete directory via site-file-delete: {target}")
+    if st.st_uid != expected_uid:
+        raise SystemExit(f"refusing to delete file not owned by {user} (uid={st.st_uid}): {target}")
+    os.unlink(leaf, dir_fd=parent_fd)
+finally:
+    try:
+        if parent_fd != base_fd:
+            os.close(parent_fd)
+    finally:
+        os.close(base_fd)
+PY
+    ;;
+
   site-file-install)
     [[ $# -eq 4 ]] || deny "usage: site-file-install <site-user> <site-root> <relative-path> <staged-path>"
     user="$1"; root_arg="$2"; rel_arg="$3"; staged_arg="$4"
@@ -12029,6 +12314,7 @@ EOF
     user="$1"; path="$2"
     require_linux_user "$user"
     target=$(require_managed_path "$path" "$user")
+    delete_laravel_worker_units "$user" "$target"
     delete_site_php_pools "$user" "$target"
     exec rm -rf "$target"
     ;;
@@ -12684,6 +12970,30 @@ EOF
     # The app's files stay put; deleting a customer's code is never implied by
     # removing its runtime.
     echo "removed ${unit_name}"
+    ;;
+
+  laravel-worker-sync)
+    [[ $# -eq 10 ]] || deny "usage: laravel-worker-sync <site-user> <site-root> <app-dir> <php-version> <workers> <queue> <tries> <timeout> <memory> <0|1>"
+    sync_laravel_worker_unit "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"
+    ;;
+
+  laravel-worker-status)
+    [[ $# -eq 2 ]] || deny "usage: laravel-worker-status <site-user> <site-root>"
+    status_laravel_worker_unit "$1" "$2"
+    ;;
+
+  laravel-worker-logs)
+    [[ $# -eq 2 || $# -eq 3 ]] || deny "usage: laravel-worker-logs <site-user> <site-root> [lines]"
+    user="$1"; root_arg="$2"; log_lines="${3:-150}"
+    [[ "$log_lines" =~ ^[0-9]{1,4}$ ]] || deny "invalid line count: $log_lines"
+    unit_base="$(laravel_worker_unit_base "$user" "$root_arg")"
+    exec journalctl -u "${unit_base}@*.service" -n "$log_lines" --no-pager --output short-iso
+    ;;
+
+  laravel-worker-delete)
+    [[ $# -eq 2 ]] || deny "usage: laravel-worker-delete <site-user> <site-root>"
+    delete_laravel_worker_units "$1" "$2"
+    echo "status=deleted"
     ;;
 
   site-app-install-deps)
