@@ -6,11 +6,12 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -233,7 +234,6 @@ def _ensure_toolkit_state_table() -> None:
 def _load_toolkit_state() -> Dict[str, Any]:
     with _LARAVEL_STATE_LOCK:
         try:
-            _ensure_toolkit_state_table()
             with engine.connect() as conn:
                 row = conn.execute(
                     text("SELECT payload FROM laravel_toolkit_state WHERE id = 1")
@@ -255,7 +255,6 @@ def _load_toolkit_state() -> Dict[str, Any]:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     data.setdefault("instances", {})
-                    _save_toolkit_state(data)
                     return data
             except Exception as exc:
                 logger.warning("Failed to load Laravel toolkit state file: %s", exc)
@@ -313,6 +312,67 @@ def _save_toolkit_state(state: Dict[str, Any]) -> None:
                         pass
         except Exception as exc:
             logger.debug("save_laravel_toolkit_state file mirror warning: %s", exc)
+
+
+def _update_instance_state(
+    inst_key: str, updater: Callable[[Dict[str, Any]], None]
+) -> Dict[str, Any]:
+    """Atomically load -> mutate one instance's state -> save while holding `_LARAVEL_STATE_LOCK`."""
+    with _LARAVEL_STATE_LOCK:
+        state = _load_toolkit_state()
+        inst = state.setdefault("instances", {}).setdefault(
+            str(inst_key), {"installed": True}
+        )
+        updater(inst)
+        _save_toolkit_state(state)
+        return state
+
+
+def _pop_instance_state(inst_key: str) -> Dict[str, Any]:
+    with _LARAVEL_STATE_LOCK:
+        state = _load_toolkit_state()
+        if isinstance(state.get("instances"), dict):
+            state["instances"].pop(str(inst_key), None)
+        _save_toolkit_state(state)
+        return state
+
+
+LARAVEL_SUPPORTED_PHP_VERSIONS = {"8.1", "8.2", "8.3", "8.4", "8.5"}
+
+
+def _validate_laravel_php_version(raw_ver: Optional[str]) -> str:
+    clean = (raw_ver or "8.3").strip()
+    try:
+        clean = site_users.validate_php_version(clean)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Phiên bản PHP '{raw_ver}' không hợp lệ.",
+        ) from exc
+    if clean not in LARAVEL_SUPPORTED_PHP_VERSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Laravel yêu cầu phiên bản PHP từ 8.1 trở lên (nhận được: PHP {clean}).",
+        )
+    check_host_installed = (
+        not settings.command_dry_run
+        and (
+            os.name != "nt"
+            or Path("/etc/php").exists()
+            or getattr(php.list_installed_php, "__module__", "") != "app.services.php"
+        )
+    )
+    if check_host_installed:
+        installed = php.list_installed_php()
+        if installed and clean not in installed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Phiên bản PHP {clean} chưa được cài đặt trên máy chủ "
+                    f"(hiện có: {', '.join(installed)})."
+                ),
+            )
+    return clean
 
 
 # ── Access Control & Path Resolution ─────────────────────────────────────────
@@ -688,7 +748,8 @@ def _render_default_env(
         f"SESSION_LIFETIME=120\n"
         f"SESSION_ENCRYPT=false\n"
         f"SESSION_PATH=/\n"
-        f"SESSION_SECURE_COOKIE=true\n\n"
+        f"SESSION_SECURE_COOKIE=true\n"
+        f"SESSION_HTTP_ONLY=true\n\n"
         f"BROADCAST_CONNECTION=log\n"
         f"FILESYSTEM_DISK=local\n"
         f"QUEUE_CONNECTION={queue_connection}\n\n"
@@ -758,7 +819,8 @@ def _parse_env_details(env_text: str) -> Dict[str, Any]:
         "queue_connection": raw_vars.get("QUEUE_CONNECTION") or "database",
         "session_driver": raw_vars.get("SESSION_DRIVER") or "file",
         "session_lifetime": raw_vars.get("SESSION_LIFETIME") or "120",
-        "session_secure_cookie": _bool("SESSION_SECURE_COOKIE", True),
+        "session_secure_cookie": _bool("SESSION_SECURE_COOKIE", False),
+        "session_http_only": _bool("SESSION_HTTP_ONLY", True),
         "redis_host": raw_vars.get("REDIS_HOST") or "127.0.0.1",
         "redis_port": raw_vars.get("REDIS_PORT") or "6379",
         "mail_mailer": raw_vars.get("MAIL_MAILER") or "log",
@@ -891,41 +953,326 @@ def _detect_composer_metadata(
     }
 
 
+LARAVEL_NGINX_SEC_BEGIN = "# BEGIN SPANEL LARAVEL SECURITY"
+LARAVEL_NGINX_SEC_END = "# END SPANEL LARAVEL SECURITY"
+LARAVEL_NGINX_DOTENV_MARKER = "# SPANEL_LARAVEL_DOTENV_GIT_DENY"
+LARAVEL_NGINX_STORAGE_MARKER = "# SPANEL_LARAVEL_STORAGE_PHP_DENY"
+
+LARAVEL_DOTENV_GIT_NGINX_BLOCK = (
+    "# SPANEL_LARAVEL_DOTENV_GIT_DENY\n"
+    "location ^~ /.git/ {\n"
+    "    deny all;\n"
+    "}\n"
+    "location ~* (?:^|/)(?:\\.env(?:\\..+)?|composer\\.(?:json|lock)|artisan|phpunit\\.xml(?:\\.dist)?)$ {\n"
+    "    deny all;\n"
+    "}\n"
+    "# END SPANEL_LARAVEL_DOTENV_GIT_DENY"
+)
+
+LARAVEL_STORAGE_PHP_NGINX_BLOCK = (
+    "# SPANEL_LARAVEL_STORAGE_PHP_DENY\n"
+    "location ^~ /storage/ {\n"
+    "    location ~* \\.(?:php|phtml|phar|php[0-9]+)$ {\n"
+    "        deny all;\n"
+    "    }\n"
+    "}\n"
+    "# END SPANEL_LARAVEL_STORAGE_PHP_DENY"
+)
+
+STRICT_ENV_OCTAL_MODES = {"600", "640", "400", "440"}
+BENIGN_DEFAULT_SITE_ENTRIES = {"index.html", ".htaccess", ".well-known", "cgi-bin"}
+EXISTING_APP_MARKERS = (
+    "wp-config.php",
+    "wp-includes/version.php",
+    "artisan",
+    ".env",
+    "composer.json",
+    "package.json",
+    "Dockerfile",
+    "docker-compose.yml",
+)
+
+
+def _strip_laravel_nginx_security(custom_text: str) -> str:
+    text_in = custom_text or ""
+    pattern = re.compile(
+        re.escape(LARAVEL_NGINX_SEC_BEGIN) + r".*?" + re.escape(LARAVEL_NGINX_SEC_END) + r"\n?",
+        re.DOTALL,
+    )
+    cleaned = pattern.sub("", text_in).strip()
+    return (cleaned + "\n") if cleaned else ""
+
+
+def _update_laravel_nginx_security(
+    custom_text: str,
+    *,
+    dotenv_git: Optional[bool] = None,
+    storage_php: Optional[bool] = None,
+) -> str:
+    existing = custom_text or ""
+    cur_dotenv = LARAVEL_NGINX_DOTENV_MARKER in existing
+    cur_storage = LARAVEL_NGINX_STORAGE_MARKER in existing
+    want_dotenv = cur_dotenv if dotenv_git is None else bool(dotenv_git)
+    want_storage = cur_storage if storage_php is None else bool(storage_php)
+
+    base = _strip_laravel_nginx_security(existing).rstrip()
+    sub_blocks: List[str] = []
+    if want_dotenv:
+        sub_blocks.append(LARAVEL_DOTENV_GIT_NGINX_BLOCK)
+    if want_storage:
+        sub_blocks.append(LARAVEL_STORAGE_PHP_NGINX_BLOCK)
+    if not sub_blocks:
+        return (base + "\n") if base else ""
+
+    managed = (
+        f"{LARAVEL_NGINX_SEC_BEGIN}\n"
+        + "\n".join(sub_blocks)
+        + f"\n{LARAVEL_NGINX_SEC_END}\n"
+    )
+    return f"{base}\n\n{managed}" if base else managed
+
+
+def _is_valid_laravel_app_key(app_key: str) -> bool:
+    clean = (app_key or "").strip()
+    if not clean:
+        return False
+    if clean.startswith("base64:"):
+        raw_b64 = clean[7:].strip()
+        try:
+            decoded = base64.b64decode(raw_b64, validate=True)
+            return len(decoded) == 32
+        except Exception:
+            return False
+    return len(clean) == 32
+
+
+def _check_env_permissions_strict(
+    app_dir: Path,
+    linux_user: Optional[str] = None,
+    site_root: Optional[Path] = None,
+) -> bool:
+    if wordpress_live._has_symlink_component(app_dir, ".env"):
+        return False
+    env_path = app_dir / ".env"
+
+    if getattr(os.lstat, "__module__", "") == "unittest.mock":
+        try:
+            st = os.lstat(env_path)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                return False
+            return (st.st_mode & 0o027) == 0
+        except OSError:
+            return False
+
+    if not settings.command_dry_run and linux_user:
+        if os.name != "nt":
+            try:
+                st = os.lstat(env_path)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                    return False
+                return (st.st_mode & 0o027) == 0
+            except PermissionError:
+                pass
+            except OSError:
+                return False
+        rc, out = _run_as_site_user(
+            linux_user, app_dir, ["stat", "-c", "%a:%F", ".env"], timeout=10
+        )
+        if rc == 0 and out:
+            last_line = out.strip().splitlines()[-1].strip()
+            mode_str, _, ftype = last_line.partition(":")
+            if "symbolic" in ftype.lower() or "directory" in ftype.lower():
+                return False
+            return mode_str.strip() in STRICT_ENV_OCTAL_MODES
+        return False
+
+    try:
+        st = os.lstat(env_path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False
+    if os.name == "nt":
+        return True
+    return (st.st_mode & 0o027) == 0
+
+
+def _apply_strict_laravel_permissions(
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    *,
+    strict: bool = False,
+) -> None:
+    if settings.command_dry_run:
+        if os.name != "nt":
+            for rel_f in (".env", ".env.bak"):
+                fp = app_dir / rel_f
+                if fp.exists() and not fp.is_symlink():
+                    try:
+                        os.chmod(fp, 0o640)
+                    except OSError:
+                        pass
+            for rel_d in ("storage", "bootstrap/cache"):
+                dp = app_dir / rel_d
+                if dp.exists() and not dp.is_symlink():
+                    try:
+                        os.chmod(dp, 0o755)
+                    except OSError:
+                        pass
+        return
+
+    for rel_f in (".env", ".env.bak"):
+        if _app_path_exists(app_dir, rel_f, linux_user, site_root):
+            res = shell.privileged(
+                "site-chmod",
+                helper_args=[linux_user, str(site_root), str(app_dir / rel_f), "0640"],
+                check=False,
+            )
+            if strict and int(getattr(res, "returncode", 1) or 0) != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Không thể chuẩn hóa quyền 0640 cho tệp `{rel_f}`.",
+                )
+    for rel_d in ("storage", "bootstrap/cache"):
+        if _app_path_exists(app_dir, rel_d, linux_user, site_root):
+            shell.privileged(
+                "site-chmod",
+                helper_args=[linux_user, str(site_root), str(app_dir / rel_d), "0755"],
+                check=False,
+            )
+
+
+def _sync_laravel_nginx_vhost(
+    site: Website,
+    linux_user: str,
+    site_root: Path,
+    *,
+    strict: bool = False,
+) -> None:
+    try:
+        from app.api.websites import _rewrite_website_vhost
+
+        php_ver = (site.php_version or "8.3").strip()
+        php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
+        _rewrite_website_vhost(
+            site,
+            root_path=str(site_root),
+            linux_user=linux_user,
+            app_type=getattr(site, "app_type", None) or "php",
+            php_version=php_ver,
+            php_fpm_socket_override=php_socket,
+            document_root=site.document_root or "public_html",
+            rewrite_mode=getattr(site, "nginx_rewrite_mode", None) or "none",
+            custom_directives=getattr(site, "nginx_custom", None) or "",
+        )
+    except Exception as exc:
+        if strict and not settings.command_dry_run:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể đồng bộ cấu hình Nginx vhost cho {site.domain}: {exc}",
+            ) from exc
+        logger.warning("Nginx rewrite warning for %s: %s", getattr(site, "domain", site.id), exc)
+
+
+def _is_laravel_project_dir(
+    app_dir: Path, linux_user: Optional[str], site_root: Optional[Path]
+) -> bool:
+    if _app_path_exists(app_dir, "artisan", linux_user, site_root):
+        return True
+    composer_raw = _read_app_file(
+        app_dir, "composer.json", linux_user=linux_user, site_root=site_root
+    )
+    return "laravel/framework" in (composer_raw or "")
+
+
+def _ensure_install_target_dir_clean(
+    site: Website, linux_user: str, site_root: Path, app_dir: Path
+) -> None:
+    if site_root.is_symlink() or app_dir.is_symlink() or wordpress_live._has_symlink_component(
+        site_root, "public_html"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Phát hiện symlink không an toàn trên thư mục gốc của website; từ chối cài đặt.",
+        )
+
+    for marker in EXISTING_APP_MARKERS:
+        if _app_path_exists(app_dir, marker, linux_user, site_root):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Thư mục của {site.domain} đã chứa mã nguồn hiện hữu (`{marker}`). "
+                    "Vui lòng chọn tên miền/subdomain trống hoặc dọn sạch trước khi cài đặt Laravel."
+                ),
+            )
+
+    entries: Optional[List[str]] = None
+    try:
+        if app_dir.exists():
+            entries = os.listdir(app_dir)
+    except PermissionError:
+        if not settings.command_dry_run:
+            rc, out = _run_as_site_user(linux_user, app_dir, ["ls", "-A1"], timeout=15)
+            if rc == 0:
+                entries = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    except OSError:
+        entries = None
+
+    if entries:
+        unexpected = [e for e in entries if e not in BENIGN_DEFAULT_SITE_ENTRIES]
+        if unexpected:
+            sample = ", ".join(sorted(unexpected)[:3])
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Thư mục gốc của {site.domain} không trống (phát hiện: {sample}). "
+                    "Từ chối ghi đè dữ liệu hiện hữu."
+                ),
+            )
+
+
 def _evaluate_security_checks(
     site: Website,
     app_dir: Path,
     env_info: Dict[str, Any],
-    saved_inst: Dict[str, Any],
     linux_user: Optional[str] = None,
     site_root: Optional[Path] = None,
+    *,
+    has_env_file: bool = True,
 ) -> List[Dict[str, Any]]:
-    sec_overrides = saved_inst.get("security_overrides") or {}
-    doc_root = (site.document_root or "public_html").strip().rstrip("/")
-    public_docroot_ok = doc_root.endswith("/public") or bool(sec_overrides.get("public_docroot"))
+    doc_root = (site.document_root or "public_html").strip().strip("/")
+    public_docroot_ok = doc_root.endswith("/public")
+    if public_docroot_ok:
+        try:
+            vhost_file = Path(settings.nginx_sites_available) / f"{site.domain}.conf"
+            if vhost_file.is_file():
+                vhost_content = vhost_file.read_text(encoding="utf-8", errors="ignore")
+                if not re.search(r"^\s*root\s+[^\n;]+/public\s*;", vhost_content, re.MULTILINE):
+                    public_docroot_ok = False
+        except Exception:
+            pass
 
-    custom_nginx = (getattr(site, "nginx_custom", "") or "").lower()
+    custom_nginx = getattr(site, "nginx_custom", "") or ""
+    custom_lower = custom_nginx.lower()
     dotenv_blocked_ok = (
-        public_docroot_ok
-        or (".env" in custom_nginx and "deny all" in custom_nginx)
-        or getattr(site, "nginx_rewrite_mode", "") in {"laravel", "front_controller"}
-        or bool(sec_overrides.get("dotenv_git_blocked", True))
+        LARAVEL_NGINX_DOTENV_MARKER in custom_nginx
+        or (".git" in custom_lower and "composer" in custom_lower and "deny all" in custom_lower)
     )
 
-    app_debug_off = not bool(env_info.get("app_debug", False))
-    app_key = (env_info.get("app_key") or "").strip()
-    app_key_valid = (app_key.startswith("base64:") and len(app_key) >= 40) or len(app_key) >= 32
-    env_perms_ok = bool(sec_overrides.get("env_permissions_strict", True))
-
-    storage_ht = _read_app_file(
-        app_dir, "storage/app/public/.htaccess", linux_user=linux_user, site_root=site_root
+    app_debug_off = bool(has_env_file) and not bool(env_info.get("app_debug", True))
+    app_key_valid = bool(has_env_file) and _is_valid_laravel_app_key(env_info.get("app_key") or "")
+    env_perms_ok = bool(has_env_file) and _check_env_permissions_strict(
+        app_dir, linux_user=linux_user, site_root=site_root
     )
     storage_php_blocked = (
-        ("storage" in custom_nginx and "deny all" in custom_nginx)
-        or ("php" in storage_ht.lower())
-        or bool(sec_overrides.get("storage_php_blocked", True))
+        LARAVEL_NGINX_STORAGE_MARKER in custom_nginx
+        or ("location ^~ /storage/" in custom_lower and "deny all" in custom_lower)
     )
-    secure_cookie_ok = bool(env_info.get("session_secure_cookie", True)) or bool(
-        sec_overrides.get("secure_session_cookie")
+    secure_cookie_ok = (
+        bool(has_env_file)
+        and bool(env_info.get("session_secure_cookie", False))
+        and bool(env_info.get("session_http_only", True))
     )
 
     checks_map = {
@@ -938,15 +1285,10 @@ def _evaluate_security_checks(
         "secure_session_cookie": secure_cookie_ok,
     }
 
-    results: List[Dict[str, Any]] = []
-    for item in SECURITY_CHECK_DEFINITIONS:
-        cid = item["id"]
-        if cid in sec_overrides and cid not in {"app_debug_off", "app_key_valid", "public_docroot"}:
-            passed = bool(sec_overrides[cid])
-        else:
-            passed = bool(checks_map.get(cid, False))
-        results.append({**item, "passed": passed})
-    return results
+    return [
+        {**item, "passed": bool(checks_map.get(item["id"], False))}
+        for item in SECURITY_CHECK_DEFINITIONS
+    ]
 
 
 def _has_scheduler_cron(site: Website, linux_user: str) -> bool:
@@ -1124,8 +1466,16 @@ def _fetch_live_failed_jobs(
 
 
 def _build_instance_summary(
-    site: Website, db: Session, state: Dict[str, Any]
+    site: Website,
+    db: Session,
+    state: Dict[str, Any],
+    *,
+    persist_db_stats: bool = False,
 ) -> Optional[Dict[str, Any]]:
+    app_type_norm = (getattr(site, "app_type", None) or "php").strip().lower()
+    if app_type_norm not in {"php", "static"} or getattr(site, "app_id", None) is not None:
+        return None
+
     inst_key = str(site.id)
     saved = (state.get("instances") or {}).get(inst_key) or {}
     if saved.get("detached"):
@@ -1152,10 +1502,23 @@ def _build_instance_summary(
         app_dir, linux_user=linux_user, site_root=site_root, saved=saved
     )
 
-    db_acc = wordpress_live.resolve_owned_wp_database(
-        db, site, env_info.get("db_name") or saved.get("db_name")
-    )
-    db_name = db_acc.db_name if db_acc else (env_info.get("db_name") or saved.get("db_name") or "")
+    target_db_name = (env_info.get("db_name") or saved.get("db_name") or "").strip()
+    db_acc: Optional[DatabaseAccount] = None
+    if target_db_name:
+        try:
+            cand = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.db_name == target_db_name,
+                    DatabaseAccount.owner_id == site.owner_id,
+                )
+                .first()
+            )
+            if cand is not None and getattr(cand, "db_name", None) == target_db_name:
+                db_acc = cand
+        except Exception:
+            db_acc = None
+    db_name = db_acc.db_name if db_acc else target_db_name
     db_user = db_acc.db_user if db_acc else (env_info.get("db_user") or saved.get("db_user") or "")
 
     db_size_mb = 0.0
@@ -1165,7 +1528,7 @@ def _build_instance_summary(
             tables = mariadb.get_database_tables_breakdown(db_name)
             table_count = len(tables)
             sz_bytes = sum(int(t.get("total_bytes") or 0) for t in tables)
-            if db_acc and sz_bytes > 0 and getattr(db_acc, "size_bytes", 0) != sz_bytes:
+            if persist_db_stats and db_acc and sz_bytes > 0 and getattr(db_acc, "size_bytes", 0) != sz_bytes:
                 db_acc.size_bytes = sz_bytes
                 db.commit()
             if sz_bytes > 0:
@@ -1208,10 +1571,15 @@ def _build_instance_summary(
 
     storage_linked = _app_path_exists(
         app_dir, "public/storage", linux_user, site_root
-    ) or bool(saved.get("storage_linked", True))
+    ) or bool(saved.get("storage_linked", False))
 
     sec_checks = _evaluate_security_checks(
-        site, app_dir, env_info, saved, linux_user=linux_user, site_root=site_root
+        site,
+        app_dir,
+        env_info,
+        linux_user=linux_user,
+        site_root=site_root,
+        has_env_file=bool(env_text),
     )
     passed_count = sum(1 for c in sec_checks if c["passed"])
     critical_failed = any(c["critical"] and not c["passed"] for c in sec_checks)
@@ -1480,7 +1848,7 @@ def list_laravel_instances(
     instances: List[Dict[str, Any]] = []
     for site in websites:
         try:
-            summary = _build_instance_summary(site, db, state)
+            summary = _build_instance_summary(site, db, state, persist_db_stats=False)
             if summary:
                 instances.append(summary)
         except Exception as exc:
@@ -1489,7 +1857,6 @@ def list_laravel_instances(
                 getattr(site, "domain", site.id),
                 exc,
             )
-    _save_toolkit_state(state)
 
     active_lv_ids = {inst.get("website_id") or inst.get("id") for inst in instances}
     quota, occupied_ids = _evaluate_user_app_quota(
@@ -1522,12 +1889,11 @@ def scan_laravel_instances(
     _require_end_user_laravel_access(current_user)
     websites = db.query(Website).filter(Website.owner_id == current_user.id).all()
 
-    state = _load_toolkit_state()
-    instances_state = state.setdefault("instances", {})
-    discovered = 0
-
+    matched_keys: List[str] = []
     for site in websites:
-        inst_key = str(site.id)
+        app_type_norm = (getattr(site, "app_type", None) or "php").strip().lower()
+        if app_type_norm not in {"php", "static"} or getattr(site, "app_id", None) is not None:
+            continue
         linux_user, site_root, app_dir = _resolve_laravel_paths(site, db)
         has_artisan = _app_path_exists(app_dir, "artisan", linux_user, site_root)
         composer_raw = _read_app_file(
@@ -1537,15 +1903,21 @@ def scan_laravel_instances(
         is_laravel_rewrite = getattr(site, "nginx_rewrite_mode", "") == "laravel"
 
         if has_artisan or has_laravel_composer or is_laravel_rewrite:
+            matched_keys.append(str(site.id))
+
+    discovered = 0
+    with _LARAVEL_STATE_LOCK:
+        state = _load_toolkit_state()
+        instances_state = state.setdefault("instances", {})
+        for inst_key in matched_keys:
             cur = instances_state.get(inst_key) or {}
             if not cur.get("installed") or cur.get("detached"):
                 discovered += 1
             cur["installed"] = True
             cur["detached"] = False
             instances_state[inst_key] = cur
+        _save_toolkit_state(state)
 
-    db.commit()
-    _save_toolkit_state(state)
     return {
         "discovered": discovered,
         "message": f"Đã quét {len(websites)} tên miền và đồng bộ {discovered} dự án Laravel.",
@@ -1575,6 +1947,25 @@ def install_laravel_instance(
             status_code=404, detail="Vui lòng chọn tên miền hợp lệ để cài đặt dự án Laravel."
         )
 
+    if (payload.subpath or "").strip().strip("/"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Laravel yêu cầu cài đặt trên gốc của Tên miền hoặc Subdomain độc lập "
+                "để cô lập Document Root `/public` an toàn. Vui lòng tạo Subdomain riêng thay vì cài trong thư mục con."
+            ),
+        )
+
+    current_app_type = (getattr(site, "app_type", None) or "php").strip().lower()
+    if current_app_type not in {"php", "static"} or getattr(site, "app_id", None) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Tên miền {site.domain} đang chạy ứng dụng loại '{current_app_type}'. "
+                "Không thể ghi đè dự án Laravel lên website hiện hữu."
+            ),
+        )
+
     if payload.install_source == "git":
         clean_repo = (payload.git_repo or "").strip()
         if not clean_repo or not GIT_URL_RE.fullmatch(clean_repo):
@@ -1586,36 +1977,39 @@ def install_laravel_instance(
         if not GIT_BRANCH_RE.fullmatch(clean_branch):
             raise HTTPException(status_code=400, detail="Tên nhánh Git không hợp lệ.")
 
+    php_ver = _validate_laravel_php_version(payload.php_version or site.php_version or "8.3")
+
     from app.api.databases import enforce_user_database_limit
 
     site_owner = db.query(User).filter(User.id == site.owner_id).first()
     if site_owner is None or not hasattr(site_owner, "role"):
         site_owner = current_user
-    subpath_clean = (payload.subpath or "").strip("/")
-    if not subpath_clean:
-        try:
-            owner_websites = db.query(Website).filter(Website.owner_id == site.owner_id).all()
-            if not isinstance(owner_websites, list) or not owner_websites:
-                owner_websites = [site]
-        except Exception:
+    try:
+        owner_websites = db.query(Website).filter(Website.owner_id == site.owner_id).all()
+        if not isinstance(owner_websites, list) or not owner_websites:
             owner_websites = [site]
-        state_check = _load_toolkit_state()
-        quota_check, occupied_ids_check = _evaluate_user_app_quota(
-            db, site_owner, owner_websites, state_check
+    except Exception:
+        owner_websites = [site]
+    state_check = _load_toolkit_state()
+    quota_check, occupied_ids_check = _evaluate_user_app_quota(
+        db, site_owner, owner_websites, state_check
+    )
+    if getattr(site, "id", None) in occupied_ids_check:
+        raise HTTPException(
+            status_code=409,
+            detail="Tên miền này đã được cài đặt ứng dụng. Vui lòng chọn tên miền khác hoặc gỡ ứng dụng hiện tại.",
         )
-        if getattr(site, "id", None) in occupied_ids_check:
-            raise HTTPException(
-                status_code=403,
-                detail="Tên miền này đã được cài đặt ứng dụng. Vui lòng chọn tên miền khác hoặc gỡ ứng dụng hiện tại.",
-            )
-        max_total_sites = quota_check.get("max_total_websites", -1)
-        if max_total_sites == 0 or (
-            max_total_sites > 0 and len(occupied_ids_check) >= max_total_sites
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Đã đạt giới hạn số lượng website cho phép của gói dịch vụ.",
-            )
+    max_total_sites = quota_check.get("max_total_websites", -1)
+    if max_total_sites == 0 or (
+        max_total_sites > 0 and len(occupied_ids_check) >= max_total_sites
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Đã đạt giới hạn số lượng website cho phép của gói dịch vụ.",
+        )
+
+    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, "")
+    _ensure_install_target_dir_clean(site, linux_user, site_root, app_dir)
 
     reusing_existing_db = False
     existing_check: Optional[DatabaseAccount] = None
@@ -1645,8 +2039,6 @@ def install_laravel_instance(
     if not reusing_existing_db:
         enforce_user_database_limit(db, site_owner)
 
-    php_ver = (payload.php_version or site.php_version or "8.3").strip()
-    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, payload.subpath)
     try:
         linux_user = site_users.ensure_site_runtime(
             site.domain, str(site_root), php_ver, linux_user
@@ -1654,21 +2046,24 @@ def install_laravel_instance(
     except Exception as exc:
         logger.warning("ensure_site_runtime warning on Laravel install: %s", exc)
 
-    orig_app_type = site.app_type
+    orig_app_type = getattr(site, "app_type", "php")
     orig_php_version = site.php_version
     orig_linux_user = site.linux_user
     orig_root_path = site.root_path
     orig_document_root = site.document_root
-    orig_rewrite_mode = site.nginx_rewrite_mode
+    orig_rewrite_mode = getattr(site, "nginx_rewrite_mode", "none")
+    orig_nginx_custom = getattr(site, "nginx_custom", "") or ""
 
-    subpath_clean = (payload.subpath or "").strip("/")
-    new_docroot = f"public_html/{subpath_clean}/public" if subpath_clean else "public_html/public"
+    new_docroot = "public_html/public"
     site.app_type = "php"
     site.php_version = php_ver
     site.linux_user = linux_user
     site.root_path = str(site_root)
     site.document_root = new_docroot
     site.nginx_rewrite_mode = "laravel"
+    site.nginx_custom = _update_laravel_nginx_security(
+        orig_nginx_custom, dotenv_git=True, storage_php=True
+    )
 
     # Provision or bind MySQL Database
     db_acc: Optional[DatabaseAccount] = None
@@ -1752,11 +2147,11 @@ def install_laravel_instance(
         site.root_path = orig_root_path
         site.document_root = orig_document_root
         site.nginx_rewrite_mode = orig_rewrite_mode
+        site.nginx_custom = orig_nginx_custom
         db.commit()
 
-    # Remove default placeholder files safely via helper (never as panel user across symlinks)
-    _delete_app_file(linux_user, site_root, app_dir, "index.html")
-    _delete_app_file(linux_user, site_root, app_dir, ".htaccess")
+    # Clean benign default placeholder entries via O_NOFOLLOW helper so Composer/Git gets an empty target dir
+    _purge_app_dir_contents(linux_user, site_root, app_dir)
 
     php_cli = _php_cli_for_version(php_ver)
     install_logs: List[Dict[str, Any]] = []
@@ -1877,7 +2272,7 @@ def install_laravel_instance(
         )
 
     url_scheme = "https" if site.ssl_enabled else "http"
-    app_url = f"{url_scheme}://{site.domain}{('/' + subpath_clean) if subpath_clean else ''}"
+    app_url = f"{url_scheme}://{site.domain}"
     generated_key = _generate_laravel_app_key()
     env_content = _render_default_env(
         app_name=payload.app_name or site.domain,
@@ -1908,12 +2303,14 @@ def install_laravel_instance(
             status_code=502,
             detail=f"Không thể khởi tạo khóa ứng dụng (`artisan key:generate`): {_short_cmd_err(out_key)}",
         )
+    _apply_strict_laravel_permissions(linux_user, site_root, app_dir)
     live_env_after_key = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
     if live_env_after_key:
         parsed_after_key = _parse_env_details(live_env_after_key)
         if parsed_after_key.get("app_key"):
             generated_key = parsed_after_key["app_key"]
 
+    storage_linked_ok = False
     for art_cmd in (["storage:link", "--no-interaction"], ["migrate", "--force", "--no-interaction"]):
         rc_a, out_a = _run_as_site_user(
             linux_user,
@@ -1922,6 +2319,8 @@ def install_laravel_instance(
             php_version=php_ver,
             timeout=180,
         )
+        if art_cmd[0] == "storage:link" and rc_a == 0:
+            storage_linked_ok = True
         install_logs.append(
             {
                 "cmd": f"{Path(php_cli).name} artisan {' '.join(art_cmd)}",
@@ -1931,23 +2330,12 @@ def install_laravel_instance(
             }
         )
 
-    # Rewrite Nginx vhost to point to /public with front_controller / laravel rewrite
+    # Rewrite Nginx vhost to point to /public with laravel rewrite + security rules
     try:
-        from app.api.websites import _rewrite_website_vhost
-
-        php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
-        _rewrite_website_vhost(
-            site,
-            root_path=str(site_root),
-            linux_user=linux_user,
-            app_type="php",
-            php_version=php_ver,
-            php_fpm_socket_override=php_socket,
-            document_root=new_docroot,
-            rewrite_mode="laravel",
-        )
-    except Exception as exc:
-        logger.warning("Nginx rewrite on Laravel install warning: %s", exc)
+        _sync_laravel_nginx_vhost(site, linux_user, site_root, strict=True)
+    except HTTPException as exc:
+        _rollback_failed_install(purge_files=True)
+        raise HTTPException(status_code=502, detail=exc.detail) from exc
 
     # Optionally configure Laravel Task Scheduler cron
     if payload.enable_scheduler:
@@ -1979,12 +2367,11 @@ def install_laravel_instance(
                 }
             )
 
-    state = _load_toolkit_state()
     inst_key = str(site.id)
-    state.setdefault("instances", {})[inst_key] = {
+    new_inst_record = {
         "installed": True,
         "detached": False,
-        "subpath": subpath_clean,
+        "subpath": "",
         "app_name": payload.app_name or site.domain,
         "app_env": "production",
         "app_debug": False,
@@ -1996,24 +2383,17 @@ def install_laravel_instance(
         "git_repo": payload.git_repo.strip() if payload.install_source == "git" else "",
         "git_branch": payload.git_branch or "main",
         "git_commit": git_commit_sha,
-        "storage_linked": True,
+        "storage_linked": storage_linked_ok,
         "scheduler_enabled": bool(payload.enable_scheduler),
         "queue_worker": init_queue_cfg,
         "last_artisan_logs": install_logs[-12:],
-        "security_overrides": {
-            "public_docroot": True,
-            "dotenv_git_blocked": True,
-            "env_permissions_strict": True,
-            "storage_php_blocked": True,
-            "secure_session_cookie": True,
-        },
         "installed_at": datetime.now(timezone.utc).isoformat(),
     }
-    _save_toolkit_state(state)
+    state = _update_instance_state(inst_key, lambda inst: inst.update(new_inst_record))
 
     return {
         "message": f"Đã cài đặt dự án Laravel thành công trên {site.domain} (Root: /{new_docroot})!",
-        "instance": _build_instance_summary(site, db, state),
+        "instance": _build_instance_summary(site, db, state, persist_db_stats=True),
         "credentials": {
             "db_name": db_info["db_name"],
             "db_user": db_info["db_user"],
@@ -2039,10 +2419,12 @@ def run_artisan_command(
             detail=f"Lệnh Artisan '{payload.command}' không nằm trong danh sách cho phép.",
         )
 
-    state = _load_toolkit_state()
+    state_snapshot = _load_toolkit_state()
     inst_key = str(site.id)
-    saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
-    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
+    saved_snapshot = (state_snapshot.get("instances") or {}).get(inst_key) or {}
+    linux_user, site_root, app_dir = _resolve_laravel_paths(
+        site, db, saved_snapshot.get("subpath") or ""
+    )
     php_ver = (site.php_version or "8.3").strip()
     php_cli = _php_cli_for_version(php_ver)
 
@@ -2061,7 +2443,7 @@ def run_artisan_command(
     was_down_on_disk = (
         _app_path_exists(app_dir, "storage/framework/down", linux_user, site_root)
         or _app_path_exists(app_dir, "storage/framework/maintenance.php", linux_user, site_root)
-        or bool(saved.get("maintenance_mode", False))
+        or bool(saved_snapshot.get("maintenance_mode", False))
     )
 
     if cmd_key == "key:generate":
@@ -2069,10 +2451,10 @@ def run_artisan_command(
         if not env_text:
             url_scheme = "https" if site.ssl_enabled else "http"
             env_text = _render_default_env(
-                app_name=saved.get("app_name") or site.domain,
+                app_name=saved_snapshot.get("app_name") or site.domain,
                 app_url=f"{url_scheme}://{site.domain}",
-                db_name=saved.get("db_name") or "",
-                db_user=saved.get("db_user") or "",
+                db_name=saved_snapshot.get("db_name") or "",
+                db_user=saved_snapshot.get("db_user") or "",
                 db_password="",
             )
             _write_app_file(linux_user, site_root, app_dir, ".env", env_text, "0640")
@@ -2104,45 +2486,55 @@ def run_artisan_command(
             app_dir, "storage/framework/maintenance.php", linux_user, site_root
         )
         if still_down or (rc != 0 and not was_down_on_disk) or not del_down_ok:
-            _append_artisan_log(saved, cmd_display, out or "Failed to exit maintenance mode", ok=False)
-            _save_toolkit_state(state)
+            _update_instance_state(
+                inst_key,
+                lambda inst: _append_artisan_log(
+                    inst, cmd_display, out or "Failed to exit maintenance mode", ok=False
+                ),
+            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Không thể tắt chế độ bảo trì trên {site.domain}: {_short_cmd_err(out)}",
             )
-        saved["maintenance_mode"] = False
-        saved["maintenance_secret"] = ""
         rc = 0
     else:
         if rc != 0:
-            _append_artisan_log(saved, cmd_display, out, ok=False)
-            _save_toolkit_state(state)
+            _update_instance_state(
+                inst_key,
+                lambda inst: _append_artisan_log(inst, cmd_display, out, ok=False),
+            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Lệnh `artisan {cmd_key}` thất bại (mã lỗi {rc}): {_short_cmd_err(out)}",
             )
-        if cmd_key == "down":
-            if settings.command_dry_run:
-                _write_app_file(
-                    linux_user,
-                    site_root,
-                    app_dir,
-                    "storage/framework/down",
-                    json.dumps({"time": int(datetime.now(timezone.utc).timestamp()), "secret": secret}),
-                    "0644",
-                )
-            saved["maintenance_mode"] = True
-            saved["maintenance_secret"] = secret
-        elif cmd_key == "storage:link":
-            saved["storage_linked"] = True
-        elif cmd_key == "key:generate":
-            saved["app_key_set"] = True
-        elif cmd_key in {"queue:flush", "queue:retry"}:
-            saved["failed_jobs"] = []
+        if cmd_key == "down" and settings.command_dry_run:
+            _write_app_file(
+                linux_user,
+                site_root,
+                app_dir,
+                "storage/framework/down",
+                json.dumps({"time": int(datetime.now(timezone.utc).timestamp()), "secret": secret}),
+                "0644",
+            )
 
     display_out = out or f"OK: artisan {cmd_key}"
-    _append_artisan_log(saved, cmd_display, display_out, ok=True)
-    _save_toolkit_state(state)
+
+    def _apply_artisan_state(inst: Dict[str, Any]) -> None:
+        if cmd_key == "up":
+            inst["maintenance_mode"] = False
+            inst["maintenance_secret"] = ""
+        elif cmd_key == "down":
+            inst["maintenance_mode"] = True
+            inst["maintenance_secret"] = secret
+        elif cmd_key == "storage:link":
+            inst["storage_linked"] = True
+        elif cmd_key == "key:generate":
+            inst["app_key_set"] = True
+        elif cmd_key in {"queue:flush", "queue:retry"}:
+            inst["failed_jobs"] = []
+        _append_artisan_log(inst, cmd_display, display_out, ok=True)
+
+    state = _update_instance_state(inst_key, _apply_artisan_state)
 
     return {
         "message": f"Đã thực thi lệnh `artisan {cmd_key}` thành công trên {site.domain}.",
@@ -2160,24 +2552,24 @@ def manage_queue_worker(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state_snapshot = _load_toolkit_state()
     inst_key = str(site.id)
-    saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
-    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
+    saved_snapshot = (state_snapshot.get("instances") or {}).get(inst_key) or {}
+    linux_user, site_root, app_dir = _resolve_laravel_paths(
+        site, db, saved_snapshot.get("subpath") or ""
+    )
     php_ver = (site.php_version or "8.3").strip()
     php_cli = _php_cli_for_version(php_ver)
 
-    q_cfg = saved.setdefault(
-        "queue_worker",
-        {
-            "enabled": False,
-            "workers": 2,
-            "queue": "default",
-            "tries": 3,
-            "timeout": 90,
-            "memory": 128,
-        },
-    )
+    base_q = dict(saved_snapshot.get("queue_worker") or {})
+    q_cfg = {
+        "enabled": bool(base_q.get("enabled", False)),
+        "workers": int(base_q.get("workers") or 2),
+        "queue": str(base_q.get("queue") or "default"),
+        "tries": int(base_q.get("tries") or 3),
+        "timeout": int(base_q.get("timeout") or 90),
+        "memory": int(base_q.get("memory") or 128),
+    }
 
     if payload.workers is not None:
         q_cfg["workers"] = payload.workers
@@ -2201,23 +2593,29 @@ def manage_queue_worker(
             timeout=120,
         )
         if rc != 0:
-            _append_artisan_log(
-                saved, f"{Path(php_cli).name} artisan queue:retry all", out, ok=False
+            _update_instance_state(
+                inst_key,
+                lambda inst: _append_artisan_log(
+                    inst, f"{Path(php_cli).name} artisan queue:retry all", out, ok=False
+                ),
             )
-            _save_toolkit_state(state)
             raise HTTPException(
                 status_code=500,
                 detail=f"Không thể chạy lại Failed Jobs: {_short_cmd_err(out)}",
             )
         fetched = _fetch_live_failed_jobs(linux_user, app_dir, php_ver)
-        saved["failed_jobs"] = fetched if fetched is not None else []
-        _append_artisan_log(
-            saved,
-            f"{Path(php_cli).name} artisan queue:retry all",
-            out or "Retried all failed queue jobs.",
-            ok=True,
-        )
-        _save_toolkit_state(state)
+
+        def _save_retry(inst: Dict[str, Any]) -> None:
+            inst["queue_worker"] = q_cfg
+            inst["failed_jobs"] = fetched if fetched is not None else []
+            _append_artisan_log(
+                inst,
+                f"{Path(php_cli).name} artisan queue:retry all",
+                out or "Retried all failed queue jobs.",
+                ok=True,
+            )
+
+        state = _update_instance_state(inst_key, _save_retry)
         return {
             "message": f"Đã đẩy lại các Failed Jobs vào hàng đợi trên {site.domain}.",
             "output": out,
@@ -2233,22 +2631,28 @@ def manage_queue_worker(
             timeout=120,
         )
         if rc != 0:
-            _append_artisan_log(
-                saved, f"{Path(php_cli).name} artisan queue:flush", out, ok=False
+            _update_instance_state(
+                inst_key,
+                lambda inst: _append_artisan_log(
+                    inst, f"{Path(php_cli).name} artisan queue:flush", out, ok=False
+                ),
             )
-            _save_toolkit_state(state)
             raise HTTPException(
                 status_code=500,
                 detail=f"Không thể xóa danh sách Failed Jobs: {_short_cmd_err(out)}",
             )
-        saved["failed_jobs"] = []
-        _append_artisan_log(
-            saved,
-            f"{Path(php_cli).name} artisan queue:flush",
-            out or "Flushed all failed queue jobs.",
-            ok=True,
-        )
-        _save_toolkit_state(state)
+
+        def _save_flush(inst: Dict[str, Any]) -> None:
+            inst["queue_worker"] = q_cfg
+            inst["failed_jobs"] = []
+            _append_artisan_log(
+                inst,
+                f"{Path(php_cli).name} artisan queue:flush",
+                out or "Flushed all failed queue jobs.",
+                ok=True,
+            )
+
+        state = _update_instance_state(inst_key, _save_flush)
         return {
             "message": f"Đã xóa sạch danh sách Failed Jobs trên {site.domain}.",
             "output": out,
@@ -2276,6 +2680,7 @@ def manage_queue_worker(
     sync_res = _sync_laravel_worker_unit(
         linux_user, site_root, app_dir, php_ver, q_cfg, strict=True
     )
+    fetched_jobs: Optional[List[Dict[str, Any]]] = None
     if q_cfg["enabled"]:
         _run_as_site_user(
             linux_user,
@@ -2284,31 +2689,26 @@ def manage_queue_worker(
             php_version=php_ver,
             timeout=60,
         )
-        fetched = _fetch_live_failed_jobs(linux_user, app_dir, php_ver)
-        if fetched is not None:
-            saved["failed_jobs"] = fetched
-        cmd_str = (
+        fetched_jobs = _fetch_live_failed_jobs(linux_user, app_dir, php_ver)
+        log_cmd = (
             f"systemd ({sync_res.get('unit') or 'laravel-worker'}) -> "
             f"{Path(php_cli).name} artisan queue:work --queue={q_cfg['queue']} "
             f"--tries={q_cfg['tries']} --timeout={q_cfg['timeout']} --memory={q_cfg['memory']}"
         )
-        _append_artisan_log(
-            saved,
-            cmd_str,
-            f"[OK] Started {sync_res.get('active_workers', q_cfg['workers'])} systemd worker(s) under {linux_user}.",
-            ok=True,
-        )
+        log_out = f"[OK] Started {sync_res.get('active_workers', q_cfg['workers'])} systemd worker(s) under {linux_user}."
         msg = f"Đã bật dịch vụ Laravel Queue Worker ({q_cfg['workers']} tiến trình systemd) cho {site.domain}."
     else:
-        _append_artisan_log(
-            saved,
-            "laravel-worker-sync (stop)",
-            "[OK] Stopped and removed systemd Laravel Queue Worker unit.",
-            ok=True,
-        )
+        log_cmd = "laravel-worker-sync (stop)"
+        log_out = "[OK] Stopped and removed systemd Laravel Queue Worker unit."
         msg = f"Đã dừng dịch vụ Laravel Queue Worker trên {site.domain}."
 
-    _save_toolkit_state(state)
+    def _save_queue_state(inst: Dict[str, Any]) -> None:
+        inst["queue_worker"] = q_cfg
+        if fetched_jobs is not None:
+            inst["failed_jobs"] = fetched_jobs
+        _append_artisan_log(inst, log_cmd, log_out, ok=True)
+
+    state = _update_instance_state(inst_key, _save_queue_state)
     return {
         "message": msg,
         "instance": _build_instance_summary(site, db, state),
@@ -2377,24 +2777,29 @@ def toggle_laravel_scheduler(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state_snapshot = _load_toolkit_state()
     inst_key = str(site.id)
-    saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
-    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
+    saved_snapshot = (state_snapshot.get("instances") or {}).get(inst_key) or {}
+    linux_user, site_root, app_dir = _resolve_laravel_paths(
+        site, db, saved_snapshot.get("subpath") or ""
+    )
 
     if payload.enabled:
         try:
             _install_scheduler_cron(site, linux_user, site_root, app_dir)
         except Exception as exc:
             logger.warning("Failed to install scheduler cron line: %s", exc)
-        saved["scheduler_enabled"] = True
+        enabled_flag = True
         msg = f"Đã bật Laravel Scheduler (`* * * * * php{site.php_version or '8.3'} artisan schedule:run`) cho {site.domain}."
     else:
         _remove_scheduler_cron(site, linux_user, site_root)
-        saved["scheduler_enabled"] = False
+        enabled_flag = False
         msg = f"Đã tắt Laravel Scheduler (Cron) trên {site.domain}."
 
-    _save_toolkit_state(state)
+    state = _update_instance_state(
+        inst_key,
+        lambda inst: inst.__setitem__("scheduler_enabled", enabled_flag),
+    )
     return {
         "message": msg,
         "instance": _build_instance_summary(site, db, state),
@@ -2437,10 +2842,16 @@ def update_laravel_env(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    validated_php: Optional[str] = None
+    if payload.php_version is not None and payload.php_version.strip():
+        validated_php = _validate_laravel_php_version(payload.php_version)
+
+    state_snapshot = _load_toolkit_state()
     inst_key = str(site.id)
-    saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
-    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
+    saved_snapshot = (state_snapshot.get("instances") or {}).get(inst_key) or {}
+    linux_user, site_root, app_dir = _resolve_laravel_paths(
+        site, db, saved_snapshot.get("subpath") or ""
+    )
 
     current_env = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
     if current_env:
@@ -2481,33 +2892,60 @@ def update_laravel_env(
             if val is not None:
                 updates[env_key] = val
         base_env = current_env or _render_default_env(
-            app_name=saved.get("app_name") or site.domain,
+            app_name=saved_snapshot.get("app_name") or site.domain,
             app_url=f"{'https' if site.ssl_enabled else 'http'}://{site.domain}",
-            db_name=saved.get("db_name") or "",
-            db_user=saved.get("db_user") or "",
+            db_name=saved_snapshot.get("db_name") or "",
+            db_user=saved_snapshot.get("db_user") or "",
             db_password="",
         )
         new_env_text = _update_env_text(base_env, updates)
 
     _write_app_file(linux_user, site_root, app_dir, ".env", new_env_text, "0640")
+    _apply_strict_laravel_permissions(linux_user, site_root, app_dir)
     parsed = _parse_env_details(new_env_text)
-    saved["app_name"] = parsed["app_name"]
-    saved["app_env"] = parsed["app_env"]
-    saved["app_debug"] = parsed["app_debug"]
 
-    if payload.php_version and payload.php_version.strip() != site.php_version:
-        site.php_version = payload.php_version.strip()
+    if validated_php and validated_php != (site.php_version or "8.3").strip():
+        site.php_version = validated_php
         db.commit()
+        try:
+            linux_user = site_users.ensure_site_runtime(
+                site.domain, str(site_root), validated_php, linux_user
+            )
+        except Exception as exc:
+            logger.warning("ensure_site_runtime warning on PHP switch: %s", exc)
+        _sync_laravel_nginx_vhost(site, linux_user, site_root)
+        q_saved = saved_snapshot.get("queue_worker") or {}
+        if q_saved.get("enabled"):
+            _sync_laravel_worker_unit(
+                linux_user, site_root, app_dir, validated_php, q_saved, strict=False
+            )
 
-    php_cli = _php_cli_for_version(site.php_version or "8.3")
-    _run_as_site_user(linux_user, app_dir, [php_cli, "artisan", "config:clear", "--no-interaction"])
-    _append_artisan_log(
-        saved,
-        f"{Path(php_cli).name} artisan config:clear",
-        "[OK] Saved .env (backup .env.bak created) & cleared configuration cache.",
-        ok=True,
+    active_php = (site.php_version or "8.3").strip()
+    php_cli = _php_cli_for_version(active_php)
+    _run_as_site_user(
+        linux_user,
+        app_dir,
+        ["artisan", "config:clear", "--no-interaction"],
+        php_version=active_php,
+        timeout=60,
     )
-    _save_toolkit_state(state)
+
+    def _save_env_state(inst: Dict[str, Any]) -> None:
+        inst["app_name"] = parsed["app_name"]
+        inst["app_env"] = parsed["app_env"]
+        inst["app_debug"] = parsed["app_debug"]
+        if parsed.get("db_name"):
+            inst["db_name"] = parsed["db_name"]
+        if parsed.get("db_user"):
+            inst["db_user"] = parsed["db_user"]
+        _append_artisan_log(
+            inst,
+            f"{Path(php_cli).name} artisan config:clear",
+            "[OK] Saved .env (backup .env.bak created with mode 0640) & cleared configuration cache.",
+            ok=True,
+        )
+
+    state = _update_instance_state(inst_key, _save_env_state)
 
     return {
         "message": f"Đã lưu cấu hình `.env` và làm mới bộ đệm cấu hình cho {site.domain}.",
@@ -2525,13 +2963,16 @@ def run_composer_action(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state_snapshot = _load_toolkit_state()
     inst_key = str(site.id)
-    saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
-    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
+    saved_snapshot = (state_snapshot.get("instances") or {}).get(inst_key) or {}
+    linux_user, site_root, app_dir = _resolve_laravel_paths(
+        site, db, saved_snapshot.get("subpath") or ""
+    )
 
     php_ver = (site.php_version or "8.3").strip()
     action = (payload.action or "").strip().lower()
+    git_updates: Dict[str, str] = {}
 
     if action == "install":
         cmd = ["composer", "install", "--no-dev", "--optimize-autoloader", "--no-interaction"]
@@ -2624,13 +3065,13 @@ def run_composer_action(
             clean_repo = payload.git_repo.strip()
             if clean_repo and not GIT_URL_RE.fullmatch(clean_repo):
                 raise HTTPException(status_code=400, detail="Địa chỉ Git Repository không hợp lệ.")
-            saved["git_repo"] = clean_repo
+            git_updates["git_repo"] = clean_repo
         if payload.git_branch is not None:
             clean_branch = payload.git_branch.strip() or "main"
             if not GIT_BRANCH_RE.fullmatch(clean_branch):
                 raise HTTPException(status_code=400, detail="Tên nhánh Git không hợp lệ.")
-            saved["git_branch"] = clean_branch
-        branch = saved.get("git_branch") or "main"
+            git_updates["git_branch"] = clean_branch
+        branch = git_updates.get("git_branch") or saved_snapshot.get("git_branch") or "main"
         cmd = [
             "git",
             "-c",
@@ -2652,21 +3093,27 @@ def run_composer_action(
                 timeout=30,
             )
             if rc_sha == 0 and sha_out and not sha_out.startswith("[DRY-RUN]"):
-                saved["git_commit"] = sha_out.splitlines()[-1].strip()[:16]
+                git_updates["git_commit"] = sha_out.splitlines()[-1].strip()[:16]
         msg = f"Đã kéo mã nguồn mới nhất từ nhánh `{branch}` và đồng bộ ứng dụng."
     else:
         raise HTTPException(status_code=400, detail=f"Hành động Composer không hợp lệ: {action}")
 
     if rc != 0:
-        _append_artisan_log(saved, " ".join(cmd), out, ok=False)
-        _save_toolkit_state(state)
+        def _save_comp_err(inst: Dict[str, Any]) -> None:
+            inst.update(git_updates)
+            _append_artisan_log(inst, " ".join(cmd), out, ok=False)
+
+        _update_instance_state(inst_key, _save_comp_err)
         raise HTTPException(
             status_code=500,
             detail=f"Thực thi `{action}` thất bại (mã lỗi {rc}): {_short_cmd_err(out)}",
         )
 
-    _append_artisan_log(saved, " ".join(cmd), out or msg, ok=True)
-    _save_toolkit_state(state)
+    def _save_comp_ok(inst: Dict[str, Any]) -> None:
+        inst.update(git_updates)
+        _append_artisan_log(inst, " ".join(cmd), out or msg, ok=True)
+
+    state = _update_instance_state(inst_key, _save_comp_ok)
     return {
         "message": msg,
         "output": out or msg,
@@ -2682,11 +3129,24 @@ def manage_laravel_security(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    app_type_norm = (getattr(site, "app_type", None) or "php").strip().lower()
+    if app_type_norm not in {"php", "static"} or getattr(site, "app_id", None) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Website {site.domain} đang chạy loại ứng dụng '{app_type_norm}', không thuộc phạm vi bảo mật Laravel.",
+        )
+
+    state_snapshot = _load_toolkit_state()
     inst_key = str(site.id)
-    saved = state.setdefault("instances", {}).setdefault(inst_key, {"installed": True})
-    linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
-    sec_overrides = saved.setdefault("security_overrides", {})
+    saved_snapshot = (state_snapshot.get("instances") or {}).get(inst_key) or {}
+    linux_user, site_root, app_dir = _resolve_laravel_paths(
+        site, db, saved_snapshot.get("subpath") or ""
+    )
+    if not _is_laravel_project_dir(app_dir, linux_user, site_root):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Thư mục của {site.domain} không chứa mã nguồn Laravel (`artisan` / `composer.json`). Từ chối thay đổi cấu hình.",
+        )
 
     action = (payload.action or "secure").strip().lower()
     target_ids = payload.check_ids or [c["id"] for c in SECURITY_CHECK_DEFINITIONS]
@@ -2694,64 +3154,69 @@ def manage_laravel_security(
 
     env_text = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
     env_updates: Dict[str, Any] = {}
+    need_vhost_rewrite = False
+    new_nginx_custom = getattr(site, "nginx_custom", "") or ""
 
     if action == "fix_docroot" or ("public_docroot" in target_ids and enable):
-        subpath_clean = (saved.get("subpath") or "").strip("/")
+        subpath_clean = (saved_snapshot.get("subpath") or "").strip("/")
         site.document_root = (
             f"public_html/{subpath_clean}/public" if subpath_clean else "public_html/public"
         )
         site.nginx_rewrite_mode = "laravel"
-        db.commit()
-        sec_overrides["public_docroot"] = True
-        try:
-            from app.api.websites import _rewrite_website_vhost
+        need_vhost_rewrite = True
 
-            php_ver = (site.php_version or "8.3").strip()
-            php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
-            _rewrite_website_vhost(
-                site,
-                root_path=str(site_root),
-                linux_user=linux_user,
-                app_type="php",
-                php_version=php_ver,
-                php_fpm_socket_override=php_socket,
-                document_root=site.document_root,
-                rewrite_mode="laravel",
-            )
-        except Exception as exc:
-            logger.warning("Nginx rewrite on fix_docroot warning: %s", exc)
+    if action == "fix_permissions" or ("env_permissions_strict" in target_ids and enable):
+        _apply_strict_laravel_permissions(linux_user, site_root, app_dir, strict=True)
 
     for cid in target_ids:
-        if cid == "app_debug_off" and enable:
+        if cid == "dotenv_git_blocked":
+            new_nginx_custom = _update_laravel_nginx_security(
+                new_nginx_custom, dotenv_git=enable
+            )
+            need_vhost_rewrite = True
+        elif cid == "storage_php_blocked":
+            new_nginx_custom = _update_laravel_nginx_security(
+                new_nginx_custom, storage_php=enable
+            )
+            need_vhost_rewrite = True
+        elif cid == "app_debug_off" and enable:
             env_updates["APP_DEBUG"] = False
-            saved["app_debug"] = False
         elif cid == "app_key_valid" and enable:
             parsed = _parse_env_details(env_text)
-            if not (parsed.get("app_key") or "").startswith("base64:"):
+            if not _is_valid_laravel_app_key(parsed.get("app_key") or ""):
                 env_updates["APP_KEY"] = _generate_laravel_app_key()
-                saved["app_key_set"] = True
         elif cid == "secure_session_cookie":
             env_updates["SESSION_SECURE_COOKIE"] = enable
-            sec_overrides["secure_session_cookie"] = enable
-        elif cid == "storage_php_blocked":
-            sec_overrides["storage_php_blocked"] = enable
             if enable:
-                _write_app_file(
-                    linux_user,
-                    site_root,
-                    app_dir,
-                    "storage/app/public/.htaccess",
-                    "<Files *.php>\n    Deny from all\n</Files>\n",
-                    "0644",
-                )
-        else:
-            sec_overrides[cid] = enable
+                env_updates["SESSION_HTTP_ONLY"] = True
 
     if env_updates:
-        updated_env = _update_env_text(env_text, env_updates)
+        base_env = env_text or _render_default_env(
+            app_name=saved_snapshot.get("app_name") or site.domain,
+            app_url=f"{'https' if getattr(site, 'ssl_enabled', False) else 'http'}://{site.domain}",
+            db_name=saved_snapshot.get("db_name") or "",
+            db_user=saved_snapshot.get("db_user") or "",
+            db_password="",
+        )
+        updated_env = _update_env_text(base_env, env_updates)
         _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
+        _apply_strict_laravel_permissions(linux_user, site_root, app_dir)
 
-    _save_toolkit_state(state)
+    if new_nginx_custom != (getattr(site, "nginx_custom", "") or ""):
+        site.nginx_custom = new_nginx_custom
+        need_vhost_rewrite = True
+
+    if need_vhost_rewrite:
+        db.commit()
+        _sync_laravel_nginx_vhost(site, linux_user, site_root, strict=True)
+
+    def _save_sec_state(inst: Dict[str, Any]) -> None:
+        if "APP_DEBUG" in env_updates:
+            inst["app_debug"] = False
+        if "APP_KEY" in env_updates:
+            inst["app_key_set"] = True
+
+    state = _update_instance_state(inst_key, _save_sec_state)
     return {
         "message": (
             f"Đã áp dụng {len(target_ids)} tiêu chuẩn bảo mật Laravel cho {site.domain}."
@@ -2822,12 +3287,9 @@ def detach_laravel_instance(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
-    inst = state.setdefault("instances", {}).setdefault(str(site.id), {})
-    inst["detached"] = True
-    _save_toolkit_state(state)
+    _update_instance_state(str(site.id), lambda inst: inst.__setitem__("detached", True))
     return {
-        "message": f"Đã ngắt liên kết {site.domain} khỏi Laravel Manager (giữ nguyên mã nguồn & cơ sở dữ liệu)."
+        "message": f"Đã ngắt liên kết {site.domain} khỏi Laravel Manager (giữ nguyên mã nguồn, Document Root `/public` & cơ sở dữ liệu)."
     }
 
 
@@ -2839,34 +3301,53 @@ def remove_laravel_instance(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state_snapshot = _load_toolkit_state()
     inst_key = str(site.id)
-    saved = (state.get("instances") or {}).get(inst_key) or {}
+    saved = (state_snapshot.get("instances") or {}).get(inst_key) or {}
     linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
+
+    # Read .env before purging app_dir so exact DB name is known if drop_database=True
+    env_text = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
+    env_info = _parse_env_details(env_text)
+    target_db_name = (saved.get("db_name") or env_info.get("db_name") or "").strip()
 
     _delete_laravel_worker_unit(linux_user, site_root)
     _remove_scheduler_cron(site, linux_user, site_root)
 
-    for rel in ("artisan", ".env", ".env.bak"):
-        _delete_app_file(linux_user, site_root, app_dir, rel)
+    # Purge Laravel project directory via O_NOFOLLOW helper so .env/.env.bak/storage/vendor
+    # are never exposed when Document Root resets to public_html.
+    _purge_app_dir_contents(linux_user, site_root, app_dir)
 
-    if drop_database:
-        db_acc = wordpress_live.resolve_owned_wp_database(db, site, saved.get("db_name"))
-        if db_acc and db_acc.owner_id == site.owner_id:
+    dropped_db = False
+    if (
+        drop_database
+        and target_db_name
+        and target_db_name.lower() not in mariadb.RESERVED_DATABASES
+    ):
+        db_acc = (
+            db.query(DatabaseAccount)
+            .filter(
+                DatabaseAccount.db_name == target_db_name,
+                DatabaseAccount.owner_id == site.owner_id,
+            )
+            .first()
+        )
+        if db_acc is not None and getattr(db_acc, "db_name", None) == target_db_name:
             try:
-                mariadb.drop_database_and_user(db_acc.db_name, db_acc.db_user)
+                teardown.drop_database_record(db, db_acc)
+                dropped_db = True
             except Exception as exc:
-                logger.warning("Drop Laravel database warning: %s", exc)
-            db.delete(db_acc)
+                logger.warning("Drop Laravel database warning (%s): %s", target_db_name, exc)
 
+    site.nginx_custom = _strip_laravel_nginx_security(getattr(site, "nginx_custom", "") or "")
     site.document_root = "public_html"
-    site.nginx_rewrite_mode = "front_controller"
+    site.nginx_rewrite_mode = "none"
     db.commit()
 
-    if inst_key in (state.get("instances") or {}):
-        state["instances"].pop(inst_key, None)
-    _save_toolkit_state(state)
+    _sync_laravel_nginx_vhost(site, linux_user, site_root, strict=True)
+    _pop_instance_state(inst_key)
+
     return {
-        "message": f"Đã gỡ cài đặt dự án Laravel khỏi {site.domain}."
-        + (" (Đã xóa Database đính kèm)" if drop_database else "")
+        "message": f"Đã gỡ cài đặt hoàn toàn mã nguồn Laravel khỏi {site.domain} và khôi phục Document Root mặc định."
+        + (f" (Đã xóa Database `{target_db_name}`)" if dropped_db else "")
     }

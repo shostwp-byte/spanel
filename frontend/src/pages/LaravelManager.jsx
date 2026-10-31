@@ -61,7 +61,7 @@ function LaravelBrandIcon({ size = 18 }) {
 }
 
 const PHP_VERSIONS = ['8.4', '8.3', '8.2', '8.1'];
-const LARAVEL_VERSIONS = ['11.x', '10.x'];
+const LARAVEL_VERSIONS = ['12.x', '11.x', '10.x'];
 const CACHE_DRIVERS = ['file', 'redis', 'database', 'memcached', 'array'];
 const QUEUE_CONNECTIONS = ['database', 'redis', 'sync'];
 const SESSION_DRIVERS = ['file', 'cookie', 'database', 'redis'];
@@ -317,7 +317,10 @@ export function LaravelManagerPage({
   const installableWebsites = useMemo(() => {
     const installedIds = new Set(instances.map(inst => Number(inst.website_id || inst.id)));
     return (allWebsitesList || []).filter(
-      w => !w.occupied && w.app_type !== 'wordpress' && !installedIds.has(Number(w.id))
+      w =>
+        !w.occupied &&
+        (!w.app_type || w.app_type === 'php' || w.app_type === 'static') &&
+        !installedIds.has(Number(w.id))
     );
   }, [allWebsitesList, instances]);
 
@@ -374,6 +377,7 @@ export function LaravelManagerPage({
     if (!firstSite) return;
     setInstallForm(prev => ({
       ...prev,
+      subpath: '',
       website_id: firstSite ? String(firstSite.id) : '',
       app_name: firstSite ? `${firstSite.domain} App` : 'My Laravel Application',
       php_version: firstSite?.php_version || '8.3',
@@ -2990,14 +2994,13 @@ export function LaravelManagerPage({
                   </select>
                 </label>
                 <label>
-                  <span>Thư mục con (Tuỳ chọn)</span>
+                  <span>Document Root cô lập</span>
                   <input
                     type="text"
-                    value={installForm.subpath}
-                    onChange={e =>
-                      setInstallForm(prev => ({ ...prev, subpath: e.target.value }))
-                    }
-                    placeholder="Để trống = gốc"
+                    value="public_html/public"
+                    readOnly
+                    disabled
+                    title="Laravel được cài trên gốc Tên miền/Subdomain để cô lập Document Root /public an toàn"
                   />
                 </label>
               </div>
@@ -3696,7 +3699,7 @@ export function LaravelManagerPage({
               Gỡ cài đặt dự án Laravel — {removeModalSite.domain}
             </h3>
             <p style={{ margin: '0 0 12px', fontSize: '13px', color: 'var(--text-muted)' }}>
-              Thao tác này sẽ gỡ cấu hình Laravel và dừng các tiến trình Scheduler/Queue của dự án.
+              Thao tác này sẽ dừng tiến trình Queue Worker/Scheduler, xóa toàn bộ mã nguồn dự án Laravel trong <code>public_html</code> và khôi phục Document Root mặc định (nếu chỉ muốn ẩn khỏi bảng quản lý mà giữ nguyên mã nguồn, hãy dùng nút <strong>Ngắt liên kết</strong>).
             </p>
             <label className="check-line" style={{ marginBottom: '16px', fontSize: '12.5px' }}>
               <input
