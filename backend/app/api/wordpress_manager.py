@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import time
 import urllib.parse
 import urllib.request
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -22,7 +23,7 @@ from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, User, Website
-from app.services import mariadb, nginx, site_users, wordpress, wordpress_live
+from app.services import cron, mariadb, nginx, site_users, teardown, wordpress, wordpress_live
 from app.services.shell import shell
 
 _WP_ACCESS_ROLE_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("wp_access_role", default="")
@@ -560,6 +561,104 @@ def _vhost_blocks_uploads_php(site: Optional[Website], subpath: str = "") -> boo
     return False
 
 
+def _wp_config_permissions_strict(
+    wp_dir: Path,
+    linux_user: Optional[str],
+    site_root: Optional[Path],
+    sec_overrides: Dict[str, Any],
+) -> bool:
+    if settings.command_dry_run:
+        return bool(sec_overrides.get("permissions_strict", True))
+    cfg_target = wp_dir / "wp-config.php"
+    try:
+        st = os.lstat(cfg_target)
+        if stat.S_ISLNK(st.st_mode):
+            return False
+        if os.name == "nt":
+            return bool(sec_overrides.get("permissions_strict", True))
+        mode_bits = stat.S_IMODE(st.st_mode)
+        return (mode_bits & 0o007) == 0 and mode_bits in (0o600, 0o640)
+    except PermissionError:
+        if linux_user and site_root:
+            try:
+                rel_cfg = str(cfg_target.relative_to(site_root)).replace("\\", "/")
+                res = shell.privileged(
+                    "terminal-exec",
+                    helper_args=[linux_user, str(site_root), "stat", "-c", "%a", rel_cfg],
+                    fallback=["stat", "-c", "%a", str(cfg_target)],
+                    check=False,
+                )
+                octal_str = (res.stdout or "").strip()
+                if re.fullmatch(r"[0-7]{3,4}", octal_str):
+                    mode_val = int(octal_str, 8)
+                    return (mode_val & 0o007) == 0 and mode_val in (0o600, 0o640)
+            except Exception:
+                pass
+    except OSError:
+        pass
+    return bool(sec_overrides.get("permissions_strict", True))
+
+
+def _require_wp_cli_ok(res: Any, action_label: str) -> None:
+    if not settings.command_dry_run and getattr(res, "returncode", 0) != 0:
+        err = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or f"{action_label} failed").strip()
+        raise HTTPException(
+            status_code=400,
+            detail=f"{action_label} thất bại: {err[:240]}",
+        )
+
+
+def _sync_wp_system_cron(
+    site: Website,
+    linux_user: str,
+    subpath: str = "",
+    interval_minutes: int = 15,
+    *,
+    enabled: bool = False,
+) -> None:
+    """Create or remove a jailed system cron job for WordPress when DISABLE_WP_CRON is toggled."""
+    if settings.command_dry_run:
+        return
+    eff_user = (site.linux_user or linux_user or "").strip()
+    if not eff_user or eff_user == "www-data":
+        return
+    clean_sub = (subpath or "").strip().strip("/")
+    try:
+        entries = cron.list_cron_entries(site.domain, eff_user)
+        for entry in reversed(entries):
+            cmd = str(entry.get("command") or "")
+            is_match = False
+            if clean_sub:
+                if f"{clean_sub}/wp-cron.php" in cmd or f"/{clean_sub}/wp-cron.php" in cmd:
+                    is_match = True
+            else:
+                if "cron event run --due-now" in cmd or (
+                    "wp-cron.php" in cmd and "/wp-cron.php" not in cmd.replace("public_html/wp-cron.php", "wp-cron.php")
+                ):
+                    is_match = True
+            if is_match:
+                cron.delete_cron(site.domain, int(entry["index"]), eff_user)
+
+        if enabled:
+            mins = max(1, min(60, int(interval_minutes or 15)))
+            schedule = "0 * * * *" if mins >= 60 else (f"*/{mins} * * * *" if mins > 1 else "* * * * *")
+            target_cmd = (
+                f"php -q {clean_sub}/wp-cron.php >/dev/null 2>&1"
+                if clean_sub
+                else "wp cron event run --due-now >/dev/null 2>&1"
+            )
+            prev_user = site.linux_user
+            try:
+                if not site.linux_user:
+                    site.linux_user = eff_user
+                cron.add_cron(site, schedule, target_cmd)
+            finally:
+                if prev_user is None and site.linux_user == eff_user:
+                    pass
+    except Exception as exc:
+        logger.warning("_sync_wp_system_cron(%s, enabled=%s) warning: %s", site.domain, enabled, exc)
+
+
 def _evaluate_security_checks(
     wp_dir: Path,
     config_info: Dict[str, Any],
@@ -585,7 +684,7 @@ def _evaluate_security_checks(
             _vhost_blocks_uploads_php(site, saved_inst.get("subpath") or "")
             or (settings.command_dry_run and ("php" in uploads_ht.lower()))
         ),
-        "permissions_strict": bool(sec_overrides.get("permissions_strict", True)),
+        "permissions_strict": _wp_config_permissions_strict(wp_dir, linux_user, site_root, sec_overrides),
         "keys_salts_fresh": int(config_info.get("salts_count") or 0) >= 8 or bool(sec_overrides.get("keys_salts_fresh")),
         "sensitive_files_blocked": bool(
             not wordpress_live.wp_path_exists(wp_dir, "readme.html", linux_user, site_root)
@@ -632,6 +731,8 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
         or wordpress_live.wp_path_exists(wp_dir, "wp-includes/version.php", linux_user, site_root)
     )
 
+    if not settings.command_dry_run and not has_wp_files:
+        return None
     if site.app_type != "wordpress" and not has_wp_files and not saved.get("installed"):
         return None
 
@@ -771,7 +872,11 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
         "wp_max_memory_limit": cfg["wp_max_memory_limit"] if config_text else (saved.get("wp_max_memory_limit") or "512M"),
         "wp_post_revisions": str(cfg["wp_post_revisions"] if config_text else (saved.get("wp_post_revisions") or "10")),
         "toggles": toggles,
-        "maintenance_message": saved.get("maintenance_message") or "Website đang được bảo trì và nâng cấp định kỳ. Vui lòng quay lại sau ít phút!",
+        "maintenance_title": saved.get("maintenance_title") or wordpress_live.DEFAULT_MAINTENANCE_TITLE,
+        "maintenance_message": saved.get("maintenance_message") or wordpress_live.DEFAULT_MAINTENANCE_MESSAGE,
+        "maintenance_bg_url": saved.get("maintenance_bg_url") or "",
+        "maintenance_bg_preset": saved.get("maintenance_bg_preset") or "emerald_ocean",
+        "maintenance_bg_overlay": int(saved.get("maintenance_bg_overlay") if saved.get("maintenance_bg_overlay") is not None else 55),
         "basic_auth_user": saved.get("basic_auth_user") or "",
         "password_protection_configured": bool(saved.get("password_protection_hash")),
         "cron_interval_minutes": int(saved.get("cron_interval_minutes") or 15),
@@ -899,7 +1004,11 @@ class WpTogglesPayload(BaseModel):
     search_engine_indexing: Optional[bool] = None
     caching_enabled: Optional[bool] = None
     maintenance_mode: Optional[bool] = None
+    maintenance_title: Optional[str] = None
     maintenance_message: Optional[str] = None
+    maintenance_bg_url: Optional[str] = None
+    maintenance_bg_preset: Optional[str] = None
+    maintenance_bg_overlay: Optional[int] = None
     debugging: Optional[bool] = None
     debug_log: Optional[bool] = None
     debug_display: Optional[bool] = None
@@ -1118,24 +1227,28 @@ def scan_wp_instances(
 
     for site in websites:
         inst_key = str(site.id)
-        _, _, wp_dir = _resolve_site_paths(site, db)
-        has_wp = (wp_dir / "wp-config.php").exists() or (wp_dir / "wp-includes/version.php").exists()
-        linux_user, site_root, wp_dir = _resolve_site_paths(site, db)
+        cur = instances_state.get(inst_key) or {}
+        saved_sub = (cur.get("subpath") or "").strip()
+        linux_user, site_root, wp_dir = _resolve_site_paths(site, db, saved_sub)
         has_wp = (
-            has_wp
-            or wordpress_live.wp_path_exists(wp_dir, "wp-config.php", linux_user, site_root)
+            wordpress_live.wp_path_exists(wp_dir, "wp-config.php", linux_user, site_root)
             or wordpress_live.wp_path_exists(wp_dir, "wp-includes/version.php", linux_user, site_root)
         )
-        if has_wp or site.app_type == "wordpress":
-            if site.app_type != "wordpress":
+        should_attach = has_wp or (settings.command_dry_run and site.app_type == "wordpress")
+        if should_attach:
+            was_known = bool(cur.get("installed")) and not bool(cur.get("detached"))
+            if not saved_sub.strip("/") and site.app_type != "wordpress":
                 site.app_type = "wordpress"
-                discovered += 1
-            cur = instances_state.get(inst_key) or {}
             if cur.get("detached"):
                 cur["detached"] = False
-                discovered += 1
             cur["installed"] = True
             instances_state[inst_key] = cur
+            if not was_known:
+                discovered += 1
+        elif not settings.command_dry_run and not has_wp:
+            # Never resurrect an empty directory or removed site when Scan is clicked
+            if inst_key in instances_state and not cur.get("detached"):
+                instances_state.pop(inst_key, None)
 
     db.commit()
     _save_toolkit_state(state)
@@ -1298,16 +1411,14 @@ def install_wp_instance(
             db.add(db_acc)
 
     db.commit()
+    created_new_db = not reusing_existing_db and db_acc is not None
 
-    # Remove default SPanel placeholder index.html so WordPress index.php takes precedence
-    try:
-        placeholder_html = wp_dir / "index.html"
-        if placeholder_html.exists():
-            placeholder_html.unlink()
-    except Exception:
-        pass
+    # Remove default SPanel placeholder index.html safely via helper so WordPress index.php takes precedence
+    wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "index.html")
 
     # 3. Install WordPress files & wp-config.php
+    prev_app_type = site.app_type
+    prev_rewrite_mode = site.nginx_rewrite_mode
     try:
         wordpress.install_wordpress(
             domain=site.domain,
@@ -1320,9 +1431,31 @@ def install_wp_instance(
             linux_user=linux_user,
             root_path=str(site_root),
             table_prefix=table_prefix,
+            subpath=subpath_clean_install,
+            ssl_enabled=bool(site.ssl_enabled),
         )
     except Exception as exc:
         logger.warning("WP-CLI install_wordpress fallback: %s", exc)
+
+    if not settings.command_dry_run and not wordpress_live.wp_path_exists(
+        wp_dir, "wp-includes/version.php", linux_user, site_root
+    ):
+        if created_new_db and db_acc is not None:
+            try:
+                teardown.drop_database_record(db, db_acc)
+            except Exception:
+                pass
+        if not subpath_clean_install:
+            site.app_type = "php"
+            site.nginx_rewrite_mode = "none"
+        else:
+            site.app_type = prev_app_type
+            site.nginx_rewrite_mode = prev_rewrite_mode
+        db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail="Không thể tải và khởi tạo bộ mã nguồn WordPress (thiếu wp-includes/version.php). Đã tự động hoàn tác cơ sở dữ liệu.",
+        )
 
     # Ensure wp-config.php has the exact table_prefix, DISALLOW_FILE_EDIT, and WP_MEMORY_LIMIT
     cfg_content = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
@@ -1343,21 +1476,23 @@ def install_wp_instance(
     # Ensure WordPress core database tables exist (if install_wordpress had to fall back)
     try:
         tables = mariadb.get_database_tables_breakdown(db_info["db_name"])
-        if not tables and (wp_dir / "wp-includes/version.php").exists():
+        if not tables and wordpress_live.wp_path_exists(wp_dir, "wp-includes/version.php", linux_user, site_root):
             scheme = "https" if site.ssl_enabled else "http"
+            install_url = f"{scheme}://{site.domain}/{subpath_clean_install}" if subpath_clean_install else f"{scheme}://{site.domain}"
             _run_wp_cli(
                 linux_user,
                 php_ver,
                 wp_dir,
                 [
                     "core", "install",
-                    f"--url={scheme}://{site.domain}",
+                    f"--url={install_url}",
                     f"--title={site_title}",
                     f"--admin_user={admin_user}",
-                    f"--admin_password={admin_password}",
+                    "--prompt=admin_password",
                     f"--admin_email={admin_email}",
                     "--skip-email",
                 ],
+                input_data=admin_password + "\n",
                 sensitive=True,
             )
             tables = mariadb.get_database_tables_breakdown(db_info["db_name"])
@@ -1367,10 +1502,16 @@ def install_wp_instance(
     except Exception as exc:
         logger.warning("Post-install DB table check warning: %s", exc)
 
-    # Update Nginx vhost for WordPress front controller
+    # Update Nginx vhost for WordPress front controller (and subpath uploads PHP block if applicable)
     try:
         from app.api.websites import _rewrite_website_vhost
 
+        if subpath_clean_install:
+            rule_line = _subpath_uploads_php_rule(subpath_clean_install)
+            prev_custom = site.nginx_custom or ""
+            if rule_line not in prev_custom:
+                site.nginx_custom = (prev_custom.rstrip("\n") + ("\n" if prev_custom.strip() else "") + rule_line + "\n")
+                db.commit()
         php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
         eff_app_type = site.app_type if subpath_clean_install else "wordpress"
         eff_rewrite_mode = (site.nginx_rewrite_mode or "front_controller") if subpath_clean_install else "front_controller"
@@ -1485,7 +1626,7 @@ def detach_wp_instance(
 @router.post("/instances/{website_id}/remove")
 def remove_wp_instance(
     website_id: int,
-    drop_database: bool = Query(default=False),
+    drop_database: bool = Query(default=True),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1493,35 +1634,81 @@ def remove_wp_instance(
     state = _load_toolkit_state()
     inst_key = str(site.id)
     saved = (state.get("instances") or {}).get(inst_key) or {}
-    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, saved.get("subpath") or "")
+    subpath_clean = (saved.get("subpath") or "").strip().strip("/")
+    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, subpath_clean)
 
-    # Remove wp-config.php if present on disk
-    try:
-        cfg_file = wp_dir / "wp-config.php"
-        if cfg_file.exists():
-            cfg_file.unlink()
-    except Exception:
-        pass
-    wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-config.php")
+    # 1. Read wp-config.php BEFORE deleting source files so scanned sites also drop their database accurately
+    cfg_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
+    cfg = _parse_wp_config_details(cfg_text)
+    db_acc = wordpress_live.resolve_owned_wp_database(
+        db, site, cfg.get("db_name") or saved.get("db_name")
+    )
 
-    if drop_database and saved.get("db_name"):
-        db_acc = db.query(DatabaseAccount).filter(
-            DatabaseAccount.db_name == saved["db_name"],
-            DatabaseAccount.owner_id == site.owner_id,
-        ).first()
-        if db_acc:
-            try:
-                mariadb.drop_database(db_acc.db_name, db_acc.db_user)
-            except Exception:
-                pass
-            db.delete(db_acc)
+    # 2. Remove managed WordPress system cron job if any
+    _sync_wp_system_cron(site, linux_user, subpath_clean, enabled=False)
 
-    site.app_type = "php"
-    if inst_key in (state.get("instances") or {}):
-        state["instances"][inst_key] = {"detached": True}
+    # 3. Completely purge WordPress files inside public_html (or subpath) and recreate empty document_root
+    wordpress_live.purge_wp_directory(
+        linux_user,
+        site_root,
+        wp_dir,
+        recreate_empty_docroot=(not bool(subpath_clean)),
+    )
+    if not subpath_clean:
+        wordpress_live.purge_wp_snapshots_directory(linux_user, site_root)
+
+    # 4. Drop associated MySQL Database + DatabaseAccount row simultaneously when requested (default True)
+    should_drop_db = drop_database if isinstance(drop_database, bool) else True
+    dropped_db_name: Optional[str] = None
+    if should_drop_db and db_acc is not None:
+        dropped_db_name = db_acc.db_name
+        teardown.drop_database_record(db, db_acc)
+
+    # 5. Reset Website & Nginx vhost and flush FastCGI cache
+    if subpath_clean:
+        rule_line = _subpath_uploads_php_rule(subpath_clean)
+        legacy_rules = _legacy_subpath_uploads_php_rules(subpath_clean)
+        all_known_rules = (rule_line, *legacy_rules)
+        prev_custom = site.nginx_custom or ""
+        if any(r in prev_custom for r in all_known_rules):
+            kept = [ln for ln in prev_custom.splitlines() if ln.strip() not in all_known_rules]
+            site.nginx_custom = ("\n".join(kept) + "\n") if kept else ""
+    else:
+        site.app_type = "php"
+        site.nginx_rewrite_mode = "none"
+
     db.commit()
+
+    if not settings.command_dry_run:
+        try:
+            from app.api.websites import _rewrite_website_vhost
+
+            php_ver = site.php_version or "8.4"
+            php_socket = site_users.site_php_fpm_socket(linux_user, str(site_root), php_ver)
+            _rewrite_website_vhost(
+                site,
+                root_path=str(site_root),
+                linux_user=linux_user,
+                app_type=site.app_type or "php",
+                php_version=php_ver,
+                php_fpm_socket_override=php_socket,
+                document_root=site.document_root or "public_html",
+                rewrite_mode=site.nginx_rewrite_mode or "none",
+            )
+        except Exception as exc:
+            logger.warning("Nginx rewrite on WP remove warning: %s", exc)
+        wordpress_live.clear_nginx_fastcgi_cache()
+
+    if isinstance(state.get("instances"), dict):
+        state["instances"].pop(inst_key, None)
     _save_toolkit_state(state)
-    return {"message": f"Đã gỡ bỏ cài đặt WordPress khỏi {site.domain}."}
+
+    db_msg = f" và cơ sở dữ liệu '{dropped_db_name}'" if dropped_db_name else ""
+    return {
+        "message": f"Đã xóa sạch mã nguồn WordPress tại {site.domain}{('/' + subpath_clean) if subpath_clean else ''}{db_msg}.",
+        "dropped_database": dropped_db_name,
+        "removed_path": str(wp_dir),
+    }
 
 
 @router.post("/instances/{website_id}/sso-login")
@@ -1530,17 +1717,31 @@ def create_wp_sso_login(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Generate a 60-second single-use self-deleting mu-plugin for 1-Click wp-admin SSO."""
+    """Generate a 90-second single-use self-deleting mu-plugin for 1-Click wp-admin SSO."""
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state()
-    saved = (state.get("instances") or {}).get(str(site.id)) or {}
+    saved = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
     linux_user, site_root, wp_dir = _resolve_site_paths(site, db, saved.get("subpath") or "")
+
+    cfg = _parse_wp_config_details(_read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root))
+    db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg.get("db_name") or saved.get("db_name"))
+    db_meta = wordpress_live.query_wp_db_live_meta(
+        db_acc.db_name if db_acc else "",
+        cfg["table_prefix"] or saved.get("table_prefix") or "wp_",
+        owner_id=site.owner_id,
+        site_id=site.id,
+        db=db,
+    )
 
     sso_token = secrets.token_urlsafe(36)
     expires_at = int(time.time()) + 90
-    admin_login = (saved.get("admin_user") or "admin").replace("'", "")
+    admin_login = (db_meta.get("admin_user") or saved.get("admin_user") or "admin").replace("'", "")
     if not wordpress.WP_USER_RE.fullmatch(admin_login):
         admin_login = "admin"
+
+    bypass_secret = wordpress_live.ensure_maintenance_bypass_secret(saved)
+    bypass_sig = wordpress_live.maintenance_bypass_token_for_secret(bypass_secret)
+    _save_toolkit_state(state)
 
     mu_plugin_php = (
         "<?php\n"
@@ -1569,6 +1770,9 @@ def create_wp_sso_login(
         "        wp_clear_auth_cookie();\n"
         "        wp_set_current_user($user->ID);\n"
         "        wp_set_auth_cookie($user->ID, true);\n"
+        f"        if ('{bypass_sig}' !== '') {{\n"
+        f"            @setcookie('spanel_maint_bypass', '{bypass_sig}', time() + 43200, '/', '', is_ssl(), true);\n"
+        "        }\n"
         "        wp_safe_redirect(admin_url());\n"
         "        exit;\n"
         "    }\n"
@@ -1642,6 +1846,11 @@ def update_wp_general(
             )
         except Exception as exc:
             logger.warning("PHP version switch warning: %s", exc)
+        try:
+            if not settings.command_dry_run:
+                cron.retarget_php_binary(site)
+        except Exception as exc:
+            logger.debug("retarget_php_binary on WP general update warning: %s", exc)
         db.commit()
 
     if payload.admin_user:
@@ -1658,19 +1867,33 @@ def update_wp_general(
         wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "admin_email", inst["admin_email"], owner_id=site.owner_id, site_id=site.id, db=db)
 
     if payload.admin_password:
-        if len(payload.admin_password) < 10:
-            raise HTTPException(status_code=400, detail="Mật khẩu mới phải có tối thiểu 10 ký tự.")
-        target_user = inst.get("admin_user") or "admin"
+        if len(payload.admin_password) < 10 or "\r" in payload.admin_password or "\n" in payload.admin_password:
+            raise HTTPException(status_code=400, detail="Mật khẩu mới phải có tối thiểu 10 ký tự và không chứa ký tự xuống dòng.")
+        db_meta_pw = wordpress_live.query_wp_db_live_meta(
+            db_name, table_prefix, owner_id=site.owner_id, site_id=site.id, db=db
+        )
+        target_user = (
+            payload.admin_user
+            or db_meta_pw.get("admin_user")
+            or inst.get("admin_user")
+            or "admin"
+        ).strip()
         try:
-            wordpress.reset_admin_password(
+            res_pw = wordpress.reset_admin_password(
                 str(wp_dir),
                 target_user,
                 payload.admin_password,
                 linux_user=linux_user,
                 php_version=php_ver,
             )
+            _require_wp_cli_ok(res_pw, "Đặt lại mật khẩu quản trị WordPress")
+        except HTTPException:
+            raise
         except Exception as exc:
-            logger.warning("reset_admin_password warning: %s", exc)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Không thể đặt lại mật khẩu cho tài khoản '{target_user}': {exc}",
+            ) from exc
 
     _save_toolkit_state(state)
     return {
@@ -1723,31 +1946,41 @@ def update_wp_toggles(
                 config_text, "WP_CACHE", "true" if payload.caching_enabled else "false"
             )
             config_changed = True
+        wordpress_live.sync_wordpress_fastcgi_cache_vhost(site.domain, bool(payload.caching_enabled))
         if not payload.caching_enabled:
             _run_wp_cli(linux_user, php_ver, wp_dir, ["cache", "flush"])
+            wordpress_live.clear_nginx_fastcgi_cache()
 
-    if payload.maintenance_mode is not None:
-        toggles["maintenance_mode"] = payload.maintenance_mode
-        if payload.maintenance_message is not None:
-            inst["maintenance_message"] = payload.maintenance_message
-        if payload.maintenance_mode:
-            _write_wp_file_text(
-                linux_user,
-                site_root,
-                wp_dir,
-                ".maintenance",
-                f"<?php $upgrading = {int(time.time())}; ?>\n",
-                "0644",
-            )
-            _run_wp_cli(linux_user, php_ver, wp_dir, ["maintenance-mode", "activate"])
-        else:
-            try:
-                if (wp_dir / ".maintenance").exists():
-                    (wp_dir / ".maintenance").unlink()
-            except Exception:
-                pass
-            wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, ".maintenance")
-            _run_wp_cli(linux_user, php_ver, wp_dir, ["maintenance-mode", "deactivate"])
+    has_maintenance_update = any(
+        val is not None
+        for val in (
+            payload.maintenance_mode,
+            payload.maintenance_title,
+            payload.maintenance_message,
+            payload.maintenance_bg_url,
+            payload.maintenance_bg_preset,
+            payload.maintenance_bg_overlay,
+        )
+    )
+    if has_maintenance_update:
+        db_meta_maint = wordpress_live.query_wp_db_live_meta(
+            db_name, table_prefix, owner_id=site.owner_id, site_id=site.id, db=db
+        )
+        eff_site_title = db_meta_maint.get("site_title") or inst.get("site_title") or site.domain
+        wordpress_live.apply_wp_maintenance_mode(
+            linux_user=linux_user,
+            site_root=site_root,
+            wp_dir=wp_dir,
+            php_ver=php_ver,
+            site_title=eff_site_title,
+            inst=inst,
+            enabled=payload.maintenance_mode,
+            title=payload.maintenance_title,
+            message=payload.maintenance_message,
+            bg_url=payload.maintenance_bg_url,
+            bg_preset=payload.maintenance_bg_preset,
+            overlay_opacity=payload.maintenance_bg_overlay,
+        )
 
     if payload.debugging is None and (payload.debug_log is not None or payload.debug_display is not None):
         payload.debugging = bool(toggles.get("debugging", False))
@@ -1797,6 +2030,13 @@ def update_wp_toggles(
                 config_text, "DISABLE_WP_CRON", "true" if payload.disable_wp_cron else "false"
             )
             config_changed = True
+        _sync_wp_system_cron(
+            site,
+            linux_user,
+            inst.get("subpath") or "",
+            int(inst.get("cron_interval_minutes") or 15),
+            enabled=bool(payload.disable_wp_cron),
+        )
 
     if config_changed and config_text:
         _write_wp_file_text(linux_user, site_root, wp_dir, "wp-config.php", config_text, "0640")
@@ -1804,6 +2044,76 @@ def update_wp_toggles(
     _save_toolkit_state(state)
     return {
         "message": "Đã cập nhật trạng thái công tắc cấu hình WordPress.",
+        "instance": _build_instance_summary(site, db, state),
+    }
+
+
+@router.post("/instances/{website_id}/maintenance-background")
+async def upload_wp_maintenance_background(
+    website_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    site = _get_accessible_website(website_id, db, current_user)
+    state = _load_toolkit_state()
+    inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
+    subpath = inst.get("subpath") or ""
+    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, subpath)
+    php_ver = site.php_version or "8.4"
+
+    raw_bytes = await file.read(wordpress_live.MAX_MAINTENANCE_BG_BYTES + 1)
+    uploaded = wordpress_live.install_maintenance_background_image(
+        linux_user=linux_user,
+        site_root=site_root,
+        wp_dir=wp_dir,
+        subpath=subpath,
+        raw_bytes=raw_bytes,
+        inst=inst,
+    )
+    wordpress_live.apply_wp_maintenance_mode(
+        linux_user=linux_user,
+        site_root=site_root,
+        wp_dir=wp_dir,
+        php_ver=php_ver,
+        site_title=inst.get("site_title") or site.domain,
+        inst=inst,
+        enabled=None,
+    )
+    _save_toolkit_state(state)
+    return {
+        "message": "Đã tải lên và áp dụng hình nền cho trang bảo trì.",
+        "bg_url": uploaded["bg_url"],
+        "instance": _build_instance_summary(site, db, state),
+    }
+
+
+@router.delete("/instances/{website_id}/maintenance-background")
+def delete_wp_maintenance_background(
+    website_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    site = _get_accessible_website(website_id, db, current_user)
+    state = _load_toolkit_state()
+    inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
+    subpath = inst.get("subpath") or ""
+    linux_user, site_root, wp_dir = _resolve_site_paths(site, db, subpath)
+    php_ver = site.php_version or "8.4"
+
+    wordpress_live.remove_maintenance_background_image(linux_user, site_root, wp_dir, inst)
+    wordpress_live.apply_wp_maintenance_mode(
+        linux_user=linux_user,
+        site_root=site_root,
+        wp_dir=wp_dir,
+        php_ver=php_ver,
+        site_title=inst.get("site_title") or site.domain,
+        inst=inst,
+        enabled=None,
+    )
+    _save_toolkit_state(state)
+    return {
+        "message": "Đã gỡ hình nền tùy chỉnh khỏi trang bảo trì.",
         "instance": _build_instance_summary(site, db, state),
     }
 
@@ -1919,23 +2229,26 @@ def manage_instance_plugins(
     msg = "Đã cập nhật trạng thái Plugin."
 
     if act in ("activate", "deactivate", "toggle") and slug:
-        for p in plugins:
-            if p["slug"].lower() == slug.lower():
-                new_status = (
-                    "active"
-                    if act == "activate"
-                    else "inactive"
-                    if act == "deactivate"
-                    else ("inactive" if p.get("status") == "active" else "active")
-                )
-                p["status"] = new_status
-                wp_cmd = "activate" if new_status == "active" else "deactivate"
-                _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", wp_cmd, slug, "--skip-plugins", "--skip-themes"])
-                msg = f"Đã {'kích hoạt' if new_status == 'active' else 'vô hiệu hóa'} plugin {p['name']}."
-                break
+        matched_plugin = next((p for p in plugins if p["slug"].lower() == slug.lower()), None)
+        cur_status = matched_plugin.get("status") if matched_plugin else "inactive"
+        new_status = (
+            "active"
+            if act == "activate"
+            else "inactive"
+            if act == "deactivate"
+            else ("inactive" if cur_status == "active" else "active")
+        )
+        wp_cmd = "activate" if new_status == "active" else "deactivate"
+        res_act = _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", wp_cmd, slug, "--skip-plugins", "--skip-themes"])
+        _require_wp_cli_ok(res_act, f"{'Kích hoạt' if new_status == 'active' else 'Vô hiệu hóa'} plugin '{slug}'")
+        if matched_plugin:
+            matched_plugin["status"] = new_status
+        disp_name = matched_plugin["name"] if matched_plugin else slug
+        msg = f"Đã {'kích hoạt' if new_status == 'active' else 'vô hiệu hóa'} plugin {disp_name}."
 
     elif act == "update" and slug:
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", slug, "--skip-plugins", "--skip-themes"])
+        res_upd = _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", slug, "--skip-plugins", "--skip-themes"])
+        _require_wp_cli_ok(res_upd, f"Cập nhật plugin '{slug}'")
         for p in plugins:
             if p["slug"].lower() == slug.lower():
                 p["version"] = p.get("latest_version") or p["version"]
@@ -1944,7 +2257,8 @@ def manage_instance_plugins(
                 break
 
     elif act == "update_all":
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", "--all", "--skip-plugins", "--skip-themes"])
+        res_upd_all = _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "update", "--all", "--skip-plugins", "--skip-themes"])
+        _require_wp_cli_ok(res_upd_all, "Cập nhật hàng loạt Plugins")
         for p in plugins:
             p["version"] = p.get("latest_version") or p["version"]
             p["update_available"] = False
@@ -1955,6 +2269,10 @@ def manage_instance_plugins(
         _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "delete", slug, "--skip-plugins", "--skip-themes"])
         wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, f"wp-content/plugins/{slug}")
         wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, f"wp-content/plugins/{slug}.php")
+        if not settings.command_dry_run and wordpress_live.wp_path_exists(
+            wp_dir, f"wp-content/plugins/{slug}", linux_user, site_root
+        ):
+            raise HTTPException(status_code=500, detail=f"Không thể xóa thư mục plugin '{slug}' trên đĩa.")
         plugins = [p for p in plugins if p["slug"].lower() != slug.lower()]
         msg = f"Đã gỡ bỏ hoàn toàn plugin {slug}."
 
@@ -2079,7 +2397,8 @@ def manage_instance_themes(
     msg = "Đã cập nhật giao diện Theme."
 
     if act == "activate" and slug:
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "activate", slug, "--skip-plugins", "--skip-themes"])
+        res_th_act = _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "activate", slug, "--skip-plugins", "--skip-themes"])
+        _require_wp_cli_ok(res_th_act, f"Kích hoạt giao diện '{slug}'")
         wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "stylesheet", slug, owner_id=site.owner_id, site_id=site.id, db=db)
         wordpress_live.update_wp_db_option_direct(db_name, table_prefix, "template", slug, owner_id=site.owner_id, site_id=site.id, db=db)
         for th in themes:
@@ -2087,7 +2406,8 @@ def manage_instance_themes(
         msg = f"Đã kích hoạt giao diện {slug}."
 
     elif act == "update" and slug:
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", slug, "--skip-plugins", "--skip-themes"])
+        res_th_upd = _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", slug, "--skip-plugins", "--skip-themes"])
+        _require_wp_cli_ok(res_th_upd, f"Cập nhật giao diện '{slug}'")
         for th in themes:
             if th["slug"].lower() == slug.lower():
                 th["version"] = th.get("latest_version") or th["version"]
@@ -2096,7 +2416,8 @@ def manage_instance_themes(
                 break
 
     elif act == "update_all":
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", "--all", "--skip-plugins", "--skip-themes"])
+        res_th_all = _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "update", "--all", "--skip-plugins", "--skip-themes"])
+        _require_wp_cli_ok(res_th_all, "Cập nhật hàng loạt giao diện Themes")
         for th in themes:
             th["version"] = th.get("latest_version") or th["version"]
             th["update_available"] = False
@@ -2108,6 +2429,10 @@ def manage_instance_themes(
             raise HTTPException(status_code=400, detail="Không thể xóa giao diện đang được kích hoạt (Active Theme).")
         _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "delete", slug, "--skip-plugins", "--skip-themes"])
         wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, f"wp-content/themes/{slug}")
+        if not settings.command_dry_run and wordpress_live.wp_path_exists(
+            wp_dir, f"wp-content/themes/{slug}", linux_user, site_root
+        ):
+            raise HTTPException(status_code=500, detail=f"Không thể xóa thư mục giao diện '{slug}' trên đĩa.")
         themes = [th for th in themes if th["slug"].lower() != slug.lower()]
         msg = f"Đã xóa giao diện {slug}."
 
@@ -2229,15 +2554,32 @@ def apply_wp_security(
     if payload.action == "verify_checksums":
         res = _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "verify-checksums"])
         ok = res.returncode == 0
+        combined_out = "\n".join(
+            part.strip() for part in (res.stdout or "", res.stderr or "") if part and part.strip()
+        )
         return {
-            "ok": True,
+            "ok": ok,
             "verified": ok,
-            "message": "Đã xác minh chữ ký SHA-256 mã nguồn gốc WordPress: Tất cả tệp hệ thống đều nguyên vẹn 100%!",
-            "output": (res.stdout or "Success: WordPress installation verifies against checksums.").strip(),
+            "message": (
+                "Đã xác minh chữ ký SHA-256 mã nguồn gốc WordPress: Tất cả tệp hệ thống đều nguyên vẹn 100%!"
+                if ok
+                else "CẢNH BÁO: Phát hiện tệp mã nguồn gốc WordPress không khớp chữ ký SHA-256 hoặc có tệp lạ!"
+            ),
+            "output": combined_out or (
+                "Success: WordPress installation verifies against checksums."
+                if ok
+                else "Error: WordPress installation failed checksum verification."
+            ),
         }
 
     if payload.action == "reinstall_core":
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "download", "--force", "--skip-content"])
+        res_reinst = _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "download", "--force", "--skip-content"])
+        _require_wp_cli_ok(res_reinst, "Tải lại mã nguồn gốc WordPress sạch")
+        try:
+            wordpress.fix_permissions(str(site_root), linux_user)
+        except Exception:
+            pass
+        wordpress_live.clear_nginx_fastcgi_cache()
         return {
             "ok": True,
             "message": "Đã tải lại bộ mã nguồn gốc WordPress sạch (giữ nguyên 100% wp-content và Database).",
@@ -2283,6 +2625,8 @@ def apply_wp_security(
                 wordpress.fix_permissions(str(site_root), linux_user)
             except Exception:
                 pass
+            if config_text:
+                config_dirty = True
         elif cid == "uploads_php_blocked" and turn_on:
             _write_wp_file_text(
                 linux_user,
@@ -2404,23 +2748,45 @@ def apply_wp_security(
         elif cid == "author_enum_blocked" and not turn_on:
             wordpress_live.delete_wp_path(linux_user, site_root, wp_dir, "wp-content/mu-plugins/spanel-block-author-scan.php")
         elif cid == "custom_table_prefix":
-            new_pfx = "wp_sp_" if turn_on else "wp_"
-            if table_prefix != new_pfx and (wordpress_live.rename_wp_table_prefix_direct(db_name, table_prefix, new_pfx, owner_id=site.owner_id, site_id=site.id, db=db) or settings.command_dry_run):
-                table_prefix = new_pfx
-                inst["table_prefix"] = new_pfx
-                if config_text:
-                    config_text = re.sub(r"\$table_prefix\s*=\s*['\"][^'\"]+['\"]\s*;", f"$table_prefix = '{new_pfx}';", config_text)
-                    config_dirty = True
+            if turn_on:
+                if table_prefix == "wp_":
+                    new_pfx = "wp_sp_"
+                    if wordpress_live.rename_wp_table_prefix_direct(db_name, table_prefix, new_pfx, owner_id=site.owner_id, site_id=site.id, db=db) or settings.command_dry_run:
+                        inst["prev_prefix_before_sec"] = table_prefix
+                        table_prefix = new_pfx
+                        inst["table_prefix"] = new_pfx
+                        if config_text:
+                            config_text = re.sub(r"\$table_prefix\s*=\s*['\"][^'\"]+['\"]\s*;", f"$table_prefix = '{new_pfx}';", config_text)
+                            config_dirty = True
+            else:
+                prev_pfx = str(inst.get("prev_prefix_before_sec") or "").strip()
+                if prev_pfx and WP_PREFIX_RE.fullmatch(prev_pfx) and table_prefix != prev_pfx:
+                    if wordpress_live.rename_wp_table_prefix_direct(db_name, table_prefix, prev_pfx, owner_id=site.owner_id, site_id=site.id, db=db) or settings.command_dry_run:
+                        table_prefix = prev_pfx
+                        inst["table_prefix"] = prev_pfx
+                        inst.pop("prev_prefix_before_sec", None)
+                        if config_text:
+                            config_text = re.sub(r"\$table_prefix\s*=\s*['\"][^'\"]+['\"]\s*;", f"$table_prefix = '{prev_pfx}';", config_text)
+                            config_dirty = True
         elif cid == "no_default_admin_user" and turn_on:
-            new_admin = (payload.new_admin_username or "wpadmin_sec").strip()
-            if not wordpress.WP_USER_RE.fullmatch(new_admin) or new_admin.lower() == "admin":
-                raise HTTPException(status_code=400, detail="Tên tài khoản quản trị mới không hợp lệ.")
-            wordpress_live.rename_wp_admin_user_direct(db_name, table_prefix, new_admin, owner_id=site.owner_id, site_id=site.id, db=db)
-            if inst.get("admin_user", "admin").lower() == "admin":
+            db_meta_sec = wordpress_live.query_wp_db_live_meta(
+                db_name, table_prefix, owner_id=site.owner_id, site_id=site.id, db=db
+            )
+            cur_admin = (db_meta_sec.get("admin_user") or inst.get("admin_user") or "admin").strip()
+            if cur_admin.lower() == "admin" or payload.new_admin_username:
+                new_admin = (payload.new_admin_username or "wpadmin_sec").strip()
+                if not wordpress.WP_USER_RE.fullmatch(new_admin) or new_admin.lower() == "admin":
+                    raise HTTPException(status_code=400, detail="Tên tài khoản quản trị mới không hợp lệ.")
+                wordpress_live.rename_wp_admin_user_direct(db_name, table_prefix, new_admin, owner_id=site.owner_id, site_id=site.id, db=db)
+                if cur_admin.lower() == "admin":
+                    inst["prev_admin_user_before_sec"] = cur_admin
                 inst["admin_user"] = new_admin
         elif cid == "no_default_admin_user" and not turn_on:
-            wordpress_live.rename_wp_admin_user_direct(db_name, table_prefix, "admin", owner_id=site.owner_id, site_id=site.id, db=db)
-            inst["admin_user"] = "admin"
+            prev_admin = str(inst.get("prev_admin_user_before_sec") or "").strip()
+            if prev_admin and wordpress.WP_USER_RE.fullmatch(prev_admin):
+                wordpress_live.rename_wp_admin_user_direct(db_name, table_prefix, prev_admin, owner_id=site.owner_id, site_id=site.id, db=db)
+                inst["admin_user"] = prev_admin
+                inst.pop("prev_admin_user_before_sec", None)
 
     if config_dirty and config_text:
         _write_wp_file_text(linux_user, site_root, wp_dir, "wp-config.php", config_text, "0640")
@@ -2455,17 +2821,21 @@ def execute_wp_tool(
     if act == "clear_cache":
         _run_wp_cli(linux_user, php_ver, wp_dir, ["cache", "flush"])
         _run_wp_cli(linux_user, php_ver, wp_dir, ["transient", "delete", "--all"])
-        return {"message": f"Đã dọn sạch Object Cache & Transients cho {site.domain}."}
+        wordpress_live.clear_nginx_fastcgi_cache()
+        return {"message": f"Đã dọn sạch Object Cache, Transients & Nginx FastCGI Cache cho {site.domain}."}
 
     if act == "optimize_db":
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["db", "optimize"])
+        res_opt = _run_wp_cli(linux_user, php_ver, wp_dir, ["db", "optimize"])
+        _require_wp_cli_ok(res_opt, "Tối ưu hóa cơ sở dữ liệu WordPress")
         _run_wp_cli(linux_user, php_ver, wp_dir, ["db", "repair"])
         return {"message": f"Đã tối ưu hóa (Optimize) và sửa lỗi (Repair) tất cả các bảng Database của {site.domain}."}
 
     if act == "update_core":
-        _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "update"])
+        res_core = _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "update"])
+        _require_wp_cli_ok(res_core, "Nâng cấp WordPress Core")
         _run_wp_cli(linux_user, php_ver, wp_dir, ["core", "update-db"])
         inst["wp_version"] = _detect_wp_version(wp_dir, linux_user=linux_user, site_root=site_root) or inst.get("latest_wp_version") or "6.7.2"
+        inst["latest_wp_version"] = inst["wp_version"]
         _save_toolkit_state(state)
         return {
             "message": f"Đã nâng cấp WordPress Core trên {site.domain} lên phiên bản {inst['wp_version']}.",
@@ -2479,12 +2849,12 @@ def execute_wp_tool(
             raise HTTPException(status_code=400, detail="Vui lòng nhập đầy đủ chuỗi cần tìm và chuỗi thay thế.")
         if old_val.startswith("-") or new_val.startswith("-"):
             raise HTTPException(status_code=400, detail="Chuỗi tìm kiếm hoặc thay thế không được bắt đầu bằng dấu '-'.")
-        cli_args = ["search-replace", old_val, new_val, "--all-tables", "--precise"]
         cli_args = ["search-replace", "--all-tables", "--precise"]
         if payload.dry_run:
             cli_args.append("--dry-run")
         cli_args.extend(["--", old_val, new_val])
         res = _run_wp_cli(linux_user, php_ver, wp_dir, cli_args)
+        _require_wp_cli_ok(res, "Tìm kiếm & Thay thế chuỗi trong Database")
         return {
             "message": (
                 f"Đã chạy thử (Dry-run) thay thế '{old_val}' → '{new_val}'."
@@ -2615,6 +2985,18 @@ def execute_wp_tool(
                 enforce_user_database_limit(db, target_owner)
 
         target_subpath = (payload.target_subpath or "").strip()
+        src_subpath_norm = (inst.get("subpath") or "").strip().strip("/")
+        dst_subpath_norm = target_subpath.strip("/")
+        if target_site.id == site.id and dst_subpath_norm == src_subpath_norm:
+            raise HTTPException(
+                status_code=400,
+                detail="Không thể nhân bản hoặc đồng bộ đè lên chính thư mục nguồn của cùng một tên miền.",
+            )
+        if not payload.sync_files and not payload.sync_database:
+            raise HTTPException(
+                status_code=400,
+                detail="Vui lòng bật ít nhất một tùy chọn đồng bộ (Mã nguồn Files hoặc Cơ sở dữ liệu Database).",
+            )
         target_linux_user, target_site_root, target_wp_dir = _resolve_site_paths(target_site, db, target_subpath)
         src_cfg_text = _read_wp_file_text(wp_dir, "wp-config.php", linux_user=linux_user, site_root=site_root)
         src_cfg = _parse_wp_config_details(src_cfg_text)
@@ -2731,7 +3113,11 @@ def apply_package_set(
     if not chosen:
         raise HTTPException(status_code=404, detail="Không tìm thấy Bộ cài mẫu.")
 
+    if not payload.website_ids:
+        raise HTTPException(status_code=400, detail="Vui lòng chọn ít nhất một website WordPress để áp dụng Bộ cài mẫu.")
+
     applied = 0
+    failed_items: List[str] = []
     for wid in payload.website_ids:
         site = _get_accessible_website(wid, db, current_user)
         inst = state.setdefault("instances", {}).setdefault(str(site.id), {"installed": True})
@@ -2741,13 +3127,16 @@ def apply_package_set(
         themes = list(inst.get("themes") or _default_themes_for_instance(wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root))
 
         for p_slug in chosen.get("plugins") or []:
-            if not WP_SLUG_RE.fullmatch(p_slug.lower()):
+            clean_p = p_slug.strip().lower()
+            if not WP_SLUG_RE.fullmatch(clean_p):
                 continue
-            _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "install", p_slug.lower(), "--activate", "--force"])
-            if settings.command_dry_run and not any(p["slug"].lower() == p_slug.lower() for p in plugins):
+            res_p = _run_wp_cli(linux_user, php_ver, wp_dir, ["plugin", "install", clean_p, "--activate", "--force"])
+            if not settings.command_dry_run and res_p.returncode != 0:
+                failed_items.append(f"{site.domain}:{clean_p}")
+            if settings.command_dry_run and not any(p["slug"].lower() == clean_p for p in plugins):
                 plugins.append({
-                    "slug": p_slug,
-                    "name": p_slug.replace("-", " ").title(),
+                    "slug": clean_p,
+                    "name": clean_p.replace("-", " ").title(),
                     "version": "Latest",
                     "latest_version": "Latest",
                     "update_available": False,
@@ -2755,13 +3144,16 @@ def apply_package_set(
                     "auto_update": True,
                 })
         for t_slug in chosen.get("themes") or []:
-            if not WP_SLUG_RE.fullmatch(t_slug.lower()):
+            clean_t = t_slug.strip().lower()
+            if not WP_SLUG_RE.fullmatch(clean_t):
                 continue
-            _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "install", t_slug.lower(), "--force"])
-            if settings.command_dry_run and not any(th["slug"].lower() == t_slug.lower() for th in themes):
+            res_t = _run_wp_cli(linux_user, php_ver, wp_dir, ["theme", "install", clean_t, "--force"])
+            if not settings.command_dry_run and res_t.returncode != 0:
+                failed_items.append(f"{site.domain}:{clean_t}")
+            if settings.command_dry_run and not any(th["slug"].lower() == clean_t for th in themes):
                 themes.append({
-                    "slug": t_slug,
-                    "name": t_slug.replace("-", " ").title(),
+                    "slug": clean_t,
+                    "name": clean_t.replace("-", " ").title(),
                     "version": "Latest",
                     "latest_version": "Latest",
                     "update_available": False,
@@ -2775,6 +3167,14 @@ def apply_package_set(
         applied += 1
 
     _save_toolkit_state(state)
+    if failed_items and applied > 0:
+        return {
+            "message": (
+                f"Đã áp dụng bộ gói '{chosen['name']}' cho {applied} website, "
+                f"tuy nhiên có {len(failed_items)} gói không tải được ({', '.join(failed_items[:4])})."
+            ),
+            "failed_items": failed_items,
+        }
     return {
         "message": f"Đã cài đặt bộ gói '{chosen['name']}' cho {applied} website WordPress!",
     }
