@@ -12,6 +12,7 @@ Reads configuration from /etc/SPanel-webmail.env (or environment variables):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextvars
 import email
@@ -22,6 +23,7 @@ import hashlib
 import hmac
 import html
 import imaplib
+import ipaddress
 import json
 import mimetypes
 import os
@@ -29,6 +31,7 @@ import re
 import secrets
 import smtplib
 import ssl
+import threading
 import time
 from email.message import EmailMessage
 from pathlib import Path
@@ -102,9 +105,14 @@ LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_FAILURES_PER_PAIR = 5
 LOGIN_MAX_FAILURES_PER_IP = 15
 LOGIN_MAX_FAILURES_PER_EMAIL = 20
+LOGIN_EMAIL_BACKOFF_THRESHOLD = 5
+LOGIN_EMAIL_BACKOFF_BASE_SECONDS = 0.5
+LOGIN_EMAIL_BACKOFF_MAX_SECONDS = 30.0
+LOGIN_MAX_CONCURRENT_BACKOFFS = 32
 _login_failures_pair: dict[tuple[str, str], list[float]] = {}
 _login_failures_ip: dict[str, list[float]] = {}
 _login_failures_email: dict[str, list[float]] = {}
+_login_backoff_semaphore = threading.BoundedSemaphore(LOGIN_MAX_CONCURRENT_BACKOFFS)
 _client_ip_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("webmail_client_ip", default="")
 
 
@@ -121,6 +129,22 @@ def _client_ip(request: Request) -> str:
     if request.client and request.client.host:
         return str(request.client.host)
     return "127.0.0.1"
+
+
+def _normalize_rate_limit_ip(client_ip: str) -> str:
+    """Group IPv6 clients by /64 subnet so rotating within a /64 cannot bypass rate limits."""
+    raw = (client_ip or "").strip()
+    if not raw:
+        return "127.0.0.1"
+    try:
+        addr = ipaddress.ip_address(raw)
+        if isinstance(addr, ipaddress.IPv6Address):
+            if addr.ipv4_mapped is not None:
+                return str(addr.ipv4_mapped)
+            return str(ipaddress.IPv6Network((addr, 64), strict=False))
+        return str(addr)
+    except ValueError:
+        return raw
 
 
 LOGIN_RATE_MAX_BUCKETS = 4096
@@ -150,10 +174,11 @@ def _check_login_rate_limit(client_ip: str, address: str, *, now: float | None =
     current = float(now if now is not None else time.time())
     cutoff = current - LOGIN_WINDOW_SECONDS
     _sweep_rate_buckets(cutoff)
-    pair_key = (client_ip, address)
+    ip_key = _normalize_rate_limit_ip(client_ip)
+    pair_key = (ip_key, address)
     if (
         len(_prune_window(_login_failures_pair, pair_key, cutoff)) >= LOGIN_MAX_FAILURES_PER_PAIR
-        or len(_prune_window(_login_failures_ip, client_ip, cutoff)) >= LOGIN_MAX_FAILURES_PER_IP
+        or len(_prune_window(_login_failures_ip, ip_key, cutoff)) >= LOGIN_MAX_FAILURES_PER_IP
     ):
         raise HTTPException(
             status_code=429,
@@ -162,15 +187,46 @@ def _check_login_rate_limit(client_ip: str, address: str, *, now: float | None =
         )
 
 
+def _get_email_backoff_delay(address: str, *, now: float | None = None) -> float:
+    current = float(now if now is not None else time.time())
+    cutoff = current - LOGIN_WINDOW_SECONDS
+    fails = len(_prune_window(_login_failures_email, address, cutoff))
+    if fails < LOGIN_EMAIL_BACKOFF_THRESHOLD:
+        return 0.0
+    exp = min(10, fails - LOGIN_EMAIL_BACKOFF_THRESHOLD)
+    return float(min(LOGIN_EMAIL_BACKOFF_MAX_SECONDS, LOGIN_EMAIL_BACKOFF_BASE_SECONDS * (2 ** exp)))
+
+
+async def _sleep_backoff(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def _apply_email_login_backoff(address: str, *, now: float | None = None) -> None:
+    delay = _get_email_backoff_delay(address, now=now)
+    if delay <= 0.0:
+        return
+    if not _login_backoff_semaphore.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Hộp thư đang có quá nhiều yêu cầu đăng nhập đồng thời. Vui lòng thử lại sau ít phút.",
+            headers={"Retry-After": "60"},
+        )
+    try:
+        await _sleep_backoff(delay)
+    finally:
+        _login_backoff_semaphore.release()
+
+
 def _record_login_failure(client_ip: str, address: str, *, now: float | None = None) -> None:
     current = float(now if now is not None else time.time())
     cutoff = current - LOGIN_WINDOW_SECONDS
     _sweep_rate_buckets(cutoff)
-    pair_key = (client_ip, address)
+    ip_key = _normalize_rate_limit_ip(client_ip)
+    pair_key = (ip_key, address)
     _prune_window(_login_failures_pair, pair_key, cutoff)
     _login_failures_pair.setdefault(pair_key, []).append(current)
-    _prune_window(_login_failures_ip, client_ip, cutoff)
-    _login_failures_ip.setdefault(client_ip, []).append(current)
+    _prune_window(_login_failures_ip, ip_key, cutoff)
+    _login_failures_ip.setdefault(ip_key, []).append(current)
     _prune_window(_login_failures_email, address, cutoff)
     _login_failures_email.setdefault(address, []).append(current)
     if len(_login_failures_email.get(address, [])) >= LOGIN_MAX_FAILURES_PER_EMAIL:
@@ -182,7 +238,9 @@ def _record_login_failure(client_ip: str, address: str, *, now: float | None = N
 
 
 def _clear_login_failures(client_ip: str, address: str) -> None:
-    _login_failures_pair.pop((client_ip, address), None)
+    ip_key = _normalize_rate_limit_ip(client_ip)
+    _login_failures_pair.pop((ip_key, address), None)
+    _login_failures_email.pop(address, None)
 
 
 def _data_dir() -> Path:
@@ -452,8 +510,7 @@ def _verify_csrf_request(request: Request) -> None:
     origin = (request.headers.get("origin") or "").strip()
     xrw = (request.headers.get("x-requested-with") or "").strip()
     expected_host = (
-        request.headers.get("x-forwarded-host")
-        or request.headers.get("host")
+        request.headers.get("host")
         or request.url.netloc
         or ""
     ).split(",")[0].strip().lower()
@@ -965,10 +1022,11 @@ async def api_auth_login(request: Request, response: Response):
 
     client_ip = _client_ip(request)
     _check_login_rate_limit(client_ip, address)
+    await _apply_email_login_backoff(address)
 
     ip_token = _client_ip_ctx.set(client_ip)
     try:
-        conn = _open_imap_with_creds(address, password)
+        conn = await asyncio.to_thread(_open_imap_with_creds, address, password)
     except HTTPException as exc:
         if exc.status_code == 401:
             _record_login_failure(client_ip, address)

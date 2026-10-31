@@ -411,13 +411,19 @@ def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTH_SECRET", "test-auth-secret-key-1234567890")
 
     imap_attempts: list[tuple[str, str]] = []
+    events: list[tuple[str, float | str]] = []
+
+    async def fake_sleep_backoff(seconds: float) -> None:
+        events.append(("backoff", seconds))
 
     def fake_open_imap(auth_user: str, auth_pass: str):
+        events.append(("imap", auth_user))
         imap_attempts.append((auth_user, auth_pass))
         if auth_pass != "correct-password-123":
             raise HTTPException(status_code=401, detail="Sai mật khẩu")
         return FakeIMAP(auth_user, auth_pass)
 
+    monkeypatch.setattr(wm, "_sleep_backoff", fake_sleep_backoff)
     monkeypatch.setattr(wm, "_open_imap_with_creds", fake_open_imap)
     client = TestClient(wm.app)
 
@@ -447,8 +453,10 @@ def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
     assert r_blocked.status_code == 429
     assert len(imap_attempts) == count_before  # IMAP not even contacted while rate-limited
 
-    # Distributed attack across 20 distinct IPs: the 20th wrong password triggers 429,
-    # yet the legitimate owner from a clean IP can STILL log in with the right password (no Account Lockout DoS).
+    # Distributed attack across 20 distinct IPs: progressive exponential backoff runs BEFORE IMAP
+    # after LOGIN_EMAIL_BACKOFF_THRESHOLD (5) failures, capped at 30.0s, and the legitimate owner
+    # from a clean IP can STILL log in with the right password (no Account Lockout DoS).
+    events.clear()
     for idx in range(wm.LOGIN_MAX_FAILURES_PER_EMAIL):
         r_dist = client.post(
             "/api/auth/login",
@@ -460,6 +468,29 @@ def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
         else:
             assert r_dist.status_code == 429
 
+    backoff_delays = [val for kind, val in events if kind == "backoff"]
+    assert backoff_delays[:7] == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+    assert all(d <= 30.0 for d in backoff_delays)
+    # Every backoff event precedes its corresponding IMAP call
+    first_backoff_pos = next(i for i, (k, _) in enumerate(events) if k == "backoff")
+    assert events[first_backoff_pos + 1] == ("imap", "victim@khach.vn")
+
+    # Concurrent backoff saturation returns 429 immediately without touching IMAP
+    held = [wm._login_backoff_semaphore.acquire(blocking=False) for _ in range(wm.LOGIN_MAX_CONCURRENT_BACKOFFS)]
+    assert all(held)
+    try:
+        imap_count_sat = len(imap_attempts)
+        r_sat = client.post(
+            "/api/auth/login",
+            json={"email": "victim@khach.vn", "password": "wrong"},
+            headers={"X-Forwarded-For": "198.51.100.200", "X-Requested-With": "XMLHttpRequest"},
+        )
+        assert r_sat.status_code == 429
+        assert len(imap_attempts) == imap_count_sat
+    finally:
+        for _ in held:
+            wm._login_backoff_semaphore.release()
+
     owner_headers = {"X-Forwarded-For": "198.51.100.77", "X-Requested-With": "XMLHttpRequest"}
     r_ok = client.post(
         "/api/auth/login",
@@ -468,6 +499,30 @@ def test_webmail_login_rate_limiting_by_ip_and_mailbox(tmp_path, monkeypatch):
     )
     assert r_ok.status_code == 200
     assert r_ok.json()["authenticated"] is True
+
+    # P2-2 IPv6 /64 grouping: rotating distinct /128 addresses within 2001:db8:abcd:1234::/64
+    # shares one subnet bucket and blocks the 6th attempt from another /128 in the same /64.
+    for host_idx in range(wm.LOGIN_MAX_FAILURES_PER_PAIR):
+        r_v6 = client.post(
+            "/api/auth/login",
+            json={"email": "v6user@khach.vn", "password": "wrong"},
+            headers={
+                "X-Forwarded-For": f"2001:db8:abcd:1234::{host_idx + 1:x}",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        assert r_v6.status_code == 401
+    count_before_v6 = len(imap_attempts)
+    r_v6_blocked = client.post(
+        "/api/auth/login",
+        json={"email": "v6user@khach.vn", "password": "correct-password-123"},
+        headers={
+            "X-Forwarded-For": "2001:db8:abcd:1234:dead:beef:cafe:9999",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    assert r_v6_blocked.status_code == 429
+    assert len(imap_attempts) == count_before_v6
 
 
 def test_webmail_non_ascii_password_login_via_sasl_plain(tmp_path, monkeypatch):
@@ -643,11 +698,15 @@ def test_webmail_csrf_draft_safety_and_crlf_sanitization(tmp_path, monkeypatch):
     assert quota_imaps[-1].stored == [], "Old draft must not be deleted when APPEND fails"
 
 
-def test_helper_locks_mail_configure_and_reconfigure():
+def test_helper_locks_mail_configure_and_reconfigure(tmp_path):
+    import subprocess
+    import textwrap
+
     cfg_body = helper_function("mail_configure")
     reconfig_body = helper_function("mail_reconfigure")
     proxy_body = helper_function("mail_webmail_proxy_block")
     host_body = helper_function("mail_webmail_host")
+    write_nginx_body = helper_function("mail_write_webmail_nginx")
     assert "/run/spanel-mail-install.lock" in cfg_body
     assert "/run/spanel-mail-install.lock" in reconfig_body
     assert "pip install" in reconfig_body
@@ -655,5 +714,94 @@ def test_helper_locks_mail_configure_and_reconfigure():
     assert "zone=spanel_webmail_login" in reconfig_body
     assert "zone=spanel_webmail_login" in host_body
     assert "prev_conf=" in host_body
+    assert "prev_conf=" in write_nginx_body
+    assert "spanel_webmail_login_key" in write_nginx_body
     assert "proxy_set_header Host $http_host;" in proxy_body
+    assert 'proxy_set_header X-Forwarded-Host "";' in proxy_body
+
+    # P3-2: Spoofed X-Forwarded-Host cannot bypass Webmail CSRF Origin verification
+    wm = load_webmail()
+    client = TestClient(wm.app)
+    r_spoof_xfh = client.post(
+        "/api/auth/login",
+        json={"email": "info@khach.vn", "password": "secret"},
+        headers={
+            "Origin": "https://evil.example.com",
+            "Host": "panel.example.com",
+            "X-Forwarded-Host": "evil.example.com",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    )
+    assert r_spoof_xfh.status_code == 403
+
+    # P2-3: Execute mail_write_webmail_nginx in bash and verify atomic rollback on nginx -t failure
+    bash_bin = _find_bash()
+    assert bash_bin is not None
+    conf_file = tmp_path / "00-spanel-webmail.conf"
+    log_file = tmp_path / "mail-install.log"
+    tls_dir = tmp_path / "tls"
+    tls_dir.mkdir(parents=True)
+    prior_content = "# EXISTING WORKING 2096 VHOST\nserver { listen 2096 ssl; }\n"
+    conf_file.write_text(prior_content, encoding="utf-8")
+
+    harness = (
+        textwrap.dedent(
+            f"""
+            export PATH="/usr/bin:/bin:$PATH"
+            set -euo pipefail
+            WEBMAIL_NGINX={conf_file.as_posix()!r}
+            WEBMAIL_PUBLIC_PORT=2096
+            MAIL_TLS_DIR={tls_dir.as_posix()!r}
+            MAIL_INSTALL_LOG={log_file.as_posix()!r}
+            MAIL_MARKER="# Managed by SPanel (Email addon)."
+            NGINX_FAIL="${{NGINX_FAIL:-0}}"
+            chmod() {{ command chmod "$@" 2>/dev/null || return 0; }}
+            deny() {{ echo "DENY: $*" >&2; exit 42; }}
+            nginx_ipv6_apply() {{ return 0; }}
+            systemctl() {{ return 0; }}
+            nginx() {{
+              if [[ "$NGINX_FAIL" == "1" ]]; then
+                echo "nginx: configuration test failed" >&2
+                return 1
+              fi
+              return 0
+            }}
+            """
+        )
+        + "\n"
+        + proxy_body
+        + "\n"
+        + write_nginx_body
+        + "\nmail_write_webmail_nginx\n"
+    ).replace("\r\n", "\n")
+    script_path = tmp_path / "test_webmail_nginx.sh"
+    script_path.write_bytes(harness.encode("utf-8"))
+
+    import os
+
+    # 1. When nginx -t fails, existing 00-spanel-webmail.conf is preserved byte-for-byte (never deleted)
+    res_fail = subprocess.run(
+        [bash_bin, script_path.as_posix()],
+        env={**os.environ, "NGINX_FAIL": "1"},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert res_fail.returncode == 42, f"unexpected rc={res_fail.returncode}: {res_fail.stderr}"
+    assert conf_file.exists(), "00-spanel-webmail.conf must NOT be deleted when nginx -t fails"
+    assert conf_file.read_text(encoding="utf-8") == prior_content
+
+    # 2. When nginx -t succeeds, new config with IPv6 /64 map and X-Forwarded-Host strip is atomically written
+    res_ok = subprocess.run(
+        [bash_bin, script_path.as_posix()],
+        env={**os.environ, "NGINX_FAIL": "0"},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert res_ok.returncode == 0, res_ok.stderr
+    rendered = conf_file.read_text(encoding="utf-8")
+    assert "map $binary_remote_addr $spanel_webmail_login_key" in rendered
+    assert 'proxy_set_header X-Forwarded-Host "";' in rendered
+    assert list(tmp_path.glob("00-spanel-webmail.conf.bak.*")) == []
 

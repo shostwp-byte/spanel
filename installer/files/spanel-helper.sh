@@ -3597,6 +3597,7 @@ mail_webmail_proxy_block() {
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
         proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
@@ -3605,6 +3606,7 @@ mail_webmail_proxy_block() {
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
         proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
         # Overwritten, not appended: the webmail reads the last address.
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
@@ -3615,17 +3617,27 @@ NGINX
 }
 
 mail_write_webmail_nginx() {
-  local conf off
+  local conf off prev_conf="" tmp_conf=""
   # Server blocks set aside when the addon was last turned off come back.
-  for off in /etc/nginx/conf.d/00-spanel-webmail*.conf.off; do
+  for off in "${WEBMAIL_NGINX%.conf}"*.conf.off; do
     [[ -f "$off" ]] || continue
     mv -f "$off" "${off%.off}"
   done
   conf="$WEBMAIL_NGINX"
+  mkdir -p "$(dirname "$conf")"
+  if [[ -f "$conf" ]]; then
+    prev_conf="$(mktemp "${conf}.bak.XXXXXX")"
+    cp -p -- "$conf" "$prev_conf"
+  fi
+  tmp_conf="$(mktemp "${conf}.tmp.XXXXXX")"
   {
     printf '%s Rewritten each time the addon is installed.\n' "$MAIL_MARKER"
     printf '# The webmail on the panel'"'"'s own name and certificate.\n'
-    printf 'limit_req_zone $binary_remote_addr zone=spanel_webmail_login:10m rate=10r/m;\n'
+    printf 'map $binary_remote_addr $spanel_webmail_login_key {\n'
+    printf '    "~^(?s)(?P<spanel_v6_net64>.{8}).{8}$" $spanel_v6_net64;\n'
+    printf '    default $binary_remote_addr;\n'
+    printf '}\n'
+    printf 'limit_req_zone $spanel_webmail_login_key zone=spanel_webmail_login:10m rate=10r/m;\n'
     printf 'server {\n'
     printf '    listen %s ssl;\n' "$WEBMAIL_PUBLIC_PORT"
     printf '    server_name _;\n'
@@ -3634,12 +3646,20 @@ mail_write_webmail_nginx() {
     printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
     mail_webmail_proxy_block
     printf '}\n'
-  } >"$conf"
+  } >"$tmp_conf"
+  chmod 0644 "$tmp_conf"
+  mv -f -- "$tmp_conf" "$conf"
   nginx_ipv6_apply >/dev/null 2>&1 || true
   if ! nginx -t >>"$MAIL_INSTALL_LOG" 2>&1; then
-    rm -f "$conf"
+    if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then
+      mv -f -- "$prev_conf" "$conf"
+      nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+    else
+      rm -f -- "$conf"
+    fi
     deny "nginx refused the webmail's server block on port ${WEBMAIL_PUBLIC_PORT} (see ${MAIL_INSTALL_LOG})"
   fi
+  rm -f -- "$prev_conf"
   systemctl reload nginx
 }
 
@@ -4816,7 +4836,11 @@ mail_reconfigure() {
         break
       fi
     done
-    if [[ -f "$WEBMAIL_NGINX" ]] && ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null; then
+    if [[ -f "$WEBMAIL_NGINX" ]] && (
+      ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null ||
+      ! grep -q 'spanel_webmail_login_key' "$WEBMAIL_NGINX" 2>/dev/null ||
+      ! grep -q 'X-Forwarded-Host ""' "$WEBMAIL_NGINX" 2>/dev/null
+    ); then
       mail_write_webmail_nginx
     fi
   fi
@@ -5181,7 +5205,9 @@ mail_webmail_host() {
   name="webmail.${domain}"
   conf="/etc/nginx/conf.d/00-spanel-webmail-${domain}.conf"
   [[ -f "$WEBMAIL_NGINX" ]] || deny "the Email addon is not installed"
-  if ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null; then
+  if ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null \
+     || ! grep -q 'spanel_webmail_login_key' "$WEBMAIL_NGINX" 2>/dev/null \
+     || ! grep -q 'X-Forwarded-Host ""' "$WEBMAIL_NGINX" 2>/dev/null; then
     mail_write_webmail_nginx
   fi
   local prev_conf=""
