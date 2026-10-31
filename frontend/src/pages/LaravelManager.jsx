@@ -43,6 +43,7 @@ import {
   Activity,
   ChevronDown,
   ChevronUp,
+  List,
   ListFilter,
   LayoutGrid,
   Save,
@@ -168,7 +169,7 @@ export function LaravelManagerPage({
   const [busyMap, setBusyMap] = useState({});
 
   // View & Filter state
-  const [viewMode, setViewMode] = useState('cards'); // 'cards' (Mockup #3 + Right Drawer) | 'expanded' (WP-style 2-col) | 'list' (Table)
+  const [viewMode, setViewMode] = useState('expanded'); // 'expanded' (Card View) | 'cards' (Grid View + Right Drawer) | 'list' (List View)
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [selectedId, setSelectedId] = useState(null);
@@ -2721,60 +2722,38 @@ export function LaravelManagerPage({
             gap: '2px',
           }}
         >
-          <button
-            type="button"
-            onClick={() => setViewMode('cards')}
-            style={{
-              height: '28px',
-              minHeight: '28px',
-              padding: '0 10px',
-              fontSize: '11.5px',
-              borderRadius: '5px',
-              background: viewMode === 'cards' ? 'var(--primary)' : 'transparent',
-              color: viewMode === 'cards' ? '#fff' : 'var(--text-secondary)',
-              border: 'none',
-              fontWeight: viewMode === 'cards' ? 600 : 500,
-              boxShadow: 'none',
-            }}
-          >
-            Thẻ &amp; Toolkit
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('expanded')}
-            style={{
-              height: '28px',
-              minHeight: '28px',
-              padding: '0 10px',
-              fontSize: '11.5px',
-              borderRadius: '5px',
-              background: viewMode === 'expanded' ? 'var(--primary)' : 'transparent',
-              color: viewMode === 'expanded' ? '#fff' : 'var(--text-secondary)',
-              border: 'none',
-              fontWeight: viewMode === 'expanded' ? 600 : 500,
-              boxShadow: 'none',
-            }}
-          >
-            Chi tiết 5 Tab
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode('list')}
-            style={{
-              height: '28px',
-              minHeight: '28px',
-              padding: '0 10px',
-              fontSize: '11.5px',
-              borderRadius: '5px',
-              background: viewMode === 'list' ? 'var(--primary)' : 'transparent',
-              color: viewMode === 'list' ? '#fff' : 'var(--text-secondary)',
-              border: 'none',
-              fontWeight: viewMode === 'list' ? 600 : 500,
-              boxShadow: 'none',
-            }}
-          >
-            Dạng Bảng
-          </button>
+          {[
+            { id: 'expanded', title: 'Card View', icon: Server },
+            { id: 'cards', title: 'Grid View', icon: LayoutGrid },
+            { id: 'list', title: 'List View', icon: List },
+          ].map(v => {
+            const VIcon = v.icon;
+            const active = viewMode === v.id;
+            return (
+              <button
+                key={v.id}
+                type="button"
+                title={v.title}
+                onClick={() => setViewMode(v.id)}
+                style={{
+                  height: '28px',
+                  minHeight: '28px',
+                  width: '32px',
+                  padding: 0,
+                  border: 'none',
+                  borderRadius: '5px',
+                  background: active ? 'var(--primary)' : 'transparent',
+                  color: active ? '#fff' : 'var(--text-secondary)',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  boxShadow: 'none',
+                }}
+              >
+                <VIcon size={14} />
+              </button>
+            );
+          })}
         </div>
       </div>
 
