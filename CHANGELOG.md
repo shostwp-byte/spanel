@@ -4,73 +4,48 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
-## [v1.0.8] — 2026-10-28
+## [v1.0.8] — 2026-10-31
 
-Các bản vá bảo mật, ổn định và hiệu năng theo đợt thẩm định độc lập lần 11 & 12:
+Bản phát hành hợp nhất các nâng cấp kiến trúc sau `v1.0.7` cùng toàn bộ bản vá bảo mật, hạn mức gói dịch vụ, Webmail, Quota, Nginx và Application Manager qua các đợt thẩm định độc lập Lần 11 → Lần 14:
 
-### Bảo mật & Phân tách đặc quyền
-- **Webmail & Helper (`P0-A`):** Gỡ bỏ hoàn toàn biến `WEBMAIL_REPO` trong `.env` và nhánh fallback sang `${APP_DIR}` khi cài đặt/cấu hình lại Webmail trong `spanel-helper.sh`, ngăn chặn leo thang đặc quyền từ user `spanel` sang `root`; đồng thời khóa cứng phiên bản phụ thuộc kèm `--only-binary :all:` trong `requirements.txt`.
-- **Webmail SSO & Session (`P1-1`):** Rút ngắn TTL của phiên SSO Master xuống 2 giờ, gắn mã định danh thế hệ hộp thư (`gen`) vào token SSO và bản đồ `mailbox_generations.json` để tự động thu hồi phiên cũ khi xóa hộp thư hoặc chuyển chủ tên miền.
-- **Chống Brute-force Webmail (`P1-2`):** Bổ sung giới hạn tốc độ đăng nhập theo cặp `(IP, email)` và theo IP từ `X-Forwarded-For` ngay trong `/api/auth/login` của Webmail, kết hợp `limit_req_zone` ở tầng Nginx.
-- **Hỗ trợ mật khẩu UTF-8 trong Webmail (`P1-3`):** Xác thực IMAP qua `AUTHENTICATE PLAIN` mã hóa UTF-8 thay vì `conn.login()` chỉ hỗ trợ ASCII.
-- **Webmail CSRF, Lưu nháp & Sanitization (`P2-5..P2-9`):** Bật `SameSite=Strict` kèm kiểm tra `Origin` / `X-Requested-With` cho các request thay đổi trạng thái; `APPEND` thư nháp mới thành công trước khi xóa bản nháp cũ; lọc bỏ ký tự `\r`/`\n` trong tên hiển thị và tiêu đề thư; bọc `flock` cho `mail-configure` và `mail-reconfigure`.
-- **WordPress Clone & Tenant File Operations (`P0-1`, `P2-3`, `P2-4`):** Mở file nguồn bằng `O_NOFOLLOW` kết hợp `fstat` kiểm tra regular file + `st_uid` khớp Linux user của khách; loại bỏ nhánh ghi/xóa file trực tiếp bằng quyền tiến trình panel khi `command_dry_run=False`.
-- **MariaDB Import (`P1-2`, `P1-3`, `P2-2`):** Bắt buộc dùng thông tin xác thực của tenant (`--defaults-file` tạm trong thư mục cùng phân vùng hoặc `/var/tmp`, `--binary-mode`), chỉ lọc mệnh đề `DEFINER=` trên các dòng DDL (`CREATE`, `ALTER`, `/*!50003`, `/*!50013`, `/*!50017`) mà không làm hỏng nội dung bài viết trong `INSERT`.
+### ⚠️ Lưu ý khi nâng cấp từ v1.0.7
+- **PHP-FPM theo từng tài khoản:** mỗi tài khoản có master PHP-FPM riêng (`spanel-php<ver>-fpm@<user>.service`) chạy trong `user-<uid>.slice`. `update.sh` tự chuyển từng site và chỉ gỡ pool cũ khi Nginx đã trỏ sang socket mới.
+- **Giới hạn tài nguyên gói dịch vụ:** các giới hạn trong gói (`CPU`, `RAM`, `Tasks`, `IO`, `Inode`, `MySQL`, cũng như số lượng `Website`, `Subdomain`, `Database`, `SFTP`, `Node/Docker Apps` với quy ước duy nhất `-1 = Không giới hạn`, `0 = Tắt`, `> 0 = Tối đa`) được cưỡng chế thật và chuẩn hóa tự động qua migration `unify_package_quota_limits`.
+- **Cụm đa máy chủ (`Multi-Server`):** request giữa các node bắt buộc có chữ ký HMAC + timestamp + nonce; tạo token node mới (scope `cluster:*`) để chuyển tài khoản giữa các node.
+- **Billing API:** token cũ `provisioning:read/write` vẫn tương thích ngược; token `sso:admin` bắt buộc phải cấu hình IP Allowlist.
 
-### Đa Runtime, Quản trị Website & Giao diện
-- **Chuyển chủ sở hữu Website (`P1-5`):** Hoàn thiện API và giao diện Admin `POST /api/websites/{id}/transfer-owner` — kiểm tra hạn mức gói của chủ mới, chuyển đồng bộ `Website`, `DatabaseAccount`, `SftpAccount`, `SiteApp`, `DnsZone`, `MailDomain`, `MailAccount`, và tự động rollback thư mục runtime nếu ghi vhost hoặc commit DB gặp lỗi.
-- **Chặn PHP trong thư mục Uploads (`P0-2`, `P2-1`):** Bảo toàn đầy đủ cấu hình vhost khi bật bảo mật WordPress; hỗ trợ chặn thực thi `.php` cho cả WordPress cài đặt trong thư mục con (`subpath`) thông qua rule Nginx location riêng mà không làm đổi `app_type` của website gốc.
-- **Tự phục hồi khi cập nhật Frontend (`P1-4`):** Bọc `ChunkErrorBoundary` quanh `React.Suspense`, lắng nghe sự kiện `vite:preloadError` để tự tải lại trang 1 lần khi mã băm chunk thay đổi sau cập nhật, và đặt lại `_aceBundlePromise = null` khi tải trình sửa mã thất bại.
-- **Khắc phục đua trạng thái Role khi đăng nhập, CORS & GZip (`P2-12..P2-16`):** Đợi `loadCurrentUser()` hoàn tất trước khi tải dữ liệu trang; bổ sung `X-Access-Role` vào CORS `allow_headers`; khôi phục `App Installer` cho tài khoản End User; giảm mức nén GZip xuống `5` và bỏ qua nén đối với luồng tải về file nén/SQL dump.
+### 🔒 Bảo mật & Phân tách đặc quyền
+- **Khôi phục Sandbox `spanel-api` (`P1-1`):** Giữ nguyên `PrivateDevices=true` và `ProtectKernelModules=true` cho tiến trình panel; các tác vụ đĩa/quota (`findmnt --verify`, `quotacheck`, `quotaon`, `modprobe`) được thực thi cô lập qua `systemd-run -p PrivateDevices=no`.
+- **Chấm dứt thao tác xóa file trực tiếp từ tiến trình Panel (`P0-1`, `P1-B7`):** Bổ sung động từ helper `site-file-delete` mở đường dẫn bằng `O_NOFOLLOW` và kiểm chứng `st_uid` thuộc đúng Linux user của khách; bổ sung `.env.bak` vào `SITE_SECRET_FILES` để luôn áp quyền `0640`; giữ nguyên `O_NOFOLLOW` + `fstat` khi clone WordPress.
+- **Cô lập kênh `x-originating-ip` giữa Webmail và Dovecot (`P2-4`):** Gỡ `127.0.0.1/32 ::1/128` khỏi `login_trusted_networks` chung và chuyển kết nối xác thực IMAP của Webmail sang UNIX socket chuyên biệt `/run/dovecot/imap-webmail` (`0660`, nhóm `spanel-webmail`) để tiến trình PHP/cron/terminal của khách không thể giả mạo IP gốc.
+- **Gia cố Webmail & Helper (`P0-A`, `P1-1..P1-3`, `P2-2`, `P3-2`):** Gỡ bỏ `WEBMAIL_REPO` và nhánh fallback `${APP_DIR}` trong `spanel-helper.sh`; rút TTL SSO Master xuống 2 giờ kèm mã thế hệ hộp thư (`gen`); hỗ trợ đăng nhập cổng `:2096` và mật khẩu UTF-8 (`AUTHENTICATE PLAIN`); gộp rate-limit IPv6 theo tiền tố `/64` ở cả ứng dụng và Nginx `map`, kết hợp trì hoãn lũy tiến (`tarpit`) theo địa chỉ email chống botnet dò mật khẩu mà không khóa chủ hộp thư thật; xóa header giả mạo `X-Forwarded-Host` tại Nginx proxy.
+- **MariaDB Import & Helper Python (`P1-2`, `P1-3`, `P2-2`):** Luôn nhập SQL dưới thông tin xác thực của tenant (`--defaults-file` tạm, `--binary-mode`), chỉ lọc `DEFINER=` trên các dòng DDL; helper chạy từ `/` kèm `PYTHONSAFEPATH=1`.
 
----
+### 📦 Hạn mức Gói Dịch vụ (`quota.py`), Cách ly Tài nguyên & Quota Kernel
+- **Một nguồn sự thật cho toàn bộ hạn mức đếm (`P2-5`):** Hợp nhất logic kiểm tra vào `backend/app/services/quota.py` (`effective_limit(user, field)` ưu tiên `package` trước `user`, `-1 = ∞`, `0 = Tắt`, `> 0 = Tối đa`) kèm migration Alembic `unify_package_quota_limits`, áp dụng đồng bộ trên tạo/gán/chuyển chủ Website, Subdomain, Database, SFTP (`GET /limits` & `POST`) và toàn bộ nhóm `Application`.
+- **Quota đĩa tầng Kernel an toàn (`P1-2`, `P3-1`):** Đối chiếu `SOURCE` `[subpath]` kết hợp `MAJ:MIN` khi phân giải bind-mount `/home` về `/`; cập nhật `/etc/fstab` nguyên tử qua tệp tạm cùng phân vùng + `findmnt --verify`, hạ `mount -fav` xuống mức cảnh báo để không bị chặn bởi các dòng NFS/USB `nofail` ngoại lai.
+- **Cách ly PHP-FPM & MySQL Governor:** Mỗi tài khoản chạy master PHP-FPM riêng trong `user-<uid>.slice` với giới hạn IO cgroups v2 và giới hạn truy vấn/kết nối MariaDB theo giờ.
 
-## [Chưa phát hành] — sau v1.0.7
+### 🌐 Nginx, Chuyển chủ Website & Giao diện
+- **Thứ tự `custom_include_path` & Cache ảnh Uploads thư mục con (`P1-5`, `P2-1`, `P3-5`):** Đặt `include {{ custom_include_path }};` về sau khối `location ~ \.php$` trong `php.conf.j2` và `wordpress.conf.j2` để ngăn chặn lộ mã nguồn `.php` khi khách viết regex tùy chỉnh; giữ luật `location ^~ /<sub>/wp-content/uploads/` kèm `expires 30d; access_log off;` và `location ~* \.php$ { deny all; }`.
+- **Chuyển chủ sở hữu Website toàn diện (`P1-5`, `P1-6`, `P3-6`):** Chuyển nguyên tử cả thư mục hộp thư `/home/<cũ>/mail/<domain>` qua `mail-move-domain`, thu hồi phiên Webmail cũ, tự động rollback nếu lỗi và trả cảnh báo rõ ràng nếu đồng bộ Dovecot thất bại.
+- **Tự phục hồi Frontend & Hiển thị Menu theo Addon (`P1-4`, `P3-3`, `P3-4`):** Phân biệt chính xác lỗi tải chunk và lỗi render trong `ChunkErrorBoundary`; ẩn `Docker` và `Node.js` khỏi menu End User khi chưa cài addon `Application`; gỡ bỏ đăng ký router `app_installer` dư thừa.
 
-Các tính năng dưới đây đã có test tự động nhưng **chưa cài thử trên máy chủ thật**. Trước khi gắn tag, chạy hết [docs/STAGING_CHECKLIST.md](docs/STAGING_CHECKLIST.md).
+### 🚀 Application Manager (`Laravel Manager` & `WordPress Manager`)
+- **Hoàn thiện sản xuất 100% `Laravel Manager` (`P0-1`, `P1-B1..B7`, `P2-B`):**
+  - Thực thi thật `composer` (2.8+ PHAR), `git` và `php artisan` bên trong mount-namespace jail `terminal-exec` dưới quyền Linux user của khách, hỗ trợ đầy đủ PHP `8.1` → `8.5` và tự động ánh xạ danh sách phiên bản PHP-FPM thực tế trên máy chủ.
+  - Chuẩn hóa `DB_HOST=localhost` trong `.env` tương thích với cấu hình `skip_name_resolve = 1` của MariaDB nội bộ, đồng thời tự động chữa các tệp `.env` cũ (`127.0.0.1` → `localhost`) và xóa cache cấu hình cũ khi thực thi `artisan migrate` / Queue Worker.
+  - Quản lý Laravel Queue Worker thật qua unit systemd template `spanel-laravel-worker` chạy dưới `user-<uid>.slice`; bật/tắt chế độ bảo trì thật (`artisan down --secret` / `up` kèm cơ chế cứu hộ khi lỗi autoloader); kiểm tra và gia cố thật 7 tiêu chí bảo mật trên Nginx & filesystem; lưu state nguyên tử mode `0600`.
+- **Nâng cấp toàn diện `WordPress Manager`:**
+  - Phân tách minh bạch `Detach` (chỉ gỡ khỏi khung quản lý) và `Remove` (xóa sạch mã nguồn qua `rm-site` + xóa Database được liên kết + khôi phục Nginx vhost, chống tái xuất hiện khi `Scan`).
+  - Trang **Maintenance Mode** tùy biến đầy đủ nội dung thông báo và tải ảnh nền trực tiếp (tự động miễn trừ cho quản trị viên đang đăng nhập `wp-admin` / `wp-login.php`).
+  - Chuẩn hóa và đồng bộ bộ 3 nút biểu tượng chuyển chế độ hiển thị (`Card View`, `Grid View`, `List View`) giữa WordPress Manager và Laravel Manager.
 
-### ⚠️ Lưu ý khi nâng cấp
-- **PHP-FPM:** mỗi tài khoản có master PHP-FPM riêng (`spanel-php<ver>-fpm@<user>.service`) chạy trong `user-<uid>.slice`. `update.sh` tự chuyển từng site và chỉ gỡ pool cũ khi nginx đã trỏ sang socket mới.
-- **Giới hạn tài nguyên:** trước đây giới hạn đặt trong gói (CPU, RAM, tasks, IO, inode, MySQL) bị mất sau mỗi request và mọi tài khoản thực tế chạy theo mặc định. Từ bản này, giới hạn trong gói **được áp dụng thật**. Kiểm tra lại các gói trước khi cập nhật.
-- **Cụm đa máy chủ:** request giữa các node phải có chữ ký, nên **mọi node phải cập nhật**. Tạo token node mới (scope `cluster:*`) để chuyển tài khoản giữa các node.
-- **Billing API:** token cũ `provisioning:read/write` vẫn dùng được. Token `sso:admin` bắt buộc phải có IP Allowlist.
-
-### Cách ly tài nguyên
-- PHP-FPM theo từng tài khoản, nằm trong slice ngay từ khi worker sinh ra; giới hạn IO cho scope.
-- Quota đĩa của kernel, có giới hạn inode (tuỳ chọn, `SPANEL_DISK_QUOTA=kernel`; không bao giờ tự remount).
-- Giới hạn MySQL theo giờ: số query, update và kết nối.
-
-### Cụm đa máy chủ và Remote MySQL
-- Remote MySQL đủ vòng đời: tạo, xoá, đổi mật khẩu, backup và khôi phục đúng máy chủ, tạm khoá và mở khoá, phpMyAdmin, TLS có kiểm tra CA. Tài khoản DB chỉ mở cho IP của web node, không dùng `%`.
-- Ký request giữa các node (HMAC, timestamp, nonce); token node được mã hoá khi lưu; mặc định kiểm tra TLS, hỗ trợ pin fingerprint.
-- Đồng bộ DNS có outbox bền vững, tự gửi lại và đối chiếu định kỳ. Mỗi zone có node gốc, serial luôn tăng, và zone của node nhận không bao giờ bị ghi đè.
-- Chuyển tài khoản giữa các node SPanel (backup mã hoá một lần → upload có chữ ký → khôi phục → tuỳ chọn chuyển DNS và tạm khoá ở nguồn).
-- Kiểm tra sức khoẻ node định kỳ, gợi ý node đặt tài khoản; kiểm tra trùng có chế độ fail-closed.
-
-### WHMCS, API và webhook
-- Sửa UsageUpdate (route bị che), xoá lịch sử webhook, và sự kiện provisioning không phát webhook.
-- API: scope chi tiết, CIDR allowlist, hạn dùng và xoay vòng token, giới hạn tốc độ, `Idempotency-Key`, dọn sạch khi tạo tài khoản thất bại, danh sách tài khoản, băng thông thật.
-- Webhook có outbox với retry, chữ ký kèm timestamp và danh mục sự kiện.
-- Module WHMCS: SSO cho khách và admin, ListAccounts, tab admin, các nút tuỳ chỉnh, configurable options, backup trước khi terminate; CI lint PHP 7.4 và 8.3.
-- Tài liệu API tiếng Việt và tiếng Anh, kèm `docs/openapi.json`.
-
-### Mail và DNS
-- Autoresponder được áp dụng thật (Sieve vacation).
-- Xoay DKIM bằng 2 selector; chỉnh chính sách DMARC; MTA-STS, TLS-RPT, autoconfig/autodiscover.
-- Chứng chỉ riêng cho `mail.<domain>` (chọn theo SNI ở Exim và Dovecot).
-- Quản lý hàng đợi mail; auto-hold hoạt động thật; Rspamd học spam khi kéo thư vào hoặc ra khỏi Junk; cảnh báo quota.
-- DNS: thêm các bản ghi TLSA, HTTPS, SVCB, PTR, DS, SSHFP, NAPTR; import và export file BIND; secondary qua AXFR/NOTIFY; template zone theo gói.
-
-### Vá lỗi, chịu lỗi, sao lưu
-- Bộ lập lịch theo khung giờ bảo trì cho tự cập nhật panel và vá core stack có lịch (có `nginx -t` trước và sau); unattended-upgrades tránh các gói do panel quản lý.
-- Rollback cập nhật khôi phục cả `spanel.db`, venv và file hệ thống.
-- Cảnh báo watchdog qua webhook (Slack, Discord, JSON); khôi phục `spanel.db` từ hot backup.
-- Panel tự backup ra ngoài máy (mã hoá) và có lệnh `spanel dr-restore` để dựng lại máy chủ.
-- Retention trên S3/SFTP/FTP, có thêm đích FTP/FTPS; kiểm tra backup định kỳ và khôi phục thử SQL.
-
-### Bảo mật
-- Helper chạy từ `/` và đặt `PYTHONSAFEPATH`, để thư mục do user `spanel` sở hữu không bao giờ lọt vào Python chạy bằng root.
-- Nhận tài khoản chuyển từ node khác: archive không thể ghi đè một tài khoản đang có trên máy.
+### ✉️ Mail, DNS, Cụm Đa Máy chủ, WHMCS & Vận hành DR
+- **Bảo toàn cấu hình Nginx Webmail cổng 2096 (`P2-3`):** Sao lưu `prev_conf` và tự động khôi phục nguyên trạng nếu `nginx -t` thất bại trong quá trình `mail_reconfigure`.
+- **Mail & PowerDNS nâng cao:** Autoresponder Sieve thật, xoay khóa DKIM 2 selector, chỉnh DMARC, MTA-STS, TLS-RPT, autoconfig/autodiscover, chứng chỉ SNI riêng cho `mail.<domain>`, quản lý hàng đợi Exim, học spam Rspamd và hỗ trợ bản ghi `TLSA`, `HTTPS`, `SVCB`, `PTR`, `DS`, `SSHFP`, `NAPTR`, import/export BIND, AXFR/NOTIFY, DNSSEC.
+- **Multi-Server & Remote MySQL:** Trọn vòng đời Remote MySQL qua TLS có kiểm tra CA & phpMyAdmin SSO; ký HMAC liên node, outbox đồng bộ DNS bền vững và chuyển tài khoản không gián đoạn giữa các node SPanel.
+- **WHMCS, Provisioning API & Cập nhật Không treo:** Scope API chi tiết, CIDR allowlist, `Idempotency-Key`, webhook outbox có retry; khắc phục lỗi treo `spanel-update` trên SSH TTY bằng cờ không tương tác `COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_NO_INTERACTION=1 --no-interaction </dev/null`; kích hoạt GitHub Actions CI tự động trên mọi nhánh push; hỗ trợ tự sao lưu DR mã hóa (`spanel dr-restore`) và auto-rollback cả mã nguồn lẫn `spanel.db`.
 
 ---
 
