@@ -2009,6 +2009,16 @@ def test_frontend_laravel_manager_no_unstable_effect_reload_loop():
     assert "loadPhpVersions]" not in jsx_text
 
 
+def test_installer_and_updater_composer_never_prompts_as_superuser():
+    for rel in ("installer/install.sh", "installer/update.sh"):
+        raw = (REPO_ROOT / rel).read_bytes()
+        assert b"\r" not in raw, f"CR byte found in {rel}"
+        text = raw.decode("utf-8")
+        assert "COMPOSER_ALLOW_SUPERUSER=1" in text, f"Missing COMPOSER_ALLOW_SUPERUSER=1 in {rel}"
+        assert "COMPOSER_NO_INTERACTION=1" in text, f"Missing COMPOSER_NO_INTERACTION=1 in {rel}"
+        assert "--version --no-interaction </dev/null" in text, f"Missing non-interactive stdin guard in {rel}"
+
+
 def test_python312_eager_annotation_compatibility():
     import inspect
     from typing import get_type_hints
@@ -2045,5 +2055,6 @@ if __name__ == "__main__":
             _fn(Path(_td))
     test_package_website_quota_enforcement_across_application_modules()
     test_frontend_laravel_manager_no_unstable_effect_reload_loop()
+    test_installer_and_updater_composer_never_prompts_as_superuser()
     test_python312_eager_annotation_compatibility()
     print("ALL LARAVEL MANAGER TESTS PASSED")
