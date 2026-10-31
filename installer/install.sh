@@ -542,13 +542,30 @@ install_wp_cli() {
 }
 
 install_composer_cli() {
-  if [[ -x /usr/local/bin/composer ]] && php -d error_reporting=8191 /usr/local/bin/composer --version 2>/dev/null | grep -qE 'Composer version (2\.(8|9|[1-9][0-9])|[3-9]\.)'; then
-    return 0
+  local php_cli="" composer_ver="" cand
+  for cand in php php8.5 php8.4 php8.3 php8.2 php8.1; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      php_cli="$(command -v "$cand")"
+      break
+    fi
+  done
+  [[ -n "$php_cli" ]] || return 0
+  if [[ -x /usr/local/bin/composer ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+      composer_ver="$(COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_NO_INTERACTION=1 timeout 15 "$php_cli" -d error_reporting=8191 /usr/local/bin/composer --version --no-interaction </dev/null 2>/dev/null || true)"
+    else
+      composer_ver="$(COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_NO_INTERACTION=1 "$php_cli" -d error_reporting=8191 /usr/local/bin/composer --version --no-interaction </dev/null 2>/dev/null || true)"
+    fi
+    if printf '%s\n' "$composer_ver" | grep -qE 'Composer version (2\.(8|9|[1-9][0-9])|[3-9]\.)'; then
+      return 0
+    fi
   fi
   local tmp_dir expected_sha actual_sha
   tmp_dir="$(mktemp -d)" || return 0
-  if curl -fsSL --connect-timeout 10 --max-time 180 -o "${tmp_dir}/composer.phar" https://getcomposer.org/download/latest-stable/composer.phar \
-    && curl -fsSL --connect-timeout 10 --max-time 30 -o "${tmp_dir}/composer.phar.sha256sum" https://getcomposer.org/download/latest-stable/composer.phar.sha256sum; then
+  if ( curl -4fsSL --connect-timeout 8 --max-time 60 -o "${tmp_dir}/composer.phar" https://getcomposer.org/download/latest-stable/composer.phar </dev/null \
+       || curl -fsSL --connect-timeout 8 --max-time 60 -o "${tmp_dir}/composer.phar" https://getcomposer.org/download/latest-stable/composer.phar </dev/null ) \
+    && ( curl -4fsSL --connect-timeout 8 --max-time 20 -o "${tmp_dir}/composer.phar.sha256sum" https://getcomposer.org/download/latest-stable/composer.phar.sha256sum </dev/null \
+       || curl -fsSL --connect-timeout 8 --max-time 20 -o "${tmp_dir}/composer.phar.sha256sum" https://getcomposer.org/download/latest-stable/composer.phar.sha256sum </dev/null ); then
     expected_sha="$(awk '{print $1}' "${tmp_dir}/composer.phar.sha256sum" 2>/dev/null || true)"
     actual_sha="$(sha256sum "${tmp_dir}/composer.phar" 2>/dev/null | awk '{print $1}' || true)"
     if [[ -n "$expected_sha" && "$expected_sha" == "$actual_sha" ]]; then
