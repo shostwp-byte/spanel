@@ -3191,10 +3191,11 @@ function AppContent() {
     if (!addons.loaded || isAdmin) return;
     const isMailPage = ['mail', 'mail_forwarders', 'mail_auto', 'mail_spam'].includes(page);
     const isMalwarePage = page === 'malware' || page === 'malware-scan';
+    const isAppsPage = ['applications', 'docker_manager', 'nodejs_manager'].includes(page);
     if (
       (page === 'dns' && !dnsAddonInstalled) ||
       (isMailPage && !mailAddonInstalled) ||
-      (page === 'applications' && !appsFeatureEnabled) ||
+      (isAppsPage && !appsFeatureEnabled) ||
       (page === 'mcp' && !mcpAddonInstalled) ||
       (isMalwarePage && !malwareAddonInstalled) ||
       (page === 'notifications')
@@ -3325,8 +3326,10 @@ function AppContent() {
         ['mail_spam', 'Spam Filters', Shield],
       ]}] : []),
       { key: 'application', title: 'Application', items: [
-        ['docker_manager', 'Docker', Boxes],
-        ['nodejs_manager', 'Node.js', Cpu],
+        ...(appsFeatureEnabled ? [
+          ['docker_manager', 'Docker', Boxes],
+          ['nodejs_manager', 'Node.js', Cpu],
+        ] : []),
         ['laravel_manager', 'Laravel', LaravelIcon],
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
       ]},

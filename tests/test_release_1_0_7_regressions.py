@@ -1467,6 +1467,7 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     mail_move_calls.clear()
     with patch.object(websites.site_users, "move_site_runtime"), \
          patch.object(mail_service, "move_domain_maildirs", side_effect=lambda o, n, d: mail_move_calls.append((o, n, d))), \
+         patch.object(mail_service, "sync"), \
          patch.object(websites, "_ensure_default_waf_file"), \
          patch.object(websites, "_rewrite_website_vhost"), \
          patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: (sftp_ensured.append((owner_u, sub_u, root)) or f"/var/lib/spanel-sftp/{sub_u}")):
@@ -1478,10 +1479,69 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
             current_user=admin,
         )
     assert updated.owner_id == end_user.id
+    assert getattr(updated, "transfer_warning", None) is None
     assert updated.linux_user == "alice"
     assert updated.root_path == expected_alice_root
     assert sftp_ensured == [("alice", "sftp_res1_deploy_a1b2c3", expected_alice_root)]
     assert mail_move_calls == [("res1", "alice", "legacy-admin.example.com")]
+
+    # 4b. When post-commit mail.sync fails, transfer still succeeds and surfaces transfer_warning + X-SPanel-Warning + audit log detail
+    from fastapi import Response
+    from app.models.entities import AuditLog
+    from app.schemas.schemas import WebsiteOut
+
+    end_user_b = User(
+        username="bob",
+        email="bob@example.com",
+        hashed_password="x",
+        role="user",
+        is_active=True,
+        website_limit=5,
+        database_limit=5,
+        sftp_accounts_limit=5,
+        mail_accounts_limit=5,
+        storage_limit_mb=1024,
+    )
+    db.add(end_user_b)
+    db.commit()
+    db.refresh(end_user_b)
+
+    warn_resp = Response()
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs"), \
+         patch.object(mail_service, "sync", side_effect=RuntimeError("dovecot reload timeout")), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: f"/var/lib/spanel-sftp/{sub_u}"):
+        warned_site = websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user_b.id),
+            request=None,
+            response=warn_resp,
+            db=db,
+            current_user=admin,
+        )
+    assert warned_site.owner_id == end_user_b.id
+    assert "dovecot reload timeout" in (warned_site.transfer_warning or "")
+    assert "dovecot reload timeout" in WebsiteOut.model_validate(warned_site).transfer_warning
+    assert "dovecot reload timeout" in warn_resp.headers.get("X-SPanel-Warning", "")
+    latest_audit = db.query(AuditLog).order_by(AuditLog.id.desc()).first()
+    assert latest_audit is not None and "warning=" in (latest_audit.detail or "") and "dovecot reload timeout" in latest_audit.detail
+
+    # Transfer back to end_user cleanly so step 5 assertions remain on end_user
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs"), \
+         patch.object(mail_service, "sync"), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: f"/var/lib/spanel-sftp/{sub_u}"):
+        websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
+            request=None,
+            db=db,
+            current_user=admin,
+        )
 
     db.refresh(legacy_db)
     db.refresh(legacy_sftp)

@@ -1,13 +1,14 @@
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from jinja2 import Environment, FileSystemLoader
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 
 from app.api.deps import get_current_user
 from app.core.config import settings
@@ -37,6 +38,7 @@ from app.services.audit import log_action
 
 _PLACEHOLDER_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "nginx"
 
+logger = logging.getLogger("spanel.websites")
 router = APIRouter(prefix="/websites", tags=["websites"])
 
 
@@ -1860,6 +1862,7 @@ def transfer_website_owner(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    response: Response = None,
 ):
     ensure_role(current_user.role, Role.admin)
     website = db.query(Website).filter(Website.id == website_id).first()
@@ -2044,21 +2047,37 @@ def transfer_website_owner(
 
     storage_quota.forget_user_storage(old_owner_id)
     storage_quota.forget_user_storage(target_owner.id)
+    transfer_warning: Optional[str] = None
     if mail_changed:
         try:
             from app.services import mail
 
-            mail.sync_quietly(db)
-        except Exception:
-            pass
+            mail.sync(db)
+        except Exception as exc:
+            transfer_warning = f"Website ownership transferred, but mail server sync failed: {exc}"
+            logger.warning(
+                "Mail sync failed after transferring website %s (id=%s) to %s: %s",
+                website.domain,
+                website.id,
+                target_owner.username,
+                exc,
+            )
 
     db.refresh(website)
+    if transfer_warning:
+        website.transfer_warning = transfer_warning
+        if response is not None:
+            response.headers["X-SPanel-Warning"] = " ".join(transfer_warning.splitlines())
+
+    audit_detail = f"new_owner={target_owner.username}"
+    if transfer_warning:
+        audit_detail = f"{audit_detail}; warning={transfer_warning}"
     log_action(
         db,
         current_user.id,
         "transfer_website_owner",
         website.domain,
-        detail=f"new_owner={target_owner.username}",
+        detail=audit_detail,
         request=request,
     )
     return website

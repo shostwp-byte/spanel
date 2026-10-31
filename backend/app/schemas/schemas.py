@@ -1054,6 +1054,7 @@ class WebsiteOut(BaseModel):
     wordpress_installed: bool = False
     app_id: Optional[int] = None
     aliases: list[WebsiteAliasOut] = Field(default_factory=list)
+    transfer_warning: Optional[str] = None
 
     class Config:
         from_attributes = True

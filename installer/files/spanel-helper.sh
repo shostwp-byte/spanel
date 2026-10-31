@@ -9975,15 +9975,25 @@ quota_enable() {
         (( rc == 2 )) && deny "${mp} has no entry in ${FSTAB_FILE}; add the quota options by hand"
         deny "could not prepare ${FSTAB_FILE}"
       fi
-      # Refuse anything findmnt or mount -fav cannot parse: a broken fstab is a
-      # server that does not boot.
-      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]] && ! "${host_run[@]}" findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
-        rm -f -- "$tmp"
-        deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+      # Refuse anything findmnt --verify cannot parse: a broken fstab is a
+      # server that does not boot. mount -fav is kept as a warning when
+      # findmnt --verify succeeded so unrelated pre-existing mount entries do
+      # not block enabling quota on /.
+      local findmnt_verified=0
+      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]]; then
+        if ! "${host_run[@]}" findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+          rm -f -- "$tmp"
+          deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+        fi
+        findmnt_verified=1
       fi
       if ! "${host_run[@]}" mount -fav --fstab "$tmp" >/dev/null 2>&1; then
-        rm -f -- "$tmp"
-        deny "the edited ${FSTAB_FILE} failed mount -fav check; nothing was changed"
+        if (( findmnt_verified == 1 )); then
+          logger -t spanel-helper -- "warning: edited ${FSTAB_FILE} reported warnings during mount -fav check; proceeding because findmnt --verify succeeded" 2>/dev/null || true
+        else
+          rm -f -- "$tmp"
+          deny "the edited ${FSTAB_FILE} failed mount -fav check; nothing was changed"
+        fi
       fi
       backup="${FSTAB_FILE}.spanel-$(date +%Y%m%d%H%M%S)"
       cp -p -- "$FSTAB_FILE" "$backup"

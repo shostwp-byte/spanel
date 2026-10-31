@@ -184,8 +184,13 @@ def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
     json_hdrs = {k.decode().lower(): v.decode() for k, v in json_start["headers"]}
     assert json_hdrs.get("content-encoding") == "gzip"
 
-    # Application menu group (Docker, Node.js, Laravel, WordPress Manager), App Installer removed,
-    # activeUser/activeRole ordering, and ChunkErrorBoundary chunk vs runtime error distinction
+    # Orphan /api/app-installer router is unregistered from FastAPI app while module file remains intact
+    registered_paths = {getattr(r, "path", "") for r in panel_main.app.routes}
+    assert not any(p.startswith("/api/app-installer") for p in registered_paths)
+    assert (ROOT / "backend" / "app" / "api" / "app_installer.py").is_file()
+
+    # Application menu group (Docker/Node.js gated by appsFeatureEnabled, Laravel & WordPress Manager always shown),
+    # App Installer removed, activeUser/activeRole ordering, and ChunkErrorBoundary chunk vs runtime error distinction
     app_src = APP_JSX.read_text(encoding="utf-8")
     user_pages_block = app_src.split("const USER_ALLOWED_PAGES = new Set([", 1)[1].split("]);", 1)[0]
     for app_key in ("docker_manager", "nodejs_manager", "laravel_manager", "wordpress_manager"):
@@ -193,7 +198,12 @@ def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
     assert "'app_installer'" not in user_pages_block
     assert "['app_installer', 'App Installer', Boxes]" not in app_src
     assert "{ key: 'application', title: 'Application', items: [" in app_src
+    app_group_block = app_src.split("{ key: 'application', title: 'Application', items: [", 1)[1].split("]},", 1)[0]
+    assert "...(appsFeatureEnabled ? [" in app_group_block
+    assert "['docker_manager', 'Docker', Boxes]" in app_group_block
+    assert "['nodejs_manager', 'Node.js', Cpu]" in app_group_block
     assert "['laravel_manager', 'Laravel', LaravelIcon]" in app_src
+    assert "const isAppsPage = ['applications', 'docker_manager', 'nodejs_manager'].includes(page);" in app_src
     assert "if (isAuthenticated && currentUser)" in app_src
     assert "if (activeUser && activeRole && !headers['X-Access-Role'])" in app_src
     assert "isChunkError: isChunkLoadError(error)" in app_src
