@@ -120,6 +120,7 @@ export function UsersPage({
   });
 
   React.useEffect(() => {
+    if (!isAdmin && !isReseller) return;
     if (loadUsers) loadUsers();
     if (loadPackages && packages.length === 0) loadPackages();
   }, []);
@@ -346,20 +347,16 @@ export function UsersPage({
       if (retryData?.access_token) {
         setNotice(`Logged in as ${user.username}.`);
         setViewLevel?.(null);
-        const nextUser = await loadCurrentUser();
-        const nextRole = nextUser?.role || user.role;
-        navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');
-        await refreshAll();
+        await loadCurrentUser();
+        navigateToPage('dashboard');
       }
       return;
     }
     if (data?.access_token) {
       setNotice(`Logged in as ${user.username}.`);
       setViewLevel?.(null);
-      const nextUser = await loadCurrentUser();
-      const nextRole = nextUser?.role || user.role;
-      navigateToPage(nextRole === 'admin' || nextRole === 'reseller' ? 'dashboard' : 'websites');
-      await refreshAll();
+      await loadCurrentUser();
+      navigateToPage('dashboard');
     }
   }
 

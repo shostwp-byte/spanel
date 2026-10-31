@@ -5,7 +5,22 @@ import { NoAutofillInput } from '../components/NoAutofillInput.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
-const Terminal = React.lazy(() => import('../components/Terminal').then(m => ({ default: m.Terminal || m.default })));
+const Terminal = React.lazy(() =>
+  import('../components/Terminal')
+    .then(m => ({ default: m.Terminal || m.default }))
+    .catch(err => {
+      try {
+        const key = 'spanel_chunk_reload_ts';
+        const last = Number(sessionStorage.getItem(key) || '0');
+        if (!last || Date.now() - last > 15000) {
+          sessionStorage.setItem(key, String(Date.now()));
+          window.location.reload();
+          return new Promise(() => {});
+        }
+      } catch {}
+      throw err;
+    })
+);
 
 export function WebsitesPage({ 
   mode = 'domains',
@@ -71,6 +86,11 @@ export function WebsitesPage({
   const [renameModalOpen, setRenameModalOpen] = useState(false);
   const [renameTargetId, setRenameTargetId] = useState('');
   const [renameNewDomain, setRenameNewDomain] = useState('');
+  const [transferOwnerTargetId, setTransferOwnerTargetId] = useState('');
+  const endUsers = React.useMemo(
+    () => (users || []).filter(u => u && u.role !== 'admin' && u.role !== 'reseller'),
+    [users]
+  );
   const [defaultDomainId, setDefaultDomainId] = useState(() => {
     try { return localStorage.getItem('spanel_default_domain_id') || ''; } catch { return ''; }
   });
@@ -166,6 +186,7 @@ export function WebsitesPage({
     setLogViewer(null);
     setTerminalViewer(null);
     setWebsiteSettingsForm(websiteConfigForm(site));
+    setTransferOwnerTargetId(String(site?.owner_id || ''));
     const data = await request(`/websites/${site.id}/nginx-custom`, {}, t('Loading Custom Nginx...'));
     if (data !== null) {
       setNginxCustomEditing({
@@ -441,6 +462,26 @@ export function WebsitesPage({
           <button disabled={!!loading} onClick={saveWebsiteSettings}><Save size={14}/>{t('Save settings')}</button>
         </div>
       </div>}
+      {!fullConfig && isAdmin && endUsers.length > 0 && <div className="website-settings-grid" style={{ marginTop: '10px' }}>
+        <label><span>{t('Owner (End User)')}</span><select
+          value={transferOwnerTargetId}
+          onChange={e => setTransferOwnerTargetId(e.target.value)}
+          disabled={!!loading}
+        >
+          <option value="">{t('Select End User...')}</option>
+          {endUsers.map(u => <option key={u.id} value={String(u.id)}>{u.username} ({u.email})</option>)}
+        </select></label>
+        <div className="website-settings-actions">
+          <button
+            type="button"
+            className="secondary-light"
+            disabled={!!loading || !transferOwnerTargetId || String(transferOwnerTargetId) === String(settingsSite.owner_id || '')}
+            onClick={() => handleTransferWebsiteOwner(nginxCustomEditing.id, transferOwnerTargetId)}
+          >
+            <Users size={14}/>{t('Transfer Owner')}
+          </button>
+        </div>
+      </div>}
       {!fullConfig && <div className="site-aliases settings-domain-manager">
         <div className="domain-manager-head">
           <h3>{t('Domains')}</h3>
@@ -611,10 +652,10 @@ export function WebsitesPage({
     () => (packages || []).find(p => p.id === currentUser?.package_id || (currentUser?.package_name && p.name === currentUser.package_name)),
     [packages, currentUser]
   );
-  const subdomainLimit = Number(currentUser?.subdomain_limit ?? userPkg?.subdomain_limit ?? 0);
-  const websiteLimit = Number(currentUser?.website_limit ?? userPkg?.website_limit ?? 0);
-  const isWebsiteLimitReached = currentUser?.role !== 'admin' && websiteLimit > 0 && rootDomains.length >= websiteLimit;
-  const isSubdomainLimitReached = currentUser?.role !== 'admin' && subdomainLimit > 0 && subdomainSites.length >= subdomainLimit;
+  const subdomainLimit = Number(userPkg?.subdomain_limit ?? currentUser?.subdomain_limit ?? -1);
+  const websiteLimit = Number(userPkg?.website_limit ?? currentUser?.website_limit ?? -1);
+  const isWebsiteLimitReached = currentUser?.role !== 'admin' && websiteLimit >= 0 && rootDomains.length >= websiteLimit;
+  const isSubdomainLimitReached = currentUser?.role !== 'admin' && subdomainLimit >= 0 && subdomainSites.length >= subdomainLimit;
 
   const defaultSite = React.useMemo(() => {
     if (!rootDomains.length) return null;
@@ -761,6 +802,35 @@ export function WebsitesPage({
       setRenameModalOpen(false);
       setRenameNewDomain('');
       setNotice(t('Renamed domain to {domain}.', { domain: cleanNew }));
+      await loadWebsiteList(websiteSearch, false);
+      if (refreshAll) await refreshAll();
+    }
+  }
+
+  async function handleTransferWebsiteOwner(websiteId = nginxCustomEditing?.id, targetOwnerId = transferOwnerTargetId) {
+    const cleanSiteId = Number(websiteId);
+    const cleanOwnerId = Number(targetOwnerId);
+    if (!cleanSiteId || !cleanOwnerId) {
+      setError(t('Please select an End User account to transfer this website to.'));
+      return;
+    }
+    const targetUser = (users || []).find(u => Number(u.id) === cleanOwnerId);
+    const data = await request(
+      `/websites/${cleanSiteId}/transfer-owner`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ target_owner_id: cleanOwnerId }),
+      },
+      t('Transferring website ownership...')
+    );
+    if (data) {
+      setNotice(
+        t('Transferred {domain} to {user}.', {
+          domain: data.domain || nginxCustomEditing?.domain || '',
+          user: targetUser?.username || String(cleanOwnerId),
+        })
+      );
+      setNginxCustomEditing(prev => (prev && prev.id === cleanSiteId ? { ...prev, site: data } : prev));
       await loadWebsiteList(websiteSearch, false);
       if (refreshAll) await refreshAll();
     }
@@ -991,7 +1061,7 @@ export function WebsitesPage({
                     {t('Subdomains')}
                   </span>
                   <strong style={{ fontSize: '15px', fontWeight: 700, color: 'var(--text)' }}>
-                    {subdomainSites.length} / {subdomainLimit > 0 ? subdomainLimit : '∞'}
+                    {subdomainSites.length} / {subdomainLimit < 0 ? '∞' : subdomainLimit}
                   </strong>
                 </div>
                 {activeParentDomain && subdomainParentFilter !== 'all' && (
@@ -1678,7 +1748,7 @@ export function WebsitesPage({
                   </button>
                   <button
                     type="button"
-                    disabled={!!loading || !subdomainPrefix.trim() || !subdomainParent}
+                    disabled={!!loading || !subdomainPrefix.trim() || !subdomainParent || isSubdomainLimitReached}
                     onClick={createSubdomain}
                     style={{
                       background: '#16a34a',
@@ -1922,7 +1992,7 @@ export function WebsitesPage({
                   {t('Domains')}
                 </span>
                 <strong style={{ fontSize: '14.5px', fontWeight: 700, color: 'var(--text)' }}>
-                  {rootDomains.length} / {websiteLimit > 0 ? websiteLimit : '∞'}
+                  {rootDomains.length} / {websiteLimit < 0 ? '∞' : websiteLimit}
                 </strong>
               </div>
             </div>

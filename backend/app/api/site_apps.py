@@ -89,6 +89,84 @@ def _app_out(app: SiteApp) -> dict:
     return payload
 
 
+def _load_json_dict(path_str: str) -> dict:
+    p = Path(path_str)
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {"instances": {}}
+
+
+def _website_quota_status(db: Session, owner: User, owner_apps: list | None = None) -> dict:
+    from app.models.entities import Website
+    from app.services import quota
+
+    w_limit = quota.effective_limit(owner, "website_limit")
+    s_limit = quota.effective_limit(owner, "subdomain_limit")
+    if w_limit < 0:
+        max_total_websites = -1
+    elif w_limit == 0:
+        max_total_websites = 0
+    else:
+        max_total_websites = -1 if s_limit < 0 else (w_limit + s_limit)
+
+    try:
+        websites = db.query(Website).filter(Website.owner_id == owner.id).all()
+        if not isinstance(websites, list):
+            websites = []
+    except Exception:
+        websites = []
+
+    wp_state = _load_json_dict("/etc/spanel/wp_toolkit.json")
+    lv_state = _load_json_dict("/etc/spanel/laravel_toolkit.json")
+    occupied_websites_count = 0
+    for w in websites:
+        inst_key = str(getattr(w, "id", ""))
+        wp_inst = (wp_state.get("instances") or {}).get(inst_key) or {}
+        lv_inst = (lv_state.get("instances") or {}).get(inst_key) or {}
+        docroot_rel = (getattr(w, "document_root", "") or "").strip().rstrip("/")
+        is_wp = getattr(w, "app_type", None) == "wordpress" or (
+            bool(wp_inst.get("installed")) and not bool(wp_inst.get("detached"))
+        )
+        is_lv = (
+            getattr(w, "nginx_rewrite_mode", None) == "laravel"
+            or docroot_rel.endswith("/public")
+            or docroot_rel == "public"
+            or (bool(lv_inst.get("installed")) and not bool(lv_inst.get("detached")))
+        )
+        is_app = getattr(w, "app_id", None) is not None or getattr(w, "app_type", None) in {
+            "application",
+            "node",
+            "python",
+            "docker",
+            "compose",
+        }
+        if is_wp or is_lv or is_app:
+            occupied_websites_count += 1
+
+    if owner_apps is None:
+        try:
+            owner_apps = db.query(SiteApp).filter(SiteApp.owner_id == owner.id).all()
+            if not isinstance(owner_apps, list):
+                owner_apps = []
+        except Exception:
+            owner_apps = []
+    unlinked_apps = sum(1 for a in owner_apps if not getattr(a, "websites", None))
+    total_occupied_slots = occupied_websites_count + unlinked_apps
+    website_quota_reached = (max_total_websites == 0) or (
+        max_total_websites > 0 and total_occupied_slots >= max_total_websites
+    )
+    return {
+        "max_total_websites": max_total_websites,
+        "occupied_websites_count": total_occupied_slots,
+        "website_quota_reached": bool(website_quota_reached),
+    }
+
+
 @router.get("")
 def list_site_apps(
     owner_id: int | None = Query(default=None),
@@ -103,12 +181,16 @@ def list_site_apps(
     else:
         query = query.filter(SiteApp.owner_id == current_user.id)
     apps = query.order_by(SiteApp.id).all()
+    quota_info = _website_quota_status(db, current_user, apps if not is_admin_role(current_user.role) else None)
     return {
         "items": [_app_out(app) for app in apps],
         "limit": site_apps.app_limit_for(current_user),
         "used": site_apps.count_apps_for_owner(db, current_user.id),
         "memory_ceiling_mb": site_apps.memory_ceiling_for(current_user),
         "port_range": [site_apps.PORT_RANGE_START, site_apps.PORT_RANGE_END],
+        "max_total_websites": quota_info["max_total_websites"],
+        "occupied_websites_count": quota_info["occupied_websites_count"],
+        "website_quota_reached": quota_info["website_quota_reached"],
     }
 
 
@@ -148,6 +230,8 @@ def create_site_app(payload: SiteAppCreate, db: Session = Depends(get_db), curre
     ensure_role(current_user.role, Role.end_user)
     owner = _resolve_owner(db, current_user, payload.owner_id)
     is_admin = is_admin_role(current_user.role)
+    if not is_admin and _website_quota_status(db, owner)["website_quota_reached"]:
+        raise HTTPException(status_code=403, detail="Website limit reached for your hosting package")
     try:
         site_apps.ensure_app_quota(db, owner, is_admin)
         name = site_apps.validate_name(payload.name)

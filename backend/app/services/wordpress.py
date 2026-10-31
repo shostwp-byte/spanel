@@ -12,6 +12,7 @@ from app.services.shell import shell
 WP_USER_RE = re.compile(r"^[A-Za-z0-9._@-]{3,60}$")
 WP_TITLE_RE = re.compile(r"^[\w\s.,'\-:!()&]{1,150}$", re.UNICODE)
 EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{3,255}$")
+WP_SUBPATH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,120}$")
 
 
 WP_SALT_KEYS = (
@@ -83,17 +84,46 @@ def install_wordpress(
     linux_user: str | None = None,
     root_path: str | None = None,
     table_prefix: str = "wp_",
+    subpath: str = "",
+    ssl_enabled: bool = True,
 ) -> str:
     safe_user = _safe_value(admin_user, WP_USER_RE, "WordPress admin username")
     safe_title = _safe_value(title, WP_TITLE_RE, "WordPress site title")
     safe_email = _safe_value(admin_email, EMAIL_RE, "WordPress admin email")
-    if not isinstance(admin_password, str) or len(admin_password) < 10 or "\x00" in admin_password:
-        raise ValueError("WordPress admin password must be at least 10 characters")
+    if (
+        not isinstance(admin_password, str)
+        or len(admin_password) < 10
+        or "\x00" in admin_password
+        or "\r" in admin_password
+        or "\n" in admin_password
+    ):
+        raise ValueError("WordPress admin password must be at least 10 characters and cannot contain line breaks")
+
+    clean_sub = (subpath or "").strip().strip("/")
+    if clean_sub:
+        if (
+            ".." in clean_sub
+            or "\x00" in clean_sub
+            or "\r" in clean_sub
+            or "\n" in clean_sub
+            or not WP_SUBPATH_RE.fullmatch(clean_sub)
+        ):
+            raise ValueError("Invalid WordPress installation subpath")
 
     root = Path(root_path or site_root(domain))
     public = site_users.document_root(root)
     linux_user = linux_user or site_users.ensure_site_runtime(domain, str(root), php_version)
-    wp_path = f"--path={public}"
+    target_dir = public / clean_sub if clean_sub else public
+    rel_docroot = f"public_html/{clean_sub}" if clean_sub else "public_html"
+    rel_wp_config = f"{rel_docroot}/wp-config.php"
+    if clean_sub and not settings.command_dry_run:
+        shell.privileged(
+            "site-document-root-ensure",
+            helper_args=[linux_user, str(root), rel_docroot],
+            check=False,
+            fallback=["mkdir", "-p", str(target_dir)],
+        )
+    wp_path = f"--path={target_dir}"
 
     # WP-CLI runs as this website's isolated Linux user through the helper.
     dl_args = ["core", "download", wp_path] if settings.command_dry_run else ["core", "download", "--force", wp_path]
@@ -106,12 +136,12 @@ def install_wordpress(
     # Render wp-config.php directly to avoid leaking the DB password through
     # argv (which would be visible to other local users via /proc/<pid>/cmdline
     # or `ps auxww` while wp config create runs).
-    config_path = public / "wp-config.php"
+    config_path = target_dir / "wp-config.php"
     config_content = _render_wp_config(db["db_name"], db["db_user"], db["db_password"], table_prefix=table_prefix)
     if not settings.command_dry_run:
         shell.privileged(
             "site-file-write",
-            helper_args=[linux_user, str(root), "public_html/wp-config.php", "0640"],
+            helper_args=[linux_user, str(root), rel_wp_config, "0640"],
             fallback=[
                 "sh",
                 "-c",
@@ -125,14 +155,16 @@ def install_wordpress(
         )
     shell.privileged(
         "site-path-fix",
-        helper_args=[str(public), linux_user],
+        helper_args=[str(target_dir), linux_user],
         check=False,
-        fallback=["chown", "-R", f"{linux_user}:{linux_user}", str(public)],
+        fallback=["chown", "-R", f"{linux_user}:{linux_user}", str(target_dir)],
     )
 
+    scheme = "https" if ssl_enabled else "http"
+    install_url = f"{scheme}://{domain}/{clean_sub}" if clean_sub else f"{scheme}://{domain}"
     install_args = [
         "core", "install", wp_path,
-        f"--url=https://{domain}",
+        f"--url={install_url}",
         f"--title={safe_title}",
         f"--admin_user={safe_user}",
         f"--admin_email={safe_email}",
@@ -154,7 +186,7 @@ def install_wordpress(
     if not settings.command_dry_run:
         shell.privileged(
             "site-file-write",
-            helper_args=[linux_user, str(root), "public_html/wp-config.php", "0640"],
+            helper_args=[linux_user, str(root), rel_wp_config, "0640"],
             fallback=[
                 "sh",
                 "-c",
@@ -225,15 +257,30 @@ def wp_update(path: str, action: str, linux_user: str | None = None, php_version
 
 def reset_admin_password(path: str, user: str, password: str, linux_user: str | None = None, php_version: str | None = None):
     safe_user = _safe_value(user, WP_USER_RE, "WordPress username")
-    if not isinstance(password, str) or len(password) < 10 or "\x00" in password:
-        raise ValueError("Password must be at least 10 characters")
-    args = ["user", "update", safe_user, "--user_pass=/dev/stdin", f"--path={path}", "--allow-root"]
+    if (
+        not isinstance(password, str)
+        or len(password) < 10
+        or "\x00" in password
+        or "\r" in password
+        or "\n" in password
+    ):
+        raise ValueError("Password must be at least 10 characters and cannot contain line breaks")
+    args = [
+        "user",
+        "update",
+        safe_user,
+        "--prompt=user_pass",
+        "--skip-plugins",
+        "--skip-themes",
+        f"--path={path}",
+        "--allow-root",
+    ]
     site_user = _site_user_for_path(path, linux_user)
     return shell.privileged(
         "wp-site",
         helper_args=[site_user, *_wp_php_flag(php_version), *args],
         fallback=["wp", *args],
-        input=password,
+        input=password + "\n",
         sensitive=True,
     )
 

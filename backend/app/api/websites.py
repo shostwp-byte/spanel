@@ -1,13 +1,14 @@
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from jinja2 import Environment, FileSystemLoader
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 
 from app.api.deps import get_current_user
 from app.core.config import settings
@@ -32,11 +33,12 @@ from app.schemas.schemas import (
     WebsiteWordPressInstall,
     WildcardSslRequest,
 )
-from app.services import addons, cloudflare, cron, db_backends, dns, file_manager, mariadb, nginx, site_apps, site_users, ssl, storage_quota, teardown, waf, wordpress
+from app.services import addons, cloudflare, cron, db_backends, dns, file_manager, mariadb, nginx, quota, site_apps, site_users, ssl, storage_quota, teardown, waf, wordpress
 from app.services.audit import log_action
 
 _PLACEHOLDER_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "nginx"
 
+logger = logging.getLogger("spanel.websites")
 router = APIRouter(prefix="/websites", tags=["websites"])
 
 
@@ -153,6 +155,16 @@ def _rewrite_ssl_kwargs(website: Website) -> dict:
 
 def _website_rewrite_mode(website: Website) -> str:
     return getattr(website, "nginx_rewrite_mode", "none") or "none"
+
+
+def effective_website_limit(user: User | None) -> int:
+    """Return the effective website quota for ``user`` (-1 = unlimited, 0 = disabled, >0 = max sites)."""
+    return quota.effective_limit(user, "website_limit")
+
+
+def effective_subdomain_limit(user: User | None) -> int:
+    """Return the effective subdomain quota for ``user`` (-1 = unlimited, 0 = disabled, >0 = max subdomains)."""
+    return quota.effective_limit(user, "subdomain_limit")
 
 
 def _is_authorized_for_website(db: Session, website: Website, current_user: User) -> bool:
@@ -591,8 +603,8 @@ def reconcile_websites_from_disk(db: Session) -> None:
                     matched_user = users_by_id[z.owner_id]
             if matched_user is None:
                 for u in end_users:
-                    eff_limit = int(u.website_limit if u.website_limit is not None else (u.package.website_limit if getattr(u, "package", None) else 0) or 0)
-                    if eff_limit > 0 and site_counts.get(u.id, 0) >= eff_limit:
+                    eff_limit = effective_website_limit(u)
+                    if quota.is_quota_reached(site_counts.get(u.id, 0), eff_limit):
                         continue
                     if _domain_matches_user(w.domain, u):
                         matched_user = u
@@ -676,12 +688,12 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
     )
     existing_root_domains_count = len(existing_domains) - existing_subdomains_count
     if is_subdomain_create:
-        eff_subdomain_limit = int((owner.package.subdomain_limit if getattr(owner, "package", None) else 0) or 0)
-        if not is_admin_role(owner.role) and eff_subdomain_limit > 0 and existing_subdomains_count >= eff_subdomain_limit:
+        eff_subdomain_limit = effective_subdomain_limit(owner)
+        if not is_admin_role(owner.role) and quota.is_quota_reached(existing_subdomains_count, eff_subdomain_limit):
             raise HTTPException(status_code=403, detail="Subdomain limit reached")
     else:
-        eff_site_limit = int(owner.website_limit if owner.website_limit is not None else (owner.package.website_limit if getattr(owner, "package", None) else 0) or 0)
-        if not is_admin_role(owner.role) and eff_site_limit > 0 and existing_root_domains_count >= eff_site_limit:
+        eff_site_limit = effective_website_limit(owner)
+        if not is_admin_role(owner.role) and quota.is_quota_reached(existing_root_domains_count, eff_site_limit):
             raise HTTPException(status_code=403, detail="Website limit reached")
 
     install_wp = payload.install_wordpress and payload.app_type == "wordpress"
@@ -1146,10 +1158,30 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
             raise HTTPException(status_code=403, detail="Domains can only be assigned to End User accounts")
         if not is_admin_role(current_user.role) and owner.reseller_id != current_user.id:
             raise HTTPException(status_code=403, detail="Cannot assign domain to a user outside your reseller pool")
-        assigned_count = db.query(Website).filter(Website.owner_id == owner.id, Website.id != website.id).count()
-        if not is_admin_role(owner.role) and owner.website_limit != 0 and assigned_count >= owner.website_limit:
-            raise HTTPException(status_code=403, detail="Website limit reached")
         if payload.owner_id != website.owner_id:
+            existing_sites = (
+                db.query(Website)
+                .filter(Website.owner_id == owner.id, Website.id != website.id)
+                .all()
+            )
+            existing_domains = {(s.domain or "").strip().lower() for s in existing_sites if s.domain}
+            target_domain_lower = ((payload.domain or website.domain) or "").strip().lower()
+            is_subdomain_assign = any(
+                target_domain_lower != d and target_domain_lower.endswith("." + d)
+                for d in existing_domains
+            )
+            existing_subdomains_count = sum(
+                1 for d in existing_domains if any(d != parent and d.endswith("." + parent) for parent in existing_domains)
+            )
+            existing_root_domains_count = len(existing_domains) - existing_subdomains_count
+            if is_subdomain_assign:
+                eff_sub_limit = effective_subdomain_limit(owner)
+                if not is_admin_role(owner.role) and quota.is_quota_reached(existing_subdomains_count, eff_sub_limit):
+                    raise HTTPException(status_code=403, detail="Subdomain limit reached")
+            else:
+                eff_site_limit = effective_website_limit(owner)
+                if not is_admin_role(owner.role) and quota.is_quota_reached(existing_root_domains_count, eff_site_limit):
+                    raise HTTPException(status_code=403, detail="Website limit reached")
             try:
                 storage_quota.enforce_user_storage_quota(
                     db,
@@ -1830,6 +1862,7 @@ def transfer_website_owner(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    response: Response = None,
 ):
     ensure_role(current_user.role, Role.admin)
     website = db.query(Website).filter(Website.id == website_id).first()
@@ -1845,36 +1878,206 @@ def transfer_website_owner(
             detail="Websites can only be assigned to End User accounts.",
         )
 
+    from app.models.entities import DnsZone, MailAccount, MailDomain, SftpAccount
+    from app.services import sftp_accounts
+
+    old_owner_id = website.owner_id
+    site_domains = {(website.domain or "").strip().lower()}
+    for alias in getattr(website, "aliases", None) or []:
+        if getattr(alias, "domain", None):
+            site_domains.add(alias.domain.strip().lower())
+    site_domains.discard("")
+
+    if website.owner_id != target_owner.id:
+        existing_sites = (
+            db.query(Website)
+            .filter(Website.owner_id == target_owner.id, Website.id != website.id)
+            .all()
+        )
+        existing_domains = {(s.domain or "").strip().lower() for s in existing_sites if s.domain}
+        domain_lower = (website.domain or "").strip().lower()
+        is_subdomain = any(domain_lower != d and domain_lower.endswith("." + d) for d in existing_domains)
+        existing_subdomains_count = sum(
+            1 for d in existing_domains if any(d != parent and d.endswith("." + parent) for parent in existing_domains)
+        )
+        existing_root_domains_count = len(existing_domains) - existing_subdomains_count
+        if is_subdomain:
+            eff_subdomain_limit = effective_subdomain_limit(target_owner)
+            if quota.is_quota_reached(existing_subdomains_count, eff_subdomain_limit):
+                raise HTTPException(status_code=403, detail="Target owner has reached their subdomain limit")
+        else:
+            eff_site_limit = effective_website_limit(target_owner)
+            if quota.is_quota_reached(existing_root_domains_count, eff_site_limit):
+                raise HTTPException(status_code=403, detail="Target owner has reached their website limit")
+
+        moving_dbs = (
+            db.query(DatabaseAccount)
+            .filter(DatabaseAccount.website_id == website.id, DatabaseAccount.owner_id != target_owner.id)
+            .count()
+        )
+        if moving_dbs > 0:
+            from app.api.databases import effective_database_limit
+
+            eff_db_limit = effective_database_limit(target_owner)
+            current_dbs = db.query(DatabaseAccount).filter(DatabaseAccount.owner_id == target_owner.id).count()
+            if quota.is_quota_reached(current_dbs, eff_db_limit, adding=moving_dbs):
+                raise HTTPException(status_code=403, detail="Target owner has reached their database limit")
+
+        moving_sftps = (
+            db.query(SftpAccount)
+            .filter(SftpAccount.website_id == website.id, SftpAccount.owner_id != target_owner.id)
+            .count()
+        )
+        if moving_sftps > 0:
+            from app.api.sftp_accounts import effective_sftp_limit
+
+            eff_sftp_limit = effective_sftp_limit(target_owner)
+            current_sftps = db.query(SftpAccount).filter(SftpAccount.owner_id == target_owner.id).count()
+            if quota.is_quota_reached(current_sftps, eff_sftp_limit, adding=moving_sftps):
+                raise HTTPException(status_code=403, detail="Target owner has reached their SFTP account limit")
+
+        moving_mailboxes = (
+            db.query(MailAccount)
+            .filter(MailAccount.domain.in_(list(site_domains)), MailAccount.owner_id != target_owner.id)
+            .count()
+        )
+        if moving_mailboxes > 0:
+            eff_mail_limit = quota.effective_limit(target_owner, "mail_accounts_limit")
+            current_mailboxes = db.query(MailAccount).filter(MailAccount.owner_id == target_owner.id).count()
+            if quota.is_quota_reached(current_mailboxes, eff_mail_limit, adding=moving_mailboxes):
+                raise HTTPException(status_code=403, detail="Target owner has reached their mailbox limit")
+
+        site_bytes = storage_quota.website_storage_used_bytes(website)
+        try:
+            storage_quota.enforce_user_storage_quota(db, target_owner, incoming_bytes=site_bytes)
+        except storage_quota.StorageQuotaExceeded as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    old_root_path = website.root_path
+    old_linux_user = website.linux_user
     new_linux_user = site_users.linux_user_for_panel_username(target_owner.username)
     new_root_path = site_users.site_root_for_panel_user(target_owner.username, website.domain)
     runtime_php = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
-    if website.root_path != new_root_path or website.linux_user != new_linux_user:
-        site_users.move_site_runtime(website.root_path, new_root_path, new_linux_user, runtime_php)
-        website.root_path = new_root_path
-        website.linux_user = new_linux_user
-        _ensure_default_waf_file(website.domain)
-        _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
+    moved_runtime = False
+    moved_mail_domains: list[str] = []
+    mail_changed = False
 
-    website.owner_id = target_owner.id
-    for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).all():
-        db_acc.owner_id = target_owner.id
     try:
-        from app.models.entities import DnsZone
+        if website.root_path != new_root_path or website.linux_user != new_linux_user:
+            site_users.move_site_runtime(website.root_path, new_root_path, new_linux_user, runtime_php)
+            moved_runtime = True
+            website.root_path = new_root_path
+            website.linux_user = new_linux_user
+            _ensure_default_waf_file(website.domain)
+            _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
 
-        z = db.query(DnsZone).filter(DnsZone.name == website.domain).first()
-        if z:
+        website.owner_id = target_owner.id
+        for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).all():
+            db_acc.owner_id = target_owner.id
+
+        for sftp_acc in db.query(SftpAccount).filter(SftpAccount.website_id == website.id).all():
+            sftp_acc.owner_id = target_owner.id
+            sftp_acc.chroot_path = sftp_accounts.ensure_account(
+                new_linux_user, sftp_acc.linux_user, new_root_path
+            )
+
+        if website.app_id:
+            app_row = db.query(SiteApp).filter(SiteApp.id == website.app_id).first()
+            if app_row and app_row.owner_id != target_owner.id:
+                other_site = (
+                    db.query(Website)
+                    .filter(Website.app_id == app_row.id, Website.id != website.id)
+                    .first()
+                )
+                if not other_site:
+                    conflict = (
+                        db.query(SiteApp)
+                        .filter(SiteApp.owner_id == target_owner.id, SiteApp.name == app_row.name, SiteApp.id != app_row.id)
+                        .first()
+                    )
+                    if conflict:
+                        app_row.name = f"{app_row.name[:50]}-{app_row.id}"
+                    app_row.owner_id = target_owner.id
+
+        for z in db.query(DnsZone).filter(DnsZone.name.in_(list(site_domains))).all():
             z.owner_id = target_owner.id
-    except Exception:
-        pass
 
-    db.commit()
+        mail_domains_for_site: set[str] = set()
+        for md in db.query(MailDomain).filter(MailDomain.domain.in_(list(site_domains))).all():
+            if md.owner_id != target_owner.id:
+                md.owner_id = target_owner.id
+                mail_changed = True
+                mail_domains_for_site.add(md.domain)
+
+        for ma in db.query(MailAccount).filter(MailAccount.domain.in_(list(site_domains))).all():
+            if ma.owner_id != target_owner.id:
+                ma.owner_id = target_owner.id
+                mail_changed = True
+                mail_domains_for_site.add(ma.domain)
+
+        if mail_domains_for_site and old_linux_user and new_linux_user and old_linux_user != new_linux_user:
+            from app.services import mail as mail_service
+
+            for dom in sorted(mail_domains_for_site):
+                mail_service.move_domain_maildirs(old_linux_user, new_linux_user, dom)
+                moved_mail_domains.append(dom)
+
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        if moved_mail_domains and old_linux_user and new_linux_user and old_linux_user != new_linux_user:
+            try:
+                from app.services import mail as mail_service
+
+                for dom in reversed(moved_mail_domains):
+                    mail_service.move_domain_maildirs(new_linux_user, old_linux_user, dom)
+            except Exception:
+                pass
+        if moved_runtime and old_linux_user:
+            try:
+                site_users.move_site_runtime(new_root_path, old_root_path, old_linux_user, runtime_php)
+                website.root_path = old_root_path
+                website.linux_user = old_linux_user
+                _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
+            except Exception:
+                pass
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"Failed to transfer website ownership: {exc}") from exc
+
+    storage_quota.forget_user_storage(old_owner_id)
+    storage_quota.forget_user_storage(target_owner.id)
+    transfer_warning: Optional[str] = None
+    if mail_changed:
+        try:
+            from app.services import mail
+
+            mail.sync(db)
+        except Exception as exc:
+            transfer_warning = f"Website ownership transferred, but mail server sync failed: {exc}"
+            logger.warning(
+                "Mail sync failed after transferring website %s (id=%s) to %s: %s",
+                website.domain,
+                website.id,
+                target_owner.username,
+                exc,
+            )
+
     db.refresh(website)
+    if transfer_warning:
+        website.transfer_warning = transfer_warning
+        if response is not None:
+            response.headers["X-SPanel-Warning"] = " ".join(transfer_warning.splitlines())
+
+    audit_detail = f"new_owner={target_owner.username}"
+    if transfer_warning:
+        audit_detail = f"{audit_detail}; warning={transfer_warning}"
     log_action(
         db,
         current_user.id,
         "transfer_website_owner",
         website.domain,
-        detail=f"new_owner={target_owner.username}",
+        detail=audit_detail,
         request=request,
     )
     return website

@@ -12,7 +12,9 @@ Reads configuration from /etc/SPanel-webmail.env (or environment variables):
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextvars
 import email
 import email.header
 import email.policy
@@ -21,18 +23,21 @@ import hashlib
 import hmac
 import html
 import imaplib
+import ipaddress
 import json
 import mimetypes
 import os
 import re
 import secrets
 import smtplib
+import socket
 import ssl
+import threading
 import time
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -77,7 +82,8 @@ def _cfg_int(name: str, default: int) -> int:
 
 
 COOKIE_NAME = "spanel_webmail_session"
-SESSION_TTL_SECONDS = 86400 * 7  # 7 days
+SESSION_TTL_SECONDS = 86400 * 7  # 7 days (password login)
+MASTER_SESSION_TTL_SECONDS = 3600 * 2  # 2 hours (SSO master login)
 SSO_MAX_SKEW_SECONDS = 300
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+=-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$")
 FOLDER_NAME_RE = re.compile(r"^[A-Za-z0-9._ /+-]{1,128}$")
@@ -95,6 +101,147 @@ IMAP_SYSTEM_FOLDERS = ("INBOX", "Sent", "Drafts", "Junk", "Trash")
 
 # Replay cache for single-use SSO nonces: {nonce: exp_timestamp}
 _used_sso_nonces: dict[str, int] = {}
+
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_MAX_FAILURES_PER_PAIR = 5
+LOGIN_MAX_FAILURES_PER_IP = 15
+LOGIN_MAX_FAILURES_PER_EMAIL = 20
+LOGIN_EMAIL_BACKOFF_THRESHOLD = 5
+LOGIN_EMAIL_BACKOFF_BASE_SECONDS = 0.5
+LOGIN_EMAIL_BACKOFF_MAX_SECONDS = 30.0
+LOGIN_MAX_CONCURRENT_BACKOFFS = 32
+_login_failures_pair: dict[tuple[str, str], list[float]] = {}
+_login_failures_ip: dict[str, list[float]] = {}
+_login_failures_email: dict[str, list[float]] = {}
+_login_backoff_semaphore = threading.BoundedSemaphore(LOGIN_MAX_CONCURRENT_BACKOFFS)
+_client_ip_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("webmail_client_ip", default="")
+
+
+def _client_ip(request: Request) -> str:
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    if xff:
+        # Nginx overwrites X-Forwarded-For with $remote_addr; take the last hop
+        last = xff.split(",")[-1].strip()
+        if last:
+            return last
+    xri = (request.headers.get("x-real-ip") or "").strip()
+    if xri:
+        return xri
+    if request.client and request.client.host:
+        return str(request.client.host)
+    return "127.0.0.1"
+
+
+def _normalize_rate_limit_ip(client_ip: str) -> str:
+    """Group IPv6 clients by /64 subnet so rotating within a /64 cannot bypass rate limits."""
+    raw = (client_ip or "").strip()
+    if not raw:
+        return "127.0.0.1"
+    try:
+        addr = ipaddress.ip_address(raw)
+        if isinstance(addr, ipaddress.IPv6Address):
+            if addr.ipv4_mapped is not None:
+                return str(addr.ipv4_mapped)
+            return str(ipaddress.IPv6Network((addr, 64), strict=False))
+        return str(addr)
+    except ValueError:
+        return raw
+
+
+LOGIN_RATE_MAX_BUCKETS = 4096
+
+
+def _prune_window(buckets: dict[Any, list[float]], key: Any, cutoff: float) -> list[float]:
+    entries = [ts for ts in buckets.get(key, []) if ts >= cutoff]
+    if entries:
+        buckets[key] = entries
+    else:
+        buckets.pop(key, None)
+    return entries
+
+
+def _sweep_rate_buckets(cutoff: float) -> None:
+    for bucket in (_login_failures_pair, _login_failures_ip, _login_failures_email):
+        if len(bucket) <= 1024:
+            continue
+        for k in list(bucket.keys()):
+            _prune_window(bucket, k, cutoff)
+        while len(bucket) > LOGIN_RATE_MAX_BUCKETS:
+            oldest_key = next(iter(bucket))
+            bucket.pop(oldest_key, None)
+
+
+def _check_login_rate_limit(client_ip: str, address: str, *, now: float | None = None) -> None:
+    current = float(now if now is not None else time.time())
+    cutoff = current - LOGIN_WINDOW_SECONDS
+    _sweep_rate_buckets(cutoff)
+    ip_key = _normalize_rate_limit_ip(client_ip)
+    pair_key = (ip_key, address)
+    if (
+        len(_prune_window(_login_failures_pair, pair_key, cutoff)) >= LOGIN_MAX_FAILURES_PER_PAIR
+        or len(_prune_window(_login_failures_ip, ip_key, cutoff)) >= LOGIN_MAX_FAILURES_PER_IP
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Quá nhiều lần đăng nhập thất bại. Vui lòng thử lại sau vài phút.",
+            headers={"Retry-After": "60"},
+        )
+
+
+def _get_email_backoff_delay(address: str, *, now: float | None = None) -> float:
+    current = float(now if now is not None else time.time())
+    cutoff = current - LOGIN_WINDOW_SECONDS
+    fails = len(_prune_window(_login_failures_email, address, cutoff))
+    if fails < LOGIN_EMAIL_BACKOFF_THRESHOLD:
+        return 0.0
+    exp = min(10, fails - LOGIN_EMAIL_BACKOFF_THRESHOLD)
+    return float(min(LOGIN_EMAIL_BACKOFF_MAX_SECONDS, LOGIN_EMAIL_BACKOFF_BASE_SECONDS * (2 ** exp)))
+
+
+async def _sleep_backoff(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def _apply_email_login_backoff(address: str, *, now: float | None = None) -> None:
+    delay = _get_email_backoff_delay(address, now=now)
+    if delay <= 0.0:
+        return
+    if not _login_backoff_semaphore.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Hộp thư đang có quá nhiều yêu cầu đăng nhập đồng thời. Vui lòng thử lại sau ít phút.",
+            headers={"Retry-After": "60"},
+        )
+    try:
+        await _sleep_backoff(delay)
+    finally:
+        _login_backoff_semaphore.release()
+
+
+def _record_login_failure(client_ip: str, address: str, *, now: float | None = None) -> None:
+    current = float(now if now is not None else time.time())
+    cutoff = current - LOGIN_WINDOW_SECONDS
+    _sweep_rate_buckets(cutoff)
+    ip_key = _normalize_rate_limit_ip(client_ip)
+    pair_key = (ip_key, address)
+    _prune_window(_login_failures_pair, pair_key, cutoff)
+    _login_failures_pair.setdefault(pair_key, []).append(current)
+    _prune_window(_login_failures_ip, ip_key, cutoff)
+    _login_failures_ip.setdefault(ip_key, []).append(current)
+    _prune_window(_login_failures_email, address, cutoff)
+    _login_failures_email.setdefault(address, []).append(current)
+    if len(_login_failures_email.get(address, [])) >= LOGIN_MAX_FAILURES_PER_EMAIL:
+        raise HTTPException(
+            status_code=429,
+            detail="Quá nhiều lần đăng nhập thất bại. Vui lòng thử lại sau vài phút.",
+            headers={"Retry-After": "60"},
+        )
+
+
+def _clear_login_failures(client_ip: str, address: str) -> None:
+    ip_key = _normalize_rate_limit_ip(client_ip)
+    _login_failures_pair.pop((ip_key, address), None)
+    _login_failures_email.pop(address, None)
 
 
 def _data_dir() -> Path:
@@ -195,15 +342,120 @@ def _verify_session_cookie(cookie_val: str | None) -> str | None:
     return session_id
 
 
-def _create_session(address: str, *, mode: str = "master", password: str = "") -> str:
+def _generations_file() -> Path:
+    return _data_dir() / "mailbox_generations.json"
+
+
+def _expected_mailbox_generation(address: str) -> tuple[bool, str]:
+    path = _generations_file()
+    if not path.is_file():
+        return False, ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return True, str(raw.get(address.lower().strip()) or "").strip()
+    except Exception:
+        pass
+    return False, ""
+
+
+def _record_mailbox_generation(address: str, gen: str) -> None:
+    clean_addr = address.lower().strip()
+    clean_gen = str(gen or "").strip()
+    if not clean_addr or not clean_gen:
+        return
+    path = _generations_file()
+    mapping: dict[str, str] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                mapping = {str(k).lower().strip(): str(v).strip() for k, v in loaded.items()}
+        except Exception:
+            mapping = {}
+    if mapping.get(clean_addr) != clean_gen:
+        mapping[clean_addr] = clean_gen
+        try:
+            path.write_text(json.dumps(mapping), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _purge_expired_sessions(now: int | None = None) -> int:
+    current_ts = int(now if now is not None else time.time())
+    removed = 0
+    for path in _sessions_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if int(data.get("exp") or 0) < current_ts:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def purge_sessions_for_email(address: str) -> int:
+    target = (address or "").strip().lower()
+    if not target:
+        return 0
+    removed = 0
+    for path in _sessions_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if str(data.get("email") or "").strip().lower() == target:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def purge_sessions_for_domain(domain: str) -> int:
+    suffix = "@" + (domain or "").strip().lower().lstrip("@")
+    if suffix == "@":
+        return 0
+    removed = 0
+    for path in _sessions_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if str(data.get("email") or "").strip().lower().endswith(suffix):
+                path.unlink(missing_ok=True)
+                removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def _create_session(address: str, *, mode: str = "master", password: str = "", gen: str = "") -> str:
+    _purge_expired_sessions()
+    clean_addr = address.lower().strip()
+    clean_gen = str(gen or "").strip()
+    if not clean_gen:
+        _, clean_gen = _expected_mailbox_generation(clean_addr)
+    else:
+        # If a new generation is presented for this address, invalidate older generation sessions
+        for old_path in _sessions_dir().glob("*.json"):
+            try:
+                old_data = json.loads(old_path.read_text(encoding="utf-8"))
+                if str(old_data.get("email") or "").strip().lower() == clean_addr:
+                    old_gen = str(old_data.get("gen") or "").strip()
+                    if old_gen and old_gen != clean_gen:
+                        old_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        _record_mailbox_generation(clean_addr, clean_gen)
+
     session_id = secrets.token_urlsafe(24)
     now = int(time.time())
+    ttl = MASTER_SESSION_TTL_SECONDS if mode == "master" else SESSION_TTL_SECONDS
     payload = {
-        "email": address.lower().strip(),
+        "email": clean_addr,
         "mode": mode,
         "password_enc": _encrypt_secret(password) if password else "",
+        "gen": clean_gen,
         "created_at": now,
-        "exp": now + SESSION_TTL_SECONDS,
+        "exp": now + ttl,
     }
     path = _sessions_dir() / f"{session_id}.json"
     tmp = _sessions_dir() / f".{session_id}.tmp"
@@ -226,24 +478,68 @@ def _get_session(request: Request) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if int(data.get("exp") or 0) < int(time.time()):
+        now = int(time.time())
+        if int(data.get("exp") or 0) < now:
             path.unlink(missing_ok=True)
             return None
+        email_addr = str(data.get("email") or "").strip().lower()
+        sess_gen = str(data.get("gen") or "").strip()
+        has_gen_map, expected_gen = _expected_mailbox_generation(email_addr)
+        if has_gen_map:
+            if not expected_gen or (sess_gen and sess_gen != expected_gen):
+                path.unlink(missing_ok=True)
+                return None
         data["session_id"] = session_id
         return data
     except Exception:
         return None
 
 
+def _extract_hostname(host_header: str) -> str:
+    val = (host_header or "").strip().lower()
+    if not val:
+        return ""
+    try:
+        return (urlsplit(f"//{val}").hostname or "").strip().lower()
+    except Exception:
+        return val.split(":", 1)[0].strip().lower()
+
+
+def _verify_csrf_request(request: Request) -> None:
+    if request.method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    origin = (request.headers.get("origin") or "").strip()
+    xrw = (request.headers.get("x-requested-with") or "").strip()
+    expected_host = (
+        request.headers.get("host")
+        or request.url.netloc
+        or ""
+    ).split(",")[0].strip().lower()
+
+    if origin:
+        if origin.lower() == "null":
+            raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (CSRF Origin không hợp lệ).")
+        parsed_origin = urlsplit(origin)
+        origin_hostname = (parsed_origin.hostname or "").strip().lower()
+        expected_hostname = _extract_hostname(expected_host)
+        if not origin_hostname or (expected_hostname and origin_hostname != expected_hostname):
+            raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (CSRF Origin không khớp).")
+        return
+
+    if xrw.lower() != "xmlhttprequest":
+        raise HTTPException(status_code=403, detail="Yêu cầu bị từ chối (thiếu xác thực CSRF).")
+
+
 def _require_session(request: Request) -> dict[str, Any]:
+    _verify_csrf_request(request)
     sess = _get_session(request)
     if not sess:
         raise HTTPException(status_code=401, detail="Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.")
     return sess
 
 
-def _verify_sso_token(token: str, *, secret: str | None = None, now: int | None = None) -> str:
-    """Verify SPanel's HMAC-SHA256 SSO token (payload.signature in base64url)."""
+def _verify_sso_token_with_gen(token: str, *, secret: str | None = None, now: int | None = None) -> tuple[str, str]:
+    """Verify SPanel's HMAC-SHA256 SSO token and return (address, generation)."""
     sso_secret = (secret if secret is not None else _cfg("SSO_SECRET")).strip()
     if not sso_secret:
         raise ValueError("SSO_SECRET is not configured")
@@ -277,7 +573,14 @@ def _verify_sso_token(token: str, *, secret: str | None = None, now: int | None 
     address = str(payload.get("email") or "").strip().lower()
     if not EMAIL_RE.fullmatch(address):
         raise ValueError("Invalid email address in SSO token")
+    gen = str(payload.get("gen") or "").strip()
     _used_sso_nonces[nonce] = exp + 60
+    return address, gen
+
+
+def _verify_sso_token(token: str, *, secret: str | None = None, now: int | None = None) -> str:
+    """Verify SPanel's HMAC-SHA256 SSO token (payload.signature in base64url)."""
+    address, _ = _verify_sso_token_with_gen(token, secret=secret, now=now)
     return address
 
 
@@ -296,21 +599,110 @@ def _session_credentials(session: dict[str, Any]) -> tuple[str, str]:
     raise HTTPException(status_code=503, detail="Chưa cấu hình thông tin xác thực hộp thư.")
 
 
+_ORIG_IMAP4 = imaplib.IMAP4
+_ORIG_IMAP4_SSL = imaplib.IMAP4_SSL
+
+
+class _BoundIMAP4(_ORIG_IMAP4):
+    """IMAP4 client that binds outbound TCP connections to a dedicated loopback source IP."""
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = imaplib.IMAP4_PORT,
+        timeout: float | None = None,
+        *,
+        source_ip: str = "",
+    ):
+        self._source_ip = source_ip.strip()
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout: float | None = None) -> socket.socket:
+        if not self._source_ip:
+            return super()._create_socket(timeout)
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+        host = None if not self.host else self.host
+        address = (host, self.port)
+        source_address = (self._source_ip, 0)
+        return socket.create_connection(address, timeout, source_address=source_address)
+
+
+class _BoundIMAP4_SSL(_ORIG_IMAP4_SSL):
+    """IMAP4_SSL client that binds outbound TCP connections to a dedicated loopback source IP."""
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = imaplib.IMAP4_SSL_PORT,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        timeout: float | None = None,
+        source_ip: str = "",
+    ):
+        self._source_ip = source_ip.strip()
+        super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
+
+    def _create_socket(self, timeout: float | None = None) -> socket.socket:
+        if not self._source_ip:
+            return super()._create_socket(timeout)
+        sock = _BoundIMAP4._create_socket(self, timeout)
+        assert self.ssl_context is not None
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _imap_authenticate(conn: imaplib.IMAP4, auth_user: str, auth_pass: str) -> None:
+    """Authenticate over IMAP using UTF-8 SASL PLAIN so non-ASCII passwords work."""
+    conn._encoding = "utf-8"
+    if "\x00" in auth_user or "\x00" in auth_pass or "\r" in auth_user or "\n" in auth_user:
+        raise imaplib.IMAP4.error("Invalid credentials")
+    orig_ip = (_client_ip_ctx.get("") or "").strip()
+    if orig_ip and orig_ip not in ("127.0.0.1", "127.0.0.96", "::1") and hasattr(conn, "_simple_command"):
+        try:
+            parsed_ip = str(ipaddress.ip_address(orig_ip))
+            if "ID" not in imaplib.Commands:
+                imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED")
+            conn._simple_command("ID", f'("name" "SPanel-Webmail" "x-originating-ip" "{parsed_ip}")')
+        except Exception:
+            pass
+    if hasattr(conn, "authenticate"):
+        auth_bytes = f"\x00{auth_user}\x00{auth_pass}".encode("utf-8")
+        conn.authenticate("PLAIN", lambda _: auth_bytes)
+    else:
+        conn.login(auth_user, auth_pass)
+
+
 def _open_imap_with_creds(auth_user: str, auth_pass: str) -> imaplib.IMAP4:
     host = _cfg("IMAP_HOST", "127.0.0.1")
     port = _cfg_int("IMAP_PORT", 143)
     secure = _cfg_bool("IMAP_SECURE", False)
+    source_ip = _cfg("IMAP_SOURCE_IP")
+    if not source_ip and host == "127.0.0.96":
+        source_ip = "127.0.0.96"
     try:
         if secure:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
+            if source_ip and imaplib.IMAP4_SSL is _ORIG_IMAP4_SSL:
+                conn: imaplib.IMAP4 = _BoundIMAP4_SSL(host, port, ssl_context=ctx, timeout=15, source_ip=source_ip)
+            else:
+                conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx, timeout=15)
         else:
-            conn = imaplib.IMAP4(host, port, timeout=15)
-        conn.login(auth_user, auth_pass)
+            if source_ip and imaplib.IMAP4 is _ORIG_IMAP4:
+                conn = _BoundIMAP4(host, port, timeout=15, source_ip=source_ip)
+            else:
+                conn = imaplib.IMAP4(host, port, timeout=15)
+        try:
+            _imap_authenticate(conn, auth_user, auth_pass)
+        except Exception:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+            raise
         return conn
-    except imaplib.IMAP4.error as exc:
+    except (imaplib.IMAP4.error, UnicodeError) as exc:
         raise HTTPException(status_code=401, detail="Tài khoản email hoặc mật khẩu không chính xác (hoặc hộp thư đang tạm khóa).") from exc
     except OSError as exc:
         raise HTTPException(status_code=503, detail=f"Không thể kết nối tới máy chủ IMAP ({host}:{port}).") from exc
@@ -458,9 +850,10 @@ def _load_user_prefs(address: str) -> dict[str, Any]:
 def _save_user_prefs(address: str, updates: dict[str, Any]) -> dict[str, Any]:
     prefs = _load_user_prefs(address)
     if "display_name" in updates:
-        prefs["display_name"] = str(updates["display_name"] or "").strip()[:120]
+        clean_dn = re.sub(r"[\x00-\x1f\x7f]+", " ", str(updates["display_name"] or "")).strip()[:120]
+        prefs["display_name"] = clean_dn
     if "reply_to" in updates:
-        rt = str(updates["reply_to"] or "").strip()
+        rt = re.sub(r"[\x00-\x1f\x7f]+", "", str(updates["reply_to"] or "")).strip()
         if rt and not EMAIL_RE.fullmatch(rt):
             raise HTTPException(status_code=400, detail="Địa chỉ Reply-To không hợp lệ.")
         prefs["reply_to"] = rt
@@ -638,7 +1031,7 @@ def api_auth_me(request: Request):
 def api_auth_sso(request: Request, token: str = Query(default="")):
     """Single sign-on from SPanel (`GET /api/auth/sso?token=<body.signature>`)."""
     try:
-        address = _verify_sso_token(token)
+        address, token_gen = _verify_sso_token_with_gen(token)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=f"Liên kết đăng nhập nhanh không hợp lệ hoặc đã hết hạn: {exc}") from exc
 
@@ -658,16 +1051,16 @@ def api_auth_sso(request: Request, token: str = Query(default="")):
         except Exception:
             pass
 
-    cookie_val = _create_session(address, mode="master")
+    cookie_val = _create_session(address, mode="master", gen=token_gen)
     is_https = (request.headers.get("x-forwarded-proto") or request.url.scheme).lower() == "https"
     response = RedirectResponse(url="/", status_code=302)
     response.set_cookie(
         key=COOKIE_NAME,
         value=cookie_val,
-        max_age=SESSION_TTL_SECONDS,
+        max_age=MASTER_SESSION_TTL_SECONDS,
         path="/",
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         secure=is_https,
     )
     return response
@@ -675,6 +1068,10 @@ def api_auth_sso(request: Request, token: str = Query(default="")):
 
 @app.post("/api/auth/login")
 async def api_auth_login(request: Request, response: Response):
+    _verify_csrf_request(request)
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" not in ctype:
+        raise HTTPException(status_code=400, detail="Dữ liệu đăng nhập không hợp lệ.")
     try:
         body = await request.json()
     except Exception as exc:
@@ -685,7 +1082,21 @@ async def api_auth_login(request: Request, response: Response):
     if not EMAIL_RE.fullmatch(address) or not password:
         raise HTTPException(status_code=400, detail="Vui lòng nhập đầy đủ địa chỉ email và mật khẩu.")
 
-    conn = _open_imap_with_creds(address, password)
+    client_ip = _client_ip(request)
+    _check_login_rate_limit(client_ip, address)
+    await _apply_email_login_backoff(address)
+
+    ip_token = _client_ip_ctx.set(client_ip)
+    try:
+        conn = await asyncio.to_thread(_open_imap_with_creds, address, password)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            _record_login_failure(client_ip, address)
+        raise
+    finally:
+        _client_ip_ctx.reset(ip_token)
+
+    _clear_login_failures(client_ip, address)
     try:
         _ensure_standard_folders(conn)
     finally:
@@ -702,7 +1113,7 @@ async def api_auth_login(request: Request, response: Response):
         max_age=SESSION_TTL_SECONDS,
         path="/",
         httponly=True,
-        samesite="lax",
+        samesite="strict",
         secure=is_https,
     )
     return {
@@ -714,6 +1125,7 @@ async def api_auth_login(request: Request, response: Response):
 
 @app.post("/api/auth/logout")
 def api_auth_logout(request: Request, response: Response):
+    _verify_csrf_request(request)
     sess = _get_session(request)
     if sess and sess.get("session_id"):
         (_sessions_dir() / f"{sess['session_id']}.json").unlink(missing_ok=True)
@@ -1034,21 +1446,21 @@ def api_download_attachment(
 
 async def _build_email_from_request(request: Request, sender_address: str) -> tuple[EmailMessage, list[str], str | None]:
     prefs = _load_user_prefs(sender_address)
-    display_name = prefs.get("display_name", "").strip()
-    reply_to_pref = prefs.get("reply_to", "").strip()
+    display_name = re.sub(r"[\x00-\x1f\x7f]+", " ", str(prefs.get("display_name") or "")).strip()
+    reply_to_pref = re.sub(r"[\x00-\x1f\x7f]+", "", str(prefs.get("reply_to") or "")).strip()
 
     ctype = (request.headers.get("content-type") or "").lower()
     uploads: list[tuple[str, str, bytes]] = []
     if "multipart/form-data" in ctype:
         form = await request.form()
-        to_raw = str(form.get("to") or "").strip()
-        cc_raw = str(form.get("cc") or "").strip()
-        bcc_raw = str(form.get("bcc") or "").strip()
-        subject = str(form.get("subject") or "").strip()
+        to_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("to") or "")).strip()
+        cc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("cc") or "")).strip()
+        bcc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("bcc") or "")).strip()
+        subject = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("subject") or "")).strip()
         body_text = str(form.get("body_text") or "")
         body_html = str(form.get("body_html") or "")
-        in_reply_to = str(form.get("in_reply_to") or "").strip()
-        references = str(form.get("references") or "").strip()
+        in_reply_to = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("in_reply_to") or "")).strip()
+        references = re.sub(r"[\x00-\x1f\x7f]+", " ", str(form.get("references") or "")).strip()
         draft_uid = str(form.get("draft_uid") or "").strip() or None
         for file_item in form.getlist("attachments"):
             if hasattr(file_item, "filename") and getattr(file_item, "filename", ""):
@@ -1065,14 +1477,14 @@ async def _build_email_from_request(request: Request, sender_address: str) -> tu
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Dữ liệu gửi thư không hợp lệ.") from exc
         body = data_json if isinstance(data_json, dict) else {}
-        to_raw = str(body.get("to") or "").strip()
-        cc_raw = str(body.get("cc") or "").strip()
-        bcc_raw = str(body.get("bcc") or "").strip()
-        subject = str(body.get("subject") or "").strip()
+        to_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("to") or "")).strip()
+        cc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("cc") or "")).strip()
+        bcc_raw = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("bcc") or "")).strip()
+        subject = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("subject") or "")).strip()
         body_text = str(body.get("body_text") or "")
         body_html = str(body.get("body_html") or "")
-        in_reply_to = str(body.get("in_reply_to") or "").strip()
-        references = str(body.get("references") or "").strip()
+        in_reply_to = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("in_reply_to") or "")).strip()
+        references = re.sub(r"[\x00-\x1f\x7f]+", " ", str(body.get("references") or "")).strip()
         draft_uid = str(body.get("draft_uid") or "").strip() or None
 
     msg = EmailMessage()
@@ -1190,12 +1602,14 @@ async def api_save_draft(request: Request):
     conn = _open_imap(sess)
     try:
         _ensure_standard_folders(conn)
+        atyp, _ = conn.append('"Drafts"', "(\\Draft \\Seen)", imaplib.Time2Internaldate(time.time()), raw_bytes)
+        if atyp != "OK":
+            raise HTTPException(status_code=500, detail="Không thể lưu thư nháp (hộp thư có thể đã đầy).")
         if draft_uid and UID_RE.fullmatch(draft_uid):
             typ, _ = conn.select('"Drafts"', readonly=False)
             if typ == "OK":
                 conn.uid("STORE", draft_uid, "+FLAGS.SILENT", "(\\Deleted)")
                 conn.expunge()
-        conn.append('"Drafts"', "(\\Draft \\Seen)", imaplib.Time2Internaldate(time.time()), raw_bytes)
     finally:
         try:
             conn.logout()
@@ -2022,7 +2436,8 @@ WEBMAIL_HTML = r"""<!DOCTYPE html>
     }
 
     async function api(path, options = {}) {
-      const res = await fetch(path, { credentials: "same-origin", ...options });
+      const headers = { "X-Requested-With": "XMLHttpRequest", ...(options.headers || {}) };
+      const res = await fetch(path, { credentials: "same-origin", ...options, headers });
       let data = null;
       const ctype = res.headers.get("content-type") || "";
       if (ctype.includes("application/json")) {

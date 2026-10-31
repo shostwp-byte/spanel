@@ -1105,7 +1105,8 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
         assert "old.alice.example.com" in (kw.get("redirects") or [])
         assert site.app_type == "wordpress"
 
-        # 2. Subpath WordPress on a non-wordpress site: site.app_type must NOT change
+        # 2. Subpath WordPress on a non-wordpress site: site.app_type must NOT change,
+        # and subpath Nginx location rule must be added to site.nginx_custom and applied via rewrite_vhost
         site.app_type = "php"
         db.commit()
         st = wordpress_manager._load_toolkit_state()
@@ -1138,8 +1139,57 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
             )
 
         assert site.app_type == "php", "Subpath WordPress must not overwrite parent site.app_type"
-        assert captured_vhost_calls == []
+        assert len(captured_vhost_calls) == 1
+        expected_subpath_rule = (
+            "location ^~ /blog/wp-content/uploads/ "
+            "{ expires 30d; location ~* \\.php$ { deny all; } }"
+        )
+        assert expected_subpath_rule in (site.nginx_custom or "")
+        assert nginx.validate_custom_nginx(site.nginx_custom).strip() == site.nginx_custom.strip()
         assert not (wp_dir / "blog" / "readme.html").exists()
+
+        # Verify upgrading an older v1 ^~ rule (without expires) replaces it cleanly without duplicates
+        site.nginx_custom = "location ^~ /blog/wp-content/uploads/ { location ~* \\.php$ { deny all; } }\n"
+        db.commit()
+        with patch.object(nginx, "rewrite_vhost", side_effect=fake_rewrite_vhost), \
+             patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("write", 0, "", "")):
+            wordpress_manager.apply_wp_security(
+                website_id=site.id,
+                payload=wordpress_manager.WpSecurityActionPayload(
+                    check_ids=["uploads_php_blocked"],
+                    action="secure",
+                ),
+                db=db,
+                current_user=alice,
+            )
+        assert (site.nginx_custom or "").count("location ^~ /blog/wp-content/uploads/") == 1
+        assert expected_subpath_rule in (site.nginx_custom or "")
+
+        # P2-1: Render both real vhost types via nginx.render_vhost and verify custom_include_path is placed AFTER
+        # location ~ \.php$ so custom regex locations cannot shadow FastCGI PHP and leak source code.
+        with patch.object(nginx.site_users, "is_site_root_for_domain", return_value=True):
+            for vhost_app_type in ("php", "wordpress"):
+                rendered_vhost = nginx.render_vhost(
+                    domain="alice.example.com",
+                    root_path=str(site_root),
+                    app_type=vhost_app_type,
+                    php_version="8.4",
+                    custom_directives=site.nginx_custom,
+                )
+                assert rendered_vhost.index("location ~ \\.php$") < rendered_vhost.index(
+                    "include /etc/nginx/spanel/custom/alice.example.com.conf;"
+                )
+
+        # Verify write_wp_file_text raises HTTPException(500) when site-file-write fails (P2-14)
+        from fastapi import HTTPException
+
+        with patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("write", 1, "", "permission denied")):
+            try:
+                wordpress_live.write_wp_file_text("alice", site_root, wp_dir, "wp-config.php", "<?php\n", "0640")
+                raise AssertionError("Expected HTTPException(500) when site-file-write returns non-zero")
+            except HTTPException as exc:
+                assert exc.status_code == 500
+                assert "permission denied" in exc.detail
     finally:
         settings.command_dry_run = orig_dry
 
@@ -1154,7 +1204,8 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
     try:
         sql_file = tmp_path / "dump_with_definer.sql"
         sql_file.write_text(
-            "CREATE TABLE `wp_posts` (`id` int PRIMARY KEY);\n"
+            "CREATE TABLE `wp_posts` (`id` int PRIMARY KEY, `post_content` text);\n"
+            "INSERT INTO `wp_posts` VALUES (1, 'Post mentioning DEFINER=`admin`@`localhost` inside body');\n"
             "/*!50003 CREATE*/ /*!50017 DEFINER=`u_src_site`@`localhost`*/ /*!50003 TRIGGER `wp_trg` BEFORE INSERT ON `wp_posts` FOR EACH ROW BEGIN END */;\n"
             "CREATE DEFINER=`other_user`@`%` TRIGGER `wp_trg2` AFTER INSERT ON `wp_posts` FOR EACH ROW BEGIN END;\n"
             "CREATE DEFINER=`admin`@`localhost` VIEW `v_posts` AS SELECT * FROM `wp_posts`;\n",
@@ -1184,7 +1235,7 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
                 assert "missing tenant database credentials" in str(exc)
             assert subproc_calls == [], "subprocess.run must never be called with ~/.my.cnf when tenant creds are missing"
 
-            # P1-2: With tenant credentials, DEFINER clauses are stripped before piping to mysql
+            # P1-2: With tenant credentials, DDL DEFINER clauses are stripped while INSERT data is preserved
             mariadb.import_database_as_tenant(
                 "wp_target_db",
                 str(sql_file),
@@ -1197,11 +1248,14 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
             assert "--binary-mode" in call["args"]
             assert call["args"][-1] == "wp_target_db"
             assert 'user="u_target_db"' in call["cnf"]
-            assert b"DEFINER" not in call["stdin"]
+            assert b"DEFINER=`u_src_site`" not in call["stdin"]
+            assert b"DEFINER=`other_user`" not in call["stdin"]
+            assert b"CREATE DEFINER=`admin`" not in call["stdin"]
+            assert b"Post mentioning DEFINER=`admin`@`localhost` inside body" in call["stdin"]
             assert b"TRIGGER `wp_trg`" in call["stdin"]
             assert b"TRIGGER `wp_trg2`" in call["stdin"]
 
-        # P1-3 remote backend: RemoteMySQLBackend.import_database_as_tenant uses tenant user/password and strips DEFINER
+        # P1-3 remote backend: RemoteMySQLBackend.import_database_as_tenant uses tenant user/password and strips DDL DEFINER
         remote_calls = []
 
         def fake_remote_subproc(args, stdin=None, **kwargs):
@@ -1241,7 +1295,8 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
             assert 'user="u_remote_tenant"' in rcall["cnf"]
             assert 'password="RemoteTenantPass!"' in rcall["cnf"]
             assert 'user="rdb_admin"' not in rcall["cnf"]
-            assert b"DEFINER" not in rcall["stdin"]
+            assert b"DEFINER=`u_src_site`" not in rcall["stdin"]
+            assert b"Post mentioning DEFINER=`admin`@`localhost` inside body" in rcall["stdin"]
 
         # Verify backup_verify.trial_restore_sql uses import_database_as_panel
         from app.services import backup_verify
@@ -1261,33 +1316,90 @@ def test_p1_2_and_p1_3_definer_strip_and_no_root_fallback(tmp_path):
 def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     from fastapi import HTTPException
     from app.api import websites
+    from app.models.entities import DnsZone, MailAccount, MailDomain, SftpAccount, SiteApp
+    from app.services import sftp_accounts, teardown
 
     db = _make_db()
     admin = User(username="admin", email="admin@example.com", hashed_password="x", role="admin", is_active=True)
     reseller = User(username="res1", email="res1@example.com", hashed_password="x", role="reseller", is_active=True)
-    end_user = User(username="alice", email="alice@example.com", hashed_password="x", role="user", is_active=True)
-    db.add_all([admin, reseller, end_user])
+    end_user = User(
+        username="alice",
+        email="alice@example.com",
+        hashed_password="x",
+        role="user",
+        is_active=True,
+        website_limit=2,
+        database_limit=2,
+        sftp_accounts_limit=2,
+        mail_accounts_limit=5,
+        storage_limit_mb=1024,
+    )
+    capped_user = User(
+        username="bobcap",
+        email="bobcap@example.com",
+        hashed_password="x",
+        role="user",
+        is_active=True,
+        website_limit=1,
+    )
+    db.add_all([admin, reseller, end_user, capped_user])
+    db.commit()
+
+    bob_existing = Website(
+        domain="bob-existing.example.com",
+        owner_id=capped_user.id,
+        root_path="/home/bobcap/bob-existing.example.com",
+        php_version="8.4",
+        linux_user="bobcap",
+        app_type="php",
+    )
+    db.add(bob_existing)
+    db.commit()
+
+    app_row = SiteApp(
+        owner_id=reseller.id,
+        name="legacy-node-app",
+        kind="node",
+        port=4310,
+    )
+    db.add(app_row)
     db.commit()
 
     legacy_site = Website(
         domain="legacy-admin.example.com",
-        owner_id=admin.id,
-        root_path="/home/admin/legacy-admin.example.com",
+        owner_id=reseller.id,
+        root_path="/home/res1/legacy-admin.example.com",
         php_version="8.4",
-        linux_user="admin",
+        linux_user="res1",
         app_type="wordpress",
+        app_id=app_row.id,
     )
     db.add(legacy_site)
     db.commit()
 
     legacy_db = DatabaseAccount(
-        owner_id=admin.id,
+        owner_id=reseller.id,
         website_id=legacy_site.id,
         db_name="wp_legacy_admin",
         db_user="u_legacy_admin",
         db_password="secret",
     )
-    db.add(legacy_db)
+    legacy_sftp = SftpAccount(
+        owner_id=reseller.id,
+        website_id=legacy_site.id,
+        label="deploy",
+        linux_user="sftp_res1_deploy_a1b2c3",
+        chroot_path="/var/lib/spanel-sftp/sftp_res1_deploy_a1b2c3",
+    )
+    legacy_zone = DnsZone(name="legacy-admin.example.com", owner_id=reseller.id)
+    legacy_mail_domain = MailDomain(domain="legacy-admin.example.com", owner_id=reseller.id)
+    legacy_mailbox = MailAccount(
+        owner_id=reseller.id,
+        domain="legacy-admin.example.com",
+        local_part="info",
+        password_hash="{SHA512-CRYPT}$6$xyz",
+    )
+    db.add_all([legacy_db, legacy_sftp, legacy_zone, legacy_mail_domain, legacy_mailbox])
     db.commit()
 
     report = websites.audit_privileged_role_owned_resources(db)
@@ -1296,7 +1408,7 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     assert any("legacy-admin.example.com" in w for w in report["warnings"])
     assert any("wp_legacy_admin" in w for w in report["warnings"])
 
-    # Cannot transfer ownership to another privileged role (reseller)
+    # 1. Cannot transfer ownership to another privileged role (reseller)
     try:
         websites.transfer_website_owner(
             website_id=legacy_site.id,
@@ -1309,10 +1421,56 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     except HTTPException as exc:
         assert exc.status_code == 403
 
-    # Transferring ownership to End User moves site + linked DB and clears warning
-    with patch.object(websites.site_users, "move_site_runtime"), \
+    # 2. Cannot transfer to an End User who has reached website_limit
+    try:
+        websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=capped_user.id),
+            request=None,
+            db=db,
+            current_user=admin,
+        )
+        raise AssertionError("Expected 403 when target End User has reached website_limit")
+    except HTTPException as exc:
+        assert exc.status_code == 403
+        assert "website limit" in exc.detail.lower()
+
+    # 3. If vhost rewrite fails after runtime move, runtime is rolled back to old path/owner
+    move_calls = []
+    mail_move_calls = []
+    from app.services import mail as mail_service
+
+    with patch.object(websites.site_users, "move_site_runtime", side_effect=lambda o, n, u, p=None: move_calls.append((o, n, u))), \
+         patch.object(mail_service, "move_domain_maildirs", side_effect=lambda o, n, d: mail_move_calls.append((o, n, d))), \
          patch.object(websites, "_ensure_default_waf_file"), \
-         patch.object(websites, "_rewrite_website_vhost"):
+         patch.object(websites, "_rewrite_website_vhost", side_effect=[HTTPException(status_code=500, detail="nginx failed"), None]):
+        try:
+            websites.transfer_website_owner(
+                website_id=legacy_site.id,
+                payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
+                request=None,
+                db=db,
+                current_user=admin,
+            )
+            raise AssertionError("Expected 500 when vhost rewrite fails")
+        except HTTPException as exc:
+            assert exc.status_code == 500
+    expected_alice_root = websites.site_users.site_root_for_panel_username("alice", "legacy-admin.example.com") if hasattr(websites.site_users, "site_root_for_panel_username") else websites.site_users.site_root_for_panel_user("alice", "legacy-admin.example.com")
+    assert len(move_calls) == 2
+    assert move_calls[0] == ("/home/res1/legacy-admin.example.com", expected_alice_root, "alice")
+    assert move_calls[1] == (expected_alice_root, "/home/res1/legacy-admin.example.com", "res1")
+    db.refresh(legacy_site)
+    assert legacy_site.owner_id == reseller.id
+
+    # 4. Transferring ownership to End User moves site + DB + SFTP + SiteApp + DNS + Mail (including physical maildir move)
+    sftp_ensured = []
+    mail_move_calls.clear()
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs", side_effect=lambda o, n, d: mail_move_calls.append((o, n, d))), \
+         patch.object(mail_service, "sync"), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: (sftp_ensured.append((owner_u, sub_u, root)) or f"/var/lib/spanel-sftp/{sub_u}")):
         updated = websites.transfer_website_owner(
             website_id=legacy_site.id,
             payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
@@ -1321,9 +1479,94 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
             current_user=admin,
         )
     assert updated.owner_id == end_user.id
+    assert getattr(updated, "transfer_warning", None) is None
     assert updated.linux_user == "alice"
+    assert updated.root_path == expected_alice_root
+    assert sftp_ensured == [("alice", "sftp_res1_deploy_a1b2c3", expected_alice_root)]
+    assert mail_move_calls == [("res1", "alice", "legacy-admin.example.com")]
+
+    # 4b. When post-commit mail.sync fails, transfer still succeeds and surfaces transfer_warning + X-SPanel-Warning + audit log detail
+    from fastapi import Response
+    from app.models.entities import AuditLog
+    from app.schemas.schemas import WebsiteOut
+
+    end_user_b = User(
+        username="bob",
+        email="bob@example.com",
+        hashed_password="x",
+        role="user",
+        is_active=True,
+        website_limit=5,
+        database_limit=5,
+        sftp_accounts_limit=5,
+        mail_accounts_limit=5,
+        storage_limit_mb=1024,
+    )
+    db.add(end_user_b)
+    db.commit()
+    db.refresh(end_user_b)
+
+    warn_resp = Response()
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs"), \
+         patch.object(mail_service, "sync", side_effect=RuntimeError("dovecot reload timeout")), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: f"/var/lib/spanel-sftp/{sub_u}"):
+        warned_site = websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user_b.id),
+            request=None,
+            response=warn_resp,
+            db=db,
+            current_user=admin,
+        )
+    assert warned_site.owner_id == end_user_b.id
+    assert "dovecot reload timeout" in (warned_site.transfer_warning or "")
+    assert "dovecot reload timeout" in WebsiteOut.model_validate(warned_site).transfer_warning
+    assert "dovecot reload timeout" in warn_resp.headers.get("X-SPanel-Warning", "")
+    latest_audit = db.query(AuditLog).order_by(AuditLog.id.desc()).first()
+    assert latest_audit is not None and "warning=" in (latest_audit.detail or "") and "dovecot reload timeout" in latest_audit.detail
+
+    # Transfer back to end_user cleanly so step 5 assertions remain on end_user
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs"), \
+         patch.object(mail_service, "sync"), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: f"/var/lib/spanel-sftp/{sub_u}"):
+        websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
+            request=None,
+            db=db,
+            current_user=admin,
+        )
+
     db.refresh(legacy_db)
+    db.refresh(legacy_sftp)
+    db.refresh(app_row)
+    db.refresh(legacy_zone)
+    db.refresh(legacy_mail_domain)
+    db.refresh(legacy_mailbox)
     assert legacy_db.owner_id == end_user.id
+    assert legacy_sftp.owner_id == end_user.id
+    assert app_row.owner_id == end_user.id
+    assert legacy_zone.owner_id == end_user.id
+    assert legacy_mail_domain.owner_id == end_user.id
+    assert legacy_mailbox.owner_id == end_user.id
+
+    # 5. Deleting the old owner (reseller) does NOT delete transferred resources
+    teardown.purge_owned_resources(db, reseller.id)
+    db.delete(reseller)
+    db.commit()
+
+    assert db.query(Website).filter(Website.id == legacy_site.id).first() is not None
+    assert db.query(DatabaseAccount).filter(DatabaseAccount.id == legacy_db.id).first() is not None
+    assert db.query(SftpAccount).filter(SftpAccount.id == legacy_sftp.id).first() is not None
+    assert db.query(SiteApp).filter(SiteApp.id == app_row.id).first() is not None
+    assert db.query(MailDomain).filter(MailDomain.id == legacy_mail_domain.id).first() is not None
+    assert db.query(MailAccount).filter(MailAccount.id == legacy_mailbox.id).first() is not None
 
     report_after = websites.audit_privileged_role_owned_resources(db)
     assert report_after["websites"] == []

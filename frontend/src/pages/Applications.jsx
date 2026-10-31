@@ -7,6 +7,7 @@ import { t } from '../i18n.js';
 export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId, setFileAppId, setFileListPath, EMPTY_SITE_APP_DRAFT, loadSiteApps }) {
   const {
     loading, setLoading, setError, setNotice, siteApps,
+    currentUser, packages, websites,
     isAdmin, SITE_APP_KINDS, SITE_APP_KIND_LABELS,
     siteRuntimes, loadSiteRuntimes, composePlan, setComposePlan, composeWebPorts,
     validateCompose, installDockerEngine, pruneDocker, installNodeMajor,
@@ -16,6 +17,46 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
     dockerPruning, dockerPruneConfirm, setDockerPruneConfirm, dockerPruneIncludeVolumes, setDockerPruneIncludeVolumes,
     nodeMajorPicker, setNodeMajorPicker,
   } = useAppContext();
+
+  const userPkg = React.useMemo(
+    () =>
+      (packages || []).find(
+        p => p.id === currentUser?.package_id || (currentUser?.package_name && p.name === currentUser.package_name)
+      ),
+    [packages, currentUser]
+  );
+
+  const isWebsiteQuotaReached = React.useMemo(() => {
+    if (isAdmin || currentUser?.role === 'admin') return false;
+    if (typeof siteApps?.website_quota_reached === 'boolean') {
+      return siteApps.website_quota_reached;
+    }
+    const wLimit = Number(currentUser?.website_limit ?? userPkg?.website_limit ?? -1);
+    const sLimit = Number(currentUser?.subdomain_limit ?? userPkg?.subdomain_limit ?? 0);
+    if (wLimit >= 0 && sLimit >= 0) {
+      const maxTotal = wLimit + sLimit;
+      const occupiedSites = (websites || []).filter(
+        w =>
+          w.app_type === 'wordpress' ||
+          w.nginx_rewrite_mode === 'laravel' ||
+          String(w.document_root || '').replace(/\/+$/, '').endsWith('/public') ||
+          w.app_id != null ||
+          ['application', 'node', 'python', 'docker', 'compose'].includes(w.app_type)
+      ).length;
+      const usedApps = siteApps?.used ?? (siteApps?.items || []).length;
+      if (maxTotal === 0 || Math.max(occupiedSites, usedApps) >= maxTotal) return true;
+    }
+    return false;
+  }, [isAdmin, currentUser, userPkg, siteApps, websites]);
+
+  const atLimit = React.useMemo(() => {
+    if (isAdmin || currentUser?.role === 'admin') return false;
+    const usedApps = siteApps?.used ?? (siteApps?.items || []).length;
+    if (siteApps?.limit === 0) return true;
+    if (siteApps?.limit > 0 && usedApps >= siteApps.limit) return true;
+    if (isWebsiteQuotaReached) return true;
+    return false;
+  }, [isAdmin, currentUser, siteApps, isWebsiteQuotaReached]);
   
   const [siteAppDraft, setSiteAppDraft] = useState(EMPTY_SITE_APP_DRAFT);
   const [siteAppLog, setSiteAppLog] = useState(null);
@@ -129,6 +170,7 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
   }
 
   async function createSiteApp() {
+    if (atLimit) return;
     const body = {
       name: siteAppDraft.name,
       kind: siteAppDraft.kind,
@@ -196,9 +238,9 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
 
   function renderApplications() {
     const [portFrom, portTo] = siteApps.port_range || [21000, 21999];
-    const atLimit = !isAdmin && siteApps.limit > 0 && siteApps.used >= siteApps.limit;
     const dockerReady = !!siteRuntimes.docker?.installed;
     const kindHint = (SITE_APP_KINDS.find(([value]) => value === siteAppDraft.kind) || [])[2];
+    const installDisabled = !!loading || !siteAppDraft.name.trim() || atLimit;
     return <>
       <div className="section">
         <div className="section-title">
@@ -224,7 +266,7 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
           </span>)}
           <button className="mini secondary-light" disabled={!!loading} onClick={pruneDocker}>{t('Prune unused layers')}</button>
         </div>}
-        {!atLimit && <div className="site-app-form">
+        <div className="site-app-form">
           <label><span>{t('Name')}</span>
             <input value={siteAppDraft.name} disabled={!!loading} onChange={e => setSiteAppDraft(prev => ({ ...prev, name: e.target.value }))} />
           </label>
@@ -351,7 +393,16 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
           <div className="site-app-form-actions">
             {siteAppDraft.kind === 'compose' && <button className="secondary-light" disabled={!!loading || !siteAppDraft.compose_source.trim()} onClick={checkComposeFile}>{t('Check file')}</button>}
             <button className="secondary-light" disabled={!!loading} onClick={suggestSiteAppPort}>{t('Pick free port')}</button>
-            <button disabled={!!loading || !siteAppDraft.name.trim()} onClick={createSiteApp}><Plus size={14}/>{t('Install application')}</button>
+            <button
+              disabled={installDisabled}
+              onClick={createSiteApp}
+              style={{
+                opacity: installDisabled ? 0.5 : 1,
+                cursor: installDisabled ? 'not-allowed' : 'pointer',
+              }}
+            >
+              <Plus size={14}/>{t('Install application')}
+            </button>
           </div>
           {composePlan && <div className={`compose-report ${composePlan.ok ? 'ok' : 'bad'}`}>
             {composePlan.ok
@@ -373,8 +424,7 @@ export function ApplicationsPage({ request, API, setPage, isReseller, fileAppId,
               </li>)}
             </ul>}
           </div>}
-        </div>}
-        {atLimit && <p className="hint">{t('This package allows {n} application(s). Delete one to install another.', { n: siteApps.limit })}</p>}
+        </div>
         {kindHint && <p className="hint site-apps-note">{kindHint} {t('Containers publish on 127.0.0.1 only, run as your own user with no capabilities, and are capped at the memory shown.')} {t('Images come from {list}.', { list: (siteRuntimes.allowed_registries || []).join(', ') || t('the allowed registries') })}</p>}
       </div>
 

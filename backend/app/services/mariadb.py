@@ -261,21 +261,36 @@ _SQL_DEFINER_RE = re.compile(
     rb"DEFINER\s*=\s*(?:`[^`]+`|'[^']+'|\"[^\"]+\"|[A-Za-z0-9_.$]+)\s*@\s*(?:`[^`]+`|'[^']+'|\"[^\"]+\"|[A-Za-z0-9_.%$-]+)\s*",
     re.IGNORECASE,
 )
+_SQL_DEFINER_DDL_PREFIX_RE = re.compile(
+    rb"^\s*(?:CREATE\b|ALTER\b|/\*![0-9]{5}\s*(?:CREATE\b|DEFINER\b))",
+    re.IGNORECASE,
+)
 
 
 @contextmanager
 def _strip_sql_definers(sql_path: Path) -> Iterator[Path]:
-    """Copy sql_path line-by-line to a 0600 temporary file with DEFINER clauses removed."""
-    fd, raw_tmp = tempfile.mkstemp(prefix="spanel-sql-import-", suffix=".sql")
+    """Copy sql_path line-by-line to a 0600 temporary file with DDL DEFINER clauses removed."""
+    tmp_dir: Optional[str] = None
+    try:
+        if os.access(sql_path.parent, os.W_OK):
+            tmp_dir = str(sql_path.parent)
+        elif os.name != "nt" and Path("/var/tmp").is_dir() and os.access("/var/tmp", os.W_OK):
+            tmp_dir = "/var/tmp"
+    except OSError:
+        tmp_dir = None
+    fd, raw_tmp = tempfile.mkstemp(prefix="spanel-sql-import-", suffix=".sql", dir=tmp_dir)
     tmp_path = Path(raw_tmp)
     try:
         os.chmod(tmp_path, 0o600)
         with os.fdopen(fd, "wb") as dst, sql_path.open("rb") as src:
             for raw_line in src:
-                cleaned = _SQL_DEFINER_RE.sub(b"", raw_line)
-                if cleaned != raw_line:
-                    cleaned = re.sub(rb"/\*![0-9]{5}\s*\*/\s*", b"", cleaned)
-                dst.write(cleaned)
+                if _SQL_DEFINER_DDL_PREFIX_RE.match(raw_line):
+                    cleaned = _SQL_DEFINER_RE.sub(b"", raw_line)
+                    if cleaned != raw_line:
+                        cleaned = re.sub(rb"/\*![0-9]{5}\s*\*/\s*", b"", cleaned)
+                    dst.write(cleaned)
+                else:
+                    dst.write(raw_line)
         yield tmp_path
     finally:
         try:
@@ -353,8 +368,6 @@ def import_database_as_panel(db_name: str, input_file: str):
     Restricted to ephemeral panel-owned databases (such as backup_verify's
     throwaway spanel_verify_* databases) that have no tenant DatabaseAccount.
     """
-    if import_database is not _default_import_database:
-        return import_database(db_name, input_file)
     safe_name = _reject_reserved_database(db_name)
     sql_path = Path(input_file).resolve()
     if not sql_path.exists() or not sql_path.is_file():
@@ -384,9 +397,6 @@ def import_database(
         db_user=db_user,
         db_password=db_password,
     )
-
-
-_default_import_database = import_database
 
 
 def dump_database_file(db_name: str, output_dir: Path) -> Path:

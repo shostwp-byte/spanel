@@ -29,10 +29,12 @@ record() { echo "$*" >>"$ROOT/calls.log"; }
 findmnt() {
   case "$*" in
     --help) echo "  --verify  verify mount table content" ;;
-    *--verify*) record findmnt-verify; return 0 ;;
+    *--verify*) record findmnt-verify; return "${FAKE_FINDMNT_VERIFY_RC:-0}" ;;
     *"-no TARGET"*) echo "${FAKE_MP:-/}" ;;
     *"-no FSTYPE"*) echo "${FAKE_FS:-ext4}" ;;
-    *"-no SOURCE"*) echo /dev/vda1 ;;
+    *"-no SOURCE"*) echo "${FAKE_SRC:-/dev/vda1}" ;;
+    *"-no MAJ:MIN"*"-T /home"*) echo "${FAKE_HOME_MAJMIN:-252:1}" ;;
+    *"-no MAJ:MIN"*"-T /"*) echo "${FAKE_ROOT_MAJMIN:-252:1}" ;;
     *"-no OPTIONS"*) echo "${FAKE_OPTS:-rw,relatime}" ;;
   esac
 }
@@ -41,9 +43,14 @@ quotacheck() { record "quotacheck $*"; }
 quotaon() { if [[ "$1" == -pu ]]; then echo "user quota on $2 (/dev/vda1) is ${FAKE_QUOTA_ON:-off}"; else record "quotaon $*"; fi; }
 apt-get() { record "apt-get $*"; }
 systemctl() { record "systemctl $*"; }
-mount() { record "mount $*"; }
+mount() {
+  case "$*" in
+    *-fav*) record fstab-mount-verify; return "${FAKE_MOUNT_FAV_RC:-0}" ;;
+    *) record "mount $*" ;;
+  esac
+}
 reboot() { record reboot; }
-logger() { :; }
+logger() { if [[ "${RECORD_LOGGER:-0}" == 1 ]]; then record "logger $*"; fi; }
 '''
 
 FSTAB = (
@@ -132,10 +139,97 @@ def test_enable_edits_fstab_and_asks_for_a_remount_instead_of_doing_it(tmp_path)
     assert "usrjquota=aquota.user,jqfmt=vfsv1" in (tmp_path / "fstab").read_text(encoding="utf-8")
     calls = _calls(tmp_path)
     assert "findmnt-verify" in calls
+    assert "fstab-mount-verify" in calls
     assert not any(c.startswith(("mount", "reboot", "quotacheck", "quotaon")) for c in calls)
     # Run again: fstab is not touched twice.
     run_bash(tmp_path, _script(tmp_path, "quota_enable"))
     assert (tmp_path / "fstab").read_text(encoding="utf-8").count("usrjquota") == 1
+
+
+@needs_bash
+def test_enable_warns_instead_of_denying_when_mount_fav_fails_after_findmnt_verify(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    out = run_bash(
+        tmp_path,
+        _script(tmp_path, "quota_enable"),
+        env={"FAKE_MOUNT_FAV_RC": "1", "RECORD_LOGGER": "1"},
+    )
+    status = _kv(out.stdout)
+    assert status["state"] == "remount-required"
+    assert "usrjquota=aquota.user,jqfmt=vfsv1" in (tmp_path / "fstab").read_text(encoding="utf-8")
+    calls = _calls(tmp_path)
+    assert "findmnt-verify" in calls
+    assert "fstab-mount-verify" in calls
+    assert any("reported warnings during mount -fav check" in c for c in calls)
+
+    # A broken fstab rejected by findmnt --verify is still hard-refused.
+    bad_dir = tmp_path / "bad_verify"
+    bad_dir.mkdir()
+    (bad_dir / "fstab").write_text(FSTAB, encoding="utf-8")
+    refused = run_bash(
+        bad_dir,
+        _script(bad_dir, "quota_enable"),
+        check=False,
+        env={"FAKE_FINDMNT_VERIFY_RC": "1"},
+    )
+    assert refused.returncode != 0
+    assert "did not verify; nothing was changed" in refused.stderr
+    assert (bad_dir / "fstab").read_text(encoding="utf-8") == FSTAB
+
+
+@needs_bash
+def test_enable_resolves_home_bind_mount_to_root_in_fstab(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    out = run_bash(
+        tmp_path,
+        _script(tmp_path, "quota_enable"),
+        env={
+            "FAKE_MP": "/home",
+            "FAKE_SRC": "/dev/vda1[/home]",
+            "FAKE_HOME_MAJMIN": "252:1",
+            "FAKE_ROOT_MAJMIN": "252:1",
+        },
+    )
+    status = _kv(out.stdout)
+    assert status["mount"] == "/"
+    assert status["state"] == "remount-required"
+    assert "usrjquota=aquota.user,jqfmt=vfsv1" in (tmp_path / "fstab").read_text(encoding="utf-8")
+
+
+@needs_bash
+def test_enable_refuses_separate_home_disk_without_fstab_entry(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    result = run_bash(
+        tmp_path,
+        _script(tmp_path, "quota_enable"),
+        check=False,
+        env={
+            "FAKE_MP": "/home",
+            "FAKE_SRC": "/dev/vdb1",
+            "FAKE_HOME_MAJMIN": "252:16",
+            "FAKE_ROOT_MAJMIN": "252:1",
+        },
+    )
+    assert result.returncode != 0
+    assert "/home has no entry in" in result.stderr
+    assert (tmp_path / "fstab").read_text(encoding="utf-8") == FSTAB
+
+    # Even if SOURCE has a bracketed subpath on a different block device, refuse to touch /.
+    result_diff_dev = run_bash(
+        tmp_path,
+        _script(tmp_path, "quota_enable"),
+        check=False,
+        env={
+            "FAKE_MP": "/home",
+            "FAKE_SRC": "/dev/vdb1[/home]",
+            "FAKE_HOME_MAJMIN": "252:16",
+            "FAKE_ROOT_MAJMIN": "252:1",
+        },
+    )
+    assert result_diff_dev.returncode != 0
+    assert "/home has no entry in" in result_diff_dev.stderr
+    assert (tmp_path / "fstab").read_text(encoding="utf-8") == FSTAB
+
 
 
 @needs_bash

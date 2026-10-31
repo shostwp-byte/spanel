@@ -476,6 +476,22 @@ def delete_domain(db: Session, actor: User, domain_id: int) -> str:
     return name
 
 
+def move_domain_maildirs(old_linux_user: str, new_linux_user: str, domain: str) -> None:
+    """Move /home/<old_user>/mail/<domain> to /home/<new_user>/mail/<domain> on website owner transfer."""
+    if not old_linux_user or not new_linux_user or old_linux_user == new_linux_user:
+        return
+    res = shell.privileged(
+        "mail-move-domain",
+        helper_args=[old_linux_user, new_linux_user, domain],
+        fallback=["true"],
+        check=False,
+        timeout=600,
+    )
+    if getattr(res, "returncode", 0) != 0:
+        err = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "mail-move-domain failed").strip()
+        raise MailError(f"Could not move mail directory for {domain}: {err}", status=500)
+
+
 def delete_for_owner(db: Session, owner: User) -> list[str]:
     """An account is being deleted: its mail goes with its home. The caller commits."""
     rows = db.query(MailDomain).filter(MailDomain.owner_id == owner.id).all()
@@ -724,17 +740,15 @@ def owner_mailbox_count(db: Session, owner_id: int) -> int:
     return db.query(MailAccount).filter(MailAccount.owner_id == owner_id).count()
 
 
-def _limit(user: User) -> int | None:
+def effective_mail_limit(user: User | None) -> int | None:
     """A customer's mailbox limit; None for an administrator or Unlimited (-1)."""
-    if _is_admin(user):
-        return None
-    val = getattr(user, "mail_accounts_limit", None)
-    if val is None and getattr(user, "package", None) is not None:
-        val = getattr(user.package, "mail_accounts_limit", None)
-    if val is None:
-        return None
-    val_int = int(val)
-    return None if val_int < 0 else val_int
+    from app.services import quota
+
+    eff = quota.effective_limit(user, "mail_accounts_limit")
+    return None if quota.is_quota_unlimited(eff) else eff
+
+
+_limit = effective_mail_limit
 
 
 def create_account(db: Session, actor: User, domain_id: int, local_part: str, password: str, quota_mb=None) -> MailAccount:
@@ -1942,6 +1956,7 @@ def build_state(db: Session) -> dict:
             # A suspended mailbox, or one of a suspended account, still
             # receives but cannot sign in.
             "enabled": bool(account.enabled) and bool(owner.is_active),
+            "gen": mailbox_generation(account),
         })
         state["senders"][account.address] = by_owner.get(account.owner_id, [])
     for row in db.query(MailForwarder).order_by(MailForwarder.domain, MailForwarder.local_part).all():
@@ -2591,7 +2606,14 @@ def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def sso_token(address: str, *, now: float | None = None, key: str | None = None) -> str:
+def mailbox_generation(account: MailAccount) -> str:
+    """Unique generation token for a mailbox row (id:owner_id:created_ts)."""
+    created_dt = getattr(account, "created_at", None)
+    ts = int(created_dt.timestamp()) if created_dt is not None else 0
+    return f"{account.id or 0}:{account.owner_id or 0}:{ts}"
+
+
+def sso_token(address: str, *, now: float | None = None, key: str | None = None, gen: str | None = None) -> str:
     """What the webmail's /api/auth/sso accepts: payload.signature, base64url."""
     if key is None:
         try:
@@ -2601,8 +2623,10 @@ def sso_token(address: str, *, now: float | None = None, key: str | None = None)
     if not key:
         raise MailError("The webmail is not set up on this server. Reinstall the Email addon.", status=503)
     issued = int(now if now is not None else time.time())
-    body = _b64(json.dumps({"email": address, "exp": issued + SSO_TOKEN_SECONDS,
-                            "nonce": secrets.token_urlsafe(16)}, separators=(",", ":")).encode())
+    payload: dict = {"email": address, "exp": issued + SSO_TOKEN_SECONDS, "nonce": secrets.token_urlsafe(16)}
+    if gen:
+        payload["gen"] = str(gen)
+    body = _b64(json.dumps(payload, separators=(",", ":")).encode())
     signature = _b64(hmac.new(key.encode(), body.encode(), hashlib.sha256).digest())
     return f"{body}.{signature}"
 
@@ -2613,7 +2637,7 @@ def sso_url(db: Session, actor: User, account_id: int) -> str:
     if not account.enabled:
         raise MailError("This mailbox is suspended.", status=409)
     row = _domain_row(db, account.domain)
-    return f"{webmail_url(row)}/api/auth/sso?token={sso_token(account.address)}"
+    return f"{webmail_url(row)}/api/auth/sso?token={sso_token(account.address, gen=mailbox_generation(account))}"
 
 
 # --- backups ---------------------------------------------------------------------------------------

@@ -13,14 +13,120 @@ import { formatBytes, roleLabel } from './utils/helpers.js';
 import { AppContext, AppProvider, useAppContext, dnsTtlLabel } from './contexts/AppContext.jsx';
 import { WebsiteSelect } from './components/WebsiteSelect.jsx';
 
+const CHUNK_RELOAD_KEY = 'spanel_chunk_reload_ts';
+
+function isChunkLoadError(err) {
+  const msg = String(err?.message || err || '');
+  return (
+    err?.name === 'ChunkLoadError' ||
+    /Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module|Unable to preload CSS/i.test(msg)
+  );
+}
+
+function tryReloadOnceForChunkError() {
+  try {
+    const last = Number(sessionStorage.getItem(CHUNK_RELOAD_KEY) || '0');
+    const now = Date.now();
+    if (!last || now - last > 15000) {
+      sessionStorage.setItem(CHUNK_RELOAD_KEY, String(now));
+      window.location.reload();
+      return true;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return false;
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('vite:preloadError', event => {
+    if (tryReloadOnceForChunkError()) {
+      event?.preventDefault?.();
+    }
+  });
+}
+
+class ChunkErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null, isChunkError: false };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error, isChunkError: isChunkLoadError(error) };
+  }
+
+  componentDidCatch(error) {
+    if (isChunkLoadError(error)) {
+      tryReloadOnceForChunkError();
+    }
+  }
+
+  componentDidUpdate(prevProps) {
+    if (this.state.error && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ error: null, isChunkError: false });
+    }
+  }
+
+  render() {
+    if (this.state.error) {
+      if (this.state.isChunkError) {
+        return (
+          <div className="section" style={{ padding: '24px', textAlign: 'center' }}>
+            <h3>{t('Page update available')}</h3>
+            <p className="hint" style={{ marginBottom: '12px' }}>
+              {t('A newer panel build was deployed. Please reload the page to continue.')}
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                try { sessionStorage.removeItem(CHUNK_RELOAD_KEY); } catch {}
+                window.location.reload();
+              }}
+            >
+              <RefreshCw size={14} />
+              {t('Reload page')}
+            </button>
+          </div>
+        );
+      }
+      return (
+        <div className="section" style={{ padding: '24px', textAlign: 'center' }}>
+          <h3>{t('Something went wrong on this page')}</h3>
+          <p className="hint" style={{ marginBottom: '12px' }}>
+            {String(this.state.error?.message || this.state.error || t('An unexpected rendering error occurred.'))}
+          </p>
+          <button
+            type="button"
+            onClick={() => this.setState({ error: null, isChunkError: false })}
+          >
+            <RefreshCw size={14} />
+            {t('Try again')}
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 const lazyNamed = (loader, exportName) =>
-  React.lazy(() => loader().then(mod => ({ default: mod[exportName] || mod.default })));
+  React.lazy(() =>
+    loader()
+      .then(mod => ({ default: mod[exportName] || mod.default }))
+      .catch(err => {
+        if (isChunkLoadError(err) && tryReloadOnceForChunkError()) {
+          return new Promise(() => {});
+        }
+        throw err;
+      })
+  );
 
 const Migration = lazyNamed(() => import('./pages/Migration.jsx'), 'Migration');
 const Packages = lazyNamed(() => import('./pages/Packages.jsx'), 'Packages');
 const IpManager = lazyNamed(() => import('./pages/IpManager.jsx'), 'IpManager');
-const AppInstallerPage = lazyNamed(() => import('./pages/AppInstaller.jsx'), 'AppInstallerPage');
 const WordPressManagerPage = lazyNamed(() => import('./pages/WordPressManager.jsx'), 'WordPressManagerPage');
+const LaravelManagerPage = lazyNamed(() => import('./pages/LaravelManager.jsx'), 'LaravelManagerPage');
 const ResellerSettingsPage = lazyNamed(() => import('./pages/ResellerSettings.jsx'), 'ResellerSettingsPage');
 const UsersPage = lazyNamed(() => import('./pages/Users.jsx'), 'UsersPage');
 const MoveUsersPage = lazyNamed(() => import('./pages/MoveUsers.jsx'), 'MoveUsersPage');
@@ -52,7 +158,7 @@ const AddonsPage = lazyNamed(() => import('./pages/Addons.jsx'), 'AddonsPage');
 const MailForwardersPage = lazyNamed(() => import('./pages/MailForwarders.jsx'), 'MailForwardersPage');
 const MailAutorespondersPage = lazyNamed(() => import('./pages/MailAutoresponders.jsx'), 'MailAutorespondersPage');
 const McpPage = lazyNamed(() => import('./pages/Mcp.jsx'), 'McpPage');
-const MessageTemplates = React.lazy(() => import('./pages/MessageTemplates.jsx'));
+const MessageTemplates = lazyNamed(() => import('./pages/MessageTemplates.jsx'), 'default');
 const CustomHttpdPage = lazyNamed(() => import('./pages/CustomHttpd.jsx'), 'CustomHttpdPage');
 const CustomBuildPage = lazyNamed(() => import('./pages/CustomBuild.jsx'), 'CustomBuildPage');
 const MaintenancePage = lazyNamed(() => import('./pages/Maintenance.jsx'), 'MaintenancePage');
@@ -195,7 +301,9 @@ const PAGE_ROUTES = {
   mail: '/email',
   mail_forwarders: '/mail-forwarders',
   mail_auto: '/mail-autoresponders',
-  app_installer: '/app-installer',
+  docker_manager: '/docker-manager',
+  nodejs_manager: '/nodejs-manager',
+  laravel_manager: '/laravel-manager',
   wordpress_manager: '/wordpress-manager',
   reseller_settings: '/reseller-settings',
   ipmanager: '/ipmanager',
@@ -289,6 +397,9 @@ const USER_ALLOWED_PAGES = new Set([
   'mail_forwarders',
   'mail_auto',
   'applications',
+  'docker_manager',
+  'nodejs_manager',
+  'laravel_manager',
   'wordpress_manager',
   'waf',
   'waf-site',
@@ -429,6 +540,14 @@ function WordPressIcon({ size = 14 }) {
     <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false" className="lucide">
       <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2" />
       <text x="12" y="16" textAnchor="middle" fontSize="11" fontWeight="700" fontFamily="Georgia, serif" fill="currentColor">W</text>
+    </svg>
+  );
+}
+function LaravelIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false" className="lucide">
+      <rect x="3.5" y="3.5" width="17" height="17" rx="4.5" fill="none" stroke="currentColor" strokeWidth="2" />
+      <text x="12" y="16" textAnchor="middle" fontSize="11" fontWeight="800" fontFamily="Georgia, serif" fill="currentColor">L</text>
     </svg>
   );
 }
@@ -759,7 +878,10 @@ function loadAceBundle() {
         import('ace-builds/src-noconflict/theme-tomorrow_night'),
       ]);
       return aceInstance;
-    })();
+    })().catch(err => {
+      _aceBundlePromise = null;
+      throw err;
+    });
   }
   return _aceBundlePromise;
 }
@@ -843,7 +965,7 @@ function CodeEditor({ value, mode, disabled, onChange, onCursorChange }) {
         editorRef.current = null;
         if (hostRef.current) hostRef.current.textContent = '';
       };
-    });
+    }).catch(() => {});
 
     return () => {
       cancelled = true;
@@ -885,6 +1007,8 @@ function AppContent() {
   // Auth is now cookie-based (HttpOnly spanel_session). The SPA does not see
   // the JWT at all. We track only whether the user is authenticated in memory.
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const currentUserRef = useRef(currentUser);
+  currentUserRef.current = currentUser;
   const [theme, toggleTheme] = useTheme();
   // Subscribed, not owned - the same shape as the theme. Reading it here
   // is what makes the whole tree render again when the language changes,
@@ -1136,8 +1260,8 @@ function AppContent() {
           );
         }
       }
-      const siteLimit = Number(currentUser.website_limit || 0);
-      if (siteLimit > 0 && ownSites.total >= siteLimit) {
+      const siteLimit = Number(currentUser.website_limit ?? -1);
+      if (siteLimit >= 0 && ownSites.total >= siteLimit) {
         flag('info', t('Quota'), t('You have reached your website limit ({used} / {limit}).', { used: ownSites.total, limit: siteLimit }), 'websites', t('Websites'), Globe);
       }
     }
@@ -1368,7 +1492,11 @@ function AppContent() {
     : (currentUser?.username || username);
 
   const navigateToPage = useCallback((nextPage, options = {}) => {
-    const resolvedPage = currentUser && !isPageAllowedForRole(nextPage, effectiveRole)
+    const activeUser = currentUserRef.current || currentUser;
+    const activeRole = activeUser && activeUser !== currentUser
+      ? (activeUser.role === 'end_user' ? 'user' : (activeUser.role || 'user'))
+      : effectiveRole;
+    const resolvedPage = activeUser && !isPageAllowedForRole(nextPage, activeRole)
       ? 'dashboard'
       : nextPage;
     const route = routeForPage(resolvedPage);
@@ -1438,6 +1566,7 @@ function AppContent() {
     try { localStorage.removeItem('spanel-view-level'); } catch { }
     setViewLevel(null);
     clearReadableSessionCookies();
+    currentUserRef.current = null;
     setIsAuthenticated(false);
     setCurrentUser(null);
     setNeedsTwoFactor(false);
@@ -1511,8 +1640,12 @@ function AppContent() {
         'Content-Type': 'application/json',
         ...(fetchOptions.headers || {}),
       };
-      if (effectiveRole && !headers['X-Access-Role']) {
-        headers['X-Access-Role'] = effectiveRole;
+      const activeUser = currentUserRef.current || currentUser;
+      const activeRole = activeUser && activeUser !== currentUser
+        ? (activeUser.role === 'end_user' ? 'user' : (activeUser.role || 'user'))
+        : effectiveRole;
+      if (activeUser && activeRole && !headers['X-Access-Role']) {
+        headers['X-Access-Role'] = activeRole;
       }
       // CSRF: echo the spanel_csrf cookie back in a header for mutating
       // requests. The backend rejects mismatches when the request was
@@ -1580,7 +1713,6 @@ function AppContent() {
         // the response. JS code MUST NOT touch the JWT.
         signedOutRef.current = false;
         setViewLevel(null);
-        setIsAuthenticated(true);
         setNeedsTwoFactor(false);
         setPasskeyPrompt(null);
         setOtpCode('');
@@ -1645,6 +1777,7 @@ function AppContent() {
           if (clearOnUnauthorized && !signedOutRef.current) clearSession('Session expired.');
           else {
             clearReadableSessionCookies();
+            currentUserRef.current = null;
             setCurrentUser(null);
             setIsAuthenticated(false);
           }
@@ -1656,17 +1789,20 @@ function AppContent() {
         if (clearOnUnauthorized && !signedOutRef.current) clearSession('Session expired.');
         else {
           clearReadableSessionCookies();
+          currentUserRef.current = null;
           setCurrentUser(null);
           setIsAuthenticated(false);
         }
         return null;
       }
+      currentUserRef.current = data.user;
       setCurrentUser(data.user);
       setAdminAccountForm(prev => ({ ...prev, email: data.user?.email || '' }));
       signedOutRef.current = false;
       setIsAuthenticated(true);
       return data.user;
     } catch {
+      currentUserRef.current = null;
       setCurrentUser(null);
       return null;
     }
@@ -1676,7 +1812,7 @@ function AppContent() {
     // Signed in, the panel tells us more than the login page is allowed to
     // know: the hostnames it answers for and the certificates on this server
     // only come back from the authenticated route.
-    const isAdminUser = currentUser?.role === 'admin';
+    const isAdminUser = (currentUserRef.current || currentUser)?.role === 'admin';
     const path = isAdminUser ? '/panel-settings' : '/panel-settings/public';
     try {
       const res = await fetch(`${API}${path}`, { credentials: 'include' });
@@ -1787,7 +1923,18 @@ function AppContent() {
 
   async function loadSiteApps(options = { silent: true }) {
     const data = await request('/site-apps', options, '');
-    if (data) setSiteApps({ items: data.items || [], limit: data.limit || 0 });
+    if (data) {
+      setSiteApps({
+        items: data.items || [],
+        limit: data.limit ?? 0,
+        used: data.used ?? (data.items || []).length,
+        memory_ceiling_mb: data.memory_ceiling_mb,
+        port_range: data.port_range,
+        max_total_websites: data.max_total_websites,
+        occupied_websites_count: data.occupied_websites_count,
+        website_quota_reached: !!data.website_quota_reached,
+      });
+    }
   }
 
   async function loadSiteRuntimes() {
@@ -1801,11 +1948,12 @@ function AppContent() {
     if (data) setDatabases(data);
   }
 
-  async function refreshAll({ skipUserReload = false } = {}) {
-    const knownRole = currentUser?.role;
+  async function refreshAll({ skipUserReload = false, userOverride = null } = {}) {
+    const latestUser = userOverride || currentUserRef.current || currentUser;
+    const knownRole = latestUser?.role;
     const canPreloadTenants = knownRole === 'admin' || knownRole === 'reseller';
     const [refreshedUser, siteData] = await Promise.all([
-      skipUserReload && currentUser ? Promise.resolve(currentUser) : loadCurrentUser(),
+      skipUserReload && latestUser ? Promise.resolve(latestUser) : loadCurrentUser(),
       request('/websites'),
       loadPhpVersions({ silent: true }),
       ...(canPreloadTenants ? [loadPackages(), loadUsers()] : []),
@@ -1823,6 +1971,7 @@ function AppContent() {
       }
     } else {
       setUsers([]);
+      setPackages([]);
     }
   }
 
@@ -1834,7 +1983,6 @@ function AppContent() {
       setViewLevel(null);
       await loadCurrentUser();
       navigateToPage('users');
-      await refreshAll();
     }
   }
 
@@ -1843,6 +1991,11 @@ function AppContent() {
 
 
   async function loadPackages() {
+    const activeRole = (currentUserRef.current ?? currentUser)?.role;
+    if (activeRole !== 'admin' && activeRole !== 'reseller') {
+      setPackages([]);
+      return;
+    }
     const data = await request('/packages');
     if (data) setPackages(data);
   }
@@ -1859,6 +2012,8 @@ function AppContent() {
   // and the figures follow. Rows come back with storage_used_bytes = -1 when
   // the panel has not measured them recently; this fills those in.
   async function loadUserStorageUsage() {
+    const activeRole = (currentUserRef.current ?? currentUser)?.role;
+    if (activeRole !== 'admin' && activeRole !== 'reseller') return;
     const usage = await request('/users/storage-usage', { silent: true });
     if (!usage) return;
     setUsers(prev => prev.map(user => {
@@ -1868,6 +2023,11 @@ function AppContent() {
   }
 
   async function loadUsers() {
+    const activeRole = (currentUserRef.current ?? currentUser)?.role;
+    if (activeRole !== 'admin' && activeRole !== 'reseller') {
+      setUsers([]);
+      return;
+    }
     const data = await request('/users');
     if (data) {
       setUsers(data);
@@ -2901,10 +3061,10 @@ function AppContent() {
 
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (isAuthenticated && currentUser) {
       refreshAll({ skipUserReload: true });
     }
-  }, [isAuthenticated, effectiveRole]);
+  }, [isAuthenticated, currentUser?.id, effectiveRole]);
 
   useEffect(() => {
     if (standaloneEditor) return undefined;
@@ -2943,7 +3103,7 @@ function AppContent() {
 
   const lastDashRoleRef = useRef(null);
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (!isAuthenticated || !currentUser) {
       lastDashRoleRef.current = null;
       return;
     }
@@ -2952,7 +3112,7 @@ function AppContent() {
       lastDashRoleRef.current = effectiveRole;
       loadDashboardSummary();
     }
-  }, [isAuthenticated, page, effectiveRole]);
+  }, [isAuthenticated, currentUser?.id, page, effectiveRole]);
 
 
   useEffect(() => {
@@ -3031,10 +3191,11 @@ function AppContent() {
     if (!addons.loaded || isAdmin) return;
     const isMailPage = ['mail', 'mail_forwarders', 'mail_auto', 'mail_spam'].includes(page);
     const isMalwarePage = page === 'malware' || page === 'malware-scan';
+    const isAppsPage = ['applications', 'docker_manager', 'nodejs_manager'].includes(page);
     if (
       (page === 'dns' && !dnsAddonInstalled) ||
       (isMailPage && !mailAddonInstalled) ||
-      (page === 'applications' && !appsFeatureEnabled) ||
+      (isAppsPage && !appsFeatureEnabled) ||
       (page === 'mcp' && !mcpAddonInstalled) ||
       (isMalwarePage && !malwareAddonInstalled) ||
       (page === 'notifications')
@@ -3164,9 +3325,15 @@ function AppContent() {
         ['mail_auto', 'Autoresponders', Mail],
         ['mail_spam', 'Spam Filters', Shield],
       ]}] : []),
-      { key: 'advanced_features', title: 'Advanced Features', items: [
-        ...(appsFeatureEnabled ? [['applications', 'Applications (Node/Python/Docker)', Cpu]] : []),
+      { key: 'application', title: 'Application', items: [
+        ...(appsFeatureEnabled ? [
+          ['docker_manager', 'Docker', Boxes],
+          ['nodejs_manager', 'Node.js', Cpu],
+        ] : []),
+        ['laravel_manager', 'Laravel', LaravelIcon],
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
+      ]},
+      { key: 'advanced_features', title: 'Advanced Features', items: [
         ['waf', 'Web Application Firewall', ShieldAlert],
         ['cron', 'Cron Jobs', Clock],
         ['backups', 'Create/Restore Backups', Archive],
@@ -3520,7 +3687,8 @@ function AppContent() {
     const dbCount = sum.databases?.total ?? databases.length;
 
     const storageLimit = currentUser ? storageLimitBytes(currentUser) : 0;
-    const siteLimit = currentUser ? (Number(currentUser.website_limit) || 0) : 0;
+    const siteLimit = currentUser ? Number(currentUser.website_limit ?? -1) : -1;
+    const hasSiteLimit = siteLimit >= 0;
     const usedBytes = currentUser ? (Number(currentUser.storage_used_bytes) || 0) : 0;
     const pct = (used, limit) => limit > 0 ? (used / limit) * 100 : null;
 
@@ -3581,7 +3749,7 @@ function AppContent() {
           <ResourceCard icon={Network} label={t('Network')} value={`${formatBytes(networkTotal)}/s`} detail={t('Down {down}/s · Up {up}/s', { down: formatBytes(network.rx_per_sec), up: formatBytes(network.tx_per_sec) })} />
         </> : currentUser ? <>
           <ResourceCard icon={HardDrive} label={t('Storage')} value={storageLimit ? formatPercent(pct(usedBytes, storageLimit)) : formatBytes(usedBytes)} percent={storageLimit ? pct(usedBytes, storageLimit) : null} detail={storageLimit ? t('{used} of {limit}', { used: formatBytes(usedBytes), limit: formatBytes(storageLimit) }) : t('unlimited')} />
-          <ResourceCard icon={Globe} label={t('Websites')} value={siteLimit ? `${websites.length} / ${siteLimit}` : String(websites.length)} percent={pct(websites.length, siteLimit)} detail={siteLimit ? t('{used} of {limit}', { used: websites.length, limit: siteLimit }) : t('unlimited')} />
+          <ResourceCard icon={Globe} label={t('Websites')} value={hasSiteLimit ? `${websites.length} / ${siteLimit}` : String(websites.length)} percent={siteLimit > 0 ? pct(websites.length, siteLimit) : (siteLimit === 0 ? 100 : null)} detail={hasSiteLimit ? t('{used} of {limit}', { used: websites.length, limit: siteLimit }) : t('unlimited')} />
           <ResourceCard icon={Database} label={t('Databases')} value={String(databases.length)} percent={null} detail={t('in your account')} />
         </> : null}
       </div>
@@ -4403,8 +4571,8 @@ function AppContent() {
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
     if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
-    if (page === 'app_installer') return <AppInstallerPage request={request} websites={roleScopedWebsites} navigateToPage={navigateToPage} />;
-    if (page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
+    if (page === 'laravel_manager') return <LaravelManagerPage request={request} websites={roleScopedWebsites} phpVersions={phpVersions} openWebsiteFileManager={openWebsiteFileManager} openWebsiteTerminal={openWebsiteTerminal} navigateToPage={navigateToPage} />;
+    if (page === 'docker_manager' || page === 'nodejs_manager' || page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;
     if (page === 'databases') return <DatabasesPage request={request} API={API} navigateToPage={navigateToPage} refreshAll={refreshAll} />;
     if (page === 'sftp') return <SftpPage request={request} currentUser={currentUser} appVersion={appVersion} />;
@@ -4624,9 +4792,9 @@ function AppContent() {
           <div className="impersonation-banner">
             <div className="banner-text">
               <span className="banner-icon">⚠️</span>
-              <span>You are currently viewing the panel as <strong>{effectiveRole.toUpperCase()}</strong>.</span>
+              <span>{t('UI Preview Mode: You are currently viewing the panel interface as')} <strong>{effectiveRole.toUpperCase()}</strong> ({t('use "Login as" on a user account for full tenant impersonation')}).</span>
             </div>
-            <button type="button" onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>Return to {actualRole.toUpperCase()}</button>
+            <button type="button" onClick={() => { setViewLevel(actualRole); navigateToPage('dashboard'); }}>{t('Return to')} {actualRole.toUpperCase()}</button>
           </div>
         )}
         <section className="topbar">
@@ -4642,7 +4810,7 @@ function AppContent() {
               and sign out live in it, as they do in OPanel. */}
           <div className="top-actions">
             {(canSwitchToAdmin || canSwitchToReseller) && (
-              <div className="segmented role-switcher-seg" aria-label="Access Level">
+              <div className="segmented role-switcher-seg" aria-label="Access Level Preview" title={t('UI View Level Preview (use Login As in Users list to manage a specific customer account)')}>
                 {canSwitchToAdmin && <button className={effectiveRole === 'admin' ? 'active' : ''} onClick={() => { setViewLevel('admin'); navigateToPage('dashboard'); }}>Admin</button>}
                 {canSwitchToReseller && <button className={effectiveRole === 'reseller' ? 'active' : ''} onClick={() => { setViewLevel('reseller'); navigateToPage('dashboard'); }}>Reseller</button>}
                 <button className={effectiveRole === 'user' ? 'active' : ''} onClick={() => { setViewLevel('user'); navigateToPage('dashboard'); }}>User</button>
@@ -4928,9 +5096,11 @@ function AppContent() {
         </section>
         {currentUser?.demo && <div className="demo-strip" role="status"><Eye size={15} /><span>{t('This is a demo: you can look at everything, but changes are not saved.')}</span></div>}
         <div className="content-body">
-          <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
-            {renderPage()}
-          </React.Suspense>
+          <ChunkErrorBoundary resetKey={page}>
+            <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
+              {renderPage()}
+            </React.Suspense>
+          </ChunkErrorBoundary>
           {loading && <div className="loading"><span></span>{t(loading)}</div>}
         </div>
       </div>

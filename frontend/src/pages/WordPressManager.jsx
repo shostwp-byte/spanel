@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
+  AlertTriangle,
   Archive,
   ArchiveRestore,
   Bug,
@@ -17,6 +18,7 @@ import {
   FileText,
   FolderOpen,
   Globe,
+  Image as ImageIcon,
   KeyRound,
   LayoutGrid,
   List,
@@ -36,6 +38,7 @@ import {
   Sparkles,
   Trash2,
   Unlink,
+  Upload,
   Wrench,
   X,
   Zap,
@@ -43,8 +46,33 @@ import {
 import { useAppContext, WordPressIcon } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
+const DEFAULT_MAINTENANCE_TITLE = 'Website đang được bảo trì & nâng cấp';
+const DEFAULT_MAINTENANCE_MESSAGE =
+  'Website đang được bảo trì và nâng cấp định kỳ. Vui lòng quay lại sau ít phút!';
+
+const MAINTENANCE_PRESET_OPTIONS = [
+  {
+    id: 'emerald_ocean',
+    label: 'Ngọc lục bảo SHOST',
+    gradient: 'radial-gradient(circle at 18% 20%, #059669 0%, #0f172a 55%, #020617 100%)',
+    accent: '#10b981',
+  },
+  {
+    id: 'midnight_nebula',
+    label: 'Tinh vân Midnight',
+    gradient: 'radial-gradient(circle at 80% 18%, #4f46e5 0%, #1e1b4b 52%, #090d16 100%)',
+    accent: '#818cf8',
+  },
+  {
+    id: 'warm_sunrise',
+    label: 'Bình minh Ấm',
+    gradient: 'radial-gradient(circle at 22% 18%, #ea580c 0%, #431407 55%, #0c0a09 100%)',
+    accent: '#fb923c',
+  },
+];
+
 export function WordPressManagerPage({ request, websites = [], openWebsiteFileManager, navigateToPage }) {
-  const { loading, setError, setNotice, phpVersions, loadPhpVersions } = useAppContext();
+  const { loading, setError, setNotice, phpVersions, loadPhpVersions, currentUser, packages } = useAppContext();
   const installedPhpList = phpVersions?.installed?.length ? phpVersions.installed : ['8.4', '8.3', '8.2', '8.1'];
 
   // Global tabs: 'instances' | 'plugins' | 'themes' | 'sets'
@@ -56,6 +84,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   const [instances, setInstances] = useState([]);
   const [packageSets, setPackageSets] = useState([]);
   const [allWebsites, setAllWebsites] = useState(websites || []);
+  const [quotaInfo, setQuotaInfo] = useState(null);
   const [busyAction, setBusyAction] = useState('');
 
   // Selection & expansion states
@@ -103,7 +132,20 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   const [debugLogText, setDebugLogText] = useState('');
 
   const [maintenanceModalInst, setMaintenanceModalInst] = useState(null);
-  const [maintenanceMsgDraft, setMaintenanceMsgDraft] = useState('');
+  const [maintenanceForm, setMaintenanceForm] = useState({
+    title: DEFAULT_MAINTENANCE_TITLE,
+    message: DEFAULT_MAINTENANCE_MESSAGE,
+    bg_url: '',
+    bg_preset: 'emerald_ocean',
+    bg_overlay: 55,
+  });
+  const [maintenanceLocalPreviewUrl, setMaintenanceLocalPreviewUrl] = useState('');
+  const [uploadingMaintBg, setUploadingMaintBg] = useState(false);
+
+  const [removeModalTargets, setRemoveModalTargets] = useState(null);
+  const [removeDropDb, setRemoveDropDb] = useState(true);
+
+  const [checksumResultModal, setChecksumResultModal] = useState(null);
 
   const [passwordAuthModalInst, setPasswordAuthModalInst] = useState(null);
   const [basicAuthForm, setBasicAuthForm] = useState({ user: 'preview', password: '' });
@@ -125,6 +167,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     replace_to: '',
     dry_run: false,
   });
+  const [searchReplaceOutput, setSearchReplaceOutput] = useState('');
 
   // WordPress.org Plugin / Theme catalog modal
   const [wporgModal, setWporgModal] = useState(null); // { kind: 'plugins' | 'themes', instance }
@@ -132,7 +175,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   const [wporgResults, setWporgResults] = useState([]);
   const [wporgSearching, setWporgSearching] = useState(false);
 
-  // Create Package Set modal
+  // Create / Apply Package Set modals
   const [showCreateSetModal, setShowCreateSetModal] = useState(false);
   const [newSetForm, setNewSetForm] = useState({
     name: '',
@@ -140,6 +183,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     pluginsText: 'classic-editor, wordpress-seo, litespeed-cache',
     themesText: 'astra',
   });
+  const [applySetModal, setApplySetModal] = useState(null); // { pkg, websiteIds: [] }
 
   useEffect(() => {
     if (loadPhpVersions) loadPhpVersions({ silent: true });
@@ -171,7 +215,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
         setInstancePluginsMap(nextPlugins);
         setInstanceThemesMap(nextThemes);
         if (Array.isArray(data.sets)) setPackageSets(data.sets);
-        if (Array.isArray(data.websites) && data.websites.length > 0) {
+        if (data.quota) setQuotaInfo(data.quota);
+        if (Array.isArray(data.websites)) {
           setAllWebsites(data.websites);
         }
       }
@@ -191,6 +236,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     }
     if (snapshotModalInst && snapshotModalInst.id === updated.id) {
       setSnapshotModalInst(updated);
+    }
+    if (maintenanceModalInst && maintenanceModalInst.id === updated.id) {
+      setMaintenanceModalInst(updated);
+    }
+    if (debugModalInst && debugModalInst.id === updated.id) {
+      setDebugModalInst(updated);
     }
   }
 
@@ -245,8 +296,39 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     }
   }
 
+  const installableWebsites = useMemo(() => {
+    const installedIds = new Set(instances.map(inst => Number(inst.website_id || inst.id)));
+    return (allWebsites || []).filter(w => !w.occupied && !installedIds.has(Number(w.id)));
+  }, [allWebsites, instances]);
+
+  const userPkg = useMemo(
+    () =>
+      (packages || []).find(
+        p => p.id === currentUser?.package_id || (currentUser?.package_name && p.name === currentUser.package_name)
+      ),
+    [packages, currentUser]
+  );
+
+  const canInstallWp = useMemo(() => {
+    if (quotaInfo && typeof quotaInfo.can_install === 'boolean') {
+      return quotaInfo.can_install && installableWebsites.length > 0;
+    }
+    if (installableWebsites.length === 0) return false;
+    if (currentUser?.role === 'admin') return true;
+    const wLimit = Number(currentUser?.website_limit ?? userPkg?.website_limit ?? -1);
+    const sLimit = Number(currentUser?.subdomain_limit ?? userPkg?.subdomain_limit ?? 0);
+    if (wLimit >= 0 && sLimit >= 0) {
+      const maxTotal = wLimit + sLimit;
+      const occupiedCount = (allWebsites || []).filter(w => w.occupied).length || instances.length;
+      if (maxTotal === 0 || occupiedCount >= maxTotal) return false;
+    }
+    return true;
+  }, [quotaInfo, installableWebsites, currentUser, userPkg, allWebsites, instances]);
+
   function openInstallDialog() {
-    const firstSite = allWebsites[0] || websites[0];
+    if (!canInstallWp) return;
+    const firstSite = installableWebsites[0];
+    if (!firstSite) return;
     const randSuffix = Math.random().toString(36).substring(2, 6);
     setInstallForm({
       website_id: firstSite ? String(firstSite.id) : '',
@@ -409,6 +491,15 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     }
   }
 
+  async function handleRefreshDebugLog() {
+    if (!debugModalInst) return;
+    setDebugLogText('Đang làm mới wp-content/debug.log...');
+    const res = await request(`/wordpress-manager/instances/${debugModalInst.id}/debug-log`, { silent: true });
+    if (res) {
+      setDebugLogText(res.log || 'Không có dữ liệu log.');
+    }
+  }
+
   async function handleClearDebugLog() {
     if (!debugModalInst) return;
     const res = await request(`/wordpress-manager/instances/${debugModalInst.id}/debug-log`, {
@@ -420,7 +511,130 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     }
   }
 
-  async function handlePluginAction(inst, action, slug = null, activateAfterInstall = true) {
+  function openMaintenanceSetupModal(inst) {
+    setMaintenanceModalInst(inst);
+    setMaintenanceLocalPreviewUrl('');
+    setMaintenanceForm({
+      title: inst.maintenance_title || DEFAULT_MAINTENANCE_TITLE,
+      message: inst.maintenance_message || DEFAULT_MAINTENANCE_MESSAGE,
+      bg_url: inst.maintenance_bg_url || '',
+      bg_preset: inst.maintenance_bg_preset || 'emerald_ocean',
+      bg_overlay: Number.isFinite(Number(inst.maintenance_bg_overlay))
+        ? Number(inst.maintenance_bg_overlay)
+        : 55,
+    });
+  }
+
+  async function handleUploadMaintenanceBackground(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !maintenanceModalInst) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setError('Ảnh nền bảo trì vượt quá giới hạn tối đa 5MB.');
+      return;
+    }
+    setUploadingMaintBg(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await request(
+        `/wordpress-manager/instances/${maintenanceModalInst.id}/maintenance-background`,
+        {
+          method: 'POST',
+          body: formData,
+        },
+        'Đang tải lên và xác thực hình nền trang bảo trì...'
+      );
+      if (res) {
+        try {
+          const reader = new FileReader();
+          reader.onload = ev => {
+            if (typeof ev.target?.result === 'string') {
+              setMaintenanceLocalPreviewUrl(ev.target.result);
+            }
+          };
+          reader.readAsDataURL(file);
+        } catch {
+          setMaintenanceLocalPreviewUrl('');
+        }
+        if (res.bg_url) {
+          setMaintenanceForm(prev => ({ ...prev, bg_url: res.bg_url }));
+        }
+        if (res.instance) {
+          updateSingleInstanceState(res.instance);
+        }
+        setNotice(res.message || 'Đã tải ảnh nền bảo trì thành công.');
+      }
+    } finally {
+      setUploadingMaintBg(false);
+    }
+  }
+
+  async function handleRemoveMaintenanceBackground() {
+    if (!maintenanceModalInst) return;
+    const currentBg = String(maintenanceForm.bg_url || '').trim();
+    if (currentBg.includes('/wp-content/maintenance-assets/')) {
+      setUploadingMaintBg(true);
+      try {
+        const res = await request(
+          `/wordpress-manager/instances/${maintenanceModalInst.id}/maintenance-background`,
+          { method: 'DELETE' },
+          'Đang gỡ bỏ hình nền bảo trì...'
+        );
+        if (res?.instance) {
+          updateSingleInstanceState(res.instance);
+        }
+        if (res?.message) setNotice(res.message);
+      } finally {
+        setUploadingMaintBg(false);
+      }
+    }
+    setMaintenanceLocalPreviewUrl('');
+    setMaintenanceForm(prev => ({ ...prev, bg_url: '' }));
+  }
+
+  async function handleSaveMaintenanceSetup(enableNow) {
+    if (!maintenanceModalInst) return;
+    const payload = {
+      maintenance_title: maintenanceForm.title,
+      maintenance_message: maintenanceForm.message,
+      maintenance_bg_url: maintenanceForm.bg_url,
+      maintenance_bg_preset: maintenanceForm.bg_preset,
+      maintenance_bg_overlay: Number(maintenanceForm.bg_overlay),
+    };
+    if (typeof enableNow === 'boolean') {
+      payload.maintenance_mode = enableNow;
+    }
+    setBusyAction(`maint-${maintenanceModalInst.id}`);
+    try {
+      const res = await request(
+        `/wordpress-manager/instances/${maintenanceModalInst.id}/toggles`,
+        {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        },
+        enableNow
+          ? 'Đang lưu cấu hình và kích hoạt Trang bảo trì...'
+          : 'Đang lưu cấu hình giao diện Trang bảo trì...'
+      );
+      if (res?.instance) {
+        updateSingleInstanceState(res.instance);
+        setNotice(res.message || 'Đã cập nhật cấu hình Trang bảo trì.');
+        setMaintenanceModalInst(null);
+      }
+    } finally {
+      setBusyAction('');
+    }
+  }
+
+  async function handlePluginAction(inst, action, slug = null, activateAfterInstall = true, skipConfirm = false) {
+    if (
+      action === 'delete' &&
+      !skipConfirm &&
+      !window.confirm(`Xác nhận xóa vĩnh viễn Plugin "${slug}" khỏi ${inst.domain}${inst.subpath || ''}?`)
+    ) {
+      return null;
+    }
     setBusyAction(`plugin-${inst.id}-${slug || action}`);
     try {
       const res = await request(
@@ -444,12 +658,20 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
         }
         setNotice(res.message);
       }
+      return res;
     } finally {
       setBusyAction('');
     }
   }
 
-  async function handleThemeAction(inst, action, slug = null, activateAfterInstall = false) {
+  async function handleThemeAction(inst, action, slug = null, activateAfterInstall = false, skipConfirm = false) {
+    if (
+      action === 'delete' &&
+      !skipConfirm &&
+      !window.confirm(`Xác nhận xóa vĩnh viễn Theme "${slug}" khỏi ${inst.domain}${inst.subpath || ''}?`)
+    ) {
+      return null;
+    }
     setBusyAction(`theme-${inst.id}-${slug || action}`);
     try {
       const res = await request(
@@ -473,6 +695,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
         }
         setNotice(res.message);
       }
+      return res;
     } finally {
       setBusyAction('');
     }
@@ -505,7 +728,24 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     }
   }
 
-  async function handleSecurityAction(inst, action, checkIds = []) {
+  async function handleSecurityAction(inst, action, checkIds = [], skipConfirm = false) {
+    if (!skipConfirm) {
+      if (
+        action === 'reinstall_core' &&
+        !window.confirm(
+          `Xác nhận tải lại bộ mã nguồn WordPress Core sạch (v${inst.wp_version || 'mới nhất'}) cho ${inst.domain}${inst.subpath || ''}?\n\nThư mục wp-content và Database MySQL được giữ nguyên.`
+        )
+      ) {
+        return null;
+      }
+      if (
+        action === 'revert' &&
+        checkIds.length > 1 &&
+        !window.confirm(`Xác nhận tắt toàn bộ ${checkIds.length} lớp bảo vệ Hardening trên ${inst.domain}${inst.subpath || ''}?`)
+      ) {
+        return null;
+      }
+    }
     setBusyAction(`sec-${inst.id}-${action}`);
     try {
       const res = await request(
@@ -521,8 +761,24 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       );
       if (res) {
         if (res.instance) updateSingleInstanceState(res.instance);
-        setNotice(res.message);
+        if (action === 'verify_checksums') {
+          const verifiedOk = res.verified !== false && res.ok !== false;
+          setChecksumResultModal({
+            instance: inst,
+            verified: verifiedOk,
+            message: res.message || '',
+            output: res.output || '',
+          });
+          if (!verifiedOk) {
+            setError(res.message || 'Phát hiện tệp tin WordPress Core không khớp chữ ký MD5!');
+          } else {
+            setNotice(res.message || 'Chữ ký MD5 của WordPress Core hợp lệ 100%.');
+          }
+        } else {
+          setNotice(res.message);
+        }
       }
+      return res;
     } finally {
       setBusyAction('');
     }
@@ -546,35 +802,68 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
           setCloneSyncModal(null);
           await loadToolkitData(true);
         }
+        if (payload.action === 'search_replace') {
+          setSearchReplaceOutput(res.output || res.message || 'Đã hoàn tất truy vấn Search & Replace.');
+        }
       }
+      return res;
     } finally {
       setBusyAction('');
     }
   }
 
   async function handleDetachInstance(inst) {
-    if (!window.confirm(`Ngắt liên kết ${inst.domain} khỏi WordPress Manager? (Toàn bộ file và Database vẫn được giữ nguyên 100%)`)) {
+    if (
+      !window.confirm(
+        `Ngắt liên kết ${inst.domain}${inst.subpath || ''} khỏi WordPress Manager?\n\nLưu ý: Detach chỉ ẩn website khỏi danh sách quản lý — toàn bộ mã nguồn trong public_html và Database vẫn giữ nguyên 100% (có thể bấm Scan để nhận lại). Nếu muốn xóa hẳn mã nguồn & Database, hãy dùng nút Remove.`
+      )
+    ) {
       return;
     }
-    const res = await request(`/wordpress-manager/instances/${inst.id}/detach`, { method: 'POST' });
+    const res = await request(`/wordpress-manager/instances/${inst.id}/detach`, { method: 'POST' }, 'Đang ngắt liên kết...');
     if (res) {
+      setSelectedIds(prev => prev.filter(id => id !== inst.id));
       setNotice(res.message);
       await loadToolkitData(true);
     }
   }
 
-  async function handleRemoveInstance(inst) {
-    if (!window.confirm(`Gỡ cài đặt WordPress khỏi ${inst.domain}?`)) {
-      return;
-    }
-    const dropDb = window.confirm('Bạn có muốn xóa luôn Database MySQL đi kèm của website này không? (Bấm OK để xóa cả DB, Cancel để giữ lại DB)');
-    const res = await request(
-      `/wordpress-manager/instances/${inst.id}/remove?drop_database=${dropDb ? 'true' : 'false'}`,
-      { method: 'POST' }
-    );
-    if (res) {
-      setNotice(res.message);
-      await loadToolkitData(true);
+  function openRemoveModal(targets) {
+    const arr = (Array.isArray(targets) ? targets : [targets]).filter(Boolean);
+    if (arr.length === 0) return;
+    setRemoveDropDb(true);
+    setRemoveModalTargets(arr);
+  }
+
+  async function handleConfirmRemoveInstances() {
+    if (!removeModalTargets || removeModalTargets.length === 0) return;
+    setBusyAction('removing-instances');
+    try {
+      const removedIds = [];
+      let lastMessage = '';
+      for (const inst of removeModalTargets) {
+        const res = await request(
+          `/wordpress-manager/instances/${inst.id}/remove?drop_database=${removeDropDb ? 'true' : 'false'}`,
+          { method: 'POST' },
+          `Đang xóa vĩnh viễn mã nguồn WordPress${removeDropDb ? ' & Database' : ''} của ${inst.domain}${inst.subpath || ''}...`
+        );
+        if (res) {
+          removedIds.push(inst.id);
+          lastMessage = res.message || lastMessage;
+        }
+      }
+      if (removedIds.length > 0) {
+        setSelectedIds(prev => prev.filter(id => !removedIds.includes(id)));
+        setRemoveModalTargets(null);
+        setNotice(
+          removedIds.length === 1
+            ? lastMessage || 'Đã xóa hoàn toàn cài đặt WordPress.'
+            : `Đã xóa hoàn toàn ${removedIds.length} cài đặt WordPress${removeDropDb ? ' cùng Database MySQL đi kèm' : ''}.`
+        );
+        await loadToolkitData(true);
+      }
+    } finally {
+      setBusyAction('');
     }
   }
 
@@ -583,14 +872,29 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     if (targets.length === 0) return;
 
     if (kind === 'updates') {
+      if (
+        !window.confirm(
+          `Xác nhận kiểm tra và cập nhật đồng loạt WordPress Core, Plugins và Themes cho ${targets.length} website${selectedIds.length > 0 ? ' đã chọn' : ''}?`
+        )
+      ) {
+        return;
+      }
       for (const inst of targets) {
         await handleToolAction(inst, { action: 'update_core' });
-        await handlePluginAction(inst, 'update_all');
+        await handlePluginAction(inst, 'update_all', null, true, true);
+        await handleThemeAction(inst, 'update_all', null, false, true);
       }
-      setNotice(`Đã cập nhật đồng loạt ${targets.length} website WordPress.`);
+      setNotice(`Đã hoàn tất cập nhật Core, Plugins & Themes cho ${targets.length} website WordPress.`);
     } else if (kind === 'security') {
+      if (
+        !window.confirm(
+          `Xác nhận áp dụng toàn bộ 9 lớp bảo mật Hardening cho ${targets.length} website${selectedIds.length > 0 ? ' đã chọn' : ''}?`
+        )
+      ) {
+        return;
+      }
       for (const inst of targets) {
-        await handleSecurityAction(inst, 'secure', []);
+        await handleSecurityAction(inst, 'secure', [], true);
       }
       setNotice(`Đã áp dụng 9 lớp bảo mật Hardening cho ${targets.length} website WordPress.`);
     } else if (kind === 'detach') {
@@ -598,22 +902,25 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
         setError('Vui lòng tích chọn ít nhất 1 website để Detach.');
         return;
       }
+      if (
+        !window.confirm(
+          `Ngắt liên kết ${targets.length} website đã chọn khỏi WordPress Manager? (Mã nguồn public_html và Database vẫn giữ nguyên 100%)`
+        )
+      ) {
+        return;
+      }
       for (const inst of targets) {
-        await request(`/wordpress-manager/instances/${inst.id}/detach`, { method: 'POST' });
+        await request(`/wordpress-manager/instances/${inst.id}/detach`, { method: 'POST' }, 'Đang ngắt liên kết...');
       }
       setSelectedIds([]);
+      setNotice(`Đã ngắt liên kết ${targets.length} website khỏi WordPress Manager.`);
       await loadToolkitData(true);
     } else if (kind === 'remove') {
       if (selectedIds.length === 0) {
-        setError('Vui lòng tích chọn ít nhất 1 website để gỡ bỏ.');
+        setError('Vui lòng tích chọn ít nhất 1 website để xóa.');
         return;
       }
-      if (!window.confirm(`Xác nhận gỡ bỏ WordPress trên ${targets.length} website đã chọn?`)) return;
-      for (const inst of targets) {
-        await request(`/wordpress-manager/instances/${inst.id}/remove?drop_database=false`, { method: 'POST' });
-      }
-      setSelectedIds([]);
-      await loadToolkitData(true);
+      openRemoveModal(targets);
     }
   }
 
@@ -644,26 +951,59 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     }
   }
 
-  async function handleApplySetToAll(pkgSet) {
+  async function handleDeletePackageSet(pkgSet) {
+    if (!pkgSet || pkgSet.is_builtin) return;
+    if (!window.confirm(`Xác nhận xóa bộ cài mẫu "${pkgSet.name}"?`)) return;
+    setBusyAction(`del-set-${pkgSet.id}`);
+    try {
+      const res = await request(`/wordpress-manager/sets/${pkgSet.id}`, { method: 'DELETE' }, 'Đang xóa bộ cài mẫu...');
+      if (res?.sets) {
+        setPackageSets(res.sets);
+        setNotice(res.message || `Đã xóa bộ cài mẫu "${pkgSet.name}".`);
+      }
+    } finally {
+      setBusyAction('');
+    }
+  }
+
+  function openApplySetModal(pkgSet) {
     if (instances.length === 0) {
       setError('Chưa có website WordPress nào để áp dụng bộ cài.');
       return;
     }
-    const targetIds = selectedIds.length > 0 ? selectedIds : instances.map(i => i.id);
-    const res = await request(
-      '/wordpress-manager/sets/apply',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          set_id: pkgSet.id,
-          website_ids: targetIds,
-        }),
-      },
-      `Đang cài đặt bộ gói '${pkgSet.name}'...`
-    );
-    if (res) {
-      setNotice(res.message);
-      await loadToolkitData(true);
+    const defaultIds = selectedIds.length > 0 ? [...selectedIds] : instances.map(i => i.id);
+    setApplySetModal({
+      pkg: pkgSet,
+      websiteIds: defaultIds,
+    });
+  }
+
+  async function handleConfirmApplySet() {
+    if (!applySetModal || !applySetModal.pkg) return;
+    if (!applySetModal.websiteIds || applySetModal.websiteIds.length === 0) {
+      setError('Vui lòng chọn ít nhất 1 website WordPress để cài đặt bộ gói này.');
+      return;
+    }
+    setBusyAction(`apply-set-${applySetModal.pkg.id}`);
+    try {
+      const res = await request(
+        '/wordpress-manager/sets/apply',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            set_id: applySetModal.pkg.id,
+            website_ids: applySetModal.websiteIds,
+          }),
+        },
+        `Đang cài đặt bộ gói '${applySetModal.pkg.name}' cho ${applySetModal.websiteIds.length} website...`
+      );
+      if (res) {
+        setNotice(res.message);
+        setApplySetModal(null);
+        await loadToolkitData(true);
+      }
+    } finally {
+      setBusyAction('');
     }
   }
 
@@ -937,6 +1277,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
 
             <button
               type="button"
+              disabled={!canInstallWp || !!busyAction}
               onClick={openInstallDialog}
               style={{
                 height: '34px',
@@ -948,6 +1289,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 color: '#fff',
                 border: 'none',
                 borderRadius: '7px',
+                opacity: !canInstallWp || !!busyAction ? 0.5 : 1,
+                cursor: !canInstallWp || !!busyAction ? 'not-allowed' : 'pointer',
               }}
             >
               <Plus size={14} /> Install
@@ -1018,9 +1361,9 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
             }}
           >
             {[
-              { id: 'expanded', title: 'Plesk Detailed Card View', icon: Server },
-              { id: 'grid', title: 'Compact 2-Column Card Grid', icon: LayoutGrid },
-              { id: 'list', title: 'Compact Table List View', icon: List },
+              { id: 'expanded', title: 'Card View', icon: Server },
+              { id: 'grid', title: 'Grid View', icon: LayoutGrid },
+              { id: 'list', title: 'List View', icon: List },
             ].map(v => {
               const VIcon = v.icon;
               const active = viewMode === v.id;
@@ -1091,6 +1434,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               <div style={{ display: 'inline-flex', gap: '10px' }}>
                 <button
                   type="button"
+                  disabled={!canInstallWp || !!busyAction}
                   onClick={openInstallDialog}
                   style={{
                     height: '38px',
@@ -1100,6 +1444,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                     border: 'none',
                     borderRadius: '8px',
                     fontWeight: 600,
+                    opacity: !canInstallWp || !!busyAction ? 0.5 : 1,
+                    cursor: !canInstallWp || !!busyAction ? 'not-allowed' : 'pointer',
                   }}
                 >
                   <Plus size={15} /> Cài đặt WordPress ngay
@@ -1209,6 +1555,24 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                           >
                             Chi tiết
                           </button>
+                          <button
+                            type="button"
+                            className="secondary-light"
+                            onClick={() => handleDetachInstance(inst)}
+                            title="Ngắt liên kết khỏi khung quản lý (Giữ nguyên mã nguồn & Database)"
+                            style={{ height: '30px', minHeight: '30px', padding: '0 8px' }}
+                          >
+                            <Unlink size={12} />
+                          </button>
+                          <button
+                            type="button"
+                            className="secondary-light"
+                            onClick={() => openRemoveModal([inst])}
+                            title="Xóa cài đặt WordPress (Xóa mã nguồn public_html & Database)"
+                            style={{ height: '30px', minHeight: '30px', padding: '0 8px', color: '#ef4444' }}
+                          >
+                            <Trash2 size={12} />
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -1295,17 +1659,37 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                       <span>Themes: <strong>{inst.themes_count}</strong></span>
                       <span>Security: <strong>{inst.security_passed}/{inst.security_total}</strong></span>
                     </div>
-                    <button
-                      type="button"
-                      className="secondary-light"
-                      onClick={() => {
-                        setViewMode('expanded');
-                        setCollapsedMap(prev => ({ ...prev, [inst.id]: false }));
-                      }}
-                      style={{ height: '28px', minHeight: '28px', padding: '0 10px', fontSize: '12px' }}
-                    >
-                      Mở Toolkit
-                    </button>
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                      <button
+                        type="button"
+                        className="secondary-light"
+                        onClick={() => {
+                          setViewMode('expanded');
+                          setCollapsedMap(prev => ({ ...prev, [inst.id]: false }));
+                        }}
+                        style={{ height: '28px', minHeight: '28px', padding: '0 10px', fontSize: '12px' }}
+                      >
+                        Mở Toolkit
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-light"
+                        onClick={() => handleDetachInstance(inst)}
+                        title="Ngắt liên kết khỏi khung quản lý (Giữ nguyên mã nguồn & Database)"
+                        style={{ height: '28px', minHeight: '28px', padding: '0 8px' }}
+                      >
+                        <Unlink size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-light"
+                        onClick={() => openRemoveModal([inst])}
+                        title="Xóa cài đặt WordPress (Xóa mã nguồn public_html & Database)"
+                        style={{ height: '28px', minHeight: '28px', padding: '0 8px', color: '#ef4444' }}
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -1318,8 +1702,10 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 const subTab = getSubTab(inst.id);
                 const instPlugins = instancePluginsMap[inst.id] ?? inst.plugins ?? [];
                 const instThemes = instanceThemesMap[inst.id] ?? inst.themes ?? [];
-                const checkedSecIds =
-                  securityCheckedMap[inst.id] || (inst.security_checks || []).map(c => c.id);
+                const totalUpdatableCount =
+                  (inst.plugins_updatable_count || 0) +
+                  (inst.themes_updatable_count || 0) +
+                  (inst.update_available ? 1 : 0);
 
                 return (
                   <div
@@ -1409,10 +1795,20 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                           type="button"
                           className="secondary-light"
                           onClick={() => handleDetachInstance(inst)}
-                          title="Ngắt liên kết khỏi WordPress Toolkit (Giữ nguyên file & DB)"
+                          title="Ngắt liên kết khỏi khung quản lý (Giữ nguyên mã nguồn & Database)"
                           style={{ height: '32px', minHeight: '32px', padding: '0 9px' }}
                         >
                           <Unlink size={13} />
+                        </button>
+
+                        <button
+                          type="button"
+                          className="secondary-light"
+                          onClick={() => openRemoveModal([inst])}
+                          title="Xóa cài đặt WordPress (Xóa mã nguồn public_html & Database)"
+                          style={{ height: '32px', minHeight: '32px', padding: '0 9px', color: '#ef4444' }}
+                        >
+                          <Trash2 size={13} />
                         </button>
 
                         <button
@@ -1593,17 +1989,22 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                 <span style={{ color: 'var(--text-secondary)' }}>Updates</span>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                   <span
-                                    className={`badge ${
-                                      inst.plugins_updatable_count > 0 || inst.update_available ? 'warn' : 'ok'
-                                    }`}
+                                    className={`badge ${totalUpdatableCount > 0 ? 'warn' : 'ok'}`}
                                   >
-                                    {inst.plugins_updatable_count > 0
-                                      ? `${inst.plugins_updatable_count} available`
+                                    {totalUpdatableCount > 0
+                                      ? `${totalUpdatableCount} available`
                                       : 'installed'}
                                   </span>
                                   <button
                                     type="button"
-                                    onClick={() => selectSubTab(inst, 'plugins')}
+                                    onClick={() =>
+                                      selectSubTab(
+                                        inst,
+                                        (inst.plugins_updatable_count || 0) === 0 && (inst.themes_updatable_count || 0) > 0
+                                          ? 'themes'
+                                          : 'plugins'
+                                      )
+                                    }
                                     style={{
                                       border: 'none',
                                       background: 'transparent',
@@ -1889,6 +2290,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                     className="secondary-light"
                                     onClick={() => {
                                       setSearchReplaceModalInst(inst);
+                                      setSearchReplaceOutput('');
                                       setSearchReplaceForm({
                                         search_from: `http://${inst.domain}`,
                                         replace_to: `https://${inst.domain}`,
@@ -2020,10 +2422,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                     )}
                                     <button
                                       type="button"
-                                      onClick={() => {
-                                        setMaintenanceModalInst(inst);
-                                        setMaintenanceMsgDraft(inst.maintenance_message || '');
-                                      }}
+                                      onClick={() => openMaintenanceSetupModal(inst)}
                                       style={{
                                         border: 'none',
                                         background: 'transparent',
@@ -2355,18 +2754,36 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                                         </td>
                                         <td style={{ padding: '9px 14px' }}>
                                           <code>{th.version}</code>
+                                          {th.update_available && (
+                                            <span className="badge warn" style={{ marginLeft: '6px', fontSize: '11px' }}>
+                                              → {th.latest_version}
+                                            </span>
+                                          )}
                                         </td>
                                         <td style={{ padding: '9px 14px', textAlign: 'right' }}>
-                                          {th.status !== 'active' && (
-                                            <button
-                                              type="button"
-                                              className="secondary-light"
-                                              onClick={() => handleThemeAction(inst, 'delete', th.slug)}
-                                              style={{ height: '28px', minHeight: '28px', padding: '0 8px', color: '#ef4444' }}
-                                            >
-                                              <Trash2 size={13} />
-                                            </button>
-                                          )}
+                                          <div style={{ display: 'inline-flex', gap: '6px' }}>
+                                            {th.update_available && (
+                                              <button
+                                                type="button"
+                                                className="secondary-light"
+                                                onClick={() => handleThemeAction(inst, 'update', th.slug)}
+                                                style={{ height: '28px', minHeight: '28px', padding: '0 10px', fontSize: '12px' }}
+                                              >
+                                                Update
+                                              </button>
+                                            )}
+                                            {th.status !== 'active' && (
+                                              <button
+                                                type="button"
+                                                className="secondary-light"
+                                                onClick={() => handleThemeAction(inst, 'delete', th.slug)}
+                                                title="Xóa Theme"
+                                                style={{ height: '28px', minHeight: '28px', padding: '0 8px', color: '#ef4444' }}
+                                              >
+                                                <Trash2 size={13} />
+                                              </button>
+                                            )}
+                                          </div>
                                         </td>
                                       </tr>
                                     ))}
@@ -2901,10 +3318,25 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                   )}
                 </div>
 
-                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', paddingTop: '10px', borderTop: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', paddingTop: '10px', borderTop: '1px solid var(--border)' }}>
+                  <div>
+                    {!pkg.is_builtin && (
+                      <button
+                        type="button"
+                        className="secondary-light"
+                        disabled={!!busyAction}
+                        onClick={() => handleDeletePackageSet(pkg)}
+                        title="Xóa bộ cài mẫu này"
+                        style={{ height: '32px', minHeight: '32px', padding: '0 10px', fontSize: '12px', color: '#ef4444' }}
+                      >
+                        <Trash2 size={13} /> Xóa
+                      </button>
+                    )}
+                  </div>
                   <button
                     type="button"
-                    onClick={() => handleApplySetToAll(pkg)}
+                    disabled={!!busyAction}
+                    onClick={() => openApplySetModal(pkg)}
                     style={{
                       height: '32px',
                       minHeight: '32px',
@@ -2967,7 +3399,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                     required
                   >
                     <option value="">-- Chọn tên miền --</option>
-                    {allWebsites.map(w => (
+                    {installableWebsites.map(w => (
                       <option key={w.id} value={w.id}>
                         {w.domain}
                       </option>
@@ -3426,16 +3858,26 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               </div>
 
               <div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', gap: '8px' }}>
                   <strong style={{ fontSize: '13px' }}>Nội dung wp-content/debug.log:</strong>
-                  <button
-                    type="button"
-                    className="secondary-light"
-                    onClick={handleClearDebugLog}
-                    style={{ height: '28px', minHeight: '28px', padding: '0 10px', fontSize: '12px' }}
-                  >
-                    Dọn sạch Log
-                  </button>
+                  <div style={{ display: 'inline-flex', gap: '6px' }}>
+                    <button
+                      type="button"
+                      className="secondary-light"
+                      onClick={handleRefreshDebugLog}
+                      style={{ height: '28px', minHeight: '28px', padding: '0 10px', fontSize: '12px' }}
+                    >
+                      <RefreshCw size={12} /> Làm mới Log
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-light"
+                      onClick={handleClearDebugLog}
+                      style={{ height: '28px', minHeight: '28px', padding: '0 10px', fontSize: '12px' }}
+                    >
+                      Dọn sạch Log
+                    </button>
+                  </div>
                 </div>
                 <pre
                   style={{
@@ -3462,59 +3904,338 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
         </div>
       )}
 
-      {/* MODAL 6: MAINTENANCE MODE SETUP */}
-      {maintenanceModalInst && (
-        <div className="modal-overlay" onClick={() => setMaintenanceModalInst(null)}>
-          <div className="modal" style={{ maxWidth: '500px', width: '100%' }} onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3 style={{ margin: 0, fontSize: '16px' }}>
-                Cấu hình Trang bảo trì ({maintenanceModalInst.domain})
-              </h3>
-              <button type="button" className="icon-button" onClick={() => setMaintenanceModalInst(null)}>
-                <X size={18} />
-              </button>
-            </div>
-            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <label>
-                <span>Thông điệp hiển thị cho khách truy cập khi đang bảo trì</span>
-                <textarea
-                  rows={3}
-                  value={maintenanceMsgDraft}
-                  onChange={e => setMaintenanceMsgDraft(e.target.value)}
-                />
-              </label>
-            </div>
-            <div className="modal-footer">
-              <button type="button" className="secondary-light" onClick={() => setMaintenanceModalInst(null)}>
-                Hủy
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  await handleToggleSwitch(
-                    maintenanceModalInst,
-                    'maintenance_mode',
-                    true,
-                    { maintenance_message: maintenanceMsgDraft }
-                  );
-                  setMaintenanceModalInst(null);
-                }}
+      {/* MODAL 6: MAINTENANCE MODE SETUP (CUSTOM MESSAGE + BACKGROUND IMAGE + LIVE PREVIEW) */}
+      {maintenanceModalInst && (() => {
+        const rawBgUrl = String(maintenanceForm.bg_url || '').trim();
+        let resolvedPreviewBgUrl = '';
+        if (maintenanceLocalPreviewUrl && rawBgUrl.includes('/wp-content/maintenance-assets/')) {
+          resolvedPreviewBgUrl = maintenanceLocalPreviewUrl;
+        } else if (rawBgUrl.startsWith('/') && maintenanceModalInst.url) {
+          try {
+            resolvedPreviewBgUrl = new URL(rawBgUrl, maintenanceModalInst.url).href;
+          } catch {
+            resolvedPreviewBgUrl = rawBgUrl;
+          }
+        } else if (/^https:\/\//i.test(rawBgUrl)) {
+          resolvedPreviewBgUrl = rawBgUrl;
+        }
+        const activePresetObj =
+          MAINTENANCE_PRESET_OPTIONS.find(p => p.id === maintenanceForm.bg_preset) ||
+          MAINTENANCE_PRESET_OPTIONS[0];
+        const overlayTop = Math.max(0.2, Math.min(0.9, Number(maintenanceForm.bg_overlay ?? 55) / 100));
+        const overlayBottom = Math.min(0.95, overlayTop + 0.12);
+        const isMaintActive = !!maintenanceModalInst.toggles?.maintenance_mode;
+
+        return (
+          <div className="modal-overlay" onClick={() => setMaintenanceModalInst(null)}>
+            <div
+              className="modal"
+              style={{ maxWidth: '700px', width: '100%' }}
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="modal-header">
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <h3 style={{ margin: 0, fontSize: '16px' }}>
+                    Cấu hình Trang bảo trì ({maintenanceModalInst.domain}{maintenanceModalInst.subpath || ''})
+                  </h3>
+                  <span className={`badge ${isMaintActive ? 'warn' : ''}`} style={{ fontSize: '11px' }}>
+                    {isMaintActive ? 'Đang bật Bảo trì' : 'Đang tắt'}
+                  </span>
+                </div>
+                <button type="button" className="icon-button" onClick={() => setMaintenanceModalInst(null)}>
+                  <X size={18} />
+                </button>
+              </div>
+
+              <div
+                className="modal-body"
                 style={{
-                  background: 'var(--primary)',
-                  color: '#fff',
-                  border: 'none',
-                  padding: '0 16px',
-                  height: '36px',
-                  borderRadius: '8px',
-                  fontWeight: 600,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '14px',
+                  maxHeight: '72vh',
+                  overflowY: 'auto',
                 }}
               >
-                Lưu & Bật chế độ bảo trì
-              </button>
+                <label>
+                  <span>Tiêu đề chính hiển thị trên trang bảo trì</span>
+                  <input
+                    type="text"
+                    placeholder={DEFAULT_MAINTENANCE_TITLE}
+                    value={maintenanceForm.title}
+                    onChange={e => setMaintenanceForm(prev => ({ ...prev, title: e.target.value }))}
+                  />
+                </label>
+
+                <label>
+                  <span>Thông điệp hiển thị cho khách truy cập khi đang bảo trì</span>
+                  <textarea
+                    rows={3}
+                    placeholder={DEFAULT_MAINTENANCE_MESSAGE}
+                    value={maintenanceForm.message}
+                    onChange={e => setMaintenanceForm(prev => ({ ...prev, message: e.target.value }))}
+                  />
+                </label>
+
+                {/* Background Theme Presets + Custom Image Upload */}
+                <div
+                  style={{
+                    border: '1px solid var(--border)',
+                    borderRadius: '10px',
+                    padding: '12px 14px',
+                    background: 'var(--surface-alt)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '12px',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+                    <strong style={{ fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                      <ImageIcon size={14} style={{ color: 'var(--primary)' }} /> Hình nền & Phong cách hiển thị
+                    </strong>
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                      <label
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          height: '30px',
+                          padding: '0 12px',
+                          borderRadius: '7px',
+                          background: 'var(--primary)',
+                          color: '#fff',
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          cursor: uploadingMaintBg ? 'wait' : 'pointer',
+                          opacity: uploadingMaintBg ? 0.65 : 1,
+                          margin: 0,
+                        }}
+                      >
+                        <Upload size={13} />
+                        <span>{uploadingMaintBg ? 'Đang tải ảnh...' : 'Tải ảnh nền lên (≤ 5MB)'}</span>
+                        <input
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp,image/gif"
+                          disabled={uploadingMaintBg}
+                          onChange={handleUploadMaintenanceBackground}
+                          style={{ display: 'none' }}
+                        />
+                      </label>
+                      {rawBgUrl && (
+                        <button
+                          type="button"
+                          className="secondary-light"
+                          disabled={uploadingMaintBg}
+                          onClick={handleRemoveMaintenanceBackground}
+                          style={{ height: '30px', minHeight: '30px', padding: '0 10px', fontSize: '12px', color: '#ef4444' }}
+                        >
+                          <Trash2 size={12} /> Gỡ ảnh nền
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* 3 Preset Gradient Cards */}
+                  <div>
+                    <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '6px' }}>
+                      Chủ đề nền mặc định (dùng khi không chọn ảnh nền riêng hoặc làm lớp lót):
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '8px' }}>
+                      {MAINTENANCE_PRESET_OPTIONS.map(preset => {
+                        const selected = maintenanceForm.bg_preset === preset.id;
+                        return (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onClick={() => setMaintenanceForm(prev => ({ ...prev, bg_preset: preset.id }))}
+                            style={{
+                              padding: '8px 10px',
+                              borderRadius: '8px',
+                              border: selected ? '2px solid var(--primary)' : '1px solid var(--border)',
+                              background: preset.gradient,
+                              color: '#f8fafc',
+                              fontSize: '12px',
+                              fontWeight: selected ? 700 : 500,
+                              cursor: 'pointer',
+                              textAlign: 'left',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              minHeight: '42px',
+                            }}
+                          >
+                            <span>{preset.label}</span>
+                            {selected && <Check size={14} style={{ color: '#34d399', flexShrink: 0 }} />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* External HTTPS URL or Uploaded Asset Path */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 190px', gap: '12px', alignItems: 'end' }}>
+                    <label style={{ margin: 0 }}>
+                      <span style={{ fontSize: '12px' }}>Đường dẫn ảnh nền (Tự động điền khi tải lên hoặc dán link https://...)</span>
+                      <input
+                        type="text"
+                        placeholder="Để trống để dùng nền Gradient hoặc dán link https://..."
+                        value={maintenanceForm.bg_url}
+                        onChange={e => {
+                          setMaintenanceLocalPreviewUrl('');
+                          setMaintenanceForm(prev => ({ ...prev, bg_url: e.target.value }));
+                        }}
+                      />
+                    </label>
+                    <label style={{ margin: 0 }}>
+                      <span style={{ fontSize: '12px' }}>
+                        Độ phủ tối nền: <strong>{maintenanceForm.bg_overlay}%</strong>
+                      </span>
+                      <input
+                        type="range"
+                        min={20}
+                        max={90}
+                        step={5}
+                        value={maintenanceForm.bg_overlay}
+                        onChange={e =>
+                          setMaintenanceForm(prev => ({ ...prev, bg_overlay: Number(e.target.value) }))
+                        }
+                        style={{ width: '100%', cursor: 'pointer', margin: '6px 0 2px' }}
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                {/* Live Visual Preview */}
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+                    <strong style={{ fontSize: '12.5px', color: 'var(--text-secondary)' }}>
+                      Xem trước trực tiếp (Live Preview — HTTP 503):
+                    </strong>
+                    <span style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                      Admin bấm &quot;Log in wp-admin&quot; vẫn vào quản trị bình thường
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      borderRadius: '12px',
+                      overflow: 'hidden',
+                      border: '1px solid var(--border)',
+                      minHeight: '215px',
+                      padding: '24px 18px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      backgroundImage: resolvedPreviewBgUrl
+                        ? `linear-gradient(180deg, rgba(2, 6, 23, ${overlayTop}), rgba(2, 6, 23, ${overlayBottom})), url("${resolvedPreviewBgUrl.replace(/"/g, '')}")`
+                        : activePresetObj.gradient,
+                      backgroundSize: 'cover',
+                      backgroundPosition: 'center',
+                    }}
+                  >
+                    <div
+                      style={{
+                        maxWidth: '460px',
+                        width: '100%',
+                        padding: '20px 22px',
+                        borderRadius: '16px',
+                        background: 'rgba(15, 23, 42, 0.72)',
+                        border: '1px solid rgba(255, 255, 255, 0.16)',
+                        backdropFilter: 'blur(12px)',
+                        color: '#f8fafc',
+                        textAlign: 'center',
+                        boxShadow: '0 14px 32px rgba(0, 0, 0, 0.38)',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '7px',
+                          padding: '4px 12px',
+                          borderRadius: '999px',
+                          background: 'rgba(16, 185, 129, 0.18)',
+                          border: '1px solid rgba(16, 185, 129, 0.38)',
+                          color: '#6ee7b7',
+                          fontSize: '10.5px',
+                          fontWeight: 700,
+                          letterSpacing: '0.04em',
+                          marginBottom: '10px',
+                        }}
+                      >
+                        <span
+                          style={{
+                            width: '7px',
+                            height: '7px',
+                            borderRadius: '50%',
+                            background: '#10b981',
+                          }}
+                        />
+                        ĐANG BẢO TRÌ HỆ THỐNG
+                      </div>
+                      <div style={{ fontSize: '17px', fontWeight: 700, lineHeight: 1.3, marginBottom: '8px', color: '#ffffff' }}>
+                        {maintenanceForm.title || DEFAULT_MAINTENANCE_TITLE}
+                      </div>
+                      <div
+                        style={{
+                          fontSize: '12.5px',
+                          lineHeight: 1.6,
+                          color: 'rgba(226, 232, 240, 0.92)',
+                          whiteSpace: 'pre-line',
+                        }}
+                      >
+                        {maintenanceForm.message || DEFAULT_MAINTENANCE_MESSAGE}
+                      </div>
+                      <div
+                        style={{
+                          marginTop: '12px',
+                          paddingTop: '10px',
+                          borderTop: '1px solid rgba(255, 255, 255, 0.1)',
+                          fontSize: '11px',
+                          color: 'rgba(148, 163, 184, 0.9)',
+                        }}
+                      >
+                        {maintenanceModalInst.site_title || maintenanceModalInst.domain} &bull; Xin cảm ơn sự kiên nhẫn của quý khách
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                <button type="button" className="secondary-light" onClick={() => setMaintenanceModalInst(null)}>
+                  Hủy
+                </button>
+                <div style={{ display: 'inline-flex', gap: '8px', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="secondary-light"
+                    disabled={!!busyAction || uploadingMaintBg}
+                    onClick={() => handleSaveMaintenanceSetup(undefined)}
+                  >
+                    Chỉ lưu cấu hình
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!!busyAction || uploadingMaintBg}
+                    onClick={() => handleSaveMaintenanceSetup(true)}
+                    style={{
+                      background: 'var(--primary)',
+                      color: '#fff',
+                      border: 'none',
+                      padding: '0 16px',
+                      height: '36px',
+                      borderRadius: '8px',
+                      fontWeight: 600,
+                    }}
+                  >
+                    {isMaintActive ? 'Lưu & Cập nhật trang bảo trì' : 'Lưu & Bật chế độ bảo trì'}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* MODAL 7: PASSWORD PROTECTION SETUP */}
       {passwordAuthModalInst && (
@@ -3552,9 +4273,14 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               </button>
               <button
                 type="button"
+                disabled={!basicAuthForm.user.trim() || !basicAuthForm.password.trim() || !!busyAction}
                 onClick={async () => {
+                  if (!basicAuthForm.user.trim() || !basicAuthForm.password.trim()) {
+                    setError('Vui lòng nhập đầy đủ Tên đăng nhập và Mật khẩu bảo vệ.');
+                    return;
+                  }
                   await handleToggleSwitch(passwordAuthModalInst, 'password_protection', true, {
-                    basic_auth_user: basicAuthForm.user,
+                    basic_auth_user: basicAuthForm.user.trim(),
                     basic_auth_password: basicAuthForm.password,
                   });
                   setPasswordAuthModalInst(null);
@@ -3567,6 +4293,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                   height: '36px',
                   borderRadius: '8px',
                   fontWeight: 600,
+                  opacity: !basicAuthForm.user.trim() || !basicAuthForm.password.trim() ? 0.55 : 1,
                 }}
               >
                 Lưu & Bật bảo vệ mật khẩu
@@ -3577,75 +4304,131 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       )}
 
       {/* MODAL 8: CLONE / SYNC MODAL */}
-      {cloneSyncModal && (
-        <div className="modal-overlay" onClick={() => setCloneSyncModal(null)}>
-          <div className="modal" style={{ maxWidth: '520px', width: '100%' }} onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3 style={{ margin: 0, fontSize: '16px' }}>
-                {cloneSyncModal.mode === 'clone'
-                  ? `Nhân bản Website (Clone): ${cloneSyncModal.instance.domain}`
-                  : `Đồng bộ dữ liệu (Sync): ${cloneSyncModal.instance.domain}`}
-              </h3>
-              <button type="button" className="icon-button" onClick={() => setCloneSyncModal(null)}>
-                <X size={18} />
-              </button>
-            </div>
-            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <label>
-                <span>Chọn Tên miền / Subdomain đích</span>
-                <select
-                  value={cloneSyncForm.target_website_id}
-                  onChange={e => setCloneSyncForm(prev => ({ ...prev, target_website_id: e.target.value }))}
+      {cloneSyncModal && (() => {
+        const normSubpath = s => String(s || '').trim().replace(/^\/+|\/+$/g, '');
+        const isSameCloneTarget =
+          String(cloneSyncForm.target_website_id || '') ===
+            String(cloneSyncModal.instance.website_id || cloneSyncModal.instance.id) &&
+          normSubpath(cloneSyncForm.target_subpath) === normSubpath(cloneSyncModal.instance.subpath);
+        const nothingToSync = !cloneSyncForm.sync_files && !cloneSyncForm.sync_database;
+        const disableCloneSubmit =
+          !cloneSyncForm.target_website_id || isSameCloneTarget || nothingToSync || !!busyAction;
+
+        return (
+          <div className="modal-overlay" onClick={() => setCloneSyncModal(null)}>
+            <div className="modal" style={{ maxWidth: '540px', width: '100%' }} onClick={e => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3 style={{ margin: 0, fontSize: '16px' }}>
+                  {cloneSyncModal.mode === 'clone'
+                    ? `Nhân bản Website (Clone): ${cloneSyncModal.instance.domain}${cloneSyncModal.instance.subpath || ''}`
+                    : `Đồng bộ dữ liệu (Sync): ${cloneSyncModal.instance.domain}${cloneSyncModal.instance.subpath || ''}`}
+                </h3>
+                <button type="button" className="icon-button" onClick={() => setCloneSyncModal(null)}>
+                  <X size={18} />
+                </button>
+              </div>
+              <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <label>
+                  <span>Chọn Tên miền / Subdomain đích</span>
+                  <select
+                    value={cloneSyncForm.target_website_id}
+                    onChange={e => setCloneSyncForm(prev => ({ ...prev, target_website_id: e.target.value }))}
+                  >
+                    <option value="">-- Chọn tên miền đích --</option>
+                    {allWebsites.map(w => (
+                      <option key={w.id} value={w.id}>
+                        {w.domain}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>Thư mục con đích (Để trống nếu nhân bản vào gốc /)</span>
+                  <input
+                    type="text"
+                    placeholder="Ví dụ: staging"
+                    value={cloneSyncForm.target_subpath}
+                    onChange={e => setCloneSyncForm(prev => ({ ...prev, target_subpath: e.target.value }))}
+                  />
+                </label>
+
+                <div
+                  style={{
+                    border: '1px solid var(--border)',
+                    borderRadius: '10px',
+                    padding: '10px 14px',
+                    background: 'var(--surface-alt)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '10px',
+                    fontSize: '13px',
+                  }}
                 >
-                  <option value="">-- Chọn tên miền đích --</option>
-                  {allWebsites.map(w => (
-                    <option key={w.id} value={w.id}>
-                      {w.domain}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>Thư mục con đích (Để trống nếu nhân bản vào gốc /)</span>
-                <input
-                  type="text"
-                  placeholder="Ví dụ: staging"
-                  value={cloneSyncForm.target_subpath}
-                  onChange={e => setCloneSyncForm(prev => ({ ...prev, target_subpath: e.target.value }))}
-                />
-              </label>
-            </div>
-            <div className="modal-footer">
-              <button type="button" className="secondary-light" onClick={() => setCloneSyncModal(null)}>
-                Hủy
-              </button>
-              <button
-                type="button"
-                onClick={() =>
-                  handleToolAction(cloneSyncModal.instance, {
-                    action: cloneSyncModal.mode,
-                    target_website_id: Number(cloneSyncForm.target_website_id),
-                    target_subpath: cloneSyncForm.target_subpath,
-                    sync_files: cloneSyncForm.sync_files,
-                    sync_database: cloneSyncForm.sync_database,
-                  })
-                }
-                style={{
-                  background: 'var(--primary)',
-                  color: '#fff',
-                  border: 'none',
-                  padding: '0 16px',
-                  height: '36px',
-                  borderRadius: '8px',
-                  fontWeight: 600,
-                }}
-              >
-                {cloneSyncModal.mode === 'clone' ? 'Bắt đầu Nhân bản (Clone)' : 'Bắt đầu Đồng bộ (Sync)'}
-              </button>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+                    <span>Đồng bộ toàn bộ mã nguồn (Files &amp; wp-content)</span>
+                    {renderSwitch(!!cloneSyncForm.sync_files, () =>
+                      setCloneSyncForm(prev => ({ ...prev, sync_files: !prev.sync_files }))
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+                    <span>Đồng bộ Cơ sở dữ liệu &amp; tự động đổi URL đích</span>
+                    {renderSwitch(!!cloneSyncForm.sync_database, () =>
+                      setCloneSyncForm(prev => ({ ...prev, sync_database: !prev.sync_database }))
+                    )}
+                  </div>
+                </div>
+
+                {isSameCloneTarget && (
+                  <div
+                    style={{
+                      padding: '10px 12px',
+                      borderRadius: '8px',
+                      background: 'rgba(245, 158, 11, 0.12)',
+                      border: '1px solid rgba(245, 158, 11, 0.35)',
+                      color: '#b45309',
+                      fontSize: '12.5px',
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    Tên miền và thư mục đích đang trùng với chính website nguồn. Vui lòng chọn tên miền khác hoặc nhập thư mục con đích (ví dụ: <code>staging</code>).
+                  </div>
+                )}
+              </div>
+              <div className="modal-footer">
+                <button type="button" className="secondary-light" onClick={() => setCloneSyncModal(null)}>
+                  Hủy
+                </button>
+                <button
+                  type="button"
+                  disabled={disableCloneSubmit}
+                  onClick={() =>
+                    handleToolAction(cloneSyncModal.instance, {
+                      action: cloneSyncModal.mode,
+                      target_website_id: Number(cloneSyncForm.target_website_id),
+                      target_subpath: cloneSyncForm.target_subpath,
+                      sync_files: cloneSyncForm.sync_files,
+                      sync_database: cloneSyncForm.sync_database,
+                    })
+                  }
+                  style={{
+                    background: 'var(--primary)',
+                    color: '#fff',
+                    border: 'none',
+                    padding: '0 16px',
+                    height: '36px',
+                    borderRadius: '8px',
+                    fontWeight: 600,
+                    opacity: disableCloneSubmit ? 0.5 : 1,
+                    cursor: disableCloneSubmit ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {cloneSyncModal.mode === 'clone' ? 'Bắt đầu Nhân bản (Clone)' : 'Bắt đầu Đồng bộ (Sync)'}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* MODAL 9: SNAPSHOT BACKUP & RESTORE */}
       {snapshotModalInst && (
@@ -3670,13 +4453,16 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 />
                 <button
                   type="button"
+                  disabled={!!busyAction}
                   onClick={async () => {
-                    await handleToolAction(snapshotModalInst, {
+                    const res = await handleToolAction(snapshotModalInst, {
                       action: 'create_snapshot',
                       snapshot_label: snapshotLabelDraft,
                     });
-                    await loadToolkitData(true);
-                    setSnapshotModalInst(null);
+                    if (res) {
+                      setSnapshotLabelDraft(`Snapshot (${new Date().toLocaleDateString()})`);
+                      await loadToolkitData(true);
+                    }
                   }}
                   style={{
                     background: 'var(--primary)',
@@ -3721,12 +4507,20 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                               <button
                                 type="button"
                                 className="secondary-light"
-                                onClick={() =>
+                                disabled={!!busyAction}
+                                onClick={() => {
+                                  if (
+                                    !window.confirm(
+                                      `Xác nhận khôi phục bản sao lưu "${sn.label || sn.id}" cho ${snapshotModalInst.domain}?\n\nMã nguồn và Database hiện tại sẽ được ghi đè bằng thời điểm tạo Snapshot này.`
+                                    )
+                                  ) {
+                                    return;
+                                  }
                                   handleToolAction(snapshotModalInst, {
                                     action: 'restore_snapshot',
                                     snapshot_id: sn.id,
-                                  })
-                                }
+                                  });
+                                }}
                                 style={{ height: '28px', minHeight: '28px', padding: '0 10px', fontSize: '12px' }}
                               >
                                 Khôi phục
@@ -3734,12 +4528,15 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                               <button
                                 type="button"
                                 className="secondary-light"
+                                disabled={!!busyAction}
                                 onClick={async () => {
+                                  if (!window.confirm(`Xóa vĩnh viễn bản sao lưu "${sn.label || sn.id}"?`)) {
+                                    return;
+                                  }
                                   await handleToolAction(snapshotModalInst, {
                                     action: 'delete_snapshot',
                                     snapshot_id: sn.id,
                                   });
-                                  setSnapshotModalInst(null);
                                 }}
                                 style={{ height: '28px', minHeight: '28px', padding: '0 8px', color: '#ef4444' }}
                               >
@@ -3754,6 +4551,11 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 </div>
               )}
             </div>
+            <div className="modal-footer">
+              <button type="button" className="secondary-light" onClick={() => setSnapshotModalInst(null)}>
+                Đóng
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -3761,7 +4563,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       {/* MODAL 10: SEARCH & REPLACE URL IN DATABASE */}
       {searchReplaceModalInst && (
         <div className="modal-overlay" onClick={() => setSearchReplaceModalInst(null)}>
-          <div className="modal" style={{ maxWidth: '500px', width: '100%' }} onClick={e => e.stopPropagation()}>
+          <div className="modal" style={{ maxWidth: '560px', width: '100%' }} onClick={e => e.stopPropagation()}>
             <div className="modal-header">
               <h3 style={{ margin: 0, fontSize: '16px' }}>
                 Search & Replace Database ({searchReplaceModalInst.domain})
@@ -3791,8 +4593,31 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 {renderSwitch(searchReplaceForm.dry_run, () =>
                   setSearchReplaceForm(prev => ({ ...prev, dry_run: !prev.dry_run }))
                 )}
-                <span>Chạy thử (Dry-run) kiểm tra trước khi ghi vào Database</span>
+                <span>Chạy thử (Dry-run) kiểm tra số lượng thay đổi trước khi ghi thật vào Database</span>
               </div>
+
+              {searchReplaceOutput && (
+                <div>
+                  <strong style={{ fontSize: '12.5px', display: 'block', marginBottom: '5px' }}>
+                    Kết quả thực thi WP-CLI:
+                  </strong>
+                  <pre
+                    style={{
+                      background: '#0f172a',
+                      color: '#e2e8f0',
+                      padding: '10px 12px',
+                      borderRadius: '8px',
+                      fontSize: '12px',
+                      maxHeight: '180px',
+                      overflowY: 'auto',
+                      margin: 0,
+                      whiteSpace: 'pre-wrap',
+                    }}
+                  >
+                    {searchReplaceOutput}
+                  </pre>
+                </div>
+              )}
             </div>
             <div className="modal-footer">
               <button type="button" className="secondary-light" onClick={() => setSearchReplaceModalInst(null)}>
@@ -3800,12 +4625,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               </button>
               <button
                 type="button"
+                disabled={!searchReplaceForm.search_from.trim() || !!busyAction}
                 onClick={async () => {
-                  await handleToolAction(searchReplaceModalInst, {
+                  const res = await handleToolAction(searchReplaceModalInst, {
                     action: 'search_replace',
                     ...searchReplaceForm,
                   });
-                  if (!searchReplaceForm.dry_run) setSearchReplaceModalInst(null);
+                  if (res && !searchReplaceForm.dry_run) setSearchReplaceModalInst(null);
                 }}
                 style={{
                   background: 'var(--primary)',
@@ -3815,9 +4641,10 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                   height: '36px',
                   borderRadius: '8px',
                   fontWeight: 600,
+                  opacity: !searchReplaceForm.search_from.trim() || !!busyAction ? 0.55 : 1,
                 }}
               >
-                Thực thi Search & Replace
+                {searchReplaceForm.dry_run ? 'Chạy thử (Dry-run)' : 'Thực thi Search & Replace'}
               </button>
             </div>
           </div>
@@ -3891,6 +4718,354 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 12: CONFIRM PERMANENT WORDPRESS INSTANCE REMOVAL (SOURCE + DATABASE) */}
+      {removeModalTargets && removeModalTargets.length > 0 && (
+        <div
+          className="modal-overlay"
+          onClick={() => {
+            if (busyAction !== 'removing-instances') setRemoveModalTargets(null);
+          }}
+        >
+          <div className="modal" style={{ maxWidth: '580px', width: '100%' }} onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#dc2626' }}>
+                <AlertTriangle size={20} />
+                <h3 style={{ margin: 0, fontSize: '16px', color: '#dc2626' }}>
+                  Xác nhận xóa vĩnh viễn WordPress ({removeModalTargets.length} website)
+                </h3>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                disabled={busyAction === 'removing-instances'}
+                onClick={() => setRemoveModalTargets(null)}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '14px', fontSize: '13.5px' }}>
+              <div
+                style={{
+                  padding: '12px 14px',
+                  borderRadius: '10px',
+                  background: 'rgba(239, 68, 68, 0.08)',
+                  border: '1px solid rgba(239, 68, 68, 0.28)',
+                  color: 'var(--text)',
+                  lineHeight: 1.55,
+                }}
+              >
+                Hành động này sẽ <strong>xóa sạch toàn bộ mã nguồn WordPress</strong> trong thư mục cài đặt, xóa các bản Snapshot đi kèm và gỡ website khỏi WordPress Manager (khi bấm <strong>Scan</strong> sẽ không còn xuất hiện lại).
+                <div style={{ marginTop: '4px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+                  Nếu chỉ muốn gỡ khỏi khung quản lý mà giữ nguyên mã nguồn &amp; Database, hãy bấm Hủy và chọn nút <strong>Detach</strong>.
+                </div>
+              </div>
+
+              <div
+                style={{
+                  border: '1px solid var(--border)',
+                  borderRadius: '10px',
+                  maxHeight: '200px',
+                  overflowY: 'auto',
+                  background: 'var(--surface-alt)',
+                }}
+              >
+                {removeModalTargets.map((inst, idx) => (
+                  <div
+                    key={inst.id}
+                    style={{
+                      padding: '10px 14px',
+                      borderBottom: idx < removeModalTargets.length - 1 ? '1px solid var(--border)' : 'none',
+                      fontSize: '12.5px',
+                    }}
+                  >
+                    <div style={{ fontWeight: 700, fontSize: '13.5px', color: 'var(--text)' }}>
+                      {inst.domain}{inst.subpath || ''}
+                    </div>
+                    <div style={{ color: 'var(--text-secondary)', marginTop: '3px' }}>
+                      Thư mục bị xóa sạch: <code>{inst.public_path}</code>
+                    </div>
+                    <div style={{ color: 'var(--text-secondary)', marginTop: '2px' }}>
+                      Database liên kết: <code>{inst.db_name || 'Tự động dò từ wp-config.php'}</code>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <label
+                style={{
+                  display: 'flex',
+                  flexDirection: 'row',
+                  alignItems: 'flex-start',
+                  gap: '10px',
+                  padding: '12px 14px',
+                  borderRadius: '10px',
+                  border: '1px solid var(--border)',
+                  background: 'var(--surface)',
+                  cursor: 'pointer',
+                  margin: 0,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={removeDropDb}
+                  onChange={e => setRemoveDropDb(e.target.checked)}
+                  style={{ width: '17px', height: '17px', marginTop: '2px', flexShrink: 0, cursor: 'pointer' }}
+                />
+                <div style={{ lineHeight: 1.45 }}>
+                  <strong style={{ display: 'block', fontSize: '13.5px', color: 'var(--text)' }}>
+                    Xóa đồng thời cơ sở dữ liệu MySQL và tài khoản Database đi kèm
+                  </strong>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                    Khuyên dùng để dọn sạch triệt để dung lượng hosting. Bỏ tích nếu bạn muốn giữ lại Database trong MySQL Management.
+                  </span>
+                </div>
+              </label>
+            </div>
+
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="secondary-light"
+                disabled={busyAction === 'removing-instances'}
+                onClick={() => setRemoveModalTargets(null)}
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                disabled={busyAction === 'removing-instances'}
+                onClick={handleConfirmRemoveInstances}
+                style={{
+                  background: '#dc2626',
+                  color: '#fff',
+                  border: 'none',
+                  padding: '0 18px',
+                  height: '38px',
+                  borderRadius: '8px',
+                  fontWeight: 600,
+                }}
+              >
+                <Trash2 size={14} />{' '}
+                {busyAction === 'removing-instances'
+                  ? 'Đang xóa mã nguồn & Database...'
+                  : removeDropDb
+                    ? 'Xóa vĩnh viễn Mã nguồn & Database'
+                    : 'Chỉ xóa Mã nguồn (Giữ lại DB)'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 13: CORE CHECKSUMS VERIFICATION RESULT */}
+      {checksumResultModal && (
+        <div className="modal-overlay" onClick={() => setChecksumResultModal(null)}>
+          <div className="modal" style={{ maxWidth: '640px', width: '100%' }} onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {checksumResultModal.verified ? (
+                  <CheckCircle size={20} style={{ color: '#10b981' }} />
+                ) : (
+                  <ShieldAlert size={20} style={{ color: '#ef4444' }} />
+                )}
+                <h3 style={{ margin: 0, fontSize: '16px' }}>
+                  Kết quả kiểm tra Core Checksums ({checksumResultModal.instance?.domain})
+                </h3>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setChecksumResultModal(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <div
+                style={{
+                  padding: '10px 14px',
+                  borderRadius: '8px',
+                  background: checksumResultModal.verified
+                    ? 'rgba(16, 185, 129, 0.1)'
+                    : 'rgba(239, 68, 68, 0.1)',
+                  border: checksumResultModal.verified
+                    ? '1px solid rgba(16, 185, 129, 0.3)'
+                    : '1px solid rgba(239, 68, 68, 0.3)',
+                  fontSize: '13px',
+                  fontWeight: 500,
+                }}
+              >
+                {checksumResultModal.message}
+              </div>
+              {checksumResultModal.output && (
+                <pre
+                  style={{
+                    background: '#0f172a',
+                    color: '#e2e8f0',
+                    padding: '12px 14px',
+                    borderRadius: '8px',
+                    fontSize: '12px',
+                    maxHeight: '260px',
+                    overflowY: 'auto',
+                    margin: 0,
+                    whiteSpace: 'pre-wrap',
+                  }}
+                >
+                  {checksumResultModal.output}
+                </pre>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="secondary-light" onClick={() => setChecksumResultModal(null)}>
+                Đóng
+              </button>
+              {!checksumResultModal.verified && checksumResultModal.instance && (
+                <button
+                  type="button"
+                  disabled={!!busyAction}
+                  onClick={async () => {
+                    const targetInst = checksumResultModal.instance;
+                    setChecksumResultModal(null);
+                    await handleSecurityAction(targetInst, 'reinstall_core');
+                  }}
+                  style={{
+                    background: 'var(--primary)',
+                    color: '#fff',
+                    border: 'none',
+                    padding: '0 16px',
+                    height: '36px',
+                    borderRadius: '8px',
+                    fontWeight: 600,
+                  }}
+                >
+                  <RotateCcw size={14} /> Tải lại Core sạch ngay (Reinstall Clean Core)
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 14: SELECT TARGET WEBSITES FOR PACKAGE SET */}
+      {applySetModal && applySetModal.pkg && (
+        <div className="modal-overlay" onClick={() => setApplySetModal(null)}>
+          <div className="modal" style={{ maxWidth: '520px', width: '100%' }} onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3 style={{ margin: 0, fontSize: '16px' }}>
+                Cài đặt bộ gói &ldquo;{applySetModal.pkg.name}&rdquo;
+              </h3>
+              <button type="button" className="icon-button" onClick={() => setApplySetModal(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <div style={{ fontSize: '12.5px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                Chọn các website WordPress muốn cài đặt tự động{' '}
+                <strong>{applySetModal.pkg.plugins?.length || 0} Plugins</strong>
+                {applySetModal.pkg.themes?.length > 0
+                  ? ` và ${applySetModal.pkg.themes.length} Themes`
+                  : ''}{' '}
+                trong bộ gói này:
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px' }}>
+                <span style={{ color: 'var(--text-muted)' }}>
+                  Đã chọn: <strong>{applySetModal.websiteIds.length}</strong> / {instances.length} website
+                </span>
+                <div style={{ display: 'inline-flex', gap: '10px' }}>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setApplySetModal(prev => ({ ...prev, websiteIds: instances.map(i => i.id) }))
+                    }
+                    style={{ border: 'none', background: 'transparent', color: 'var(--primary)', padding: 0, cursor: 'pointer', fontSize: '12px', boxShadow: 'none' }}
+                  >
+                    Chọn tất cả
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setApplySetModal(prev => ({ ...prev, websiteIds: [] }))}
+                    style={{ border: 'none', background: 'transparent', color: 'var(--text-muted)', padding: 0, cursor: 'pointer', fontSize: '12px', boxShadow: 'none' }}
+                  >
+                    Bỏ chọn
+                  </button>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  border: '1px solid var(--border)',
+                  borderRadius: '10px',
+                  maxHeight: '240px',
+                  overflowY: 'auto',
+                  background: 'var(--surface-alt)',
+                }}
+              >
+                {instances.map((inst, idx) => {
+                  const checked = applySetModal.websiteIds.includes(inst.id);
+                  return (
+                    <label
+                      key={inst.id}
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        gap: '10px',
+                        padding: '10px 14px',
+                        margin: 0,
+                        cursor: 'pointer',
+                        borderBottom: idx < instances.length - 1 ? '1px solid var(--border)' : 'none',
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() =>
+                          setApplySetModal(prev => ({
+                            ...prev,
+                            websiteIds: checked
+                              ? prev.websiteIds.filter(id => id !== inst.id)
+                              : [...prev.websiteIds, inst.id],
+                          }))
+                        }
+                        style={{ width: '16px', height: '16px', margin: 0, cursor: 'pointer' }}
+                      />
+                      <div>
+                        <strong style={{ fontSize: '13.5px', color: 'var(--text)' }}>
+                          {inst.domain}{inst.subpath || ''}
+                        </strong>
+                        <div style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                          {inst.site_title}
+                        </div>
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="secondary-light" onClick={() => setApplySetModal(null)}>
+                Hủy
+              </button>
+              <button
+                type="button"
+                disabled={applySetModal.websiteIds.length === 0 || !!busyAction}
+                onClick={handleConfirmApplySet}
+                style={{
+                  background: 'var(--primary)',
+                  color: '#fff',
+                  border: 'none',
+                  padding: '0 16px',
+                  height: '36px',
+                  borderRadius: '8px',
+                  fontWeight: 600,
+                  opacity: applySetModal.websiteIds.length === 0 || !!busyAction ? 0.55 : 1,
+                }}
+              >
+                Cài đặt cho {applySetModal.websiteIds.length} website
+              </button>
+            </div>
           </div>
         </div>
       )}

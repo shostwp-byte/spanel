@@ -1,9 +1,9 @@
 <div align="center">
 
-# SPanel (`v1.0.7`)
+# SPanel (`v1.0.8`)
 ### Nền tảng Quản trị Web Hosting & Máy chủ Đa tầng Thế hệ mới cho Ubuntu 24.04 LTS
 
-[![Release](https://img.shields.io/badge/version-v1.0.7-4f46e5?style=flat-square)](https://github.com/shostwp-byte/spanel)
+[![Release](https://img.shields.io/badge/version-v1.0.8-4f46e5?style=flat-square)](https://github.com/shostwp-byte/spanel)
 [![OS](https://img.shields.io/badge/OS-Ubuntu%2024.04%20LTS-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Backend](https://img.shields.io/badge/Backend-FastAPI%20%7C%20Python%203.12-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Frontend](https://img.shields.io/badge/Frontend-React%2019%20%7C%20Vite%208-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
@@ -45,7 +45,7 @@
 
 ## 🚀 Tổng quan & Điểm khác biệt
 
-| Tiêu chí | Giải pháp truyền thống | SPanel (`v1.0.7`) |
+| Tiêu chí | Giải pháp truyền thống | SPanel (`v1.0.8`) |
 | :--- | :--- | :--- |
 | **Đặc quyền tiến trình Web Panel** | Thường chạy trực tiếp dưới `root` hoặc wrapper rộng | Tiến trình `spanel-api` chạy dưới user không đặc quyền `spanel`, mọi tác vụ hệ thống đi qua cổng kiểm duyệt `/usr/local/sbin/spanel-helper` |
 | **Cô lập Người dùng & Website** | Dùng chung pool PHP hoặc quyền thư mục lỏng lẻo | Mỗi khách hàng có **Linux user riêng**, mỗi website chạy **PHP-FPM Unix socket riêng**, Web Terminal cô lập mount namespace (`unshare --mount`) |
@@ -324,7 +324,7 @@ spanel/
 ├── tools/i18n/               # Công cụ kiểm tra và đồng bộ từ điển đa ngôn ngữ
 ├── docs/                     # Tài liệu kỹ thuật chi tiết & giao diện GitHub Pages
 ├── install.sh                # Kịch bản bootstrap cài đặt nhanh từ GitHub
-└── VERSION                   # Phiên bản phát hành chuẩn SemVer (1.0.7)
+└── VERSION                   # Phiên bản phát hành chuẩn SemVer (1.0.8)
 ```
 
 ---

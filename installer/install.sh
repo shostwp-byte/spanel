@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SPANEL_INSTALLER_VERSION="${SPANEL_INSTALLER_VERSION:-v1.0.7}"
+SPANEL_INSTALLER_VERSION="${SPANEL_INSTALLER_VERSION:-v1.0.8}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Please run this installer as root"
@@ -539,6 +539,44 @@ install_wp_cli() {
     curl -fsSL --connect-timeout 10 --max-time 180 -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
     chmod +x /usr/local/bin/wp
   fi
+}
+
+install_composer_cli() {
+  local php_cli="" composer_ver="" cand
+  for cand in php php8.5 php8.4 php8.3 php8.2 php8.1; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      php_cli="$(command -v "$cand")"
+      break
+    fi
+  done
+  [[ -n "$php_cli" ]] || return 0
+  if [[ -x /usr/local/bin/composer ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+      composer_ver="$(COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_NO_INTERACTION=1 timeout 15 "$php_cli" -d error_reporting=8191 /usr/local/bin/composer --version --no-interaction </dev/null 2>/dev/null || true)"
+    else
+      composer_ver="$(COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_NO_INTERACTION=1 "$php_cli" -d error_reporting=8191 /usr/local/bin/composer --version --no-interaction </dev/null 2>/dev/null || true)"
+    fi
+    if printf '%s\n' "$composer_ver" | grep -qE 'Composer version (2\.(8|9|[1-9][0-9])|[3-9]\.)'; then
+      return 0
+    fi
+  fi
+  local tmp_dir expected_sha actual_sha
+  tmp_dir="$(mktemp -d)" || return 0
+  if ( curl -4fsSL --connect-timeout 8 --max-time 60 -o "${tmp_dir}/composer.phar" https://getcomposer.org/download/latest-stable/composer.phar </dev/null \
+       || curl -fsSL --connect-timeout 8 --max-time 60 -o "${tmp_dir}/composer.phar" https://getcomposer.org/download/latest-stable/composer.phar </dev/null ) \
+    && ( curl -4fsSL --connect-timeout 8 --max-time 20 -o "${tmp_dir}/composer.phar.sha256sum" https://getcomposer.org/download/latest-stable/composer.phar.sha256sum </dev/null \
+       || curl -fsSL --connect-timeout 8 --max-time 20 -o "${tmp_dir}/composer.phar.sha256sum" https://getcomposer.org/download/latest-stable/composer.phar.sha256sum </dev/null ); then
+    expected_sha="$(awk '{print $1}' "${tmp_dir}/composer.phar.sha256sum" 2>/dev/null || true)"
+    actual_sha="$(sha256sum "${tmp_dir}/composer.phar" 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -n "$expected_sha" && "$expected_sha" == "$actual_sha" ]]; then
+      install -o root -g root -m 0755 "${tmp_dir}/composer.phar" /usr/local/bin/composer
+    else
+      echo "WARNING: Composer PHAR SHA-256 mismatch; falling back to system composer." >&2
+    fi
+  else
+    echo "WARNING: Could not download latest Composer PHAR; falling back to system composer." >&2
+  fi
+  rm -rf "$tmp_dir"
 }
 
 copy_sources() {
@@ -1405,7 +1443,7 @@ source_version() {
 write_update_state() {
   local version now
   version="$(source_version)"
-  version="${version:-1.0.7}"
+  version="${version:-1.0.8}"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   install -d -o spanel -g spanel -m 0750 /var/lib/spanel /var/lib/spanel/geoip
   cat >/var/lib/spanel/update-status.json <<STATE
@@ -1522,8 +1560,9 @@ main() {
     echo "WARNING: WAF engine installation failed; continuing without ModSecurity."
   fi
 
-  log "Installing WP-CLI"
+  log "Installing WP-CLI and Composer"
   install_wp_cli
+  install_composer_cli
 
   log "Copying source to ${APP_DIR}"
   copy_sources

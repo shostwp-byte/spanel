@@ -78,13 +78,13 @@ def _sftp_host() -> str:
     return ""
 
 
-def _limit_for(user: User) -> int:
-    val = getattr(user, "sftp_accounts_limit", None)
-    if val is None and getattr(user, "package", None) is not None:
-        val = getattr(user.package, "sftp_accounts_limit", None)
-        if val is None:
-            val = getattr(user.package, "ftp_accounts_limit", None)
-    return int(0 if val is None else val)
+def effective_sftp_limit(user: User | None) -> int:
+    from app.services import quota
+
+    return quota.effective_limit(user, "sftp_accounts_limit")
+
+
+_limit_for = effective_sftp_limit
 
 
 def _owned_website(db: Session, website_id: int, current_user: User) -> Website:
@@ -288,8 +288,10 @@ def account_limits(
     current_user: User = Depends(get_current_user),
 ):
     """What the UI needs to decide whether to offer the button at all."""
+    from app.services import quota
+
     limit = _limit_for(current_user)
     used = db.query(SftpAccount).filter(SftpAccount.owner_id == current_user.id).count()
-    if is_admin_role(current_user.role) or limit == 0:
-        return {"limit": None if is_admin_role(current_user.role) else 0, "used": used, "unlimited": True}
+    if is_admin_role(current_user.role) or quota.is_quota_unlimited(limit):
+        return {"limit": None if is_admin_role(current_user.role) else -1, "used": used, "unlimited": True}
     return {"limit": limit, "used": used, "unlimited": False}

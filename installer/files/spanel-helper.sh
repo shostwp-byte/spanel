@@ -40,7 +40,7 @@ SPANEL_SITES_GROUP="spanel-sites"
 SITE_FILE_MODE="0644"
 SITE_DIR_MODE="0755"
 # Files that carry database credentials are kept off the default mode.
-SITE_SECRET_FILES=(wp-config.php .env .my.cnf)
+SITE_SECRET_FILES=(wp-config.php .env .env.bak .my.cnf)
 SPANEL_SFTP_GROUP="spanel-sftp"
 # Per-website SFTP sub-accounts. A separate group because they get a different
 # sshd Match block: the panel user's own account chroots to its whole home,
@@ -2636,12 +2636,14 @@ MAIL_TLS_SCRIPT="/usr/local/sbin/spanel-mail-tls"
 MAIL_INSTALL_LOG="/var/log/spanel-mail-install.log"
 MAIL_MARKER="# Managed by SPanel (Email addon)."
 WEBMAIL_HOME="/opt/SPanel-webmail"
-WEBMAIL_REPO="https://github.com/shostwp-byte/spanel.git"
 WEBMAIL_BUNDLED_DIR="/usr/local/lib/spanel/webmail"
 WEBMAIL_ENV="/etc/SPanel-webmail.env"
 WEBMAIL_UNIT="/etc/systemd/system/spanel-webmail.service"
 WEBMAIL_PORT="8096"
 WEBMAIL_PUBLIC_PORT="2096"
+WEBMAIL_IMAP_HOST="127.0.0.96"
+WEBMAIL_IMAP_PORT="14143"
+WEBMAIL_LO_CHAIN="SPANEL_WEBMAIL_LO"
 WEBMAIL_NGINX="/etc/nginx/conf.d/00-spanel-webmail.conf"
 WEBMAIL_SSO_KEY_FILE="/etc/spanel/webmail-sso.key"
 WEBMAIL_MASTER_USER="spanel-webmail"
@@ -2668,12 +2670,12 @@ MAIL_QUOTA_WARNING="${MAIL_TOOL_DIR}/mail-quota-warning"
 
 mail_port_taken() {
   # "<port> (<program>)" for each mail port some other program already holds.
-  local port owner
-  for port in 25 465 587 143 993 110 995 "$WEBMAIL_PUBLIC_PORT" "$WEBMAIL_PORT"; do
+  local port owner wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
+  for port in 25 465 587 143 993 110 995 "$wm_imap_port" "$WEBMAIL_PUBLIC_PORT" "$WEBMAIL_PORT"; do
     owner="$(ss -H -lntp "sport = :${port}" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1 | sed 's/^users:(("//; s/"$//' || true)"
     [[ -n "$owner" ]] || continue
     case "${port}:${owner}" in
-      25:exim4|465:exim4|587:exim4|143:dovecot|993:dovecot|110:dovecot|995:dovecot) continue ;;
+      25:exim4|465:exim4|587:exim4|143:dovecot|993:dovecot|110:dovecot|995:dovecot|"${wm_imap_port}:dovecot") continue ;;
       "${WEBMAIL_PUBLIC_PORT}:nginx") continue ;;
       "${WEBMAIL_PORT}:python"*) systemctl is-active --quiet spanel-webmail && continue ;;
     esac
@@ -3285,7 +3287,7 @@ EOF
 }
 
 mail_write_dovecot_conf() {
-  local tmp listen="*"
+  local tmp listen="*" wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
   # "::" on a machine without IPv6 stops Dovecot from starting at all.
   if [[ -s /proc/net/if_inet6 ]]; then listen="*, ::"; fi
   if [[ -f "$MAIL_DOVECOT_CONF" && ! -f "${MAIL_DOVECOT_CONF}.spanel-orig" ]] \
@@ -3302,8 +3304,9 @@ protocols = imap pop3 lmtp
 listen = ${listen}
 login_greeting = Ready.
 
-# Passwords only over TLS; loopback (the webmail) counts as secure.
+# Passwords only over TLS; only the SPanel-webmail loopback channel counts as trusted.
 disable_plaintext_auth = yes
+login_trusted_networks = ${wm_imap_host}/32
 auth_mechanisms = plain login
 auth_username_format = %Lu
 # The webmail's single sign-on: "mailbox*${WEBMAIL_MASTER_USER}" with the master password.
@@ -3429,6 +3432,10 @@ service imap-login {
   inet_listener imap {
     port = 143
   }
+  inet_listener imap_webmail {
+    address = ${wm_imap_host}
+    port = ${wm_imap_port}
+  }
   inet_listener imaps {
     port = 993
     ssl = yes
@@ -3461,12 +3468,37 @@ mail_env_value() {
   sed -nE "s/^$1=//p" "$WEBMAIL_ENV" | tail -n1
 }
 
+mail_apply_webmail_lo_guard() {
+  # Isolate the trusted 127.0.0.96 loopback channel so only UID SPanel-webmail
+  # can initiate TCP connections from or to 127.0.0.96 (preventing local tenant
+  # PHP/cron/terminal processes from spoofing IMAP ID x-originating-ip).
+  local wm_uid wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}" chain="${WEBMAIL_LO_CHAIN:-SPANEL_WEBMAIL_LO}"
+  if command -v ip >/dev/null 2>&1 && ! ip -4 addr show dev lo 2>/dev/null | grep -qE "inet 127\\.0\\.0\\.1/8|inet ${wm_imap_host//./\\.}/"; then
+    ip addr add "${wm_imap_host}/32" dev lo 2>/dev/null || true
+  fi
+  wm_uid="$(id -u SPanel-webmail 2>/dev/null || true)"
+  if [[ "$wm_uid" =~ ^[0-9]+$ ]] && command -v iptables >/dev/null 2>&1; then
+    iptables -w -N "$chain" 2>/dev/null || true
+    iptables -w -F "$chain"
+    iptables -w -A "$chain" -p tcp --syn -s "${wm_imap_host}/32" -m owner ! --uid-owner "$wm_uid" -j REJECT --reject-with tcp-reset
+    iptables -w -A "$chain" -p tcp --syn -d "${wm_imap_host}/32" --dport "$wm_imap_port" -m owner ! --uid-owner "$wm_uid" -j REJECT --reject-with tcp-reset
+    iptables -w -A "$chain" -p tcp --syn -d "${wm_imap_host}/32" -m owner ! --uid-owner "$wm_uid" -j REJECT --reject-with tcp-reset
+    iptables -w -C OUTPUT -o lo -j "$chain" 2>/dev/null || iptables -w -I OUTPUT 1 -o lo -j "$chain"
+  fi
+}
+
+mail_remove_webmail_lo_guard() {
+  local chain="${WEBMAIL_LO_CHAIN:-SPANEL_WEBMAIL_LO}"
+  command -v iptables >/dev/null 2>&1 || return 0
+  while iptables -w -C OUTPUT -o lo -j "$chain" 2>/dev/null; do
+    iptables -w -D OUTPUT -o lo -j "$chain" || break
+  done
+  iptables -w -F "$chain" 2>/dev/null || true
+  iptables -w -X "$chain" 2>/dev/null || true
+}
+
 mail_install_webmail() {
-  local ref custom_repo bundled_src="" candidate auth_secret sso_secret master_password
-  ref="$(env_get WEBMAIL_REF)"
-  ref="${ref:-main}"
-  [[ "$ref" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || deny "invalid WEBMAIL_REF: $ref"
-  custom_repo="$(env_get WEBMAIL_REPO)"
+  local bundled_src="" candidate auth_secret sso_secret master_password
   if [[ -d "$WEBMAIL_HOME" && ! -f "$WEBMAIL_HOME/.spanel" ]]; then
     deny "${WEBMAIL_HOME} already exists and was not set up by SPanel - the Email addon will not take it over"
   fi
@@ -3475,25 +3507,15 @@ mail_install_webmail() {
   install -d -o root -g root -m 0755 "$WEBMAIL_HOME"
   touch "$WEBMAIL_HOME/.spanel"
 
-  for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "${APP_DIR}/installer/files/webmail/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
-    if [[ -f "${candidate}/main.py" && -f "${candidate}/requirements.txt" ]]; then
+  for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
+    if [[ -d "$candidate" && ! -L "$candidate" && "$(stat -c '%u' "$candidate" 2>/dev/null || echo 0)" == "0" ]] \
+       && [[ -f "${candidate}/main.py" && ! -L "${candidate}/main.py" && -f "${candidate}/requirements.txt" && ! -L "${candidate}/requirements.txt" ]]; then
       bundled_src="$candidate"
       break
     fi
   done
 
-  if [[ -n "$custom_repo" && "$custom_repo" != *"shostwp-byte/spanel"* ]]; then
-    if [[ -d "$WEBMAIL_HOME/src/.git" ]]; then
-      git -C "$WEBMAIL_HOME/src" fetch --quiet --depth 1 origin "$ref" >>"$MAIL_INSTALL_LOG" 2>&1 \
-        || deny "could not fetch the webmail from ${custom_repo} (see ${MAIL_INSTALL_LOG})"
-      git -C "$WEBMAIL_HOME/src" reset --quiet --hard FETCH_HEAD >>"$MAIL_INSTALL_LOG" 2>&1 \
-        || deny "could not update the webmail checkout (see ${MAIL_INSTALL_LOG})"
-    else
-      rm -rf "$WEBMAIL_HOME/src"
-      git clone --quiet --depth 1 --branch "$ref" "$custom_repo" "$WEBMAIL_HOME/src" >>"$MAIL_INSTALL_LOG" 2>&1 \
-        || deny "could not download the webmail from ${custom_repo} (see ${MAIL_INSTALL_LOG})"
-    fi
-  elif [[ -n "$bundled_src" ]]; then
+  if [[ -n "$bundled_src" ]]; then
     # Remove any previous broken git checkout (e.g. spanel.git) before installing bundled webmail
     [[ -d "$WEBMAIL_HOME/src/.git" ]] && rm -rf "$WEBMAIL_HOME/src"
     install -d -o root -g root -m 0755 "$WEBMAIL_HOME/src" "$WEBMAIL_HOME/src/backend"
@@ -3512,9 +3534,17 @@ mail_install_webmail() {
   if ! "$WEBMAIL_HOME/venv/bin/python" -m pip --version >/dev/null 2>&1; then
     "$WEBMAIL_HOME/venv/bin/python" -m ensurepip --upgrade >>"$MAIL_INSTALL_LOG" 2>&1 || true
   fi
-  "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
-    -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 \
-    || deny "could not install the webmail's Python packages (see ${MAIL_INSTALL_LOG})"
+  chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+      -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 \
+      || deny "could not install the webmail's Python packages (see ${MAIL_INSTALL_LOG})"
+  else
+    "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+      -r "$WEBMAIL_HOME/src/backend/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 \
+      || deny "could not install the webmail's Python packages (see ${MAIL_INSTALL_LOG})"
+  fi
+  chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
   install -d -o SPanel-webmail -g SPanel-webmail -m 0750 "$WEBMAIL_HOME/data"
 
   # Secrets survive a reinstall: a new AUTH_SECRET would sign everybody out,
@@ -3527,13 +3557,15 @@ mail_install_webmail() {
   [[ -n "$master_password" ]] || master_password="$(openssl rand -hex 24)"
 
   # Each file is made with its final mode while still empty, then filled.
+  local wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
   install -m 0640 -o root -g SPanel-webmail /dev/null "${WEBMAIL_ENV}.new"
   cat >"${WEBMAIL_ENV}.new" <<EOF
 ${MAIL_MARKER} Rewritten each time the addon is installed.
 AUTH_SECRET=${auth_secret}
-# Dovecot and Exim on this server, over loopback.
-IMAP_HOST=127.0.0.1
-IMAP_PORT=143
+# Dovecot and Exim on this server, over dedicated loopback channel.
+IMAP_HOST=${wm_imap_host}
+IMAP_PORT=${wm_imap_port}
+IMAP_SOURCE_IP=${wm_imap_host}
 IMAP_SECURE=false
 SMTP_HOST=127.0.0.1
 SMTP_PORT=587
@@ -3557,6 +3589,10 @@ EOF
     "$(printf '%s\n' "$master_password" | openssl passwd -6 -stdin)" >"${MAIL_DOVECOT_DIR}/masters.new"
   mv -f "${MAIL_DOVECOT_DIR}/masters.new" "${MAIL_DOVECOT_DIR}/masters"
 
+  if declare -F mail_apply_webmail_lo_guard >/dev/null 2>&1; then
+    mail_apply_webmail_lo_guard
+  fi
+
   cat >"$WEBMAIL_UNIT" <<UNIT
 [Unit]
 Description=SPanel Webmail (Email addon)
@@ -3573,6 +3609,7 @@ Environment=DATA_DIR=${WEBMAIL_HOME}/data
 Environment=HOST=127.0.0.1
 Environment=PORT=${WEBMAIL_PORT}
 Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=+/usr/local/sbin/spanel-helper mail-webmail-lo-guard
 ExecStart=${WEBMAIL_HOME}/venv/bin/python ${WEBMAIL_HOME}/src/backend/main.py
 Restart=always
 RestartSec=5
@@ -3597,10 +3634,22 @@ mail_webmail_proxy_block() {
     location ^~ /admin { return 404; }
     location ^~ /api/admin/ { return 404; }
 
+    location = /api/auth/login {
+        limit_req zone=spanel_webmail_login burst=5 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8096;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8096;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
         # Overwritten, not appended: the webmail reads the last address.
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
@@ -3611,16 +3660,27 @@ NGINX
 }
 
 mail_write_webmail_nginx() {
-  local conf off
+  local conf off prev_conf="" tmp_conf=""
   # Server blocks set aside when the addon was last turned off come back.
-  for off in /etc/nginx/conf.d/00-spanel-webmail*.conf.off; do
+  for off in "${WEBMAIL_NGINX%.conf}"*.conf.off; do
     [[ -f "$off" ]] || continue
     mv -f "$off" "${off%.off}"
   done
   conf="$WEBMAIL_NGINX"
+  mkdir -p "$(dirname "$conf")"
+  if [[ -f "$conf" ]]; then
+    prev_conf="$(mktemp "${conf}.bak.XXXXXX")"
+    cp -p -- "$conf" "$prev_conf"
+  fi
+  tmp_conf="$(mktemp "${conf}.tmp.XXXXXX")"
   {
     printf '%s Rewritten each time the addon is installed.\n' "$MAIL_MARKER"
     printf '# The webmail on the panel'"'"'s own name and certificate.\n'
+    printf 'map $binary_remote_addr $spanel_webmail_login_key {\n'
+    printf '    "~^(?s)(?P<spanel_v6_net64>.{8}).{8}$" $spanel_v6_net64;\n'
+    printf '    default $binary_remote_addr;\n'
+    printf '}\n'
+    printf 'limit_req_zone $spanel_webmail_login_key zone=spanel_webmail_login:10m rate=10r/m;\n'
     printf 'server {\n'
     printf '    listen %s ssl;\n' "$WEBMAIL_PUBLIC_PORT"
     printf '    server_name _;\n'
@@ -3629,12 +3689,20 @@ mail_write_webmail_nginx() {
     printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
     mail_webmail_proxy_block
     printf '}\n'
-  } >"$conf"
+  } >"$tmp_conf"
+  chmod 0644 "$tmp_conf"
+  mv -f -- "$tmp_conf" "$conf"
   nginx_ipv6_apply >/dev/null 2>&1 || true
   if ! nginx -t >>"$MAIL_INSTALL_LOG" 2>&1; then
-    rm -f "$conf"
+    if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then
+      mv -f -- "$prev_conf" "$conf"
+      nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+    else
+      rm -f -- "$conf"
+    fi
     deny "nginx refused the webmail's server block on port ${WEBMAIL_PUBLIC_PORT} (see ${MAIL_INSTALL_LOG})"
   fi
+  rm -f -- "$prev_conf"
   systemctl reload nginx
 }
 
@@ -3736,6 +3804,7 @@ remove_mail() {
   done
   if nginx -t >/dev/null 2>&1; then systemctl reload nginx >/dev/null 2>&1 || true; fi
   rm -f "$FIREWALL_ADDON_PORTS_DIR/mail.ports"
+  mail_remove_webmail_lo_guard
   firewall_apply >/dev/null
   echo "Email stopped: Exim, Dovecot, Rspamd and the webmail are off and the mail ports are closed. Mail, mailboxes, DKIM keys and settings are kept."
 }
@@ -3910,7 +3979,7 @@ for item in data.get("mailboxes") or []:
     boxes.append({
         "address": address, "local": local, "domain": domain, "user": account.pw_name,
         "uid": account.pw_uid, "gid": account.pw_gid, "hash": secret, "quota": quota,
-        "enabled": bool(item.get("enabled", True)),
+        "enabled": bool(item.get("enabled", True)), "gen": str(item.get("gen") or ""),
     })
 
 aliases = {}
@@ -4120,6 +4189,43 @@ for line in denied:
     address = line.split(":", 1)[0]
     if address not in previously_denied:
         subprocess.run(["doveadm", "kick", address], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+webmail_data = "/opt/SPanel-webmail/data"
+if os.path.isdir(webmail_data) and not os.path.islink(webmail_data):
+    gen_map = {box["address"]: box["gen"] for box in boxes if box.get("enabled") and box.get("gen")}
+    try:
+        webmail_gid = grp.getgrnam("SPanel-webmail").gr_gid
+    except KeyError:
+        webmail_gid = 0
+    gen_tmp = os.path.join(webmail_data, ".mailbox_generations.json.new")
+    gen_dst = os.path.join(webmail_data, "mailbox_generations.json")
+    try:
+        fd = os.open(gen_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o640)
+        try:
+            os.fchown(fd, 0, webmail_gid)
+            os.fchmod(fd, 0o640)
+            os.write(fd, json.dumps(gen_map).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(gen_tmp, gen_dst)
+    except OSError:
+        pass
+    sess_dir = os.path.join(webmail_data, "sessions")
+    if os.path.isdir(sess_dir) and not os.path.islink(sess_dir):
+        active_addrs = {box["address"] for box in boxes if box.get("enabled")}
+        for fname in os.listdir(sess_dir):
+            if not fname.endswith(".json"):
+                continue
+            spath = os.path.join(sess_dir, fname)
+            try:
+                with open(spath, encoding="utf-8") as sfh:
+                    sdata = json.load(sfh)
+                semail = str(sdata.get("email") or "").strip().lower()
+                sgen = str(sdata.get("gen") or "").strip()
+                if semail not in active_addrs or (sgen and gen_map.get(semail) and sgen != gen_map.get(semail)):
+                    os.unlink(spath)
+            except Exception:
+                pass
 
 print(json.dumps({"domains": domains, "mailboxes": len(boxes), "forwarders": len(aliases), "dkim": dkim,
                   "autoresponders": len(vacations)}))
@@ -4474,6 +4580,10 @@ mail_configure() {
   # and Rspamd's configuration and reloads them. Which domain uses which relay
   # is mail-sync's.
   [[ -f "$MAIL_EXIM_CONF" ]] || deny "the Email addon is not installed"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/spanel-mail-install.lock
+    flock -w 120 9 || deny "another Email addon operation is currently running - wait for it to finish"
+  fi
   local payload status=0 previous
   payload="$(mktemp)"
   head -c 2000000 >"$payload"
@@ -4723,29 +4833,137 @@ mail_reconfigure() {
     echo "The Email addon is not installed; nothing to reconfigure."
     return 0
   fi
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/spanel-mail-install.lock
+    flock -w 120 9 || deny "another Email addon operation is currently running - wait for it to finish"
+  fi
   mail_ensure_maps
   mail_write_tls_script
   "$MAIL_TLS_SCRIPT" >/dev/null 2>&1 || true
   mail_write_exim_conf
   mail_write_sieve
   mail_write_quota_warning
+  if [[ -f "$WEBMAIL_HOME/.spanel" ]]; then
+    mail_apply_webmail_lo_guard
+  fi
   mail_write_dovecot_conf
   mail_write_learn_service
+  if systemctl is-active --quiet dovecot; then
+    systemctl reload dovecot 2>/dev/null || systemctl restart dovecot
+    if command -v ss >/dev/null 2>&1 && ! ss -H -lnt "sport = :${WEBMAIL_IMAP_PORT:-14143}" 2>/dev/null | grep -q .; then
+      systemctl restart dovecot 2>/dev/null || true
+    fi
+  fi
   if [[ -f "$WEBMAIL_HOME/.spanel" ]]; then
-    local candidate
-    for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "${APP_DIR}/installer/files/webmail/backend"; do
-      if [[ -f "${candidate}/main.py" && -f "${candidate}/requirements.txt" ]]; then
+    local candidate webmail_changed=0 req_changed=0
+    local wm_imap_host="${WEBMAIL_IMAP_HOST:-127.0.0.96}" wm_imap_port="${WEBMAIL_IMAP_PORT:-14143}"
+    if [[ -f "$WEBMAIL_ENV" ]] && (
+      [[ "$(mail_env_value IMAP_HOST)" != "$wm_imap_host" ]] ||
+      [[ "$(mail_env_value IMAP_PORT)" != "$wm_imap_port" ]] ||
+      [[ "$(mail_env_value IMAP_SOURCE_IP)" != "$wm_imap_host" ]]
+    ); then
+      local auth_secret sso_secret master_password
+      auth_secret="$(mail_env_value AUTH_SECRET)"
+      [[ -n "$auth_secret" ]] || auth_secret="$(openssl rand -hex 32)"
+      sso_secret="$(mail_env_value SSO_SECRET)"
+      [[ -n "$sso_secret" ]] || sso_secret="$(openssl rand -hex 32)"
+      master_password="$(mail_env_value SSO_MASTER_PASSWORD)"
+      [[ -n "$master_password" ]] || master_password="$(openssl rand -hex 24)"
+      install -m 0640 -o root -g SPanel-webmail /dev/null "${WEBMAIL_ENV}.new"
+      cat >"${WEBMAIL_ENV}.new" <<EOF
+${MAIL_MARKER} Rewritten each time the addon is installed.
+AUTH_SECRET=${auth_secret}
+# Dovecot and Exim on this server, over dedicated loopback channel.
+IMAP_HOST=${wm_imap_host}
+IMAP_PORT=${wm_imap_port}
+IMAP_SOURCE_IP=${wm_imap_host}
+IMAP_SECURE=false
+SMTP_HOST=127.0.0.1
+SMTP_PORT=587
+SMTP_SECURE=false
+ENABLE_CADDY_AUTOMATION=false
+# Single sign-on from SPanel.
+SSO_SECRET=${sso_secret}
+SSO_MASTER_USER=${WEBMAIL_MASTER_USER}
+SSO_MASTER_PASSWORD=${master_password}
+SSO_MASTER_SEPARATOR=*
+EOF
+      mv -f "${WEBMAIL_ENV}.new" "$WEBMAIL_ENV"
+      webmail_changed=1
+    fi
+    if [[ -f "$WEBMAIL_UNIT" ]] && ! grep -q 'mail-webmail-lo-guard' "$WEBMAIL_UNIT" 2>/dev/null; then
+      cat >"$WEBMAIL_UNIT" <<UNIT
+[Unit]
+Description=SPanel Webmail (Email addon)
+After=network-online.target dovecot.service exim4.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=SPanel-webmail
+Group=SPanel-webmail
+WorkingDirectory=${WEBMAIL_HOME}/src/backend
+EnvironmentFile=${WEBMAIL_ENV}
+Environment=DATA_DIR=${WEBMAIL_HOME}/data
+Environment=HOST=127.0.0.1
+Environment=PORT=${WEBMAIL_PORT}
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=+/usr/local/sbin/spanel-helper mail-webmail-lo-guard
+ExecStart=${WEBMAIL_HOME}/venv/bin/python ${WEBMAIL_HOME}/src/backend/main.py
+Restart=always
+RestartSec=5
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+ReadWritePaths=${WEBMAIL_HOME}/data
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+      systemctl daemon-reload
+      webmail_changed=1
+    fi
+    for candidate in "${WEBMAIL_BUNDLED_DIR}/backend" "/opt/spanel-source/installer/files/webmail/backend"; do
+      if [[ -d "$candidate" && ! -L "$candidate" && "$(stat -c '%u' "$candidate" 2>/dev/null || echo 0)" == "0" ]] \
+         && [[ -f "${candidate}/main.py" && ! -L "${candidate}/main.py" && -f "${candidate}/requirements.txt" && ! -L "${candidate}/requirements.txt" ]]; then
         install -d -o root -g root -m 0755 "$WEBMAIL_HOME/src" "$WEBMAIL_HOME/src/backend"
         if ! cmp -s "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py" 2>/dev/null; then
           install -m 0755 -o root -g root "${candidate}/main.py" "$WEBMAIL_HOME/src/backend/main.py"
-          install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
-          systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
+          webmail_changed=1
+        fi
+        if ! cmp -s "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt" 2>/dev/null; then
+          local pip_ok=0
+          if [[ -x "$WEBMAIL_HOME/venv/bin/python" ]]; then
+            chown -R SPanel-webmail:SPanel-webmail "$WEBMAIL_HOME/venv" 2>/dev/null || true
+            if command -v runuser >/dev/null 2>&1; then
+              runuser -u SPanel-webmail -- "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+                -r "${candidate}/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 && pip_ok=1
+            else
+              "$WEBMAIL_HOME/venv/bin/python" -m pip install --quiet --disable-pip-version-check --only-binary :all: \
+                -r "${candidate}/requirements.txt" >>"$MAIL_INSTALL_LOG" 2>&1 && pip_ok=1
+            fi
+            chown -R root:root "$WEBMAIL_HOME/venv" 2>/dev/null || true
+          fi
+          if [[ "$pip_ok" -eq 1 ]]; then
+            install -m 0644 -o root -g root "${candidate}/requirements.txt" "$WEBMAIL_HOME/src/backend/requirements.txt"
+            req_changed=1
+            webmail_changed=1
+          fi
         fi
         break
       fi
     done
+    if [[ "$webmail_changed" -eq 1 ]]; then
+      systemctl is-active --quiet spanel-webmail && systemctl restart spanel-webmail 2>/dev/null || true
+    fi
+    if [[ -f "$WEBMAIL_NGINX" ]] && (
+      ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null ||
+      ! grep -q 'spanel_webmail_login_key' "$WEBMAIL_NGINX" 2>/dev/null ||
+      ! grep -q 'X-Forwarded-Host ""' "$WEBMAIL_NGINX" 2>/dev/null
+    ); then
+      mail_write_webmail_nginx
+    fi
   fi
-  if systemctl is-active --quiet dovecot; then systemctl reload dovecot 2>/dev/null || systemctl restart dovecot; fi
   if systemctl is-active --quiet exim4; then systemctl reload exim4 2>/dev/null || systemctl restart exim4; fi
   echo "Mail configuration rewritten."
 }
@@ -4924,6 +5142,33 @@ mail_rspamd_log() {
   tail -n "$lines" /var/log/rspamd/rspamd.log 2>/dev/null || true
 }
 
+mail_purge_webmail_sessions() {
+  local target="$1" sess_dir="${WEBMAIL_HOME}/data/sessions"
+  [[ -d "$sess_dir" && ! -L "$sess_dir" ]] || return 0
+  python3 - "$sess_dir" "$target" <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+
+sess_dir, target = sys.argv[1], sys.argv[2].strip().lower()
+if not target or not os.path.isdir(sess_dir):
+    sys.exit(0)
+is_domain = "@" not in target
+for name in os.listdir(sess_dir):
+    if not name.endswith(".json"):
+        continue
+    path = os.path.join(sess_dir, name)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        email_addr = str(data.get("email") or "").strip().lower()
+        if (is_domain and email_addr.endswith("@" + target)) or (not is_domain and email_addr == target):
+            os.unlink(path)
+    except Exception:
+        pass
+PY
+}
+
 mail_purge_domain() {
   # A mail domain removed in the panel: its mail, from its owner's home, and
   # its DKIM key. mail/ and mail/<domain>/ are root's, so the path cannot be
@@ -4931,6 +5176,7 @@ mail_purge_domain() {
   local user="$1" domain="$2" dir
   require_linux_user "$user"
   require_domain "$domain"
+  mail_purge_webmail_sessions "$domain"
   dir="/home/${user}/mail/${domain}"
   if [[ -L "$dir" ]]; then
     rm -f -- "$dir"
@@ -4939,6 +5185,34 @@ mail_purge_domain() {
   fi
   rm -f -- "$MAIL_EXIM_DIR/dkim/${domain}.pem" "$MAIL_EXIM_DIR"/dkim/*/"${domain}.pem"
   echo "mail data removed: ${domain}"
+}
+
+mail_move_domain() {
+  # Move a mail domain's maildirs from one Linux user's home to another's on
+  # website ownership transfer. mail/ and mail/<domain>/ are root:spanel 0751;
+  # each mailbox inside is owned by <new_user>:spanel.
+  local old_user="$1" new_user="$2" domain="$3" src_dir dst_dir
+  require_linux_user "$old_user"
+  require_linux_user "$new_user"
+  require_domain "$domain"
+  [[ "$old_user" != "$new_user" ]] || return 0
+  id -u "$new_user" >/dev/null 2>&1 || deny "no Linux user $new_user"
+  mail_purge_webmail_sessions "$domain"
+  src_dir="/home/${old_user}/mail/${domain}"
+  dst_dir="/home/${new_user}/mail/${domain}"
+  [[ -d "$src_dir" && ! -L "$src_dir" ]] || return 0
+  [[ ! -L "/home/${old_user}/mail" ]] || deny "/home/${old_user}/mail cannot be a symlink"
+  [[ ! -L "/home/${new_user}/mail" ]] || deny "/home/${new_user}/mail cannot be a symlink"
+  install -d -o root -g spanel -m 0751 "/home/${new_user}/mail"
+  if [[ -e "$dst_dir" || -L "$dst_dir" ]]; then
+    deny "destination mail directory already exists: ${dst_dir}"
+  fi
+  mv -- "$src_dir" "$dst_dir"
+  chown root:spanel "$dst_dir"
+  chmod 0751 "$dst_dir"
+  find "$dst_dir" \( -type l -o -type b -o -type c -o -type p -o -type s \) -delete 2>/dev/null || true
+  find "$dst_dir" -mindepth 1 -exec chown -h "${new_user}:spanel" {} +
+  echo "mail data moved: ${domain} (${old_user} -> ${new_user})"
 }
 
 mail_rspamd_answers() {
@@ -4993,6 +5267,7 @@ mail_delete_box() {
   # cannot be redirected; rm does not follow links inside it.
   local box
   box="$(mail_box_path "$1" "$2" "$3")"
+  mail_purge_webmail_sessions "${3}@${2}"
   if [[ -L "$box" ]]; then
     rm -f -- "$box"
   elif [[ -d "$box" ]]; then
@@ -5049,6 +5324,16 @@ mail_webmail_host() {
   name="webmail.${domain}"
   conf="/etc/nginx/conf.d/00-spanel-webmail-${domain}.conf"
   [[ -f "$WEBMAIL_NGINX" ]] || deny "the Email addon is not installed"
+  if ! grep -q 'zone=spanel_webmail_login' "$WEBMAIL_NGINX" 2>/dev/null \
+     || ! grep -q 'spanel_webmail_login_key' "$WEBMAIL_NGINX" 2>/dev/null \
+     || ! grep -q 'X-Forwarded-Host ""' "$WEBMAIL_NGINX" 2>/dev/null; then
+    mail_write_webmail_nginx
+  fi
+  local prev_conf=""
+  if [[ -f "$conf" ]]; then
+    prev_conf="$(mktemp "${conf}.bak.XXXXXX")"
+    cp -p -- "$conf" "$prev_conf"
+  fi
   install -d -o root -g spanel -m 0755 /var/www/spanel-acme/.well-known/acme-challenge
   if [[ ! -f "/etc/letsencrypt/live/${name}/fullchain.pem" ]]; then
     cat >"$conf" <<NGINX
@@ -5066,7 +5351,7 @@ server {
 NGINX
     nginx_ipv6_apply >/dev/null 2>&1 || true
     if ! nginx -t >/dev/null 2>&1; then
-      rm -f "$conf"
+      if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
       deny "nginx refused the server block for ${name}"
     fi
     systemctl reload nginx
@@ -5080,7 +5365,7 @@ NGINX
     fi
     certbot "${args[@]}" >>"$MAIL_INSTALL_LOG" 2>&1 || rc=$?
     if [[ ! -f "/etc/letsencrypt/live/${name}/fullchain.pem" ]]; then
-      rm -f "$conf"
+      if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
       nginx -t >/dev/null 2>&1 && systemctl reload nginx
       deny "no certificate for ${name} (certbot exited ${rc}) - point ${name} at this server first"
     fi
@@ -5099,10 +5384,11 @@ NGINX
   } >"$conf"
   nginx_ipv6_apply >/dev/null 2>&1 || true
   if ! nginx -t >/dev/null 2>&1; then
-    rm -f "$conf"
+    if [[ -n "$prev_conf" && -f "$prev_conf" ]]; then mv -f -- "$prev_conf" "$conf"; else rm -f "$conf"; fi
     nginx -t >/dev/null 2>&1 && systemctl reload nginx
     deny "nginx refused the server block for ${name}"
   fi
+  rm -f -- "$prev_conf"
   systemctl reload nginx
   echo "https://${name}"
 }
@@ -6366,6 +6652,9 @@ firewall_apply() {
   firewall_write_boot_unit
   # Never let a Docker guard failure abort the main firewall apply.
   install_docker_firewall_guard || echo "WARNING: could not apply the Docker inbound guard" >&2
+  if declare -F mail_apply_webmail_lo_guard >/dev/null 2>&1 && [[ -f "${FIREWALL_ADDON_PORTS_DIR:-}/mail.ports" ]]; then
+    mail_apply_webmail_lo_guard || true
+  fi
   if [[ "$state" == "enabled" ]]; then
     firewall_kill_blocked_connections || true
   fi
@@ -7253,6 +7542,226 @@ app_directory() {
   # the app being tied to any website.
   local user="$1" name="$2"
   printf '%s/%s/apps/%s' "$HOME_ROOT" "$user" "$name"
+}
+
+laravel_worker_unit_base() {
+  local user="$1" site_root="$2" root_target site_hash
+  require_linux_user "$user"
+  root_target=$(require_managed_path "$site_root" "$user")
+  site_hash=$(printf '%s' "$root_target" | sha256sum | awk '{print substr($1, 1, 12)}')
+  printf 'spanel-laravel-%s-%s' "$user" "$site_hash"
+}
+
+verify_laravel_app_artisan() {
+  local user="$1" expected_uid="$2" root_target="$3" app_target="$4"
+  python3 - "$HOME_ROOT" "$user" "$expected_uid" "$root_target" "$app_target" <<'PY'
+import os
+import stat
+import sys
+
+home_root, user, expected_uid_raw, root_target, app_target = sys.argv[1:6]
+expected_uid = int(expected_uid_raw)
+base = os.path.normpath(os.path.join(home_root, user))
+root = os.path.normpath(root_target)
+app = os.path.normpath(app_target)
+
+if os.path.dirname(root) not in (base, os.path.join(base, "apps")):
+    raise SystemExit("invalid site root")
+if app != root and not app.startswith(root + os.sep):
+    raise SystemExit("laravel app directory outside site root")
+
+rel = os.path.relpath(app, base)
+if rel.startswith("..") or rel == ".":
+    raise SystemExit("laravel app directory outside user home")
+
+parts = [p for p in rel.split(os.sep) if p]
+base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+cur_fd = base_fd
+try:
+    for part in parts:
+        nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=cur_fd)
+        if cur_fd != base_fd:
+            os.close(cur_fd)
+        cur_fd = nxt
+    st = os.lstat("artisan", dir_fd=cur_fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise SystemExit("artisan must be a regular file (symlinks refused)")
+    if st.st_uid != expected_uid:
+        raise SystemExit(f"artisan is not owned by {user} (uid={st.st_uid})")
+except FileNotFoundError:
+    raise SystemExit(f"artisan not found in {app}")
+finally:
+    try:
+        if cur_fd != base_fd:
+            os.close(cur_fd)
+    finally:
+        os.close(base_fd)
+PY
+}
+
+delete_laravel_worker_units() {
+  local user="$1" site_root="$2" base unit_file i
+  base="$(laravel_worker_unit_base "$user" "$site_root")" || return 0
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}@.service"
+  for i in 1 2 3 4 5 6 7 8; do
+    systemctl disable --now "${base}@${i}.service" >/dev/null 2>&1 || true
+  done
+  if [[ -f "$unit_file" ]]; then
+    rm -f -- "$unit_file"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+delete_laravel_worker_units_for_user() {
+  local user="$1" unit_file unit_base i removed=0
+  require_linux_user "$user"
+  shopt -s nullglob
+  for unit_file in "${SYSTEMD_UNIT_DIR}/spanel-laravel-${user}-"*@.service; do
+    [[ -f "$unit_file" ]] || continue
+    unit_base="$(basename "$unit_file" "@.service")"
+    for i in 1 2 3 4 5 6 7 8; do
+      systemctl disable --now "${unit_base}@${i}.service" >/dev/null 2>&1 || true
+    done
+    rm -f -- "$unit_file"
+    removed=1
+  done
+  shopt -u nullglob
+  if (( removed == 1 )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+sync_laravel_worker_unit() {
+  local user="$1" site_root="$2" app_dir="$3" php_ver="$4"
+  local workers="$5" queue_name="$6" tries="$7" timeout_sec="$8" memory_mb="$9" enabled_flag="${10}"
+  local uid root_target app_target php_bin base unit_file tmp_file open_basedir mem_cap i
+
+  require_linux_user "$user"
+  uid="$(id -u "$user" 2>/dev/null)" || deny "panel Linux user does not exist: $user"
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 1000 ]] || deny "refusing privileged uid for laravel worker: $uid"
+  root_target="$(require_managed_path "$site_root" "$user")"
+  app_target="$(require_bound_managed_path "$user" "$root_target" "$app_dir")"
+  require_php_version "$php_ver"
+  [[ "$workers" =~ ^[1-8]$ ]] || deny "invalid worker count: $workers"
+  [[ "$queue_name" =~ ^[A-Za-z0-9_,-]{1,120}$ ]] || deny "invalid queue name: $queue_name"
+  [[ "$tries" =~ ^([1-9]|10)$ ]] || deny "invalid tries count: $tries"
+  [[ "$timeout_sec" =~ ^[0-9]{2,4}$ ]] && (( 10#$timeout_sec >= 15 && 10#$timeout_sec <= 3600 )) \
+    || deny "invalid worker timeout: $timeout_sec"
+  [[ "$memory_mb" =~ ^[0-9]{2,4}$ ]] && (( 10#$memory_mb >= 64 && 10#$memory_mb <= 1024 )) \
+    || deny "invalid worker memory limit: $memory_mb"
+  [[ "$enabled_flag" == "0" || "$enabled_flag" == "1" ]] || deny "invalid enabled flag: $enabled_flag"
+
+  if [[ "$enabled_flag" == "0" ]]; then
+    delete_laravel_worker_units "$user" "$root_target"
+    echo "status=stopped"
+    echo "active_workers=0"
+    return 0
+  fi
+
+  php_bin="$(command -v "php${php_ver}" || true)"
+  [[ -n "$php_bin" ]] || deny "PHP CLI is not installed: php${php_ver}"
+  verify_laravel_app_artisan "$user" "$uid" "$root_target" "$app_target"
+
+  install -d -o "$user" -g "$user" -m 0700 "/var/lib/php/sessions/${user}" "/var/lib/php/uploads/${user}"
+  install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
+
+  open_basedir="$(site_open_basedir "$user"):/usr/local/bin:/usr/share/composer:/run/mysqld:/var/run/mysqld:/etc/ssl/certs:/usr/share/ca-certificates:/dev"
+  base="$(laravel_worker_unit_base "$user" "$root_target")"
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}@.service"
+  tmp_file="${unit_file}.spanel-tmp-$$"
+  mem_cap=$(( 10#$memory_mb + 64 ))
+
+  cat >"$tmp_file" <<UNIT
+[Unit]
+Description=SPanel Laravel Queue Worker (%i) for ${user} (${root_target})
+After=network.target mariadb.service redis-server.service
+
+[Service]
+Type=simple
+User=${user}
+Group=${user}
+Slice=user-${uid}.slice
+WorkingDirectory=${app_target}
+UMask=0027
+Environment=HOME=${HOME_ROOT}/${user}
+Environment=APP_RUNNING_IN_CONSOLE=true
+ExecStart=${php_bin} -d open_basedir=${open_basedir} ${app_target}/artisan queue:work --queue=${queue_name} --tries=${tries} --timeout=${timeout_sec} --memory=${memory_mb} --sleep=3 --no-interaction
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+MemoryAccounting=yes
+MemoryMax=${mem_cap}M
+TasksMax=64
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${app_target} /var/lib/php/sessions/${user} /var/lib/php/uploads/${user}
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${base}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chown root:root "$tmp_file"
+  chmod 0644 "$tmp_file"
+  mv -f -- "$tmp_file" "$unit_file"
+
+  systemctl daemon-reload
+  for (( i = 1; i <= 10#$workers; i++ )); do
+    systemctl enable "${base}@${i}.service" >/dev/null 2>&1 || true
+    systemctl restart "${base}@${i}.service"
+  done
+  for (( i = 10#$workers + 1; i <= 8; i++ )); do
+    systemctl disable --now "${base}@${i}.service" >/dev/null 2>&1 || true
+  done
+
+  echo "status=running"
+  echo "unit=${base}@.service"
+  echo "active_workers=${workers}"
+}
+
+status_laravel_worker_unit() {
+  local user="$1" site_root="$2" base unit_file i
+  local unit_present=0 enabled_count=0 active_count=0 failed_count=0 state="inactive"
+  base="$(laravel_worker_unit_base "$user" "$site_root")"
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}@.service"
+  if [[ -f "$unit_file" ]]; then
+    unit_present=1
+    for i in 1 2 3 4 5 6 7 8; do
+      if systemctl is-enabled --quiet "${base}@${i}.service" 2>/dev/null; then
+        enabled_count=$((enabled_count + 1))
+      fi
+      if systemctl is-active --quiet "${base}@${i}.service" 2>/dev/null; then
+        active_count=$((active_count + 1))
+      elif systemctl is-failed --quiet "${base}@${i}.service" 2>/dev/null; then
+        failed_count=$((failed_count + 1))
+      fi
+    done
+    if (( active_count > 0 && failed_count == 0 )); then
+      state="active"
+    elif (( active_count > 0 && failed_count > 0 )); then
+      state="degraded"
+    elif (( failed_count > 0 )); then
+      state="failed"
+    elif (( enabled_count > 0 )); then
+      state="starting"
+    fi
+  fi
+  echo "unit_present=${unit_present}"
+  echo "enabled=$(( enabled_count > 0 || active_count > 0 ? 1 : 0 ))"
+  echo "configured_workers=${enabled_count}"
+  echo "active_workers=${active_count}"
+  echo "failed_workers=${failed_count}"
+  echo "state=${state}"
 }
 
 ipv6_available() {
@@ -8452,6 +8961,7 @@ delete_panel_user_runtime() {
     rmdir -- "$(dirname "$user_fpm_dir")" 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || true
   done
+  delete_laravel_worker_units_for_user "$user"
   crontab -r -u "$user" 2>/dev/null || true
   rm -f "/etc/cron.d/spanel-user-${user}" 2>/dev/null || true
   local old_uid
@@ -9521,7 +10031,26 @@ QUOTA_HOME="/home"
 FSTAB_FILE="/etc/fstab"
 
 quota_mount_field() {
-  findmnt -no "$1" -T "$QUOTA_HOME" 2>/dev/null | head -n1 | tr -d '[:space:]' || true
+  # spanel-api.service's ReadWritePaths=/home creates a bind mount at /home
+  # inside the service's mount namespace (SOURCE=/dev/...[/home], TARGET=/home)
+  # when /home is a directory on the / filesystem. Resolve back to / only when
+  # findmnt reports a bind-mount subpath on the exact same block device
+  # (matching MAJ:MIN) as /.
+  local target="$QUOTA_HOME" mp src home_majmin root_majmin
+  mp="$(findmnt -no TARGET -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+  src="$(findmnt -no SOURCE -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+  if [[ -n "$mp" && "$mp" != "/" && "$src" == *"["*"]" ]]; then
+    home_majmin="$(findmnt -no MAJ:MIN -T "$target" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    root_majmin="$(findmnt -no MAJ:MIN -T / 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    if [[ -n "$home_majmin" && "$home_majmin" == "$root_majmin" ]]; then
+      if [[ "$1" == "TARGET" ]]; then
+        echo "/"
+        return 0
+      fi
+      target="/"
+    fi
+  fi
+  findmnt -no "$1" -T "$target" 2>/dev/null | head -n1 | sed 's/\[.*\]$//' | tr -d '[:space:]' || true
 }
 
 # Whether a mount option string turns user quota on.
@@ -9594,7 +10123,7 @@ quota_state() {
 }
 
 quota_status() {
-  local mp fstype device options active=no fstab=no on=no tools=no state hint=""
+  local mp fstype device options active=no fstab=no on=no tools=no state hint="" qon_out=""
   mp="$(quota_mount_field TARGET)"
   fstype="$(quota_mount_field FSTYPE)"
   device="$(quota_mount_field SOURCE)"
@@ -9605,7 +10134,14 @@ quota_status() {
   fi
   command -v setquota >/dev/null 2>&1 && tools=yes
   if [[ "$tools" == yes && "$active" == yes && "$fstype" == ext4 ]]; then
-    [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" == *" is on"* ]] && on=yes
+    if [[ "$(type -t quotaon)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+      qon_out="$(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no -- quotaon -pu "$mp" 2>/dev/null || true)"
+    elif [[ "$(type -t quotaon)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+      qon_out="$(nsenter -t 1 -m -- quotaon -pu "$mp" 2>/dev/null || true)"
+    else
+      qon_out="$(quotaon -pu "$mp" 2>/dev/null || true)"
+    fi
+    [[ "$qon_out" == *" is on"* ]] && on=yes
   fi
   state="$(quota_state "$fstype" "$mp" "$active" "$fstab" "$on")"
   case "$state" in
@@ -9635,13 +10171,24 @@ quota_enable() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y quota >/dev/null || deny "apt-get could not install the quota tools"
   fi
+  # spanel-api.service runs with PrivateDevices=true and ProtectKernelModules=true,
+  # which attaches a cgroup BPF device filter (DevicePolicy=closed) and hides
+  # /dev/disk inside the service namespace. Run host-level verification and quota
+  # commands in a transient unit outside the restricted cgroup when available.
+  local -a host_run=()
+  if [[ "$(type -t findmnt)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+    host_run=(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no --)
+  elif [[ "$(type -t findmnt)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+    host_run=(nsenter -t 1 -m --)
+  fi
   if ! quota_options_active "$options"; then
     if [[ "$fstype" == xfs && "$mp" == / ]]; then
       quota_status
       return 0
     fi
     if ! quota_options_active "$(fstab_quota_options "$FSTAB_FILE" "$mp")"; then
-      tmp="$(mktemp)"
+      tmp="$(mktemp "${FSTAB_FILE}.spanel.XXXXXX")"
+      cp -p -- "$FSTAB_FILE" "$tmp" 2>/dev/null || true
       local rc=0
       fstab_with_quota_options "$FSTAB_FILE" "$mp" "$fstype" >"$tmp" || rc=$?
       if (( rc != 0 )); then
@@ -9649,16 +10196,34 @@ quota_enable() {
         (( rc == 2 )) && deny "${mp} has no entry in ${FSTAB_FILE}; add the quota options by hand"
         deny "could not prepare ${FSTAB_FILE}"
       fi
-      # Refuse anything findmnt cannot parse: a broken fstab is a server that
-      # does not boot.
-      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]] && ! findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
-        rm -f -- "$tmp"
-        deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+      # Refuse anything findmnt --verify cannot parse: a broken fstab is a
+      # server that does not boot. mount -fav is kept as a warning when
+      # findmnt --verify succeeded so unrelated pre-existing mount entries do
+      # not block enabling quota on /.
+      local findmnt_verified=0
+      if [[ "$(findmnt --help 2>&1 || true)" == *--verify* ]]; then
+        if ! "${host_run[@]}" findmnt --verify --tab-file "$tmp" >/dev/null 2>&1; then
+          rm -f -- "$tmp"
+          deny "the edited ${FSTAB_FILE} did not verify; nothing was changed"
+        fi
+        findmnt_verified=1
+      fi
+      if ! "${host_run[@]}" mount -fav --fstab "$tmp" >/dev/null 2>&1; then
+        if (( findmnt_verified == 1 )); then
+          logger -t spanel-helper -- "warning: edited ${FSTAB_FILE} reported warnings during mount -fav check; proceeding because findmnt --verify succeeded" 2>/dev/null || true
+        else
+          rm -f -- "$tmp"
+          deny "the edited ${FSTAB_FILE} failed mount -fav check; nothing was changed"
+        fi
       fi
       backup="${FSTAB_FILE}.spanel-$(date +%Y%m%d%H%M%S)"
       cp -p -- "$FSTAB_FILE" "$backup"
-      cat "$tmp" >"$FSTAB_FILE"
-      rm -f -- "$tmp"
+      sync "$tmp" 2>/dev/null || true
+      if ! mv -f -- "$tmp" "$FSTAB_FILE"; then
+        rm -f -- "$tmp"
+        cp -p -- "$backup" "$FSTAB_FILE" 2>/dev/null || true
+        deny "could not atomically replace ${FSTAB_FILE}"
+      fi
       systemctl daemon-reload >/dev/null 2>&1 || true
       logger -t spanel-helper -- "quota: added user quota options for ${mp} to ${FSTAB_FILE} (backup ${backup})" 2>/dev/null || true
       echo "backup=${backup}"
@@ -9669,11 +10234,14 @@ quota_enable() {
   if [[ "$fstype" == ext4 ]]; then
     # Journaled quota: build the quota file once, then switch it on. -m keeps
     # the filesystem mounted read-write while it is counted.
-    if [[ ! -f "${mp%/}/aquota.user" ]]; then
-      quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
+    if [[ ! -s "${mp%/}/aquota.user" ]]; then
+      "${host_run[@]}" quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
     fi
-    if [[ "$(quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
-      quotaon -u "$mp" || deny "quotaon failed on ${mp} (is the quota_v2 kernel module available? linux-modules-extra-$(uname -r))"
+    if [[ "$("${host_run[@]}" quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
+      if ! "${host_run[@]}" quotaon -u "$mp" 2>/dev/null; then
+        "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
+        "${host_run[@]}" quotaon -u "$mp" || deny "quotaon failed on ${mp}; install linux-modules-extra-$(uname -r) so the quota_v2 kernel module is available"
+      fi
     fi
   fi
   quota_status
@@ -9702,8 +10270,14 @@ apply_kernel_quota() {
   mp="$(quota_mount_field TARGET)"
   [[ -n "$mp" ]] || return 0
   limits="$(quota_limits "$2" "$3")"
+  local -a host_run=()
+  if [[ "$(type -t setquota)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+    host_run=(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no --)
+  elif [[ "$(type -t setquota)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
+    host_run=(nsenter -t 1 -m --)
+  fi
   # shellcheck disable=SC2086 # four numbers, split on purpose
-  setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
+  "${host_run[@]}" setquota -u "$user" $limits "$mp" >/dev/null 2>&1 || \
     echo "warning: setquota failed for ${user} on ${mp}" >&2
 }
 
@@ -10179,6 +10753,11 @@ case "$cmd" in
     mail_reconfigure
     ;;
 
+  mail-webmail-lo-guard)
+    [[ $# -eq 0 ]] || deny "usage: mail-webmail-lo-guard"
+    mail_apply_webmail_lo_guard
+    ;;
+
   mail-dkim)
     [[ $# -ge 1 && $# -le 2 ]] || deny "usage: mail-dkim <domain> [selector]"
     mail_dkim "$1" "${2:-spanel}"
@@ -10237,6 +10816,11 @@ case "$cmd" in
   mail-purge-domain)
     [[ $# -eq 2 ]] || deny "usage: mail-purge-domain <site-user> <domain>"
     mail_purge_domain "$1" "$2"
+    ;;
+
+  mail-move-domain)
+    [[ $# -eq 3 ]] || deny "usage: mail-move-domain <old-user> <new-user> <domain>"
+    mail_move_domain "$1" "$2" "$3"
     ;;
 
   mail-relay-test)
@@ -11127,6 +11711,70 @@ PY
     mv -f -- "$tmp" "$target"
     ;;
 
+  site-file-delete)
+    [[ $# -eq 3 ]] || deny "usage: site-file-delete <site-user> <site-root> <relative-path>"
+    user="$1"; root_arg="$2"; rel_arg="$3"
+    require_linux_user "$user"
+    expected_uid=$(id -u "$user" 2>/dev/null) || deny "panel Linux user does not exist: $user"
+    root_target=$(require_managed_path "$root_arg" "$user")
+    case "$rel_arg" in
+      ""|"/"|/*|*$'\n'*|"."|".."|"./"*|"../"*|*"/."|*"/.."|*"/./"*|*"/../"*) deny "unsafe relative path: $rel_arg" ;;
+    esac
+    python3 - "$HOME_ROOT" "$user" "$expected_uid" "$root_target" "$rel_arg" <<'PY'
+import os
+import stat
+import sys
+
+home_root, user, expected_uid_raw, root_target, rel_arg = sys.argv[1:6]
+expected_uid = int(expected_uid_raw)
+base = os.path.normpath(os.path.join(home_root, user))
+root = os.path.normpath(root_target)
+target = os.path.normpath(os.path.join(root, rel_arg))
+
+if os.path.dirname(root) not in (base, os.path.join(base, "apps")):
+    raise SystemExit("invalid site root")
+if not target.startswith(root + os.sep):
+    raise SystemExit("target outside site root")
+
+rel = os.path.relpath(target, base)
+if rel.startswith("..") or rel == ".":
+    raise SystemExit("target outside site root")
+
+parts = [p for p in rel.split(os.sep) if p]
+if not parts:
+    raise SystemExit("refusing to delete base directory")
+
+def open_child_dir(parent_fd, name):
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+
+base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+parent_fd = base_fd
+try:
+    for part in parts[:-1]:
+        next_fd = open_child_dir(parent_fd, part)
+        if parent_fd != base_fd:
+            os.close(parent_fd)
+        parent_fd = next_fd
+
+    leaf = parts[-1]
+    try:
+        st = os.lstat(leaf, dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    if stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"refusing to delete directory via site-file-delete: {target}")
+    if st.st_uid != expected_uid:
+        raise SystemExit(f"refusing to delete file not owned by {user} (uid={st.st_uid}): {target}")
+    os.unlink(leaf, dir_fd=parent_fd)
+finally:
+    try:
+        if parent_fd != base_fd:
+            os.close(parent_fd)
+    finally:
+        os.close(base_fd)
+PY
+    ;;
+
   site-file-install)
     [[ $# -eq 4 ]] || deny "usage: site-file-install <site-user> <site-root> <relative-path> <staged-path>"
     user="$1"; root_arg="$2"; rel_arg="$3"; staged_arg="$4"
@@ -11666,6 +12314,7 @@ EOF
     user="$1"; path="$2"
     require_linux_user "$user"
     target=$(require_managed_path "$path" "$user")
+    delete_laravel_worker_units "$user" "$target"
     delete_site_php_pools "$user" "$target"
     exec rm -rf "$target"
     ;;
@@ -12018,18 +12667,21 @@ EOF
 
     # Whitelist of allowed commands for terminal access. Keep this in sync with
     # ALLOWED_COMMANDS in backend/app/services/terminal.py.
+    terminal_cli_open_basedir="${terminal_open_basedir}:/usr/local/bin:/usr/share/composer:/run/mysqld:/var/run/mysqld:/etc/ssl/certs:/usr/share/ca-certificates:/dev"
     case "$cmd" in
       php)
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir" "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_cli_open_basedir" "$@"
         ;;
       composer)
         composer_bin="$(command -v composer || true)"
         [[ -n "$composer_bin" ]] || deny "composer not found"
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir:$(dirname "$composer_bin")" "$composer_bin" "$@"
+        composer_real="$(readlink -f "$composer_bin" 2>/dev/null || echo "$composer_bin")"
+        composer_basedir="${terminal_cli_open_basedir}:$(dirname "$composer_bin"):$(dirname "$composer_real")"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "COMPOSER_MEMORY_LIMIT=-1" "COMPOSER_DISABLE_XDEBUG_WARN=1" "COMPOSER_NO_INTERACTION=1" "$php_bin" -d memory_limit=-1 -d error_reporting=8191 -d open_basedir="$composer_basedir" "$composer_bin" "$@"
         ;;
       wp)
         [[ -f /usr/local/bin/wp ]] || deny "wp-cli not found"
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" WP_CLI_PHP_ARGS="-d pcre.jit=0 -d open_basedir=$terminal_open_basedir:/usr/local/bin" "$php_bin" -d pcre.jit=0 -d open_basedir="$terminal_open_basedir:/usr/local/bin" /usr/local/bin/wp "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" WP_CLI_PHP_ARGS="-d pcre.jit=0 -d open_basedir=$terminal_cli_open_basedir" "$php_bin" -d pcre.jit=0 -d open_basedir="$terminal_cli_open_basedir" /usr/local/bin/wp "$@"
         ;;
       phpunit)
         phpunit_bin="$(command -v phpunit || true)"
@@ -12038,7 +12690,7 @@ EOF
           phpunit_bin="$target/vendor/bin/phpunit"
         fi
         [[ -n "$phpunit_bin" ]] || deny "phpunit not found (install it globally or with composer)"
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir:$(dirname "$phpunit_bin")" "$phpunit_bin" "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="${terminal_cli_open_basedir}:$(dirname "$phpunit_bin")" "$phpunit_bin" "$@"
         ;;
       node|npm|npx|yarn|git)
         exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$cmd" "$@"
@@ -12060,7 +12712,7 @@ EOF
         if [[ ! -f artisan ]]; then
           deny "artisan not found in $target (Laravel keeps it in the site root; try 'cd ..' first)"
         fi
-        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_open_basedir" artisan "$@"
+        exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="$terminal_cli_open_basedir" artisan "$@"
         ;;
       *)
         echo "Command not allowed: $cmd" >&2
@@ -12321,6 +12973,30 @@ EOF
     # The app's files stay put; deleting a customer's code is never implied by
     # removing its runtime.
     echo "removed ${unit_name}"
+    ;;
+
+  laravel-worker-sync)
+    [[ $# -eq 10 ]] || deny "usage: laravel-worker-sync <site-user> <site-root> <app-dir> <php-version> <workers> <queue> <tries> <timeout> <memory> <0|1>"
+    sync_laravel_worker_unit "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"
+    ;;
+
+  laravel-worker-status)
+    [[ $# -eq 2 ]] || deny "usage: laravel-worker-status <site-user> <site-root>"
+    status_laravel_worker_unit "$1" "$2"
+    ;;
+
+  laravel-worker-logs)
+    [[ $# -eq 2 || $# -eq 3 ]] || deny "usage: laravel-worker-logs <site-user> <site-root> [lines]"
+    user="$1"; root_arg="$2"; log_lines="${3:-150}"
+    [[ "$log_lines" =~ ^[0-9]{1,4}$ ]] || deny "invalid line count: $log_lines"
+    unit_base="$(laravel_worker_unit_base "$user" "$root_arg")"
+    exec journalctl -u "${unit_base}@*.service" -n "$log_lines" --no-pager --output short-iso
+    ;;
+
+  laravel-worker-delete)
+    [[ $# -eq 2 ]] || deny "usage: laravel-worker-delete <site-user> <site-root>"
+    delete_laravel_worker_units "$1" "$2"
+    echo "status=deleted"
     ;;
 
   site-app-install-deps)
