@@ -2019,6 +2019,157 @@ def test_installer_and_updater_composer_never_prompts_as_superuser():
         assert "--version --no-interaction </dev/null" in text, f"Missing non-interactive stdin guard in {rel}"
 
 
+def test_local_mariadb_db_host_localhost_and_migrate_auto_heal(tmp_path):
+    # 1. Default .env uses DB_HOST=localhost (required by SPanel skip_name_resolve=1) and escapes $
+    rendered = lm._render_default_env(
+        app_name="SHost App",
+        app_url="https://shost.com.vn",
+        db_name="lv_shost_com_vn_a1",
+        db_user="u_lv_shost_a1",
+        db_password='p@ss$var"quote\\1',
+    )
+    assert "\nDB_HOST=localhost\n" in rendered
+    assert "\nDB_PORT=3306\n" in rendered
+    parsed = lm._parse_env_details(rendered)
+    assert parsed["db_host"] == "localhost"
+    assert parsed["db_password"] == 'p@ss$var"quote\\1'
+
+    # 2. _short_cmd_err surfaces SQLSTATE / exception line instead of Collision vendor frame tail
+    collision_err = (
+        "\n   Illuminate\\Database\\QueryException\n\n"
+        "  SQLSTATE[HY000] [1045] Access denied for user 'u_lv_shost'@'127.0.0.1' (using password: YES)\n\n"
+        "  at vendor/laravel/framework/src/Illuminate/Database/Connection.php:838\n"
+        "    834▕                     $this->getName(), $query, $this->prepareBindings($bindings), $e\n"
+        "    842▕                 $e,\n"
+        "      +39 vendor frames\n"
+        "  40  artisan:16\n"
+        "      Illuminate\\Foundation\\Application::handleCommand()\n"
+    )
+    short_err = lm._short_cmd_err(collision_err)
+    assert "SQLSTATE[HY000] [1045]" in short_err
+    assert "842▕" not in short_err
+
+    # 3. Existing instance deployed with legacy DB_HOST=127.0.0.1 auto-heals to localhost on migrate
+    site_root = tmp_path / "home" / "shostc" / "shost.com.vn"
+    app_dir = site_root / "public_html"
+    (app_dir / "bootstrap" / "cache").mkdir(parents=True)
+    (app_dir / "artisan").write_text("#!/usr/bin/env php\n<?php\n", encoding="utf-8")
+    stale_cfg = app_dir / "bootstrap" / "cache" / "config.php"
+    stale_cfg.write_text("<?php return ['database' => ['host' => '127.0.0.1']];\n", encoding="utf-8")
+    env_file = app_dir / ".env"
+    env_file.write_text(
+        'APP_NAME="shost.com.vn App"\n'
+        "APP_ENV=production\n"
+        f"APP_KEY={lm._generate_laravel_app_key()}\n"
+        "DB_CONNECTION=mysql\n"
+        "DB_HOST=127.0.0.1\n"
+        "DB_PORT=3306\n"
+        "DB_DATABASE=lv_shost_com_vn_a1\n"
+        "DB_USERNAME=u_lv_shost_a1\n"
+        'DB_PASSWORD="secret"\n',
+        encoding="utf-8",
+    )
+
+    site = SimpleNamespace(
+        id=1,
+        owner_id=2,
+        domain="shost.com.vn",
+        root_path=str(site_root),
+        document_root="public_html/public",
+        linux_user="shostc",
+        php_version="8.5",
+        app_type="php",
+        app_id=None,
+        ssl_enabled=True,
+        waf_enabled=True,
+        nginx_rewrite_mode="laravel",
+        nginx_custom="",
+        created_at=None,
+    )
+    user = SimpleNamespace(id=2, username="shostc", role="end_user")
+    local_db_acc = SimpleNamespace(
+        id=9,
+        owner_id=2,
+        website_id=1,
+        db_name="lv_shost_com_vn_a1",
+        db_user="u_lv_shost_a1",
+        db_host_id=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = local_db_acc
+    state_holder = {"instances": {"1": {"installed": True}}}
+
+    seen_hosts: List[str] = []
+
+    def _sim_migrate(linux_user, target_dir, cmd_args, **kwargs):
+        cur_env = (target_dir / ".env").read_text(encoding="utf-8")
+        cur_host = lm._parse_env_details(cur_env)["db_host"]
+        seen_hosts.append(cur_host)
+        if cur_host == "127.0.0.1" or (target_dir / "bootstrap" / "cache" / "config.php").exists():
+            return 1, collision_err
+        return 0, "INFO  Running migrations.\n  0001_01_01_000000_create_users_table .... DONE"
+
+    def _fake_del(lu, sr, ad, rel, *, strict=False):
+        p = ad / rel
+        if p.exists():
+            p.unlink()
+        return True
+
+    with patch.object(lm.settings, "command_dry_run", False), \
+            patch.object(lm, "_get_accessible_website", return_value=site), \
+            patch.object(lm, "_load_toolkit_state", side_effect=lambda: state_holder), \
+            patch.object(lm, "_save_toolkit_state"), \
+            patch.object(lm, "_build_instance_summary", return_value={"id": 1}), \
+            patch.object(
+                lm,
+                "_read_app_file",
+                side_effect=lambda ad, rel, **kw: (ad / rel).read_text(encoding="utf-8")
+                if (ad / rel).exists()
+                else "",
+            ), \
+            patch.object(
+                lm,
+                "_write_app_file",
+                side_effect=lambda lu, sr, ad, rel, content, mode="0640": (ad / rel).write_text(
+                    content, encoding="utf-8"
+                ),
+            ), \
+            patch.object(lm, "_delete_app_file", side_effect=_fake_del), \
+            patch.object(lm, "_app_path_exists", return_value=False), \
+            patch.object(lm, "_run_as_site_user", side_effect=_sim_migrate):
+        res = lm.run_artisan_command(
+            1,
+            lm.LaravelArtisanPayload(command="migrate"),
+            db=db,
+            current_user=user,
+        )
+
+    assert "thành công" in res["message"]
+    assert seen_hosts == ["localhost"]
+    assert "DB_HOST=localhost" in env_file.read_text(encoding="utf-8")
+    assert not stale_cfg.exists()
+
+
+def test_view_switcher_buttons_match_wordpress_and_laravel_managers():
+    lv_text = (REPO_ROOT / "frontend" / "src" / "pages" / "LaravelManager.jsx").read_text(
+        encoding="utf-8"
+    )
+    wp_text = (REPO_ROOT / "frontend" / "src" / "pages" / "WordPressManager.jsx").read_text(
+        encoding="utf-8"
+    )
+    assert "List," in lv_text
+    assert "{ id: 'expanded', title: 'Card View', icon: Server }" in lv_text
+    assert "{ id: 'cards', title: 'Grid View', icon: LayoutGrid }" in lv_text
+    assert "{ id: 'list', title: 'List View', icon: List }" in lv_text
+    assert "Thẻ &amp; Toolkit" not in lv_text
+    assert "Chi tiết 5 Tab" not in lv_text
+    assert "Dạng Bảng" not in lv_text
+
+    assert "{ id: 'expanded', title: 'Card View', icon: Server }" in wp_text
+    assert "{ id: 'grid', title: 'Grid View', icon: LayoutGrid }" in wp_text
+    assert "{ id: 'list', title: 'List View', icon: List }" in wp_text
+
+
 def test_python312_eager_annotation_compatibility():
     import inspect
     from typing import get_type_hints
@@ -2050,11 +2201,13 @@ if __name__ == "__main__":
         test_p1_b6_blocks_subpath_occupied_sites_non_empty_dirs_and_cross_app_security,
         test_p2_b_php_version_validation_readonly_get_and_concurrent_state_updates,
         test_asgi_router_contextvar_lifecycle_and_php85_deploy_flow,
+        test_local_mariadb_db_host_localhost_and_migrate_auto_heal,
     ):
         with tempfile.TemporaryDirectory() as _td:
             _fn(Path(_td))
     test_package_website_quota_enforcement_across_application_modules()
     test_frontend_laravel_manager_no_unstable_effect_reload_loop()
     test_installer_and_updater_composer_never_prompts_as_superuser()
+    test_view_switcher_buttons_match_wordpress_and_laravel_managers()
     test_python312_eager_annotation_compatibility()
     print("ALL LARAVEL MANAGER TESTS PASSED")

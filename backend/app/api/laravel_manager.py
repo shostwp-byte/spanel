@@ -636,7 +636,30 @@ def _short_cmd_err(output: str, fallback: str = "Lệnh thực thi trả về m�
     if not cleaned:
         return fallback
     lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
-    tail = " | ".join(lines[-4:]) if lines else cleaned
+    if not lines:
+        return cleaned[-420:]
+    # Prefer high-signal exception/SQLSTATE lines from the top of Laravel Collision / PHP output
+    # rather than slicing only the bottom stack-trace frames (e.g. `842▕ $e, | +39 vendor frames`).
+    priority_markers = (
+        "sqlstate[",
+        "exception",
+        "fatal error",
+        "parse error",
+        "access denied",
+        "could not find driver",
+        "connection refused",
+        "no such file or directory",
+        "permission denied",
+    )
+    top_hits = [
+        ln
+        for ln in lines[:12]
+        if any(m in ln.lower() for m in priority_markers) and "▕" not in ln
+    ]
+    if top_hits:
+        summary = " | ".join(top_hits[:3])
+        return summary[:420]
+    tail = " | ".join(lines[-4:])
     return tail[-420:]
 
 
@@ -780,7 +803,8 @@ def _render_default_env(
     db_name: str,
     db_user: str,
     db_password: str,
-    db_host: str = "127.0.0.1",
+    db_host: str = "localhost",
+    db_port: int = 3306,
     app_env: str = "production",
     app_debug: bool = False,
     app_key: Optional[str] = None,
@@ -790,6 +814,12 @@ def _render_default_env(
 ) -> str:
     key_val = app_key or _generate_laravel_app_key()
     safe_name = (app_name or "Laravel").replace('"', "").replace("\n", " ").strip()
+    safe_db_pw = (
+        (db_password or "")
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+    )
     debug_str = "true" if app_debug else "false"
     return (
         f'APP_NAME="{safe_name}"\n'
@@ -805,10 +835,10 @@ def _render_default_env(
         f"LOG_LEVEL=debug\n\n"
         f"DB_CONNECTION=mysql\n"
         f"DB_HOST={db_host}\n"
-        f"DB_PORT=3306\n"
+        f"DB_PORT={int(db_port or 3306)}\n"
         f"DB_DATABASE={db_name}\n"
         f"DB_USERNAME={db_user}\n"
-        f'DB_PASSWORD="{db_password}"\n\n'
+        f'DB_PASSWORD="{safe_db_pw}"\n\n'
         f"SESSION_DRIVER={session_driver}\n"
         f"SESSION_LIFETIME=120\n"
         f"SESSION_ENCRYPT=false\n"
@@ -849,9 +879,14 @@ def _parse_env_details(env_text: str) -> Dict[str, Any]:
             k, v = line.split("=", 1)
             key = k.strip()
             val = v.strip()
-            if (val.startswith('"') and val.endswith('"')) or (
-                val.startswith("'") and val.endswith("'")
-            ):
+            if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+                val = (
+                    val[1:-1]
+                    .replace('\\"', '"')
+                    .replace("\\$", "$")
+                    .replace("\\\\", "\\")
+                )
+            elif val.startswith("'") and val.endswith("'") and len(val) >= 2:
                 val = val[1:-1]
             elif " #" in val:
                 val = val.split(" #", 1)[0].strip()
@@ -875,7 +910,7 @@ def _parse_env_details(env_text: str) -> Dict[str, Any]:
         "log_channel": raw_vars.get("LOG_CHANNEL") or "stack",
         "log_level": raw_vars.get("LOG_LEVEL") or "debug",
         "db_connection": raw_vars.get("DB_CONNECTION") or "mysql",
-        "db_host": raw_vars.get("DB_HOST") or "127.0.0.1",
+        "db_host": raw_vars.get("DB_HOST") or "localhost",
         "db_port": raw_vars.get("DB_PORT") or "3306",
         "db_name": raw_vars.get("DB_DATABASE") or "",
         "db_user": raw_vars.get("DB_USERNAME") or "",
@@ -903,8 +938,8 @@ def _format_env_value(val: Any) -> str:
     s = str(val if val is not None else "")
     if any(ch in s for ch in ("\r", "\n", "\x00")):
         raise HTTPException(status_code=400, detail="Invalid control character in .env value")
-    if " " in s or "#" in s or ";" in s or (s and s[0] in ('"', "'")):
-        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    if " " in s or "#" in s or ";" in s or "$" in s or (s and s[0] in ('"', "'")):
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
         return f'"{escaped}"'
     return s
 
@@ -934,6 +969,69 @@ def _update_env_text(env_text: str, updates: Dict[str, Any]) -> str:
         out_lines.append(f"{k}={formatted_val}")
 
     return "\n".join(out_lines).rstrip() + "\n"
+
+
+def _is_local_spanel_mariadb_target(
+    db: Session,
+    site: Website,
+    db_name: str,
+    db_user: str,
+) -> bool:
+    clean_name = (db_name or "").strip()
+    clean_user = (db_user or "").strip()
+    if not clean_name and not clean_user:
+        return False
+    try:
+        if clean_name:
+            acc = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.db_name == clean_name,
+                    DatabaseAccount.owner_id == site.owner_id,
+                )
+                .first()
+            )
+            if acc is not None and getattr(acc, "db_name", None) == clean_name:
+                return getattr(acc, "db_host_id", None) is None
+    except Exception:
+        pass
+    return clean_name.startswith("lv_") or clean_user.startswith("u_lv_")
+
+
+def _heal_local_mariadb_env_if_needed(
+    site: Website,
+    db: Session,
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    *,
+    force_if_loopback: bool = False,
+) -> bool:
+    """Normalize legacy `DB_HOST=127.0.0.1` to `DB_HOST=localhost` for local SPanel MariaDB
+    accounts (`'user'@'localhost'` under `skip_name_resolve = 1`) and drop stale config cache."""
+    env_text = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
+    if not env_text:
+        return False
+    parsed = _parse_env_details(env_text)
+    raw_vars = parsed.get("variables") or {}
+    raw_host = (raw_vars.get("DB_HOST") or "").strip()
+    raw_port = (raw_vars.get("DB_PORT") or "3306").strip()
+    conn = (parsed.get("db_connection") or "mysql").strip().lower()
+    if conn not in {"mysql", "mariadb"} or raw_host != "127.0.0.1" or raw_port != "3306":
+        return False
+    if not force_if_loopback and not _is_local_spanel_mariadb_target(
+        db,
+        site,
+        parsed.get("db_name") or "",
+        parsed.get("db_user") or "",
+    ):
+        return False
+    healed_env = _update_env_text(env_text, {"DB_HOST": "localhost"})
+    _write_app_file(linux_user, site_root, app_dir, ".env", healed_env, "0640")
+    _delete_app_file(
+        linux_user, site_root, app_dir, "bootstrap/cache/config.php", strict=False
+    )
+    return True
 
 
 # ── Composer Metadata Detection ──────────────────────────────────────────────
@@ -2168,10 +2266,14 @@ def install_laravel_instance(
                 status_code=403,
                 detail="Provided database password does not match the database account.",
             )
+        remote_host = getattr(existing_check, "db_host", None)
+        has_remote_host = remote_host is not None and bool(getattr(remote_host, "host", None))
         db_info = {
             "db_name": existing_check.db_name,
             "db_user": existing_check.db_user,
             "db_password": stored_db_pass,
+            "db_host": str(remote_host.host).strip() if has_remote_host else "localhost",
+            "db_port": int(remote_host.port or 3306) if has_remote_host else 3306,
         }
         prev_existing_db_website_id = existing_check.website_id
         existing_check.website_id = site.id
@@ -2179,7 +2281,9 @@ def install_laravel_instance(
     else:
         seed = f"{site.domain}_{secrets.token_hex(2)}"
         try:
-            db_info = mariadb.create_database(seed, prefix="lv")
+            db_info = dict(mariadb.create_database(seed, prefix="lv"))
+            db_info.setdefault("db_host", "localhost")
+            db_info.setdefault("db_port", 3306)
         except Exception as exc:
             db.rollback()
             raise HTTPException(
@@ -2393,6 +2497,8 @@ def install_laravel_instance(
         db_name=db_info["db_name"],
         db_user=db_info["db_user"],
         db_password=db_info["db_password"],
+        db_host=str(db_info.get("db_host") or "localhost"),
+        db_port=int(db_info.get("db_port") or 3306),
         app_env="production",
         app_debug=False,
         app_key=generated_key,
@@ -2592,6 +2698,9 @@ def run_artisan_command(
             updated_env = _update_env_text(env_text, {"APP_KEY": _generate_laravel_app_key()})
             _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
 
+    elif cmd_key not in {"down", "up", "storage:link"}:
+        _heal_local_mariadb_env_if_needed(site, db, linux_user, site_root, app_dir)
+
     rc, out = _run_as_site_user(
         linux_user,
         app_dir,
@@ -2599,6 +2708,30 @@ def run_artisan_command(
         php_version=php_ver,
         timeout=180,
     )
+    if (
+        rc != 0
+        and cmd_key != "up"
+        and "access denied for user" in (out or "").lower()
+        and "@'127.0.0.1'" in (out or "").lower()
+    ):
+        _heal_local_mariadb_env_if_needed(
+            site,
+            db,
+            linux_user,
+            site_root,
+            app_dir,
+            force_if_loopback=True,
+        )
+        _delete_app_file(
+            linux_user, site_root, app_dir, "bootstrap/cache/config.php", strict=False
+        )
+        rc, out = _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["artisan", *art_args],
+            php_version=php_ver,
+            timeout=180,
+        )
     cmd_display = f"{Path(php_cli).name} artisan {' '.join(art_args)}"
 
     if cmd_key == "up":
@@ -2714,6 +2847,8 @@ def manage_queue_worker(
         q_cfg["memory"] = payload.memory
 
     action = (payload.action or "toggle").strip().lower()
+    if action in {"retry_failed", "retry_all", "flush_failed"}:
+        _heal_local_mariadb_env_if_needed(site, db, linux_user, site_root, app_dir)
     if action in {"retry_failed", "retry_all"}:
         rc, out = _run_as_site_user(
             linux_user,
@@ -2807,6 +2942,8 @@ def manage_queue_worker(
     else:
         raise HTTPException(status_code=400, detail=f"Hành động Queue không hợp lệ: {action}")
 
+    if q_cfg["enabled"]:
+        _heal_local_mariadb_env_if_needed(site, db, linux_user, site_root, app_dir)
     sync_res = _sync_laravel_worker_unit(
         linux_user, site_root, app_dir, php_ver, q_cfg, strict=True
     )
@@ -3028,6 +3165,15 @@ def update_laravel_env(
             db_user=saved_snapshot.get("db_user") or "",
             db_password="",
         )
+        if str(updates.get("DB_HOST") or "").strip() == "127.0.0.1":
+            cur_parsed = _parse_env_details(base_env)
+            eff_port = str(updates.get("DB_PORT") or cur_parsed.get("db_port") or "3306").strip()
+            eff_name = str(updates.get("DB_DATABASE") or cur_parsed.get("db_name") or "").strip()
+            eff_user = str(updates.get("DB_USERNAME") or cur_parsed.get("db_user") or "").strip()
+            if eff_port == "3306" and _is_local_spanel_mariadb_target(
+                db, site, eff_name, eff_user
+            ):
+                updates["DB_HOST"] = "localhost"
         new_env_text = _update_env_text(base_env, updates)
 
     _write_app_file(linux_user, site_root, app_dir, ".env", new_env_text, "0640")

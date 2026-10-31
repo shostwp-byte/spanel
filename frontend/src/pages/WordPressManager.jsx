@@ -1361,9 +1361,9 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
             }}
           >
             {[
-              { id: 'expanded', title: 'Plesk Detailed Card View', icon: Server },
-              { id: 'grid', title: 'Compact 2-Column Card Grid', icon: LayoutGrid },
-              { id: 'list', title: 'Compact Table List View', icon: List },
+              { id: 'expanded', title: 'Card View', icon: Server },
+              { id: 'grid', title: 'Grid View', icon: LayoutGrid },
+              { id: 'list', title: 'List View', icon: List },
             ].map(v => {
               const VIcon = v.icon;
               const active = viewMode === v.id;
