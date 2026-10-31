@@ -14,12 +14,12 @@ if [[ -n "${SPANEL_VERSION:-}" ]]; then
   archive_url="${SPANEL_GITHUB}/archive/refs/tags/${SPANEL_VERSION}.tar.gz"
 else
   branch="${SPANEL_BRANCH:-main}"
-  echo "==> Installing SPanel (v1.0.7 - branch ${branch}) from ${SPANEL_GITHUB}"
+  echo "==> Installing SPanel (v1.0.8 - branch ${branch}) from ${SPANEL_GITHUB}"
   archive_url="${SPANEL_GITHUB}/archive/refs/heads/${branch}.tar.gz"
 fi
 
 if ! curl -fsSL "$archive_url" -o "$tmp_dir/source.tar.gz" 2>/dev/null; then
-  if ! curl -fsSL "${SPANEL_GITHUB}/archive/refs/heads/1.0.6.tar.gz" -o "$tmp_dir/source.tar.gz" 2>/dev/null; then
+  if ! curl -fsSL "${SPANEL_GITHUB}/archive/refs/heads/1.0.8.tar.gz" -o "$tmp_dir/source.tar.gz" 2>/dev/null; then
     echo "==> Downloading latest HEAD archive from ${SPANEL_GITHUB}"
     curl -fsSL "${SPANEL_GITHUB}/archive/HEAD.tar.gz" -o "$tmp_dir/source.tar.gz"
   fi
