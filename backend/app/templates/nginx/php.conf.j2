@@ -59,9 +59,6 @@ server {
         deny all;
     }
 
-    # SPANEL CUSTOM INCLUDE
-    include {{ custom_include_path }};
-
     location ~ \.php$ {
         try_files $uri =404;
         include fastcgi_params;
@@ -75,6 +72,9 @@ server {
     location ~ /\.ht {
         deny all;
     }
+
+    # SPANEL CUSTOM INCLUDE
+    include {{ custom_include_path }};
 
 {% if rewrite_mode in ["front_controller", "laravel", "codeigniter"] %}
     location / {

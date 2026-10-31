@@ -1140,13 +1140,45 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
 
         assert site.app_type == "php", "Subpath WordPress must not overwrite parent site.app_type"
         assert len(captured_vhost_calls) == 1
-        assert "location ^~ /blog/wp-content/uploads/ { location ~* \\.php$ { deny all; } }" in (site.nginx_custom or "")
+        expected_subpath_rule = (
+            "location ^~ /blog/wp-content/uploads/ "
+            "{ expires 30d; location ~* \\.php$ { deny all; } }"
+        )
+        assert expected_subpath_rule in (site.nginx_custom or "")
+        assert nginx.validate_custom_nginx(site.nginx_custom).strip() == site.nginx_custom.strip()
         assert not (wp_dir / "blog" / "readme.html").exists()
 
-        # Verify custom_include_path appears BEFORE location ~ \.php$ in both php.conf.j2 and wordpress.conf.j2
-        for tpl_name in ("php.conf.j2", "wordpress.conf.j2"):
-            tpl_text = (REPO_ROOT / "backend" / "app" / "templates" / "nginx" / tpl_name).read_text(encoding="utf-8")
-            assert tpl_text.index("# SPANEL CUSTOM INCLUDE") < tpl_text.index("location ~ \\.php$")
+        # Verify upgrading an older v1 ^~ rule (without expires) replaces it cleanly without duplicates
+        site.nginx_custom = "location ^~ /blog/wp-content/uploads/ { location ~* \\.php$ { deny all; } }\n"
+        db.commit()
+        with patch.object(nginx, "rewrite_vhost", side_effect=fake_rewrite_vhost), \
+             patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("write", 0, "", "")):
+            wordpress_manager.apply_wp_security(
+                website_id=site.id,
+                payload=wordpress_manager.WpSecurityActionPayload(
+                    check_ids=["uploads_php_blocked"],
+                    action="secure",
+                ),
+                db=db,
+                current_user=alice,
+            )
+        assert (site.nginx_custom or "").count("location ^~ /blog/wp-content/uploads/") == 1
+        assert expected_subpath_rule in (site.nginx_custom or "")
+
+        # P2-1: Render both real vhost types via nginx.render_vhost and verify custom_include_path is placed AFTER
+        # location ~ \.php$ so custom regex locations cannot shadow FastCGI PHP and leak source code.
+        with patch.object(nginx.site_users, "is_site_root_for_domain", return_value=True):
+            for vhost_app_type in ("php", "wordpress"):
+                rendered_vhost = nginx.render_vhost(
+                    domain="alice.example.com",
+                    root_path=str(site_root),
+                    app_type=vhost_app_type,
+                    php_version="8.4",
+                    custom_directives=site.nginx_custom,
+                )
+                assert rendered_vhost.index("location ~ \\.php$") < rendered_vhost.index(
+                    "include /etc/nginx/spanel/custom/alice.example.com.conf;"
+                )
 
         # Verify write_wp_file_text raises HTTPException(500) when site-file-write fails (P2-14)
         from fastapi import HTTPException
