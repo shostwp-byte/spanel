@@ -61,7 +61,7 @@ class UserPackage(Base):
     # --- DirectAdmin Reseller Limits & Features ---
     bandwidth_limit_mb: Mapped[int] = mapped_column(Integer, default=0)
     inode_limit: Mapped[int] = mapped_column(Integer, default=0)
-    subdomain_limit: Mapped[int] = mapped_column(Integer, default=0)
+    subdomain_limit: Mapped[int] = mapped_column(Integer, default=20)
     email_forwarders_limit: Mapped[int] = mapped_column(Integer, default=0)
     mailing_lists_limit: Mapped[int] = mapped_column(Integer, default=0)
     autoresponders_limit: Mapped[int] = mapped_column(Integer, default=0)

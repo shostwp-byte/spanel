@@ -1140,13 +1140,45 @@ def test_p0_2_uploads_php_blocked_preserves_vhost_and_subpath_app_type(tmp_path)
 
         assert site.app_type == "php", "Subpath WordPress must not overwrite parent site.app_type"
         assert len(captured_vhost_calls) == 1
-        assert "location ^~ /blog/wp-content/uploads/ { location ~* \\.php$ { deny all; } }" in (site.nginx_custom or "")
+        expected_subpath_rule = (
+            "location ^~ /blog/wp-content/uploads/ "
+            "{ expires 30d; location ~* \\.php$ { deny all; } }"
+        )
+        assert expected_subpath_rule in (site.nginx_custom or "")
+        assert nginx.validate_custom_nginx(site.nginx_custom).strip() == site.nginx_custom.strip()
         assert not (wp_dir / "blog" / "readme.html").exists()
 
-        # Verify custom_include_path appears BEFORE location ~ \.php$ in both php.conf.j2 and wordpress.conf.j2
-        for tpl_name in ("php.conf.j2", "wordpress.conf.j2"):
-            tpl_text = (REPO_ROOT / "backend" / "app" / "templates" / "nginx" / tpl_name).read_text(encoding="utf-8")
-            assert tpl_text.index("# SPANEL CUSTOM INCLUDE") < tpl_text.index("location ~ \\.php$")
+        # Verify upgrading an older v1 ^~ rule (without expires) replaces it cleanly without duplicates
+        site.nginx_custom = "location ^~ /blog/wp-content/uploads/ { location ~* \\.php$ { deny all; } }\n"
+        db.commit()
+        with patch.object(nginx, "rewrite_vhost", side_effect=fake_rewrite_vhost), \
+             patch.object(wordpress_live.shell, "privileged", return_value=CommandResult("write", 0, "", "")):
+            wordpress_manager.apply_wp_security(
+                website_id=site.id,
+                payload=wordpress_manager.WpSecurityActionPayload(
+                    check_ids=["uploads_php_blocked"],
+                    action="secure",
+                ),
+                db=db,
+                current_user=alice,
+            )
+        assert (site.nginx_custom or "").count("location ^~ /blog/wp-content/uploads/") == 1
+        assert expected_subpath_rule in (site.nginx_custom or "")
+
+        # P2-1: Render both real vhost types via nginx.render_vhost and verify custom_include_path is placed AFTER
+        # location ~ \.php$ so custom regex locations cannot shadow FastCGI PHP and leak source code.
+        with patch.object(nginx.site_users, "is_site_root_for_domain", return_value=True):
+            for vhost_app_type in ("php", "wordpress"):
+                rendered_vhost = nginx.render_vhost(
+                    domain="alice.example.com",
+                    root_path=str(site_root),
+                    app_type=vhost_app_type,
+                    php_version="8.4",
+                    custom_directives=site.nginx_custom,
+                )
+                assert rendered_vhost.index("location ~ \\.php$") < rendered_vhost.index(
+                    "include /etc/nginx/spanel/custom/alice.example.com.conf;"
+                )
 
         # Verify write_wp_file_text raises HTTPException(500) when site-file-write fails (P2-14)
         from fastapi import HTTPException
@@ -1435,6 +1467,7 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
     mail_move_calls.clear()
     with patch.object(websites.site_users, "move_site_runtime"), \
          patch.object(mail_service, "move_domain_maildirs", side_effect=lambda o, n, d: mail_move_calls.append((o, n, d))), \
+         patch.object(mail_service, "sync"), \
          patch.object(websites, "_ensure_default_waf_file"), \
          patch.object(websites, "_rewrite_website_vhost"), \
          patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: (sftp_ensured.append((owner_u, sub_u, root)) or f"/var/lib/spanel-sftp/{sub_u}")):
@@ -1446,10 +1479,69 @@ def test_p1_4_legacy_admin_owned_resources_warning_and_owner_transfer():
             current_user=admin,
         )
     assert updated.owner_id == end_user.id
+    assert getattr(updated, "transfer_warning", None) is None
     assert updated.linux_user == "alice"
     assert updated.root_path == expected_alice_root
     assert sftp_ensured == [("alice", "sftp_res1_deploy_a1b2c3", expected_alice_root)]
     assert mail_move_calls == [("res1", "alice", "legacy-admin.example.com")]
+
+    # 4b. When post-commit mail.sync fails, transfer still succeeds and surfaces transfer_warning + X-SPanel-Warning + audit log detail
+    from fastapi import Response
+    from app.models.entities import AuditLog
+    from app.schemas.schemas import WebsiteOut
+
+    end_user_b = User(
+        username="bob",
+        email="bob@example.com",
+        hashed_password="x",
+        role="user",
+        is_active=True,
+        website_limit=5,
+        database_limit=5,
+        sftp_accounts_limit=5,
+        mail_accounts_limit=5,
+        storage_limit_mb=1024,
+    )
+    db.add(end_user_b)
+    db.commit()
+    db.refresh(end_user_b)
+
+    warn_resp = Response()
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs"), \
+         patch.object(mail_service, "sync", side_effect=RuntimeError("dovecot reload timeout")), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: f"/var/lib/spanel-sftp/{sub_u}"):
+        warned_site = websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user_b.id),
+            request=None,
+            response=warn_resp,
+            db=db,
+            current_user=admin,
+        )
+    assert warned_site.owner_id == end_user_b.id
+    assert "dovecot reload timeout" in (warned_site.transfer_warning or "")
+    assert "dovecot reload timeout" in WebsiteOut.model_validate(warned_site).transfer_warning
+    assert "dovecot reload timeout" in warn_resp.headers.get("X-SPanel-Warning", "")
+    latest_audit = db.query(AuditLog).order_by(AuditLog.id.desc()).first()
+    assert latest_audit is not None and "warning=" in (latest_audit.detail or "") and "dovecot reload timeout" in latest_audit.detail
+
+    # Transfer back to end_user cleanly so step 5 assertions remain on end_user
+    with patch.object(websites.site_users, "move_site_runtime"), \
+         patch.object(mail_service, "move_domain_maildirs"), \
+         patch.object(mail_service, "sync"), \
+         patch.object(websites, "_ensure_default_waf_file"), \
+         patch.object(websites, "_rewrite_website_vhost"), \
+         patch.object(sftp_accounts, "ensure_account", side_effect=lambda owner_u, sub_u, root: f"/var/lib/spanel-sftp/{sub_u}"):
+        websites.transfer_website_owner(
+            website_id=legacy_site.id,
+            payload=websites.WebsiteTransferOwnerPayload(target_owner_id=end_user.id),
+            request=None,
+            db=db,
+            current_user=admin,
+        )
 
     db.refresh(legacy_db)
     db.refresh(legacy_sftp)

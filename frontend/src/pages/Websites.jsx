@@ -652,10 +652,10 @@ export function WebsitesPage({
     () => (packages || []).find(p => p.id === currentUser?.package_id || (currentUser?.package_name && p.name === currentUser.package_name)),
     [packages, currentUser]
   );
-  const subdomainLimit = Number(currentUser?.subdomain_limit ?? userPkg?.subdomain_limit ?? 0);
-  const websiteLimit = Number(currentUser?.website_limit ?? userPkg?.website_limit ?? 0);
-  const isWebsiteLimitReached = currentUser?.role !== 'admin' && websiteLimit > 0 && rootDomains.length >= websiteLimit;
-  const isSubdomainLimitReached = currentUser?.role !== 'admin' && subdomainLimit > 0 && subdomainSites.length >= subdomainLimit;
+  const subdomainLimit = Number(userPkg?.subdomain_limit ?? currentUser?.subdomain_limit ?? -1);
+  const websiteLimit = Number(userPkg?.website_limit ?? currentUser?.website_limit ?? -1);
+  const isWebsiteLimitReached = currentUser?.role !== 'admin' && websiteLimit >= 0 && rootDomains.length >= websiteLimit;
+  const isSubdomainLimitReached = currentUser?.role !== 'admin' && subdomainLimit >= 0 && subdomainSites.length >= subdomainLimit;
 
   const defaultSite = React.useMemo(() => {
     if (!rootDomains.length) return null;
@@ -1061,7 +1061,7 @@ export function WebsitesPage({
                     {t('Subdomains')}
                   </span>
                   <strong style={{ fontSize: '15px', fontWeight: 700, color: 'var(--text)' }}>
-                    {subdomainSites.length} / {subdomainLimit > 0 ? subdomainLimit : '∞'}
+                    {subdomainSites.length} / {subdomainLimit < 0 ? '∞' : subdomainLimit}
                   </strong>
                 </div>
                 {activeParentDomain && subdomainParentFilter !== 'all' && (
@@ -1748,7 +1748,7 @@ export function WebsitesPage({
                   </button>
                   <button
                     type="button"
-                    disabled={!!loading || !subdomainPrefix.trim() || !subdomainParent}
+                    disabled={!!loading || !subdomainPrefix.trim() || !subdomainParent || isSubdomainLimitReached}
                     onClick={createSubdomain}
                     style={{
                       background: '#16a34a',
@@ -1992,7 +1992,7 @@ export function WebsitesPage({
                   {t('Domains')}
                 </span>
                 <strong style={{ fontSize: '14.5px', fontWeight: 700, color: 'var(--text)' }}>
-                  {rootDomains.length} / {websiteLimit > 0 ? websiteLimit : '∞'}
+                  {rootDomains.length} / {websiteLimit < 0 ? '∞' : websiteLimit}
                 </strong>
               </div>
             </div>

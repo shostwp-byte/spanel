@@ -513,12 +513,22 @@ def _detect_wp_version(
 
 def _subpath_uploads_php_rule(subpath: str) -> str:
     clean_sub = (subpath or "").strip("/")
-    return f"location ^~ /{clean_sub}/wp-content/uploads/ {{ location ~* \\.php$ {{ deny all; }} }}"
+    return (
+        f"location ^~ /{clean_sub}/wp-content/uploads/ "
+        f"{{ expires 30d; location ~* \\.php$ {{ deny all; }} }}"
+    )
+
+
+def _legacy_subpath_uploads_php_rules(subpath: str) -> Tuple[str, ...]:
+    clean_sub = (subpath or "").strip("/")
+    return (
+        f"location ~* ^/{clean_sub}/wp-content/uploads/.*\\.php$ {{ deny all; }}",
+        f"location ^~ /{clean_sub}/wp-content/uploads/ {{ location ~* \\.php$ {{ deny all; }} }}",
+    )
 
 
 def _legacy_subpath_uploads_php_rule(subpath: str) -> str:
-    clean_sub = (subpath or "").strip("/")
-    return f"location ~* ^/{clean_sub}/wp-content/uploads/.*\\.php$ {{ deny all; }}"
+    return _legacy_subpath_uploads_php_rules(subpath)[0]
 
 
 def _vhost_blocks_uploads_php(site: Optional[Website], subpath: str = "") -> bool:
@@ -998,8 +1008,7 @@ def _evaluate_user_app_quota(
     wp_state: Dict[str, Any],
     active_wp_ids: Optional[set] = None,
 ) -> Tuple[Dict[str, Any], set]:
-    from app.api.databases import effective_database_limit
-    from app.api.websites import effective_website_limit
+    from app.services import quota
 
     lv_state = _load_laravel_state_readonly()
     occupied_ids: set = set()
@@ -1007,25 +1016,20 @@ def _evaluate_user_app_quota(
         if _is_website_occupied(w, wp_state, lv_state, active_wp_ids):
             occupied_ids.add(getattr(w, "id", None))
 
-    w_limit = effective_website_limit(user)
+    w_limit = quota.effective_limit(user, "website_limit")
+    s_limit = quota.effective_limit(user, "subdomain_limit")
     if w_limit < 0:
-        s_limit = -1
         max_total_websites = -1
+    elif w_limit == 0:
+        max_total_websites = 0
     else:
-        pkg = getattr(user, "package", None)
-        raw_sub = (
-            getattr(pkg, "subdomain_limit", None)
-            if pkg is not None and getattr(pkg, "subdomain_limit", None) is not None
-            else getattr(user, "subdomain_limit", None)
-        )
-        s_limit = int(0 if raw_sub is None else raw_sub)
-        max_total_websites = -1 if s_limit < 0 else (max(0, w_limit) + max(0, s_limit))
+        max_total_websites = -1 if s_limit < 0 else (w_limit + s_limit)
 
     occupied_count = len(occupied_ids)
     available_websites_count = sum(
         1 for w in (websites or []) if getattr(w, "id", None) not in occupied_ids
     )
-    db_limit = effective_database_limit(user)
+    db_limit = quota.effective_limit(user, "database_limit")
     try:
         raw_db_cnt = db.query(DatabaseAccount).filter(
             DatabaseAccount.owner_id == getattr(user, "id", 0)
@@ -2294,12 +2298,13 @@ def apply_wp_security(
 
                 if subpath_clean:
                     rule_line = _subpath_uploads_php_rule(subpath_clean)
-                    legacy_rule = _legacy_subpath_uploads_php_rule(subpath_clean)
+                    legacy_rules = _legacy_subpath_uploads_php_rules(subpath_clean)
+                    all_known_rules = (rule_line, *legacy_rules)
                     prev_custom = site.nginx_custom or ""
-                    if rule_line not in prev_custom or legacy_rule in prev_custom:
+                    if rule_line not in prev_custom or any(lr in prev_custom for lr in legacy_rules):
                         cleaned_lines = [
                             ln for ln in prev_custom.splitlines()
-                            if ln.strip() not in (rule_line, legacy_rule)
+                            if ln.strip() not in all_known_rules
                         ]
                         cleaned_lines.append(rule_line)
                         next_custom = ("\n".join(cleaned_lines) + "\n").lstrip("\n")
@@ -2356,14 +2361,15 @@ def apply_wp_security(
             subpath_clean = (inst.get("subpath") or "").strip("/")
             if not settings.command_dry_run and subpath_clean:
                 rule_line = _subpath_uploads_php_rule(subpath_clean)
-                legacy_rule = _legacy_subpath_uploads_php_rule(subpath_clean)
+                legacy_rules = _legacy_subpath_uploads_php_rules(subpath_clean)
+                all_known_rules = (rule_line, *legacy_rules)
                 prev_custom = site.nginx_custom or ""
-                if rule_line in prev_custom or legacy_rule in prev_custom:
+                if any(r in prev_custom for r in all_known_rules):
                     from app.api.websites import _rewrite_website_vhost
 
                     kept_lines = [
                         ln for ln in prev_custom.splitlines()
-                        if ln.strip() not in (rule_line, legacy_rule)
+                        if ln.strip() not in all_known_rules
                     ]
                     site.nginx_custom = ("\n".join(kept_lines) + "\n") if kept_lines else ""
                     try:

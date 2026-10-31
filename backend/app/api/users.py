@@ -29,12 +29,15 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 
 def _user_out(user: User, db: Session, *, cached_usage: bool = False) -> dict:
-    from app.api.databases import effective_database_limit
+    from app.services import quota
 
     data = UserOut.model_validate(user).model_dump()
     data["package_name"] = user.package.name if user.package else None
-    data["subdomain_limit"] = int(getattr(user.package, "subdomain_limit", 0) or 0) if user.package else 0
-    data["database_limit"] = effective_database_limit(user)
+    data["website_limit"] = quota.effective_limit(user, "website_limit")
+    data["subdomain_limit"] = quota.effective_limit(user, "subdomain_limit")
+    data["database_limit"] = quota.effective_limit(user, "database_limit")
+    data["sftp_accounts_limit"] = quota.effective_limit(user, "sftp_accounts_limit")
+    data["mail_accounts_limit"] = quota.effective_limit(user, "mail_accounts_limit")
     owner = None
     if user.reseller_id:
         owner = db.query(User).filter(User.id == user.reseller_id).first()
@@ -398,13 +401,16 @@ def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_c
     if current_user.role == Role.reseller:
         query = query.filter(User.reseller_id == current_user.id)
 
-    from app.api.databases import effective_database_limit
+    from app.services import quota
 
     for user in query.order_by(User.id.desc()).all():
         data = UserOut.model_validate(user).model_dump()
         data["package_name"] = user.package.name if user.package else None
-        data["subdomain_limit"] = int(getattr(user.package, "subdomain_limit", 0) or 0) if user.package else 0
-        data["database_limit"] = effective_database_limit(user)
+        data["website_limit"] = quota.effective_limit(user, "website_limit")
+        data["subdomain_limit"] = quota.effective_limit(user, "subdomain_limit")
+        data["database_limit"] = quota.effective_limit(user, "database_limit")
+        data["sftp_accounts_limit"] = quota.effective_limit(user, "sftp_accounts_limit")
+        data["mail_accounts_limit"] = quota.effective_limit(user, "mail_accounts_limit")
         owner = managers.get(user.reseller_id) if user.reseller_id else (
             primary_admin if user.role in (Role.end_user, "user") else None
         )
