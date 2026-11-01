@@ -159,8 +159,21 @@ def _emit(db: Session, event: str, account: ProvisioningAccount, **extra) -> Non
     webhooks.emit_event(db, event, data, subject=account.user)
 
 
-def _provisioning_email(username: str) -> str:
-    return f"{username}@users.spanel.dev"
+def _provisioning_email(payload: ProvisioningAccountCreate) -> str:
+    if payload.email:
+        return str(payload.email).strip().lower()
+    domain = (payload.domain or "").strip().lower()
+    if domain:
+        return f"admin@{domain}"
+    from app.services import panel_settings
+
+    panel_domain = (panel_settings.get_brand().panel_domain or "").strip().lower()
+    if panel_domain and panel_settings.DOMAIN_RE.fullmatch(panel_domain):
+        return f"admin@{panel_domain}"
+    import re
+
+    safe_host = re.sub(r"[^a-z0-9-]", "-", payload.username.lower()).strip("-") or "user"
+    return f"admin@{safe_host}.localdomain"
 
 def _provisioning_app_type(payload: ProvisioningAccountCreate) -> str:
     if not payload.domain:
@@ -239,7 +252,7 @@ def _create_account(
         # creates were rolled back may still own a panel and Linux user.
         discard_failed_account(db, existing)
 
-    account_email = _provisioning_email(payload.username)
+    account_email = _provisioning_email(payload)
 
     if db.query(User).filter(User.username == payload.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")

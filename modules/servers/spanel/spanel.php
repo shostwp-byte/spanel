@@ -187,7 +187,7 @@ function spanel_CreateAccount($params)
         $payload['limits'] = $limits;
     }
 
-    $key = 'whmcs-' . (int) ($params['serviceid'] ?? 0) . '-create-' . substr(hash('sha256', $username . "\n" . $password), 0, 24);
+    $key = 'whmcs-' . (int) ($params['serviceid'] ?? 0) . '-create-' . substr(hash('sha256', (string) json_encode($payload)), 0, 24);
     $result = spanel_request($params, 'POST', SPANEL_API . '/accounts', $payload, [], $key);
     if (!$result['ok']) {
         if ((int) ($result['status'] ?? 0) === 404 && stripos((string) $result['error'], 'Package not found') !== false) {
