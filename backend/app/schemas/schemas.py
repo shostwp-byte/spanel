@@ -1780,6 +1780,8 @@ class ApiTokenCreate(BaseModel):
     expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
     # 0 uses the panel default.
     rate_limit_per_minute: int = Field(default=0, ge=0, le=6000)
+    # Optional delegation target when an Admin creates a Reseller-scoped token.
+    owner_user_id: Optional[int] = None
 
 class ApiTokenRotate(BaseModel):
     # How long the old token keeps working after the new one is issued, so the
@@ -1797,6 +1799,9 @@ class ApiTokenOut(BaseModel):
     expires_at: Optional[datetime] = None
     revoked_at: Optional[datetime] = None
     rate_limit_per_minute: int = 0
+    created_by_id: Optional[int] = None
+    owner_username: Optional[str] = None
+    owner_role: Optional[str] = None
 
     class Config:
         from_attributes = True

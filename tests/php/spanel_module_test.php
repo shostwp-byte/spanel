@@ -310,6 +310,15 @@ fake_api(["GET $base/plans" => [401, ['detail' => 'Invalid, expired or revoked t
 $tcWrongToken = spanel_TestConnection(params(['serveraccesshash' => '', 'serverpassword' => 'MyAdminPass123!']));
 check($tcWrongToken['success'] === false && strpos($tcWrongToken['error'], 'bp_') !== false, '401 non-bp_ password gives token hint');
 
+// Server-level SSO supports both Admin and Reseller tokens + IP allowlist hints
+check($meta['AdminSingleSignOnLabel'] === 'Login to SPanel', 'AdminSingleSignOnLabel neutral for Admin/Reseller');
+fake_api(["POST $base/admin/login" => [403, ['detail' => 'sso:reseller requires the token to have an IP allowlist']]]);
+$ssoNoIp = spanel_AdminSingleSignOn(params());
+check($ssoNoIp['success'] === false && strpos($ssoNoIp['errorMsg'], 'Allowed IPs') !== false, 'SSO IP allowlist hint: ' . $ssoNoIp['errorMsg']);
+fake_api(["POST $base/admin/login" => [200, ['login_url' => '/api/auth/sso/res123', 'role' => 'reseller', 'username' => 'res1']]]);
+$ssoResOk = spanel_AdminSingleSignOn(params());
+check($ssoResOk === ['success' => true, 'redirectTo' => 'https://panel.example.com:2222/api/auth/sso/res123'], 'Reseller Server SSO redirect');
+
 if ($failures) {
     fwrite(STDERR, "$failures of $checks checks failed\n");
     exit(1);
