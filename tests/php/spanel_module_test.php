@@ -397,6 +397,7 @@ check(spanel_CreateAccount($daMigrated) === 'success', 'CreateAccount identical 
 $keySamePayload = (string) header_value($GLOBALS['SENT'][0]['headers'], 'Idempotency-Key');
 check($keySamePayload === $keyBeforeChange, 'identical CreateAccount payload keeps same Idempotency-Key');
 reset_recorders();
+$GLOBALS['SENT'] = [];
 $daModified = $daMigrated;
 $daModified['configoption1'] = '3';
 check(spanel_CreateAccount($daModified) === 'success', 'CreateAccount modified package succeeds');
