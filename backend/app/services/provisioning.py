@@ -32,6 +32,7 @@ SCOPES: dict[str, str] = {
     "usage:read": "Read disk, bandwidth, website and database usage",
     "sso": "Create one-time login links for customer accounts",
     "sso:admin": "Create one-time login links for the administrator who issued the token",
+    "sso:reseller": "Create one-time login links for the reseller who issued the token",
     "tokens:rotate": "Rotate this token through the API",
 }
 

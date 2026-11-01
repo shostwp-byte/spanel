@@ -1,13 +1,14 @@
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.users import _enforce_reseller_quotas, _reseller_can_grant_terminal
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role
+from app.core.permissions import Role, ensure_role, is_admin_role
 from app.core.rate_limit import enforce_rate_limit
 from app.core.security import hash_password
 from app.models.entities import ApiToken, DatabaseAccount, ProvisioningAccount, ResellerPackage, User, UserPackage, Website
@@ -81,7 +82,26 @@ def _get_provisioning_token(request: Request, db: Session) -> ApiToken:
         window_seconds=60,
         key_suffix=f"token{token.id}",
     )
+    actor: Optional[User] = None
+    if token.created_by_id is not None:
+        actor = db.query(User).filter(User.id == token.created_by_id).first()
+        if actor is None or not actor.is_active or actor.role not in (Role.admin, Role.reseller):
+            raise _auth_failure(request, 403, "Token owner account is inactive or unauthorized")
+    token._actor = actor  # type: ignore[attr-defined]
     return token
+
+
+def _token_reseller(token: ApiToken) -> Optional[User]:
+    actor = getattr(token, "_actor", None)
+    if actor is not None and actor.role == Role.reseller:
+        return actor
+    return None
+
+
+def _account_belongs_to_reseller(account: ProvisioningAccount, reseller: User) -> bool:
+    if account.user is not None:
+        return account.user.reseller_id == reseller.id
+    return account.reseller_id == reseller.id
 
 
 def _require_scope(token: ApiToken, scope: str) -> None:
@@ -95,9 +115,15 @@ def _authorize(request: Request, db: Session, scope: str) -> ApiToken:
     return token
 
 
-def _account_by_external_id(db: Session, external_id: str) -> ProvisioningAccount:
+def _account_by_external_id(
+    db: Session,
+    external_id: str,
+    reseller: Optional[User] = None,
+) -> ProvisioningAccount:
     account = db.query(ProvisioningAccount).filter(ProvisioningAccount.external_id == external_id).first()
     if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if reseller is not None and not _account_belongs_to_reseller(account, reseller):
         raise HTTPException(status_code=404, detail="Account not found")
     return account
 
@@ -147,8 +173,15 @@ def _provisioning_app_type(payload: ProvisioningAccountCreate) -> str:
 
 @router.get("/plans")
 def list_plans(request: Request, db: Session = Depends(get_db)):
-    _authorize(request, db, "plans:read")
-    packages = db.query(UserPackage).order_by(UserPackage.id.asc()).all()
+    token = _authorize(request, db, "plans:read")
+    reseller = _token_reseller(token)
+    query = db.query(UserPackage)
+    if reseller is not None:
+        query = query.filter(
+            or_(UserPackage.owner_id == None, UserPackage.owner_id == reseller.id),  # noqa: E711
+            UserPackage.is_reseller_package == False,  # noqa: E712
+        )
+    packages = query.order_by(UserPackage.id.asc()).all()
     return [
         {
             "id": p.id,
@@ -169,11 +202,17 @@ def list_plans(request: Request, db: Session = Depends(get_db)):
 
 # ── Accounts ─────────────────────────────────────────────────────────────
 
-def _record_failed_create(db: Session, payload: ProvisioningAccountCreate, message: str) -> None:
+def _record_failed_create(
+    db: Session,
+    payload: ProvisioningAccountCreate,
+    message: str,
+    reseller_id: Optional[int] = None,
+) -> None:
     """Keep a visible "failed" record after everything else was rolled back."""
     db.add(ProvisioningAccount(
         external_id=payload.external_id,
         package_id=payload.package_id,
+        reseller_id=reseller_id,
         status="failed",
         last_action="create",
         last_message=message[:2000],
@@ -181,9 +220,16 @@ def _record_failed_create(db: Session, payload: ProvisioningAccountCreate, messa
     db.commit()
 
 
-def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Session) -> dict:
+def _create_account(
+    payload: ProvisioningAccountCreate,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
     existing = db.query(ProvisioningAccount).filter(ProvisioningAccount.external_id == payload.external_id).first()
     if existing:
+        if reseller is not None and not _account_belongs_to_reseller(existing, reseller):
+            raise HTTPException(status_code=409, detail="External account ID already exists")
         if existing.status in ("active", "pending") and existing.user:
             return account_to_dict(existing, db)
         if existing.status == "suspended" and existing.user:
@@ -211,11 +257,37 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
     package = db.query(UserPackage).filter(UserPackage.id == payload.package_id).first()
     if not package:
         raise HTTPException(status_code=404, detail="Package not found")
-    _check_reseller_package(db, payload.is_reseller, payload.reseller_package_id)
+    if reseller is not None:
+        if bool(getattr(payload, "is_reseller", False)) or payload.reseller_package_id is not None:
+            raise HTTPException(status_code=403, detail="Reseller API tokens can only create end-user hosting accounts")
+        if bool(getattr(package, "is_reseller_package", False)) or package.owner_id not in (None, reseller.id):
+            raise HTTPException(status_code=403, detail="Cannot assign a package you do not own")
+        eff_website_limit = (
+            payload.limits.website_limit
+            if (payload.limits and payload.limits.website_limit is not None)
+            else package.website_limit
+        )
+        eff_storage_mb = (
+            payload.limits.storage_limit_mb
+            if (payload.limits and payload.limits.storage_limit_mb is not None)
+            else package.storage_limit_mb
+        )
+        eff_database_limit = getattr(package, "database_limit", None)
+        _enforce_reseller_quotas(
+            db,
+            reseller,
+            target_website_limit=eff_website_limit,
+            target_storage_mb=eff_storage_mb,
+            target_database_limit=eff_database_limit,
+            is_create=True,
+        )
+    else:
+        _check_reseller_package(db, payload.is_reseller, payload.reseller_package_id)
 
     account = ProvisioningAccount(
         external_id=payload.external_id,
         package_id=payload.package_id,
+        reseller_id=reseller.id if reseller is not None else None,
         status="pending",
         last_action="create",
     )
@@ -239,7 +311,12 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
             db_info=db_info,
             delete_linux_user=created_linux_user,
         )
-        _record_failed_create(db, payload, str(exc))
+        _record_failed_create(
+            db,
+            payload,
+            str(exc),
+            reseller_id=reseller.id if reseller is not None else None,
+        )
         if isinstance(exc, HTTPException):
             return exc
         return HTTPException(status_code=400, detail=str(exc))
@@ -259,8 +336,11 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
             storage_limit_mb=package.storage_limit_mb,
             sftp_password_set_at=datetime.utcnow(),
             reseller_package_id=payload.reseller_package_id if payload.is_reseller else None,
+            reseller_id=reseller.id if reseller is not None else None,
         )
         apply_account_limits(user, package, payload.limits)
+        if reseller is not None and user.terminal_enabled and not _reseller_can_grant_terminal(reseller):
+            user.terminal_enabled = False
         db.add(user)
         db.flush()
         account.user_id = user.id
@@ -373,7 +453,8 @@ def _create_account(payload: ProvisioningAccountCreate, request: Request, db: Se
 @router.post("/accounts", response_model=ProvisioningAccountOut)
 def create_account(payload: ProvisioningAccountCreate, request: Request, db: Session = Depends(get_db)):
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, payload, lambda: _create_account(payload, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, payload, lambda: _create_account(payload, request, db, reseller=reseller))
 
 
 # Declared before /accounts/{external_id}: Starlette matches routes in order,
@@ -381,8 +462,12 @@ def create_account(payload: ProvisioningAccountCreate, request: Request, db: Ses
 # usage call WHMCS's UsageUpdate makes used to be answered "Account not found".
 @router.get("/accounts/usage", response_model=List[ProvisioningUsageOut])
 def get_all_usage(request: Request, db: Session = Depends(get_db)):
-    _authorize(request, db, "usage:read")
-    accounts = db.query(ProvisioningAccount).filter(ProvisioningAccount.user_id.isnot(None)).all()
+    token = _authorize(request, db, "usage:read")
+    reseller = _token_reseller(token)
+    query = db.query(ProvisioningAccount).filter(ProvisioningAccount.user_id.isnot(None))
+    if reseller is not None:
+        query = query.join(User, ProvisioningAccount.user_id == User.id).filter(User.reseller_id == reseller.id)
+    accounts = query.all()
     return [account_usage(db, account, use_cache=True) for account in accounts if account.user]
 
 
@@ -401,7 +486,8 @@ def list_accounts(
     (active, suspended, pending); ``status=all`` adds failed and terminated
     records.
     """
-    _authorize(request, db, "accounts:read")
+    token = _authorize(request, db, "accounts:read")
+    reseller = _token_reseller(token)
     query = db.query(ProvisioningAccount)
     wanted = status.strip().lower()
     if wanted and wanted != "all":
@@ -409,9 +495,18 @@ def list_accounts(
     elif not wanted:
         query = query.filter(ProvisioningAccount.status.in_(("active", "suspended", "pending")))
     term = q.strip()
+    if reseller is not None or term:
+        query = query.outerjoin(User, ProvisioningAccount.user_id == User.id)
+    if reseller is not None:
+        query = query.filter(
+            or_(
+                User.reseller_id == reseller.id,
+                and_(ProvisioningAccount.user_id == None, ProvisioningAccount.reseller_id == reseller.id),  # noqa: E711
+            )
+        )
     if term:
         like = f"%{term}%"
-        query = query.outerjoin(User, ProvisioningAccount.user_id == User.id).filter(
+        query = query.filter(
             or_(ProvisioningAccount.external_id.ilike(like), User.username.ilike(like))
         )
     total = query.count()
@@ -431,15 +526,15 @@ def list_accounts(
 
 @router.get("/accounts/{external_id}", response_model=ProvisioningAccountOut)
 def get_account(external_id: str, request: Request, db: Session = Depends(get_db)):
-    _authorize(request, db, "accounts:read")
-    account = _account_by_external_id(db, external_id)
+    token = _authorize(request, db, "accounts:read")
+    account = _account_by_external_id(db, external_id, reseller=_token_reseller(token))
     return account_to_dict(account, db)
 
 
 @router.post("/accounts/{external_id}/login")
 def create_login_url(external_id: str, request: Request, db: Session = Depends(get_db)):
-    _authorize(request, db, "sso")
-    account = _account_by_external_id(db, external_id)
+    token = _authorize(request, db, "sso")
+    account = _account_by_external_id(db, external_id, reseller=_token_reseller(token))
     if not account.user or not account.user.is_active:
         raise HTTPException(status_code=404, detail="Account user not found or inactive")
     login_token = create_panel_login_token(account.user.username)
@@ -452,8 +547,14 @@ def create_login_url(external_id: str, request: Request, db: Session = Depends(g
     return {"login_url": absolute, "url": absolute, "path": path, "expires_in": 300}
 
 
-def _suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Request, db: Session) -> dict:
-    account = _account_by_external_id(db, external_id)
+def _suspend(
+    external_id: str,
+    payload: ProvisioningSuspendRequest,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
+    account = _account_by_external_id(db, external_id, reseller=reseller)
     if account.status == "suspended":
         return {"ok": True, "status": "suspended"}
     if account.status != "active":
@@ -467,11 +568,17 @@ def _suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Req
 @router.post("/accounts/{external_id}/suspend")
 def suspend(external_id: str, payload: ProvisioningSuspendRequest, request: Request, db: Session = Depends(get_db)):
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, payload, lambda: _suspend(external_id, payload, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, payload, lambda: _suspend(external_id, payload, request, db, reseller=reseller))
 
 
-def _unsuspend(external_id: str, request: Request, db: Session) -> dict:
-    account = _account_by_external_id(db, external_id)
+def _unsuspend(
+    external_id: str,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
+    account = _account_by_external_id(db, external_id, reseller=reseller)
     if account.status == "active":
         return {"ok": True, "status": "active"}
     if account.status != "suspended":
@@ -485,11 +592,18 @@ def _unsuspend(external_id: str, request: Request, db: Session) -> dict:
 @router.post("/accounts/{external_id}/unsuspend")
 def unsuspend(external_id: str, request: Request, db: Session = Depends(get_db)):
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, None, lambda: _unsuspend(external_id, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, None, lambda: _unsuspend(external_id, request, db, reseller=reseller))
 
 
-def _terminate(external_id: str, backup: bool, request: Request, db: Session) -> dict:
-    account = _account_by_external_id(db, external_id)
+def _terminate(
+    external_id: str,
+    backup: bool,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
+    account = _account_by_external_id(db, external_id, reseller=reseller)
     if account.status == "terminated":
         return {"ok": True, "status": "terminated"}
     # Captured first: termination deletes the user the event describes.
@@ -500,6 +614,8 @@ def _terminate(external_id: str, backup: bool, request: Request, db: Session) ->
         from types import SimpleNamespace
 
         subject_info = SimpleNamespace(id=subject.id, username=subject.username, reseller_id=subject.reseller_id)
+        if account.reseller_id is None and subject.reseller_id is not None:
+            account.reseller_id = subject.reseller_id
     deleted_domains = terminate_account(db, account, backup=backup)
     log_action(db, None, "provisioning_terminate", external_id, detail=",".join(deleted_domains), request=request)
     body = {"ok": True, "status": "terminated", "deleted_websites": deleted_domains}
@@ -523,11 +639,18 @@ def terminate(external_id: str, request: Request, backup: bool = Query(default=F
     caller can wait for a full account archive.
     """
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, None, lambda: _terminate(external_id, backup, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, None, lambda: _terminate(external_id, backup, request, db, reseller=reseller))
 
 
-def _change_password(external_id: str, payload: ProvisioningPasswordChange, request: Request, db: Session) -> dict:
-    account = _account_by_external_id(db, external_id)
+def _change_password(
+    external_id: str,
+    payload: ProvisioningPasswordChange,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
+    account = _account_by_external_id(db, external_id, reseller=reseller)
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
     account.user.hashed_password = hash_password(payload.password)
@@ -557,20 +680,55 @@ def _change_password(external_id: str, payload: ProvisioningPasswordChange, requ
 @router.patch("/accounts/{external_id}/password")
 def change_password(external_id: str, payload: ProvisioningPasswordChange, request: Request, db: Session = Depends(get_db)):
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, payload, lambda: _change_password(external_id, payload, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, payload, lambda: _change_password(external_id, payload, request, db, reseller=reseller))
 
 
-def _change_package(external_id: str, payload: ProvisioningPackageChange, request: Request, db: Session) -> dict:
-    account = _account_by_external_id(db, external_id)
+def _change_package(
+    external_id: str,
+    payload: ProvisioningPackageChange,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
+    account = _account_by_external_id(db, external_id, reseller=reseller)
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
     package = db.query(UserPackage).filter(UserPackage.id == payload.package_id).first()
     if not package:
         raise HTTPException(status_code=404, detail="Package not found")
-    _check_reseller_package(db, account.user.role == Role.reseller, payload.reseller_package_id)
+    if reseller is not None:
+        if payload.reseller_package_id is not None:
+            raise HTTPException(status_code=403, detail="Reseller API tokens cannot modify reseller packages")
+        if bool(getattr(package, "is_reseller_package", False)) or package.owner_id not in (None, reseller.id):
+            raise HTTPException(status_code=403, detail="Cannot assign a package you do not own")
+        eff_website_limit = (
+            payload.limits.website_limit
+            if (payload.limits and payload.limits.website_limit is not None)
+            else package.website_limit
+        )
+        eff_storage_mb = (
+            payload.limits.storage_limit_mb
+            if (payload.limits and payload.limits.storage_limit_mb is not None)
+            else package.storage_limit_mb
+        )
+        eff_database_limit = getattr(package, "database_limit", None)
+        _enforce_reseller_quotas(
+            db,
+            reseller,
+            target_website_limit=eff_website_limit,
+            target_storage_mb=eff_storage_mb,
+            target_database_limit=eff_database_limit,
+            is_create=False,
+            exclude_user_id=account.user.id,
+        )
+    else:
+        _check_reseller_package(db, account.user.role == Role.reseller, payload.reseller_package_id)
     account.package_id = package.id
     apply_account_limits(account.user, package, payload.limits)
-    if payload.reseller_package_id is not None:
+    if reseller is not None and account.user.terminal_enabled and not _reseller_can_grant_terminal(reseller):
+        account.user.terminal_enabled = False
+    if reseller is None and payload.reseller_package_id is not None:
         account.user.reseller_package_id = payload.reseller_package_id
     account.last_action = "change_package"
     db.commit()
@@ -583,20 +741,26 @@ def _change_package(external_id: str, payload: ProvisioningPackageChange, reques
 @router.patch("/accounts/{external_id}/package")
 def change_package(external_id: str, payload: ProvisioningPackageChange, request: Request, db: Session = Depends(get_db)):
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, payload, lambda: _change_package(external_id, payload, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, payload, lambda: _change_package(external_id, payload, request, db, reseller=reseller))
 
 
 @router.get("/accounts/{external_id}/usage", response_model=ProvisioningUsageOut)
 def get_usage(external_id: str, request: Request, db: Session = Depends(get_db)):
-    _authorize(request, db, "usage:read")
-    account = _account_by_external_id(db, external_id)
+    token = _authorize(request, db, "usage:read")
+    account = _account_by_external_id(db, external_id, reseller=_token_reseller(token))
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
     return account_usage(db, account)
 
 
-def _reset_sftp_password(external_id: str, request: Request, db: Session) -> dict:
-    account = _account_by_external_id(db, external_id)
+def _reset_sftp_password(
+    external_id: str,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
+    account = _account_by_external_id(db, external_id, reseller=reseller)
     if not account.user:
         raise HTTPException(status_code=400, detail="Account has no user")
     password = site_users.rotate_panel_user_password(account.user.username)
@@ -613,11 +777,17 @@ def _reset_sftp_password(external_id: str, request: Request, db: Session) -> dic
 def reset_sftp_password(external_id: str, request: Request, db: Session = Depends(get_db)):
     """Give the account's SFTP/SSH login a new random password and return it."""
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, None, lambda: _reset_sftp_password(external_id, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, None, lambda: _reset_sftp_password(external_id, request, db, reseller=reseller))
 
 
-def _backup(external_id: str, request: Request, db: Session) -> dict:
-    account = _account_by_external_id(db, external_id)
+def _backup(
+    external_id: str,
+    request: Request,
+    db: Session,
+    reseller: Optional[User] = None,
+) -> dict:
+    account = _account_by_external_id(db, external_id, reseller=reseller)
     if not account.user or account.status not in ("active", "suspended"):
         raise HTTPException(status_code=400, detail=f"Cannot back up account in status: {account.status}")
     if not queue_account_backup(account.id):
@@ -631,7 +801,8 @@ def create_backup(external_id: str, request: Request, db: Session = Depends(get_
     """Queue a full backup of the account. It runs in the background; the
     outcome lands on the account (``last_action=backup``) and in the audit log."""
     token = _authorize(request, db, "accounts:write")
-    return idempotency.run(db, token, request, None, lambda: _backup(external_id, request, db))
+    reseller = _token_reseller(token)
+    return idempotency.run(db, token, request, None, lambda: _backup(external_id, request, db, reseller=reseller))
 
 
 # Changing a username is deliberately not offered. The username is the Linux
@@ -647,7 +818,9 @@ def create_backup(external_id: str, request: Request, db: Session = Depends(get_
 
 @router.get("/reseller-plans")
 def list_reseller_plans(request: Request, db: Session = Depends(get_db)):
-    _authorize(request, db, "plans:read")
+    token = _authorize(request, db, "plans:read")
+    if _token_reseller(token) is not None:
+        return []
     return [
         {
             "id": p.id,
@@ -663,33 +836,72 @@ def list_reseller_plans(request: Request, db: Session = Depends(get_db)):
     ]
 
 
-# ── Administrator single sign-on ─────────────────────────────────────────
+# ── Server-level panel single sign-on (Admin or Reseller) ────────────────
 
 @router.post("/admin/login")
 def create_admin_login_url(request: Request, db: Session = Depends(get_db)):
-    """A one-time login link for the administrator who issued this token.
+    """A one-time login link for the Admin or Reseller who owns this token.
 
-    Only with the ``sso:admin`` scope, which no legacy token has and which must
-    be granted explicitly: whoever holds such a token can open the panel as
-    that administrator, so it belongs only on a billing server trusted as much.
+    - Admin tokens require explicit ``sso:admin`` scope and a non-empty IP
+      allowlist, signing in as that Administrator.
+    - Reseller tokens require explicit ``sso:reseller`` (or ``sso:admin``) scope
+      and a non-empty IP allowlist, signing in strictly as that Reseller.
     """
-    token = _authorize(request, db, "sso:admin")
+    token = _get_provisioning_token(request, db)
+    issuer: Optional[User] = getattr(token, "_actor", None)
+    if issuer is not None and issuer.role == Role.reseller:
+        if not (has_scope(token, "sso:reseller") or has_scope(token, "sso:admin")):
+            raise HTTPException(status_code=403, detail="Missing scope: sso:reseller")
+        if not (token.allowed_ips or "").strip():
+            raise HTTPException(status_code=403, detail="sso:reseller requires the token to have an IP allowlist")
+        if not issuer.is_active:
+            raise HTTPException(status_code=403, detail="Token has no active reseller to sign in as")
+        login_token = create_panel_login_token(issuer.username)
+        log_action(db, None, "provisioning_reseller_login", issuer.username, detail=f"token={token.id}", request=request)
+        path = f"/api/auth/sso/{login_token}"
+        base = panel_base_url(request)
+        absolute = f"{base}{path}" if base else path
+        return {
+            "login_url": absolute,
+            "url": absolute,
+            "path": path,
+            "expires_in": 300,
+            "role": "reseller",
+            "username": issuer.username,
+        }
+
+    _require_scope(token, "sso:admin")
     if not (token.allowed_ips or "").strip():
         # The link skips the administrator's own 2FA, so it is only handed out
         # to a token pinned to the billing server's addresses.
         raise HTTPException(status_code=403, detail="sso:admin requires the token to have an IP allowlist")
-    admin = db.query(User).filter(User.id == token.created_by_id).first() if token.created_by_id else None
-    if admin is None or admin.role != Role.admin or not admin.is_active:
+    if issuer is None or issuer.role != Role.admin or not issuer.is_active:
         raise HTTPException(status_code=403, detail="Token has no active administrator to sign in as")
-    login_token = create_panel_login_token(admin.username)
-    log_action(db, None, "provisioning_admin_login", admin.username, detail=f"token={token.id}", request=request)
+    login_token = create_panel_login_token(issuer.username)
+    log_action(db, None, "provisioning_admin_login", issuer.username, detail=f"token={token.id}", request=request)
     path = f"/api/auth/sso/{login_token}"
     base = panel_base_url(request)
     absolute = f"{base}{path}" if base else path
-    return {"login_url": absolute, "url": absolute, "path": path, "expires_in": 300}
+    return {
+        "login_url": absolute,
+        "url": absolute,
+        "path": path,
+        "expires_in": 300,
+        "role": "admin",
+        "username": issuer.username,
+    }
 
 
 # ── Token self-service (Bearer auth) ─────────────────────────────────────
+
+def _serialize_token(token: ApiToken, owners_by_id: dict[int, User]) -> dict:
+    out = ApiTokenOut.model_validate(token).model_dump()
+    owner = owners_by_id.get(token.created_by_id) if token.created_by_id else None
+    if owner is not None:
+        out["owner_username"] = owner.username
+        out["owner_role"] = owner.role
+    return out
+
 
 @router.post("/token/rotate", response_model=ApiTokenCreatedResponse)
 def rotate_own_token(payload: ApiTokenRotate, request: Request, db: Session = Depends(get_db)):
@@ -698,40 +910,81 @@ def rotate_own_token(payload: ApiTokenRotate, request: Request, db: Session = De
 
     def _rotate() -> dict:
         raw, replacement = rotate_api_token(db, token, payload.grace_minutes)
+        owners = {}
+        if replacement.created_by_id:
+            u = db.query(User).filter(User.id == replacement.created_by_id).first()
+            if u:
+                owners[u.id] = u
         log_action(db, None, "rotate_api_token", replacement.name, detail=f"self old={token.id} new={replacement.id}", request=request)
-        return {"token": raw, "info": ApiTokenOut.model_validate(replacement).model_dump()}
+        return {"token": raw, "info": _serialize_token(replacement, owners)}
 
     return idempotency.run(db, token, request, payload, _rotate)
 
 
-# ── API Tokens (admin-only, cookie auth) ─────────────────────────────────
+# ── API Tokens (Admin & Reseller self-service, cookie auth) ──────────────
 
 @router.get("/tokens", response_model=List[ApiTokenOut])
 def list_tokens(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
-    return db.query(ApiToken).order_by(ApiToken.id.desc()).all()
+    ensure_role(current_user.role, Role.reseller)
+    query = db.query(ApiToken)
+    if not is_admin_role(current_user.role):
+        query = query.filter(ApiToken.created_by_id == current_user.id)
+    rows = query.order_by(ApiToken.id.desc()).all()
+    owner_ids = {r.created_by_id for r in rows if r.created_by_id}
+    owners = (
+        {u.id: u for u in db.query(User).filter(User.id.in_(owner_ids)).all()}
+        if owner_ids
+        else {}
+    )
+    return [_serialize_token(r, owners) for r in rows]
 
 
 @router.get("/scopes")
 def list_scopes(current_user: User = Depends(get_current_user)):
     """The scope catalogue, for the token form."""
-    ensure_role(current_user.role, Role.admin)
+    ensure_role(current_user.role, Role.reseller)
     from app.services.provisioning import LEGACY_SCOPES, SCOPES
 
+    is_admin = is_admin_role(current_user.role)
+    visible_scopes = [
+        {"name": name, "description": desc}
+        for name, desc in SCOPES.items()
+        if is_admin or name != "sso:admin"
+    ]
     return {
-        "scopes": [{"name": name, "description": desc} for name, desc in SCOPES.items()],
+        "scopes": visible_scopes,
         "legacy": {name: sorted(expanded) for name, expanded in LEGACY_SCOPES.items()},
     }
 
 
 @router.post("/tokens", response_model=ApiTokenCreatedResponse)
 def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
+    ensure_role(current_user.role, Role.reseller)
+    is_admin = is_admin_role(current_user.role)
+    owner_user = current_user
+    if payload.owner_user_id is not None:
+        if not is_admin and payload.owner_user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Resellers can only create API tokens for their own account")
+        target = db.query(User).filter(User.id == payload.owner_user_id).first()
+        if not target or not target.is_active or target.role not in (Role.admin, Role.reseller):
+            raise HTTPException(status_code=400, detail="Token owner must be an active Admin or Reseller account")
+        owner_user = target
+
     try:
         scopes = normalize_scopes(payload.scopes)
         allowed_ips = normalize_allowed_ips(payload.allowed_ips)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if owner_user.role == Role.reseller:
+        # Never store sso:admin on a Reseller-owned token; downgrade/map to sso:reseller.
+        mapped = []
+        for s in scopes.split(","):
+            s_item = "sso:reseller" if s == "sso:admin" else s
+            if s_item not in mapped:
+                mapped.append(s_item)
+        scopes = ",".join(mapped)
+
     expires_at = None
     if payload.expires_in_days:
         expires_at = datetime.utcnow() + timedelta(days=payload.expires_in_days)
@@ -742,30 +995,42 @@ def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depend
         allowed_ips,
         expires_at=expires_at,
         rate_limit_per_minute=payload.rate_limit_per_minute,
-        created_by_id=current_user.id,
+        created_by_id=owner_user.id,
     )
-    log_action(db, current_user.id, "create_api_token", payload.name, detail=scopes, request=request)
-    return {"token": raw, "info": token}
+    log_action(
+        db,
+        current_user.id,
+        "create_api_token",
+        payload.name,
+        detail=f"owner={owner_user.username}({owner_user.role}) scopes={scopes}",
+        request=request,
+    )
+    return {"token": raw, "info": _serialize_token(token, {owner_user.id: owner_user})}
 
 
 @router.post("/tokens/{token_id}/rotate", response_model=ApiTokenCreatedResponse)
 def rotate_token(token_id: int, payload: ApiTokenRotate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
+    ensure_role(current_user.role, Role.reseller)
     token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
-    if not token:
+    if not token or (not is_admin_role(current_user.role) and token.created_by_id != current_user.id):
         raise HTTPException(status_code=404, detail="Token not found")
     if not token.is_active or token.revoked_at is not None:
         raise HTTPException(status_code=400, detail="A revoked token cannot be rotated")
     raw, replacement = rotate_api_token(db, token, payload.grace_minutes)
+    owners = {}
+    if replacement.created_by_id:
+        u = db.query(User).filter(User.id == replacement.created_by_id).first()
+        if u:
+            owners[u.id] = u
     log_action(db, current_user.id, "rotate_api_token", token.name, detail=f"old={token.id} new={replacement.id} grace={payload.grace_minutes}m", request=request)
-    return {"token": raw, "info": replacement}
+    return {"token": raw, "info": _serialize_token(replacement, owners)}
 
 
 @router.delete("/tokens/{token_id}")
 def revoke_token(token_id: int, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.admin)
+    ensure_role(current_user.role, Role.reseller)
     token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
-    if not token:
+    if not token or (not is_admin_role(current_user.role) and token.created_by_id != current_user.id):
         raise HTTPException(status_code=404, detail="Token not found")
     token.is_active = False
     token.revoked_at = datetime.now(timezone.utc)

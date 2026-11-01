@@ -1,0 +1,280 @@
+"""DirectAdmin-style dual-role (Admin & Reseller) WHMCS provisioning & SSO tests."""
+from unittest.mock import patch
+
+import pytest
+
+import api_testkit as kit
+from app.core.database import SessionLocal
+from app.models.entities import ApiToken, ProvisioningAccount, ResellerPackage, User, UserPackage
+
+BASE = "/api/provisioning/v1"
+
+
+@pytest.fixture(autouse=True)
+def _clean_db():
+    kit.reset_db()
+    with patch("app.services.audit._write_audit_anchor"), \
+            patch("app.api.provisioning._apply_cgroup_limits"):
+        yield
+
+
+def _create_payload(**extra):
+    body = {
+        "external_id": "whmcs:101",
+        "username": "rescust1",
+        "password": "StrongPassword123!",
+        "package_id": 0,
+        "domain": "",
+    }
+    body.update(extra)
+    return body
+
+
+def test_reseller_token_self_service_and_admin_delegation():
+    with SessionLocal() as db:
+        admin = kit.make_user(db, "rootadmin", role="admin")
+        res_a = kit.make_user(db, "reseller_a", role="reseller")
+        res_b = kit.make_user(db, "reseller_b", role="reseller")
+        kit.make_package(db, "SharedBasic")
+
+    c_admin = kit.client(admin.id)
+    c_res_a = kit.client(res_a.id)
+    c_res_b = kit.client(res_b.id)
+
+    # Reseller scope catalogue hides sso:admin and exposes sso:reseller.
+    scopes_resp = c_res_a.get(f"{BASE}/scopes")
+    assert scopes_resp.status_code == 200
+    scope_names = {s["name"] for s in scopes_resp.json()["scopes"]}
+    assert "sso:reseller" in scope_names
+    assert "sso:admin" not in scope_names
+
+    # Reseller cannot create a token owned by Admin or another Reseller.
+    forbid = c_res_a.post(f"{BASE}/tokens", json={
+        "name": "bad",
+        "scopes": "accounts:read",
+        "owner_user_id": admin.id,
+    })
+    assert forbid.status_code == 403
+
+    # Reseller creates own token; passing sso:admin maps cleanly to sso:reseller.
+    created_a = c_res_a.post(f"{BASE}/tokens", json={
+        "name": "WHMCS Reseller A",
+        "scopes": "plans:read,accounts:read,accounts:write,usage:read,sso,sso:admin",
+        "allowed_ips": "203.0.113.10",
+    })
+    assert created_a.status_code == 200, created_a.text
+    info_a = created_a.json()["info"]
+    assert info_a["owner_username"] == "reseller_a"
+    assert info_a["owner_role"] == "reseller"
+    assert "sso:reseller" in info_a["scopes"]
+    assert "sso:admin" not in info_a["scopes"]
+    tok_a_id = info_a["id"]
+
+    # Admin can delegate a token directly to Reseller B from Admin Settings UI.
+    delegated_b = c_admin.post(f"{BASE}/tokens", json={
+        "name": "Delegated WHMCS B",
+        "scopes": "plans:read,accounts:read,accounts:write,sso:reseller",
+        "allowed_ips": "203.0.113.20",
+        "owner_user_id": res_b.id,
+    })
+    assert delegated_b.status_code == 200, delegated_b.text
+    info_b = delegated_b.json()["info"]
+    assert info_b["owner_username"] == "reseller_b"
+    assert info_b["owner_role"] == "reseller"
+    tok_b_id = info_b["id"]
+
+    # Reseller A only sees own token; cannot rotate or revoke Reseller B's token.
+    list_a = c_res_a.get(f"{BASE}/tokens").json()
+    assert [t["id"] for t in list_a] == [tok_a_id]
+    assert c_res_a.post(f"{BASE}/tokens/{tok_b_id}/rotate", json={}).status_code == 404
+    assert c_res_a.delete(f"{BASE}/tokens/{tok_b_id}").status_code == 404
+
+    # Admin sees all tokens.
+    list_admin = c_admin.get(f"{BASE}/tokens").json()
+    assert {t["id"] for t in list_admin} == {tok_a_id, tok_b_id}
+
+    # Reseller WHMCS diagnostic works and counts only Reseller A's active write tokens.
+    diag_a = c_res_a.get("/api/resellers/whmcs-diagnostic")
+    assert diag_a.status_code == 200
+    assert diag_a.json()["write_tokens_count"] == 1
+    assert diag_a.json()["ready"] is True
+
+
+def test_reseller_and_admin_server_sso_isolation():
+    with SessionLocal() as db:
+        admin = kit.make_user(db, "chief_admin", role="admin")
+        reseller = kit.make_user(db, "shost_reseller", role="reseller")
+
+        res_no_scope = kit.make_token(db, scopes="plans:read,sso", created_by_id=reseller.id, allowed_ips="testclient")
+        res_no_ip = kit.make_token(db, scopes="sso:reseller", created_by_id=reseller.id)
+        res_ok = kit.make_token(db, scopes="sso:reseller", created_by_id=reseller.id, allowed_ips="testclient")
+        # Admin token carrying ONLY sso:reseller must NOT sign in as Admin!
+        admin_wrong_scope = kit.make_token(db, scopes="sso:reseller", created_by_id=admin.id, allowed_ips="testclient")
+
+    c = kit.client()
+    with patch("app.api.provisioning.create_panel_login_token", return_value="res_sso_999") as mint:
+        r1 = c.post(f"{BASE}/admin/login", headers=kit.bearer(res_no_scope))
+        assert r1.status_code == 403 and "sso:reseller" in r1.text
+
+        r2 = c.post(f"{BASE}/admin/login", headers=kit.bearer(res_no_ip))
+        assert r2.status_code == 403 and "IP allowlist" in r2.text
+
+        r3 = c.post(f"{BASE}/admin/login", headers=kit.bearer(admin_wrong_scope))
+        assert r3.status_code == 403 and "sso:admin" in r3.text
+
+        ok = c.post(f"{BASE}/admin/login", headers=kit.bearer(res_ok))
+        assert ok.status_code == 200, ok.text
+        data = ok.json()
+        assert data["path"] == "/api/auth/sso/res_sso_999"
+        assert data["role"] == "reseller"
+        assert data["username"] == "shost_reseller"
+        mint.assert_called_once_with("shost_reseller")
+
+
+def test_reseller_provisioning_ownership_quotas_and_tenant_isolation():
+    with SessionLocal() as db:
+        rpkg = ResellerPackage(
+            name="Reseller Silver",
+            slug="reseller-silver",
+            user_limit=1,
+            total_storage_mb=4096,
+            total_website_limit=5,
+            total_database_limit=5,
+            overselling_enabled=False,
+        )
+        db.add(rpkg)
+        db.commit()
+        db.refresh(rpkg)
+
+        admin = kit.make_user(db, "admin_root", role="admin")
+        res_a = kit.make_user(db, "res_alpha", role="reseller", reseller_package_id=rpkg.id)
+        res_b = kit.make_user(db, "res_beta", role="reseller")
+
+        shared_pkg = kit.make_package(db, "SharedStarter", storage_limit_mb=2048, website_limit=2, terminal_enabled=True)
+        own_pkg_a = kit.make_package(db, "AlphaCustom", owner_id=res_a.id, storage_limit_mb=1024, website_limit=1)
+        own_pkg_b = kit.make_package(db, "BetaPrivate", owner_id=res_b.id, storage_limit_mb=1024, website_limit=1)
+        reseller_tier_pkg = kit.make_package(db, "ResellerTier", is_reseller_package=True, storage_limit_mb=1024)
+        huge_pkg = kit.make_package(db, "HugePlan", storage_limit_mb=10240, website_limit=2)
+
+        admin_cust = kit.make_user(db, "admin_cust", role="end_user", package_id=shared_pkg.id)
+        beta_cust = kit.make_user(db, "beta_cust", role="end_user", package_id=own_pkg_b.id, reseller_id=res_b.id)
+        db.add(ProvisioningAccount(external_id="whmcs:admin1", user_id=admin_cust.id, package_id=shared_pkg.id, status="active"))
+        db.add(ProvisioningAccount(external_id="whmcs:beta1", user_id=beta_cust.id, reseller_id=res_b.id, package_id=own_pkg_b.id, status="active"))
+        db.commit()
+
+        tok_a = kit.make_token(db, created_by_id=res_a.id)
+        tok_b = kit.make_token(db, created_by_id=res_b.id)
+        tok_admin = kit.make_token(db, created_by_id=admin.id)
+
+    c = kit.client()
+
+    # 1. Plans isolation: Reseller A sees SharedStarter + AlphaCustom, NOT BetaPrivate or ResellerTier.
+    plans_a = c.get(f"{BASE}/plans", headers=kit.bearer(tok_a)).json()
+    assert {p["name"] for p in plans_a} == {"SharedStarter", "AlphaCustom", "HugePlan"}
+    assert c.get(f"{BASE}/reseller-plans", headers=kit.bearer(tok_a)).json() == []
+
+    # 2. Reseller A cannot create a sub-reseller, use Beta's package, or exceed Reseller quota.
+    with patch("app.services.site_users.ensure_panel_user", side_effect=lambda u, p: u):
+        assert c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(package_id=shared_pkg.id, is_reseller=True),
+            headers=kit.bearer(tok_a),
+        ).status_code == 403
+
+        assert c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(package_id=own_pkg_b.id),
+            headers=kit.bearer(tok_a),
+        ).status_code == 403
+
+        assert c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(package_id=reseller_tier_pkg.id),
+            headers=kit.bearer(tok_a),
+        ).status_code == 403
+
+        # Exceeds total_storage_mb=4096 via HugePlan (10240 MB) or limits override:
+        over_pkg = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(external_id="whmcs:over1", username="overcust1", package_id=huge_pkg.id),
+            headers=kit.bearer(tok_a),
+        )
+        assert over_pkg.status_code == 403 and "storage quota" in over_pkg.text.lower()
+
+        over_lim = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(
+                external_id="whmcs:over2",
+                username="overcust2",
+                package_id=own_pkg_a.id,
+                limits={"storage_limit_mb": 8192},
+            ),
+            headers=kit.bearer(tok_a),
+        )
+        assert over_lim.status_code == 403
+
+        # Valid create under Reseller A:
+        ok = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(external_id="whmcs:alpha1", username="alphacust1", package_id=shared_pkg.id),
+            headers=kit.bearer(tok_a),
+        )
+        assert ok.status_code == 200, ok.text
+
+        # Second create blocked by user_limit=1 on Reseller A's ResellerPackage:
+        second = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(external_id="whmcs:alpha2", username="alphacust2", package_id=own_pkg_a.id),
+            headers=kit.bearer(tok_a),
+        )
+        assert second.status_code == 403 and "user limit" in second.text.lower()
+
+    # Verify created user is strictly owned by Reseller A and terminal_enabled was capped to False.
+    with SessionLocal() as db:
+        u = db.query(User).filter(User.username == "alphacust1").one()
+        assert u.role == "end_user"
+        assert u.reseller_id == res_a.id
+        assert u.terminal_enabled is False
+
+    # 3. Tenant isolation across list, get, SSO, suspend, package, password, terminate:
+    listed_a = c.get(f"{BASE}/accounts", headers=kit.bearer(tok_a)).json()
+    assert [item["external_id"] for item in listed_a["items"]] == ["whmcs:alpha1"]
+
+    # Reseller A gets 404 on Admin's and Reseller B's accounts:
+    for foreign_ext in ("whmcs:admin1", "whmcs:beta1"):
+        assert c.get(f"{BASE}/accounts/{foreign_ext}", headers=kit.bearer(tok_a)).status_code == 404
+        assert c.post(f"{BASE}/accounts/{foreign_ext}/login", headers=kit.bearer(tok_a)).status_code == 404
+        assert c.post(f"{BASE}/accounts/{foreign_ext}/suspend", json={"reason": "x"}, headers=kit.bearer(tok_a)).status_code == 404
+        assert c.delete(f"{BASE}/accounts/{foreign_ext}", headers=kit.bearer(tok_a)).status_code == 404
+
+    # Reseller A CAN manage own account (SSO + Upgrade within quota + Terminate):
+    with patch("app.api.provisioning.create_panel_login_token", return_value="cust_tok"):
+        sso_ok = c.post(f"{BASE}/accounts/whmcs:alpha1/login", headers=kit.bearer(tok_a))
+        assert sso_ok.status_code == 200
+
+    pkg_change = c.patch(
+        f"{BASE}/accounts/whmcs:alpha1/package",
+        json={"package_id": own_pkg_a.id},
+        headers=kit.bearer(tok_a),
+    )
+    assert pkg_change.status_code == 200
+
+    with patch("app.services.site_users.delete_panel_user"), \
+            patch("app.services.teardown.purge_owned_resources"):
+        term = c.delete(f"{BASE}/accounts/whmcs:alpha1", headers=kit.bearer(tok_a))
+        assert term.status_code == 200 and term.json()["status"] == "terminated"
+        # Idempotent retry of DELETE by Reseller A still succeeds (200), while Reseller B gets 404!
+        term_retry = c.delete(f"{BASE}/accounts/whmcs:alpha1", headers=kit.bearer(tok_a))
+        assert term_retry.status_code == 200
+        assert c.delete(f"{BASE}/accounts/whmcs:alpha1", headers=kit.bearer(tok_b)).status_code == 404
+
+    # Admin still sees all active accounts across the server:
+    listed_admin = c.get(f"{BASE}/accounts", headers=kit.bearer(tok_admin)).json()
+    assert {item["external_id"] for item in listed_admin["items"]} == {"whmcs:admin1", "whmcs:beta1"}
+
+    # 4. Suspending Reseller A immediately disables Reseller A's API token!
+    with SessionLocal() as db:
+        ra = db.get(User, res_a.id)
+        ra.is_active = False
+        db.commit()
+    assert c.get(f"{BASE}/plans", headers=kit.bearer(tok_a)).status_code == 403

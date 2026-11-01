@@ -380,26 +380,36 @@ def replay_webhook_delivery(delivery_id: str, db: Session = Depends(get_db), cur
 @router.get("/whmcs-diagnostic")
 def whmcs_connection_diagnostic(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Comprehensive diagnostic for WHMCS, HostBill, Blesta & Perfex CRM integration."""
-    ensure_role(current_user.role, Role.admin)
+    ensure_role(current_user.role, Role.reseller)
     from datetime import datetime as _dt
 
     from app.services.provisioning import has_scope
 
+    is_admin = is_admin_role(current_user.role)
     now = _dt.utcnow()
+    token_query = db.query(ApiToken).filter(ApiToken.is_active == True)  # noqa: E712
+    if not is_admin:
+        token_query = token_query.filter(ApiToken.created_by_id == current_user.id)
     active_tokens = [
-        t for t in db.query(ApiToken).filter(ApiToken.is_active == True).all()  # noqa: E712
+        t for t in token_query.all()
         if t.revoked_at is None and (t.expires_at is None or t.expires_at > now)
     ]
     write_tokens = [
         t for t in active_tokens
         if has_scope(t, "accounts:write") and has_scope(t, "accounts:read")
     ]
-    packages_count = db.query(UserPackage).count()
+    pkg_query = db.query(UserPackage)
+    if not is_admin:
+        pkg_query = pkg_query.filter(
+            (UserPackage.owner_id == None) | (UserPackage.owner_id == current_user.id),  # noqa: E711
+            UserPackage.is_reseller_package == False,  # noqa: E712
+        )
+    packages_count = pkg_query.count()
     p_settings = panel_settings.current_settings()
     ssl_enabled = bool(p_settings.get("ssl_enabled"))
     hostname = p_settings.get("panel_hostname") or ""
     port = int(p_settings.get("panel_port") or 2222)
-    deliveries = webhooks_service.list_deliveries(is_admin=True, limit=20)
+    deliveries = webhooks_service.list_deliveries(user_id=current_user.id, is_admin=is_admin, limit=20)
     # A pending row that has not been tried yet is not a failure.
     failed_deliveries = [
         d for d in deliveries

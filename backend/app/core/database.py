@@ -147,6 +147,9 @@ def _ensure_resource_limit_columns() -> None:
             ("prev_hash", "VARCHAR(64) DEFAULT ''"),
             ("entry_hash", "VARCHAR(64) DEFAULT ''"),
         ],
+        "provisioning_accounts": [
+            ("reseller_id", "INTEGER DEFAULT NULL"),
+        ],
     }
     try:
         inspector = inspect(engine)
