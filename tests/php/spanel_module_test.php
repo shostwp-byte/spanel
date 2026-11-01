@@ -245,6 +245,71 @@ foreach ($GLOBALS['SENT'] as $request) {
     check(strpos($request['url'], '/login') === false, 'client area does not mint login tokens');
 }
 
+// --- TestConnection, port 2222 default, Nginx 404 -> :2222 fallback & HTML cleaning ---
+reset_recorders();
+fake_api([
+    "GET $base/plans" => [200, [['id' => 1, 'name' => 'Starter']]],
+]);
+$tcEmptyPort = spanel_TestConnection(params(['serverport' => '']));
+check($tcEmptyPort === ['success' => true, 'error' => ''], 'TestConnection succeeds with empty serverport');
+check($GLOBALS['SENT'][0]['url'] === "https://panel.example.com:2222$base/plans", 'empty serverport defaults to 2222: ' . $GLOBALS['SENT'][0]['url']);
+
+$tcZeroPort = spanel_TestConnection(params(['serverport' => '0']));
+check($tcZeroPort['success'] === true && $GLOBALS['SENT'][1]['url'] === "https://panel.example.com:2222$base/plans", 'zero serverport defaults to 2222');
+
+check(
+    spanel_base_url(params(['serverhostname' => 'https://panel.example.com:2222/', 'serverport' => '2222'])) === 'https://panel.example.com:2222',
+    'inline hostname port is not duplicated'
+);
+check(
+    spanel_base_url(params(['serverhostname' => '', 'serverip' => '2001:db8::1', 'serverport' => ''])) === 'https://[2001:db8::1]:2222',
+    'bare IPv6 address is bracketed with default port 2222'
+);
+
+// Simulate WHMCS passing serverport=443 hitting tenant Nginx HTML 404, then succeeding on :2222
+$GLOBALS['SENT'] = [];
+$GLOBALS['SPANEL_TRANSPORT'] = function ($method, $url, $headers, $body) {
+    $GLOBALS['SENT'][] = compact('method', 'url', 'headers', 'body');
+    if (strpos($url, 'https://panel.example.com/api/') === 0) {
+        return [
+            'errno' => 0,
+            'error' => '',
+            'status' => 404,
+            'body' => "<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.24.0 (Ubuntu)</center></body></html>",
+        ];
+    }
+    return [
+        'errno' => 0,
+        'error' => '',
+        'status' => 200,
+        'body' => json_encode([['id' => 1, 'name' => 'Starter']]),
+    ];
+};
+$tcFallback = spanel_TestConnection(params(['serverport' => '443']));
+check($tcFallback === ['success' => true, 'error' => ''], 'TestConnection falls back from Nginx 443 HTML 404 to 2222');
+check(count($GLOBALS['SENT']) === 2, 'two requests made during 443->2222 fallback');
+check($GLOBALS['SENT'][1]['url'] === "https://panel.example.com:2222$base/plans", 'second request used port 2222');
+
+// Simulate HTML error page when :2222 also fails: strips raw HTML tags
+$GLOBALS['SENT'] = [];
+$GLOBALS['SPANEL_TRANSPORT'] = function ($method, $url, $headers, $body) {
+    return [
+        'errno' => 0,
+        'error' => '',
+        'status' => 404,
+        'body' => "<html><script>alert(1)</script><body><h1>404 Not Found</h1><hr>nginx/1.24.0 (Ubuntu)</body></html>",
+    ];
+};
+$tcHtmlErr = spanel_TestConnection(params(['serverport' => '2222']));
+check($tcHtmlErr['success'] === false, 'HTML 404 fails cleanly');
+check(strpos($tcHtmlErr['error'], '<') === false && strpos($tcHtmlErr['error'], 'alert(1)') === false, 'HTML and script tags stripped: ' . $tcHtmlErr['error']);
+check(strpos($tcHtmlErr['error'], '2222') !== false, '404 diagnostic mentions port 2222');
+
+// Simulate 401 when admin typed plain panel password instead of bp_ API token
+fake_api(["GET $base/plans" => [401, ['detail' => 'Invalid, expired or revoked token']]]);
+$tcWrongToken = spanel_TestConnection(params(['serveraccesshash' => '', 'serverpassword' => 'MyAdminPass123!']));
+check($tcWrongToken['success'] === false && strpos($tcWrongToken['error'], 'bp_') !== false, '401 non-bp_ password gives token hint');
+
 if ($failures) {
     fwrite(STDERR, "$failures of $checks checks failed\n");
     exit(1);
