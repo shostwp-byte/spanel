@@ -356,7 +356,8 @@ POST /api/provisioning/v1/accounts
 ```
 
 `username`: `^[a-z_][a-z0-9_-]{2,31}$`, not a reserved system name. `domain` is
-optional (required for WordPress or SSL). `limits` fields are optional; 0 means
+optional (required for WordPress or SSL). `email` is optional and defaults to
+`admin@<domain>` when `domain` is provided. `limits` fields are optional; 0 means
 unlimited. The account first receives the package limits the panel's own user
 form applies (websites, disk, bandwidth, terminal, SFTP sub-accounts,
 mailboxes; databases are enforced from the package), then the overrides.
@@ -367,7 +368,7 @@ Response (`ProvisioningAccountOut`):
 {
   "external_id": "whmcs:42",
   "username": "sp42_ab12cd34",
-  "email": "sp42_ab12cd34@users.spanel.dev",
+  "email": "admin@shop.example.com",
   "domain": "shop.example.com",
   "package_id": 2,
   "package_name": "Basic",
