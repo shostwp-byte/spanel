@@ -13,6 +13,9 @@ if (!defined('WHMCS')) {
 if (!defined('SPANEL_API')) {
     define('SPANEL_API', '/api/provisioning/v1');
 }
+if (!defined('SPANEL_DEFAULT_PORT')) {
+    define('SPANEL_DEFAULT_PORT', '2222');
+}
 // Name (prefix) of the optional product custom field that receives the
 // account's SFTP password. Mark it "Admin Only" to keep it from customers,
 // or leave it visible so they can read it on the product details page.
@@ -448,10 +451,13 @@ function spanel_request($params, $method, $path, $payload = null, $query = [], $
         return ['ok' => false, 'error' => 'Missing SPanel API token in server Access Hash or Password'];
     }
 
-    $url = spanel_base_url($params) . $path;
-    if ($query) {
-        $url .= '?' . http_build_query($query);
+    $endpoint = spanel_parse_endpoint($params);
+    if ($endpoint['host_for_url'] === '') {
+        return ['ok' => false, 'error' => 'Missing SPanel server Hostname or IP Address'];
     }
+
+    $querySuffix = $query ? ('?' . http_build_query($query)) : '';
+    $url = $endpoint['base_url'] . $path . $querySuffix;
 
     $headers = [
         'Authorization: Bearer ' . $token,
@@ -467,7 +473,27 @@ function spanel_request($params, $method, $path, $payload = null, $query = [], $
         $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
     }
 
-    $response = spanel_http_send(strtoupper($method), $url, $headers, $body);
+    $httpMethod = strtoupper($method);
+    $response = spanel_http_send($httpMethod, $url, $headers, $body);
+    // When WHMCS leaves port=80/443 from another module selection, the request
+    // hits tenant Nginx (HTML 404) instead of SPanel Uvicorn (:2222). Retry
+    // default port 2222 on the same scheme when 80/443 answers non-JSON 404.
+    if (
+        !$response['errno']
+        && (int) $response['status'] === 404
+        && !$endpoint['inline_port']
+        && in_array($endpoint['port'], ['80', '443'], true)
+        && !is_array(json_decode((string) $response['body'], true))
+    ) {
+        $fallbackBase = $endpoint['scheme'] . '://' . $endpoint['host_for_url'] . ':' . SPANEL_DEFAULT_PORT;
+        $fallbackUrl = $fallbackBase . $path . $querySuffix;
+        $retryResponse = spanel_http_send($httpMethod, $fallbackUrl, $headers, $body);
+        if (!$retryResponse['errno']) {
+            $response = $retryResponse;
+            $url = $fallbackUrl;
+        }
+    }
+
     $secrets = spanel_request_secrets($payload);
     if ($response['errno']) {
         spanel_log($params, $method, $path, $payload, null, 'cURL ' . $response['errno'] . ': ' . $response['error'], $secrets);
@@ -494,7 +520,10 @@ function spanel_request($params, $method, $path, $payload = null, $query = [], $
             }
         }
         if ($message === '') {
-            $message = $raw !== '' ? $raw : 'HTTP ' . $status;
+            $message = spanel_clean_http_error($raw, $status, $url);
+        }
+        if ($status === 401 && strpos($token, 'bp_') !== 0) {
+            $message .= ' (Paste a SPanel API token starting with bp_ from Settings -> API & Billing Integration into Access Hash or Password)';
         }
         spanel_log($params, $method, $path, $payload, $raw, 'HTTP ' . $status . ': ' . $message, $secrets);
         return ['ok' => false, 'error' => 'SPanel API error: ' . $message, 'status' => $status];
@@ -564,24 +593,101 @@ function spanel_request_secrets($payload)
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function spanel_base_url($params)
+function spanel_clean_http_error($raw, $status, $url)
 {
-    $hostname = trim((string) ($params['serverhostname'] ?? ''));
-    if ($hostname === '') {
-        $hostname = trim((string) ($params['serverip'] ?? ''));
+    $text = preg_replace('#<(script|style)\b[^>]*>.*?</\1>#is', ' ', (string) $raw);
+    $text = strip_tags((string) $text);
+    $text = html_entity_decode($text, ENT_QUOTES, 'UTF-8');
+    $text = trim((string) preg_replace('/\s+/', ' ', $text));
+    if (strlen($text) > 220) {
+        $text = substr($text, 0, 217) . '...';
     }
-    $hostname = preg_replace('#^https?://#', '', $hostname);
-    $hostname = rtrim($hostname, '/');
+    if ($text === '') {
+        $text = 'HTTP ' . (int) $status;
+    } elseif (stripos($text, (string) $status) === false) {
+        $text = 'HTTP ' . (int) $status . ' ' . $text;
+    }
+    if ((int) $status === 404) {
+        $parts = parse_url((string) $url);
+        $origin = isset($parts['scheme'], $parts['host'])
+            ? ($parts['scheme'] . '://' . $parts['host'] . (isset($parts['port']) ? (':' . $parts['port']) : ''))
+            : (string) $url;
+        $text .= ' [endpoint ' . $origin . ' — ensure SPanel port 2222 is reachable]';
+    }
+    return $text;
+}
+
+function spanel_parse_endpoint($params)
+{
+    $raw = trim((string) ($params['serverhostname'] ?? ''));
+    if ($raw === '') {
+        $raw = trim((string) ($params['serverip'] ?? ''));
+    }
 
     $secure = !empty($params['serversecure']);
     $scheme = $secure ? 'https' : 'http';
-    $port = trim((string) ($params['serverport'] ?? ''));
-
-    if ($port !== '' && !in_array($port, ['80', '443'], true)) {
-        return $scheme . '://' . $hostname . ':' . $port;
+    if (preg_match('#^(https?)://#i', $raw, $m)) {
+        if (strtolower($m[1]) === 'https') {
+            $scheme = 'https';
+        } elseif (!$secure) {
+            $scheme = 'http';
+        }
+        $raw = substr($raw, strlen($m[0]));
     }
 
-    return $scheme . '://' . $hostname;
+    $slashPos = strcspn($raw, '/?#');
+    $authority = trim(substr($raw, 0, $slashPos));
+    $hostForUrl = '';
+    $inlinePort = '';
+
+    if ($authority !== '') {
+        if (preg_match('/^(\[[0-9a-fA-F:]+\])(?::([0-9]{1,5}))?$/', $authority, $hm)) {
+            $hostForUrl = $hm[1];
+            $inlinePort = isset($hm[2]) ? $hm[2] : '';
+        } elseif (substr_count($authority, ':') > 1) {
+            $hostForUrl = '[' . $authority . ']';
+        } elseif (preg_match('/^([^:]+?)(?::([0-9]{1,5}))?$/', $authority, $hm)) {
+            $hostForUrl = $hm[1];
+            $inlinePort = isset($hm[2]) ? $hm[2] : '';
+        } else {
+            $hostForUrl = $authority;
+        }
+    }
+
+    $paramPort = trim((string) ($params['serverport'] ?? ''));
+    $hasInlinePort = false;
+    if ($inlinePort !== '' && (int) $inlinePort > 0 && (int) $inlinePort <= 65535) {
+        $port = (string) (int) $inlinePort;
+        $hasInlinePort = true;
+    } elseif ($paramPort !== '' && ctype_digit($paramPort) && (int) $paramPort > 0 && (int) $paramPort <= 65535) {
+        $port = (string) (int) $paramPort;
+    } else {
+        // WHMCS leaves serverport empty when "Override with Custom Port" is
+        // unchecked or on newly switched server forms; SPanel listens on 2222.
+        $port = SPANEL_DEFAULT_PORT;
+    }
+
+    if ($hostForUrl === '') {
+        $baseUrl = '';
+    } elseif (($scheme === 'https' && $port === '443') || ($scheme === 'http' && $port === '80')) {
+        $baseUrl = $scheme . '://' . $hostForUrl;
+    } else {
+        $baseUrl = $scheme . '://' . $hostForUrl . ':' . $port;
+    }
+
+    return [
+        'scheme' => $scheme,
+        'host_for_url' => $hostForUrl,
+        'port' => $port,
+        'inline_port' => $hasInlinePort,
+        'base_url' => $baseUrl,
+    ];
+}
+
+function spanel_base_url($params)
+{
+    $endpoint = spanel_parse_endpoint($params);
+    return $endpoint['base_url'];
 }
 
 function spanel_absolute_url($params, $url)
