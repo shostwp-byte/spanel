@@ -131,11 +131,16 @@ function spanel_CreateAccount($params)
     // credentials, so it gets the account the first attempt created.
     spanel_save_service_record($params, [], $username, $password);
 
+    $pkgResolved = spanel_resolve_package_id($params, spanel_config($params, 1, '1'), false);
+    if (!$pkgResolved['ok'] || $pkgResolved['id'] <= 0) {
+        return $pkgResolved['error'] !== '' ? $pkgResolved['error'] : 'Invalid SPanel package selection';
+    }
+
     $payload = [
         'external_id' => spanel_external_id($params),
         'username' => $username,
         'password' => $password,
-        'package_id' => (int) spanel_config($params, 1, '1'),
+        'package_id' => $pkgResolved['id'],
         'php_version' => spanel_config($params, 3, '8.4'),
         'app_type' => $domain === '' ? 'php' : spanel_config($params, 2, 'php'),
         'install_wordpress' => spanel_yesno(spanel_config($params, 4, '')),
@@ -153,9 +158,13 @@ function spanel_CreateAccount($params)
     if ($domain === '' && ($payload['install_wordpress'] || $payload['enable_ssl'])) {
         return 'A domain is required when Install WordPress or Auto SSL is enabled';
     }
-    $resellerPackage = (int) spanel_config($params, 7, '0');
-    if ($payload['is_reseller'] && $resellerPackage > 0) {
-        $payload['reseller_package_id'] = $resellerPackage;
+    $rawResellerPkg = spanel_config($params, 7, '');
+    if ($payload['is_reseller'] && $rawResellerPkg !== '' && $rawResellerPkg !== '0') {
+        $resPkgResolved = spanel_resolve_package_id($params, $rawResellerPkg, true);
+        if (!$resPkgResolved['ok'] || $resPkgResolved['id'] <= 0) {
+            return $resPkgResolved['error'] !== '' ? $resPkgResolved['error'] : 'Invalid SPanel reseller package selection';
+        }
+        $payload['reseller_package_id'] = $resPkgResolved['id'];
     }
     $limits = spanel_limits_from_config_options($params['configoptions'] ?? []);
     if ($limits) {
@@ -165,6 +174,12 @@ function spanel_CreateAccount($params)
     $key = 'whmcs-' . (int) ($params['serviceid'] ?? 0) . '-create-' . substr(hash('sha256', $username . "\n" . $password), 0, 24);
     $result = spanel_request($params, 'POST', SPANEL_API . '/accounts', $payload, [], $key);
     if (!$result['ok']) {
+        if ((int) ($result['status'] ?? 0) === 404 && stripos((string) $result['error'], 'Package not found') !== false) {
+            $hint = spanel_available_packages_hint($params);
+            if ($hint !== '') {
+                return $result['error'] . ' (' . $hint . ')';
+            }
+        }
         return $result['error'];
     }
 
@@ -178,7 +193,8 @@ function spanel_CreateAccount($params)
 
 function spanel_SuspendAccount($params)
 {
-    $payload = ['reason' => (string) ($params['suspendreason'] ?? 'Suspended by WHMCS')];
+    $reason = trim((string) ($params['suspendreason'] ?? ''));
+    $payload = ['reason' => $reason !== '' ? $reason : 'Suspended by WHMCS'];
     $result = spanel_request($params, 'POST', spanel_account_path($params, '/suspend'), $payload);
     return $result['ok'] ? 'success' : $result['error'];
 }
@@ -201,7 +217,10 @@ function spanel_TerminateAccount($params)
 
 function spanel_ChangePassword($params)
 {
-    $password = spanel_password($params);
+    $password = (string) ($params['password'] ?? '');
+    if (strlen($password) < 12 || strlen($password) > 72) {
+        return 'Password must be between 12 and 72 characters';
+    }
     $payload = ['password' => $password];
     // A retry of the same change replays the first answer, which may carry
     // the only copy of a newly minted SFTP password.
@@ -218,10 +237,18 @@ function spanel_ChangePassword($params)
 
 function spanel_ChangePackage($params)
 {
-    $payload = ['package_id' => (int) spanel_config($params, 1, '1')];
-    $resellerPackage = (int) spanel_config($params, 7, '0');
-    if (spanel_yesno(spanel_config($params, 6, '')) && $resellerPackage > 0) {
-        $payload['reseller_package_id'] = $resellerPackage;
+    $pkgResolved = spanel_resolve_package_id($params, spanel_config($params, 1, '1'), false);
+    if (!$pkgResolved['ok'] || $pkgResolved['id'] <= 0) {
+        return $pkgResolved['error'] !== '' ? $pkgResolved['error'] : 'Invalid SPanel package selection';
+    }
+    $payload = ['package_id' => $pkgResolved['id']];
+    $rawResellerPkg = spanel_config($params, 7, '');
+    if (spanel_yesno(spanel_config($params, 6, '')) && $rawResellerPkg !== '' && $rawResellerPkg !== '0') {
+        $resPkgResolved = spanel_resolve_package_id($params, $rawResellerPkg, true);
+        if (!$resPkgResolved['ok'] || $resPkgResolved['id'] <= 0) {
+            return $resPkgResolved['error'] !== '' ? $resPkgResolved['error'] : 'Invalid SPanel reseller package selection';
+        }
+        $payload['reseller_package_id'] = $resPkgResolved['id'];
     }
     $limits = spanel_limits_from_config_options($params['configoptions'] ?? []);
     if ($limits) {
@@ -336,7 +363,11 @@ function spanel_AdminServicesTabFields($params)
     $fields = [];
     $account = spanel_request($params, 'GET', spanel_account_path($params));
     if (!$account['ok']) {
-        return ['SPanel' => spanel_h($account['error'])];
+        $errText = (string) ($account['error'] ?? '');
+        if ((int) ($account['status'] ?? 0) === 404 && stripos($errText, 'Account not found') !== false) {
+            return ['SPanel status' => '<em>Not provisioned yet (click Create to provision)</em>'];
+        }
+        return ['SPanel' => spanel_h($errText)];
     }
     $data = $account['data'];
     $fields['SPanel status'] = spanel_h((string) ($data['status'] ?? '')) . (empty($data['last_action']) ? '' : ' <small>(last: ' . spanel_h((string) $data['last_action']) . ')</small>');
@@ -481,22 +512,41 @@ function spanel_request($params, $method, $path, $payload = null, $query = [], $
 
     $httpMethod = strtoupper($method);
     $response = spanel_http_send($httpMethod, $url, $headers, $body);
-    // When WHMCS leaves port=80/443 from another module selection, the request
-    // hits tenant Nginx (HTML 404) instead of SPanel Uvicorn (:2222). Retry
-    // default port 2222 on the same scheme when 80/443 answers non-JSON 404.
+
+    // If "Secure" was left unchecked in WHMCS while SPanel runs TLS on :2222,
+    // plaintext HTTP either drops at the TLS handshake (cURL errno) or returns
+    // a non-JSON 301/302/307/308/400 response. Auto-upgrade once to HTTPS.
     if (
-        !$response['errno']
-        && (int) $response['status'] === 404
-        && !$endpoint['inline_port']
-        && in_array($endpoint['port'], ['80', '443'], true)
-        && !is_array(json_decode((string) $response['body'], true))
+        $endpoint['scheme'] === 'http'
+        && empty($endpoint['explicit_http'])
+        && (
+            $response['errno']
+            || (
+                in_array((int) $response['status'], [301, 302, 303, 307, 308, 400], true)
+                && !is_array(json_decode((string) $response['body'], true))
+            )
+        )
     ) {
-        $fallbackBase = $endpoint['scheme'] . '://' . $endpoint['host_for_url'] . ':' . SPANEL_DEFAULT_PORT;
-        $fallbackUrl = $fallbackBase . $path . $querySuffix;
-        $retryResponse = spanel_http_send($httpMethod, $fallbackUrl, $headers, $body);
-        if (!$retryResponse['errno']) {
-            $response = $retryResponse;
-            $url = $fallbackUrl;
+        $httpsBase = 'https://' . $endpoint['host_for_url'] . ':' . $endpoint['port'];
+        $httpsUrl = $httpsBase . $path . $querySuffix;
+        $httpsResponse = spanel_http_send($httpMethod, $httpsUrl, $headers, $body);
+        if (!$httpsResponse['errno']) {
+            $response = $httpsResponse;
+            $url = $httpsUrl;
+        }
+    }
+
+    // If port 2222 is unreachable (e.g. closed behind a 443/80 reverse proxy)
+    // and WHMCS had port 80/443 configured, fall back to that web port.
+    if ($response['errno'] && !empty($endpoint['web_fallback_port'])) {
+        $webPort = (string) $endpoint['web_fallback_port'];
+        $webScheme = $webPort === '443' ? 'https' : $endpoint['scheme'];
+        $webBase = $webScheme . '://' . $endpoint['host_for_url'];
+        $webUrl = $webBase . $path . $querySuffix;
+        $webResponse = spanel_http_send($httpMethod, $webUrl, $headers, $body);
+        if (!$webResponse['errno']) {
+            $response = $webResponse;
+            $url = $webUrl;
         }
     }
 
@@ -563,18 +613,22 @@ function spanel_http_send($method, $url, $headers, $body)
     }
 
     $ch = curl_init($url);
+    $curlHeaders = $headers;
     $options = [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_TIMEOUT => 120,
-        CURLOPT_HTTPHEADER => $headers,
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
     ];
     if ($body !== null) {
         $options[CURLOPT_POSTFIELDS] = $body;
+    } elseif (in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
+        $options[CURLOPT_POSTFIELDS] = '';
+        $curlHeaders[] = 'Content-Length: 0';
     }
+    $options[CURLOPT_HTTPHEADER] = $curlHeaders;
     curl_setopt_array($ch, $options);
 
     $responseBody = curl_exec($ch);
@@ -613,12 +667,17 @@ function spanel_clean_http_error($raw, $status, $url)
     } elseif (stripos($text, (string) $status) === false) {
         $text = 'HTTP ' . (int) $status . ' ' . $text;
     }
-    if ((int) $status === 404) {
+    $code = (int) $status;
+    if (in_array($code, [301, 302, 303, 307, 308, 404, 405], true)) {
         $parts = parse_url((string) $url);
         $origin = isset($parts['scheme'], $parts['host'])
             ? ($parts['scheme'] . '://' . $parts['host'] . (isset($parts['port']) ? (':' . $parts['port']) : ''))
             : (string) $url;
-        $text .= ' [endpoint ' . $origin . ' — ensure SPanel port 2222 is reachable]';
+        if ($code === 404) {
+            $text .= ' [endpoint ' . $origin . ' — ensure SPanel port 2222 is reachable]';
+        } else {
+            $text .= ' [endpoint ' . $origin . ' — verify this WHMCS service is assigned to your SPanel server (not DirectAdmin/another panel on 2222) and Secure SSL is enabled]';
+        }
     }
     return $text;
 }
@@ -631,12 +690,14 @@ function spanel_parse_endpoint($params)
     }
 
     $secure = !empty($params['serversecure']);
+    $explicitHttp = false;
     $scheme = $secure ? 'https' : 'http';
     if (preg_match('#^(https?)://#i', $raw, $m)) {
         if (strtolower($m[1]) === 'https') {
             $scheme = 'https';
         } elseif (!$secure) {
             $scheme = 'http';
+            $explicitHttp = true;
         }
         $raw = substr($raw, strlen($m[0]));
     }
@@ -662,11 +723,24 @@ function spanel_parse_endpoint($params)
 
     $paramPort = trim((string) ($params['serverport'] ?? ''));
     $hasInlinePort = false;
+    $webFallbackPort = '';
     if ($inlinePort !== '' && (int) $inlinePort > 0 && (int) $inlinePort <= 65535) {
         $port = (string) (int) $inlinePort;
         $hasInlinePort = true;
     } elseif ($paramPort !== '' && ctype_digit($paramPort) && (int) $paramPort > 0 && (int) $paramPort <= 65535) {
-        $port = (string) (int) $paramPort;
+        if (in_array($paramPort, ['80', '443'], true)) {
+            // WHMCS carries over port 80/443 when switching modules or leaving
+            // "Override with Custom Port" unchecked. SPanel never binds 80/443
+            // directly (those belong to tenant Nginx, which answers 302/404/405),
+            // so target port 2222 first and keep 80/443 as a proxy fallback.
+            $port = SPANEL_DEFAULT_PORT;
+            $webFallbackPort = $paramPort;
+            if ($paramPort === '443' && !$explicitHttp) {
+                $scheme = 'https';
+            }
+        } else {
+            $port = (string) (int) $paramPort;
+        }
     } else {
         // WHMCS leaves serverport empty when "Override with Custom Port" is
         // unchecked or on newly switched server forms; SPanel listens on 2222.
@@ -683,9 +757,11 @@ function spanel_parse_endpoint($params)
 
     return [
         'scheme' => $scheme,
+        'explicit_http' => $explicitHttp,
         'host_for_url' => $hostForUrl,
         'port' => $port,
         'inline_port' => $hasInlinePort,
+        'web_fallback_port' => $webFallbackPort,
         'base_url' => $baseUrl,
     ];
 }
@@ -935,6 +1011,68 @@ function spanel_package_options($packages)
     }
 
     return $options;
+}
+
+function spanel_resolve_package_id($params, $rawValue, $isResellerList = false)
+{
+    $val = trim((string) $rawValue);
+    if ($val === '') {
+        return ['ok' => true, 'id' => 0, 'error' => ''];
+    }
+    if (ctype_digit($val) && (int) $val > 0) {
+        return ['ok' => true, 'id' => (int) $val, 'error' => ''];
+    }
+    if (preg_match('/#([0-9]+)\)?\s*$/', $val, $m) && (int) $m[1] > 0) {
+        return ['ok' => true, 'id' => (int) $m[1], 'error' => ''];
+    }
+
+    $listPath = $isResellerList ? (SPANEL_API . '/reseller-plans') : (SPANEL_API . '/plans');
+    $result = spanel_request($params, 'GET', $listPath);
+    if (!$result['ok']) {
+        return ['ok' => false, 'id' => 0, 'error' => $result['error']];
+    }
+
+    $needle = strtolower($val);
+    $labels = [];
+    foreach ($result['data'] as $pkg) {
+        if (!is_array($pkg) || (int) ($pkg['id'] ?? 0) <= 0) {
+            continue;
+        }
+        $id = (int) $pkg['id'];
+        $name = trim((string) ($pkg['name'] ?? ''));
+        $slug = trim((string) ($pkg['slug'] ?? ''));
+        if ($name !== '' && strtolower($name) === $needle) {
+            return ['ok' => true, 'id' => $id, 'error' => ''];
+        }
+        if ($slug !== '' && strtolower($slug) === $needle) {
+            return ['ok' => true, 'id' => $id, 'error' => ''];
+        }
+        $labels[] = ($name !== '' ? $name : ('Package ' . $id)) . ' (#' . $id . ')';
+    }
+
+    $avail = $labels ? ('available packages - ' . implode(', ', $labels)) : 'no packages configured on SPanel';
+    return ['ok' => false, 'id' => 0, 'error' => 'SPanel package "' . $val . '" was not found (' . $avail . ')'];
+}
+
+function spanel_available_packages_hint($params)
+{
+    $plans = spanel_request($params, 'GET', SPANEL_API . '/plans');
+    if (!$plans['ok'] || !is_array($plans['data'])) {
+        return '';
+    }
+    $labels = [];
+    foreach ($plans['data'] as $pkg) {
+        if (!is_array($pkg) || (int) ($pkg['id'] ?? 0) <= 0) {
+            continue;
+        }
+        $id = (int) $pkg['id'];
+        $name = trim((string) ($pkg['name'] ?? ''));
+        $labels[] = ($name !== '' ? $name : ('Package ' . $id)) . ' (#' . $id . ')';
+    }
+    if (!$labels) {
+        return 'create a User Package in SPanel first';
+    }
+    return 'select a valid SPanel package in WHMCS Product Module Settings — available ' . implode(', ', $labels);
 }
 
 function spanel_service_label($params, $account)
