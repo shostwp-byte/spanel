@@ -30,7 +30,7 @@ def _create_payload(**extra):
     return body
 
 
-def test_reseller_token_self_service_and_admin_delegation():
+def test_admin_only_token_management_and_reseller_delegation():
     with SessionLocal() as db:
         admin = kit.make_user(db, "rootadmin", role="admin")
         res_a = kit.make_user(db, "reseller_a", role="reseller")
@@ -39,28 +39,29 @@ def test_reseller_token_self_service_and_admin_delegation():
 
     c_admin = kit.client(admin.id)
     c_res_a = kit.client(res_a.id)
-    c_res_b = kit.client(res_b.id)
 
-    # Reseller scope catalogue hides sso:admin and exposes sso:reseller.
-    scopes_resp = c_res_a.get(f"{BASE}/scopes")
+    # Panel API & Billing configuration endpoints are strictly Admin-only (403 for Reseller sessions).
+    assert c_res_a.get(f"{BASE}/scopes").status_code == 403
+    assert c_res_a.get(f"{BASE}/tokens").status_code == 403
+    assert c_res_a.post(f"{BASE}/tokens", json={"name": "bad", "scopes": "accounts:read"}).status_code == 403
+    assert c_res_a.get("/api/resellers/whmcs-diagnostic").status_code == 403
+    assert c_res_a.get("/api/resellers/webhooks").status_code == 403
+    assert c_res_a.post("/api/resellers/webhooks", json={"url": "https://hooks.example.com/in"}).status_code == 403
+    assert c_res_a.get("/api/resellers/webhooks/events").status_code == 403
+    assert c_res_a.get("/api/resellers/webhooks/deliveries").status_code == 403
+
+    # Admin scope catalogue exposes both sso:admin and sso:reseller.
+    scopes_resp = c_admin.get(f"{BASE}/scopes")
     assert scopes_resp.status_code == 200
     scope_names = {s["name"] for s in scopes_resp.json()["scopes"]}
-    assert "sso:reseller" in scope_names
-    assert "sso:admin" not in scope_names
+    assert {"sso:admin", "sso:reseller"} <= scope_names
 
-    # Reseller cannot create a token owned by Admin or another Reseller.
-    forbid = c_res_a.post(f"{BASE}/tokens", json={
-        "name": "bad",
-        "scopes": "accounts:read",
-        "owner_user_id": admin.id,
-    })
-    assert forbid.status_code == 403
-
-    # Reseller creates own token; passing sso:admin maps cleanly to sso:reseller.
-    created_a = c_res_a.post(f"{BASE}/tokens", json={
+    # Admin delegates a token to Reseller A; passing sso:admin on a Reseller owner maps cleanly to sso:reseller.
+    created_a = c_admin.post(f"{BASE}/tokens", json={
         "name": "WHMCS Reseller A",
         "scopes": "plans:read,accounts:read,accounts:write,usage:read,sso,sso:admin",
         "allowed_ips": "203.0.113.10",
+        "owner_user_id": res_a.id,
     })
     assert created_a.status_code == 200, created_a.text
     info_a = created_a.json()["info"]
@@ -70,7 +71,7 @@ def test_reseller_token_self_service_and_admin_delegation():
     assert "sso:admin" not in info_a["scopes"]
     tok_a_id = info_a["id"]
 
-    # Admin can delegate a token directly to Reseller B from Admin Settings UI.
+    # Admin can delegate another token directly to Reseller B from Admin Settings UI.
     delegated_b = c_admin.post(f"{BASE}/tokens", json={
         "name": "Delegated WHMCS B",
         "scopes": "plans:read,accounts:read,accounts:write,sso:reseller",
@@ -83,14 +84,12 @@ def test_reseller_token_self_service_and_admin_delegation():
     assert info_b["owner_role"] == "reseller"
     tok_b_id = info_b["id"]
 
-    # Reseller A only sees own token; cannot update, rotate or revoke Reseller B's token.
-    list_a = c_res_a.get(f"{BASE}/tokens").json()
-    assert [t["id"] for t in list_a] == [tok_a_id]
-    assert c_res_a.patch(f"{BASE}/tokens/{tok_b_id}", json={"name": "hijack"}).status_code == 404
-    assert c_res_a.post(f"{BASE}/tokens/{tok_b_id}/rotate", json={}).status_code == 404
-    assert c_res_a.delete(f"{BASE}/tokens/{tok_b_id}").status_code == 404
+    # Reseller sessions still get 403 when attempting to patch, rotate or revoke existing tokens.
+    assert c_res_a.patch(f"{BASE}/tokens/{tok_a_id}", json={"name": "hijack"}).status_code == 403
+    assert c_res_a.post(f"{BASE}/tokens/{tok_a_id}/rotate", json={}).status_code == 403
+    assert c_res_a.delete(f"{BASE}/tokens/{tok_a_id}").status_code == 403
 
-    # In-place PATCH enables sso:reseller without changing the existing bp_... secret:
+    # In-place PATCH by Admin enables sso:reseller without changing the existing bp_... secret:
     from fastapi.testclient import TestClient
 
     created_plain = c_admin.post(f"{BASE}/tokens", json={
@@ -125,15 +124,14 @@ def test_reseller_token_self_service_and_admin_delegation():
     assert sso_now.json()["username"] == "reseller_a"
     assert sso_now.json()["role"] == "reseller"
 
-    # Admin sees all tokens.
+    # Admin sees all tokens and WHMCS readiness diagnostic.
     list_admin = c_admin.get(f"{BASE}/tokens").json()
     assert {t["id"] for t in list_admin} == {tok_a_id, tok_b_id, plain_id}
 
-    # Reseller WHMCS diagnostic works and counts only Reseller A's active write tokens.
-    diag_a = c_res_a.get("/api/resellers/whmcs-diagnostic")
-    assert diag_a.status_code == 200
-    assert diag_a.json()["write_tokens_count"] == 2
-    assert diag_a.json()["ready"] is True
+    diag_admin = c_admin.get("/api/resellers/whmcs-diagnostic")
+    assert diag_admin.status_code == 200
+    assert diag_admin.json()["write_tokens_count"] == 3
+    assert diag_admin.json()["ready"] is True
 
 
 def test_reseller_and_admin_server_sso_isolation():

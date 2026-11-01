@@ -922,15 +922,12 @@ def rotate_own_token(payload: ApiTokenRotate, request: Request, db: Session = De
     return idempotency.run(db, token, request, payload, _rotate)
 
 
-# ── API Tokens (Admin & Reseller self-service, cookie auth) ──────────────
+# ── API Tokens (Admin-only panel management, cookie auth) ─────────────────
 
 @router.get("/tokens", response_model=List[ApiTokenOut])
 def list_tokens(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
-    query = db.query(ApiToken)
-    if not is_admin_role(current_user.role):
-        query = query.filter(ApiToken.created_by_id == current_user.id)
-    rows = query.order_by(ApiToken.id.desc()).all()
+    ensure_role(current_user.role, Role.admin)
+    rows = db.query(ApiToken).order_by(ApiToken.id.desc()).all()
     owner_ids = {r.created_by_id for r in rows if r.created_by_id}
     owners = (
         {u.id: u for u in db.query(User).filter(User.id.in_(owner_ids)).all()}
@@ -943,17 +940,11 @@ def list_tokens(db: Session = Depends(get_db), current_user: User = Depends(get_
 @router.get("/scopes")
 def list_scopes(current_user: User = Depends(get_current_user)):
     """The scope catalogue, for the token form."""
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     from app.services.provisioning import LEGACY_SCOPES, SCOPES
 
-    is_admin = is_admin_role(current_user.role)
-    visible_scopes = [
-        {"name": name, "description": desc}
-        for name, desc in SCOPES.items()
-        if is_admin or name != "sso:admin"
-    ]
     return {
-        "scopes": visible_scopes,
+        "scopes": [{"name": name, "description": desc} for name, desc in SCOPES.items()],
         "legacy": {name: sorted(expanded) for name, expanded in LEGACY_SCOPES.items()},
     }
 
@@ -975,12 +966,9 @@ def _align_scopes_for_owner_role(scopes: str, owner_role: Optional[str]) -> str:
 
 @router.post("/tokens", response_model=ApiTokenCreatedResponse)
 def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
-    is_admin = is_admin_role(current_user.role)
+    ensure_role(current_user.role, Role.admin)
     owner_user = current_user
     if payload.owner_user_id is not None:
-        if not is_admin and payload.owner_user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Resellers can only create API tokens for their own account")
         target = db.query(User).filter(User.id == payload.owner_user_id).first()
         if not target or not target.is_active or target.role not in (Role.admin, Role.reseller):
             raise HTTPException(status_code=400, detail="Token owner must be an active Admin or Reseller account")
@@ -1026,9 +1014,9 @@ def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depend
 @router.patch("/tokens/{token_id}", response_model=ApiTokenOut)
 def update_token(token_id: int, payload: ApiTokenUpdate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Update an active token's name, scopes, allowed IPs or rate limit in place without changing its secret."""
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
-    if not token or (not is_admin_role(current_user.role) and token.created_by_id != current_user.id):
+    if not token:
         raise HTTPException(status_code=404, detail="Token not found")
     if not token.is_active or token.revoked_at is not None:
         raise HTTPException(status_code=400, detail="A revoked token cannot be updated")
@@ -1077,9 +1065,9 @@ def update_token(token_id: int, payload: ApiTokenUpdate, request: Request, db: S
 
 @router.post("/tokens/{token_id}/rotate", response_model=ApiTokenCreatedResponse)
 def rotate_token(token_id: int, payload: ApiTokenRotate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
-    if not token or (not is_admin_role(current_user.role) and token.created_by_id != current_user.id):
+    if not token:
         raise HTTPException(status_code=404, detail="Token not found")
     if not token.is_active or token.revoked_at is not None:
         raise HTTPException(status_code=400, detail="A revoked token cannot be rotated")
@@ -1095,9 +1083,9 @@ def rotate_token(token_id: int, payload: ApiTokenRotate, request: Request, db: S
 
 @router.delete("/tokens/{token_id}")
 def revoke_token(token_id: int, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
-    if not token or (not is_admin_role(current_user.role) and token.created_by_id != current_user.id):
+    if not token:
         raise HTTPException(status_code=404, detail="Token not found")
     token.is_active = False
     token.revoked_at = datetime.now(timezone.utc)
