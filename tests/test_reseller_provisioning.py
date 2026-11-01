@@ -83,20 +83,56 @@ def test_reseller_token_self_service_and_admin_delegation():
     assert info_b["owner_role"] == "reseller"
     tok_b_id = info_b["id"]
 
-    # Reseller A only sees own token; cannot rotate or revoke Reseller B's token.
+    # Reseller A only sees own token; cannot update, rotate or revoke Reseller B's token.
     list_a = c_res_a.get(f"{BASE}/tokens").json()
     assert [t["id"] for t in list_a] == [tok_a_id]
+    assert c_res_a.patch(f"{BASE}/tokens/{tok_b_id}", json={"name": "hijack"}).status_code == 404
     assert c_res_a.post(f"{BASE}/tokens/{tok_b_id}/rotate", json={}).status_code == 404
     assert c_res_a.delete(f"{BASE}/tokens/{tok_b_id}").status_code == 404
 
+    # In-place PATCH enables sso:reseller without changing the existing bp_... secret:
+    from fastapi.testclient import TestClient
+
+    created_plain = c_admin.post(f"{BASE}/tokens", json={
+        "name": "WHMCS Billing",
+        "scopes": "plans:read,accounts:read,accounts:write,usage:read,sso",
+        "allowed_ips": "160.191.248.77",
+        "owner_user_id": res_a.id,
+    })
+    assert created_plain.status_code == 200
+    plain_raw = created_plain.json()["token"]
+    plain_id = created_plain.json()["info"]["id"]
+
+    c_whmcs = TestClient(kit.build_app(), client=("160.191.248.77", 50000))
+    assert c_whmcs.post(f"{BASE}/admin/login", headers=kit.bearer(plain_raw)).status_code == 403
+
+    # Clearing allowed_ips while requesting sso:reseller is rejected with 400:
+    assert c_admin.patch(
+        f"{BASE}/tokens/{plain_id}",
+        json={"scopes": "plans:read,sso,sso:reseller", "allowed_ips": ""},
+    ).status_code == 400
+
+    # Enabling sso:reseller in place keeps plain_raw working immediately for Server SSO:
+    patched = c_admin.patch(
+        f"{BASE}/tokens/{plain_id}",
+        json={"scopes": "plans:read,accounts:read,accounts:write,usage:read,sso,sso:reseller"},
+    )
+    assert patched.status_code == 200, patched.text
+    assert "sso:reseller" in patched.json()["scopes"]
+    with patch("app.api.provisioning.create_panel_login_token", return_value="res_inplace_sso"):
+        sso_now = c_whmcs.post(f"{BASE}/admin/login", headers=kit.bearer(plain_raw))
+    assert sso_now.status_code == 200
+    assert sso_now.json()["username"] == "reseller_a"
+    assert sso_now.json()["role"] == "reseller"
+
     # Admin sees all tokens.
     list_admin = c_admin.get(f"{BASE}/tokens").json()
-    assert {t["id"] for t in list_admin} == {tok_a_id, tok_b_id}
+    assert {t["id"] for t in list_admin} == {tok_a_id, tok_b_id, plain_id}
 
     # Reseller WHMCS diagnostic works and counts only Reseller A's active write tokens.
     diag_a = c_res_a.get("/api/resellers/whmcs-diagnostic")
     assert diag_a.status_code == 200
-    assert diag_a.json()["write_tokens_count"] == 1
+    assert diag_a.json()["write_tokens_count"] == 2
     assert diag_a.json()["ready"] is True
 
 
