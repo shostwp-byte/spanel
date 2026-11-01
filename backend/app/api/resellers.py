@@ -221,7 +221,7 @@ def _validate_events(raw: str) -> str:
 @router.get("/webhooks/events")
 def list_webhook_events(current_user: User = Depends(get_current_user)):
     """The event catalogue for the endpoint form."""
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     return {
         "events": [{"name": name, "description": desc} for name, desc in webhooks_service.EVENT_CATALOGUE.items()],
         "signature": {
@@ -246,13 +246,13 @@ def _webhook_to_out(webhook: WebhookEndpoint) -> dict:
 
 @router.get("/webhooks", response_model=List[WebhookEndpointOut])
 def list_webhooks(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     rows = db.query(WebhookEndpoint).filter(WebhookEndpoint.user_id == current_user.id).all()
     return [_webhook_to_out(row) for row in rows]
 
 @router.post("/webhooks", response_model=WebhookEndpointOut)
 def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     safe_url = _validate_webhook_url(payload.url)
 
     webhook = WebhookEndpoint(
@@ -269,7 +269,7 @@ def create_webhook(payload: WebhookEndpointCreate, db: Session = Depends(get_db)
 
 @router.put("/webhooks/{webhook_id}", response_model=WebhookEndpointOut)
 def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
 
     webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id, WebhookEndpoint.user_id == current_user.id).first()
     if not webhook:
@@ -294,17 +294,17 @@ def update_webhook(webhook_id: int, payload: WebhookEndpointUpdate, db: Session 
 # validation on webhook_id (422) and never reach this handler.
 @router.delete("/webhooks/deliveries")
 def clear_webhook_deliveries(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     removed = webhooks_service.clear_deliveries(
         user_id=current_user.id,
-        is_admin=is_admin_role(current_user.role),
+        is_admin=True,
     )
     return {"ok": True, "removed": removed, "message": f"Đã xóa {removed} bản ghi lịch sử Webhook."}
 
 
 @router.delete("/webhooks/{webhook_id}")
 def delete_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
 
     webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id, WebhookEndpoint.user_id == current_user.id).first()
     if not webhook:
@@ -317,10 +317,8 @@ def delete_webhook(webhook_id: int, db: Session = Depends(get_db), current_user:
 
 @router.post("/webhooks/{webhook_id}/test")
 def test_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
-    webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id, WebhookEndpoint.user_id == current_user.id).first()
-    if not webhook and is_admin_role(current_user.role):
-        webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id).first()
+    ensure_role(current_user.role, Role.admin)
+    webhook = db.query(WebhookEndpoint).filter(WebhookEndpoint.id == webhook_id).first()
     if not webhook:
         raise HTTPException(status_code=404, detail="Webhook not found")
 
@@ -352,11 +350,11 @@ def test_webhook(webhook_id: int, db: Session = Depends(get_db), current_user: U
 
 @router.get("/webhooks/deliveries")
 def list_webhook_deliveries(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     return {
         "items": webhooks_service.list_deliveries(
             user_id=current_user.id,
-            is_admin=is_admin_role(current_user.role),
+            is_admin=True,
             limit=50,
         )
     }
@@ -364,13 +362,13 @@ def list_webhook_deliveries(db: Session = Depends(get_db), current_user: User = 
 
 @router.post("/webhooks/deliveries/{delivery_id}/replay")
 def replay_webhook_delivery(delivery_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     try:
         delivery = webhooks_service.replay_delivery(
             db,
             delivery_id,
             user_id=current_user.id,
-            is_admin=is_admin_role(current_user.role),
+            is_admin=True,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -380,16 +378,13 @@ def replay_webhook_delivery(delivery_id: str, db: Session = Depends(get_db), cur
 @router.get("/whmcs-diagnostic")
 def whmcs_connection_diagnostic(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Comprehensive diagnostic for WHMCS, HostBill, Blesta & Perfex CRM integration."""
-    ensure_role(current_user.role, Role.reseller)
+    ensure_role(current_user.role, Role.admin)
     from datetime import datetime as _dt
 
     from app.services.provisioning import has_scope
 
-    is_admin = is_admin_role(current_user.role)
     now = _dt.utcnow()
     token_query = db.query(ApiToken).filter(ApiToken.is_active == True)  # noqa: E712
-    if not is_admin:
-        token_query = token_query.filter(ApiToken.created_by_id == current_user.id)
     active_tokens = [
         t for t in token_query.all()
         if t.revoked_at is None and (t.expires_at is None or t.expires_at > now)
@@ -398,18 +393,12 @@ def whmcs_connection_diagnostic(db: Session = Depends(get_db), current_user: Use
         t for t in active_tokens
         if has_scope(t, "accounts:write") and has_scope(t, "accounts:read")
     ]
-    pkg_query = db.query(UserPackage)
-    if not is_admin:
-        pkg_query = pkg_query.filter(
-            (UserPackage.owner_id == None) | (UserPackage.owner_id == current_user.id),  # noqa: E711
-            UserPackage.is_reseller_package == False,  # noqa: E712
-        )
-    packages_count = pkg_query.count()
+    packages_count = db.query(UserPackage).count()
     p_settings = panel_settings.current_settings()
     ssl_enabled = bool(p_settings.get("ssl_enabled"))
     hostname = p_settings.get("panel_hostname") or ""
     port = int(p_settings.get("panel_port") or 2222)
-    deliveries = webhooks_service.list_deliveries(user_id=current_user.id, is_admin=is_admin, limit=20)
+    deliveries = webhooks_service.list_deliveries(user_id=current_user.id, is_admin=True, limit=20)
     # A pending row that has not been tried yet is not a failure.
     failed_deliveries = [
         d for d in deliveries

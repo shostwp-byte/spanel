@@ -29,10 +29,11 @@ phát tài khoản, nhận sự kiện qua **Outbound Webhook**, và kết nối
 
 Yêu cầu: WHMCS 7.x/8.x, PHP 7.4 – 8.3, extension cURL. Không cần thư viện ngoài.
 
-### Bước 2: Tạo API Token trên SPanel (Admin hoặc Reseller)
+### Bước 2: Tạo API Token trên SPanel (Chỉ Admin cấu hình, hỗ trợ ủy quyền tài khoản thực thi Reseller)
 
-1. Đăng nhập SPanel bằng tài khoản **Admin** (vào **Cài đặt → API & Billing Integration**, có thể chọn tạo token cho chính Admin hoặc ủy quyền trực tiếp cho một tài khoản **Reseller**) — hoặc đăng nhập bằng tài khoản **Reseller** và vào **API & Billing (WHMCS)**.
-2. Chọn quyền (scopes), giới hạn IP (chấp nhận IP đơn và dải CIDR như
+1. Đăng nhập SPanel bằng tài khoản **Admin** và vào **Administrator Settings → API & Billing Integration** (tài khoản Reseller không được phép truy cập trang cấu hình API/Webhook).
+2. Ở mục **Tài khoản thực thi (Vai trò Token)**, Admin có thể chọn cấp token cho chính **Admin** hoặc ủy quyền cho một tài khoản phụ vai trò **Reseller** để cô lập quyền tạo dịch vụ End User kiểu DirectAdmin.
+3. Chọn quyền (scopes), giới hạn IP (chấp nhận IP đơn và dải CIDR như
    `103.1.2.0/24`, cả IPv6), thời hạn và giới hạn request/phút, rồi bấm
    **Tạo API Token**. Token (`bp_...`) chỉ hiện **một lần**.
 
@@ -328,7 +329,7 @@ stored, so they can be retried with the same key.
 | `POST /api/provisioning/v1/admin/login` | sso:admin / sso:reseller | One-time login link for the Admin (`sso:admin`) or Reseller (`sso:reseller`) who owns the token; 403 unless the token has an IP allowlist |
 | `POST /api/provisioning/v1/token/rotate` | tokens:rotate | Body `{"grace_minutes": 0}` → `{token, info}`: replaces the calling token |
 
-Panel token-management endpoints (panel session cookie, `admin` or `reseller` role; Resellers manage only their own tokens while Admins can also pass `owner_user_id` to delegate a token to a Reseller): `GET /api/provisioning/v1/tokens`,
+Panel token-management endpoints (panel session cookie, strictly `admin` role; Admins can pass `owner_user_id` to issue a token scoped to a Reseller execution account): `GET /api/provisioning/v1/tokens`,
 `POST /api/provisioning/v1/tokens` (`{name, scopes, allowed_ips, expires_in_days, rate_limit_per_minute, owner_user_id?}`),
 `PATCH /api/provisioning/v1/tokens/{token_id}` (`{name?, scopes?, allowed_ips?, rate_limit_per_minute?}` — updates scopes/IPs in place without changing the `bp_...` secret),
 `POST /api/provisioning/v1/tokens/{token_id}/rotate` (`{grace_minutes}`),
