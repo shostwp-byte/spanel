@@ -170,14 +170,17 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
   // API Tokens state
   const [apiTokens, setApiTokens] = useState([]);
   const [selectedPlatform, setSelectedPlatform] = useState('whmcs');
-  const [newApiToken, setNewApiToken] = useState({
+  const [newApiToken, setNewApiToken] = useState(() => ({
     name: 'WHMCS Billing',
     allowed_ips: '',
-    scopes: 'plans:read,accounts:read,accounts:write,usage:read,sso',
+    scopes: !isAdmin
+      ? 'plans:read,accounts:read,accounts:write,usage:read,sso,sso:reseller'
+      : 'plans:read,accounts:read,accounts:write,usage:read,sso',
     expires_in_days: '',
     rate_limit_per_minute: '',
     owner_user_id: '',
-  });
+  }));
+  const [editingToken, setEditingToken] = useState(null);
   const [createdApiToken, setCreatedApiToken] = useState('');
   const [showEndpointsRef, setShowEndpointsRef] = useState(false);
 
@@ -560,6 +563,85 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
       setCreatedApiToken(data.token || '');
       setNotice(`Đã tạo token thay thế cho ${token.name}. Sao chép ngay, token chỉ hiển thị 1 lần.`);
       await loadApiTokens();
+    }
+  }
+
+  async function enableServerSsoOnToken(token) {
+    const isResellerTok = token.owner_role === 'reseller' || (!isAdmin && isReseller);
+    const targetScope = isResellerTok ? 'sso:reseller' : 'sso:admin';
+    let nextIps = String(token.allowed_ips || '').trim();
+    if (!nextIps) {
+      const ipInput = prompt(
+        `Để bật nút "Login to SPanel" (${targetScope}) trên WHMCS, vui lòng nhập địa chỉ IP máy chủ WHMCS (VD: 160.191.248.77):`,
+        ''
+      );
+      if (ipInput === null) return;
+      nextIps = ipInput.trim();
+      if (!nextIps) {
+        setError('Cần nhập địa chỉ IP máy chủ WHMCS (Allowed IPs) để bật quyền đăng nhập nhanh SSO Server.');
+        return;
+      }
+    }
+    const existing = String(token.scopes || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!existing.includes(targetScope)) {
+      existing.push(targetScope);
+    }
+    const data = await request(
+      `/provisioning/v1/tokens/${token.id}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          scopes: existing.join(','),
+          allowed_ips: nextIps,
+        }),
+      },
+      `Đang bật quyền ${targetScope} cho ${token.name}...`
+    );
+    if (data) {
+      setNotice(
+        `Đã bật quyền Login to SPanel (${targetScope}) trực tiếp cho "${token.name}" — bạn có thể bấm Login to SPanel ngay trên WHMCS mà không cần đổi lại Token!`
+      );
+      await loadApiTokens();
+      await loadWhmcsDiagnostic();
+    }
+  }
+
+  async function saveTokenEdit(e) {
+    e.preventDefault();
+    if (!editingToken) return;
+    const trimmedName = String(editingToken.name || '').trim();
+    if (!trimmedName) {
+      setError(t('Token name is required.'));
+      return;
+    }
+    const chosenScopes = String(editingToken.scopes || '').trim();
+    const chosenIps = String(editingToken.allowed_ips || '').trim();
+    if ((chosenScopes.includes('sso:admin') || chosenScopes.includes('sso:reseller')) && !chosenIps) {
+      setError('Quyền sso:admin / sso:reseller bắt buộc phải nhập địa chỉ IP máy chủ WHMCS vào ô Giới hạn IP.');
+      return;
+    }
+    const data = await request(
+      `/provisioning/v1/tokens/${editingToken.id}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: trimmedName,
+          scopes: chosenScopes,
+          allowed_ips: chosenIps,
+          rate_limit_per_minute:
+            Number(editingToken.rate_limit_per_minute) > 0 ? Number(editingToken.rate_limit_per_minute) : 0,
+        }),
+      },
+      'Đang cập nhật quyền hạn & IP của API Token...'
+    );
+    if (data) {
+      setEditingToken(null);
+      setNotice(`Đã cập nhật trực tiếp API Token "${data.name}" (giữ nguyên mã bp_... trên WHMCS).`);
+      await loadApiTokens();
+      await loadWhmcsDiagnostic();
     }
   }
 
@@ -1229,10 +1311,17 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                       const nextIsReseller = Number(nextOwnerId) > 0;
                       setNewApiToken((prev) => {
                         let nextScopes = prev.scopes || '';
-                        if (nextIsReseller && nextScopes.includes('sso:admin')) {
-                          nextScopes = nextScopes.replace('sso:admin', 'sso:reseller');
-                        } else if (!nextIsReseller && nextScopes.includes('sso:reseller')) {
-                          nextScopes = nextScopes.replace('sso:reseller', 'sso:admin');
+                        if (nextIsReseller) {
+                          if (
+                            nextScopes === 'plans:read,accounts:read,accounts:write,usage:read,sso' ||
+                            nextScopes.includes('sso:admin')
+                          ) {
+                            nextScopes = 'plans:read,accounts:read,accounts:write,usage:read,sso,sso:reseller';
+                          }
+                        } else if (nextScopes.includes('sso:reseller')) {
+                          nextScopes = String(prev.allowed_ips || '').trim()
+                            ? nextScopes.replace('sso:reseller', 'sso:admin')
+                            : 'plans:read,accounts:read,accounts:write,usage:read,sso';
                         }
                         return { ...prev, owner_user_id: nextOwnerId, scopes: nextScopes };
                       });
@@ -1259,7 +1348,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 <input
                   value={newApiToken.allowed_ips}
                   onChange={(e) => setNewApiToken((prev) => ({ ...prev, allowed_ips: e.target.value }))}
-                  placeholder={selectedScopesNeedIp ? 'Bắt buộc: VD 103.1.2.3, 103.1.2.0/24' : 'Tùy chọn: 103.1.2.3, 103.1.2.0/24'}
+                  placeholder={selectedScopesNeedIp ? 'Bắt buộc: VD 160.191.248.77, 103.1.2.0/24' : 'Tùy chọn: 103.1.2.3, 103.1.2.0/24'}
                   style={selectedScopesNeedIp && !newApiToken.allowed_ips.trim() ? { borderColor: '#f59e0b' } : undefined}
                 />
               </label>
@@ -1274,11 +1363,11 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 >
                   {selectedOwnerIsReseller ? (
                     <>
-                      <option value="plans:read,accounts:read,accounts:write,usage:read,sso">
-                        WHMCS Reseller Chuẩn (Tạo End User & SSO Khách hàng)
-                      </option>
                       <option value="plans:read,accounts:read,accounts:write,usage:read,sso,sso:reseller">
-                        WHMCS Reseller + Nút Login to SPanel (sso:reseller)
+                        WHMCS Reseller + Login to SPanel (sso:reseller — Khuyên dùng)
+                      </option>
+                      <option value="plans:read,accounts:read,accounts:write,usage:read,sso">
+                        WHMCS Reseller (Không bật nút Login to SPanel)
                       </option>
                       <option value="provisioning:read,provisioning:write">
                         Đọc & Ghi Provisioning (Phạm vi Reseller)
@@ -1289,10 +1378,10 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                   ) : (
                     <>
                       <option value="plans:read,accounts:read,accounts:write,usage:read,sso">
-                        WHMCS Chuẩn (Phân quyền chi tiết — Khuyên dùng)
+                        WHMCS Chuẩn (Không bật Admin SSO)
                       </option>
                       <option value="plans:read,accounts:read,accounts:write,usage:read,sso,sso:admin">
-                        WHMCS + Nút Login to SPanel (Admin SSO — sso:admin)
+                        WHMCS + Login to SPanel (Admin SSO — sso:admin)
                       </option>
                       <option value="provisioning:read,provisioning:write">
                         Toàn quyền (Đọc & Ghi Provisioning)
@@ -1364,6 +1453,78 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
               )}
             </div>
 
+            {editingToken && (
+              <form
+                onSubmit={saveTokenEdit}
+                style={{
+                  padding: '14px 16px',
+                  borderRadius: '10px',
+                  background: 'var(--surface-2)',
+                  border: '1px solid var(--accent-primary)',
+                  marginBottom: '14px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '12px',
+                }}
+              >
+                <div style={{ fontWeight: 700, fontSize: '0.88rem', color: 'var(--text-main)' }}>
+                  Chỉnh sửa trực tiếp quyền hạn & IP của Token &ldquo;{editingToken.name}&rdquo; (giữ nguyên mã bp_... trên WHMCS)
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px', alignItems: 'end' }}>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      Tên gợi nhớ
+                    </span>
+                    <input
+                      value={editingToken.name}
+                      onChange={(e) => setEditingToken((prev) => ({ ...prev, name: e.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      Giới hạn IP (IP máy chủ WHMCS)
+                    </span>
+                    <input
+                      value={editingToken.allowed_ips}
+                      onChange={(e) => setEditingToken((prev) => ({ ...prev, allowed_ips: e.target.value }))}
+                      placeholder="VD: 160.191.248.77"
+                    />
+                  </label>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      Danh sách quyền (Scopes, phân tách dấu phẩy)
+                    </span>
+                    <input
+                      value={editingToken.scopes}
+                      onChange={(e) => setEditingToken((prev) => ({ ...prev, scopes: e.target.value }))}
+                      required
+                    />
+                  </label>
+                  <label style={{ margin: 0 }}>
+                    <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                      Giới hạn request/phút (0 = 120)
+                    </span>
+                    <input
+                      type="number"
+                      min="0"
+                      max="6000"
+                      value={editingToken.rate_limit_per_minute}
+                      onChange={(e) => setEditingToken((prev) => ({ ...prev, rate_limit_per_minute: e.target.value }))}
+                    />
+                  </label>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                  <button type="button" className="secondary-light" onClick={() => setEditingToken(null)}>
+                    Hủy
+                  </button>
+                  <button type="submit" disabled={!!loading}>
+                    <Check size={14} /> Lưu quyền & IP
+                  </button>
+                </div>
+              </form>
+            )}
+
             {/* Tokens Table */}
             <div className="pkg-table-wrap">
               <table className="pkg-clean-table">
@@ -1380,7 +1541,13 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 </thead>
                 <tbody>
                   {apiTokens.map((token) => {
-                    const isResellerTok = token.owner_role === 'reseller';
+                    const isResellerTok = token.owner_role === 'reseller' || (!isAdmin && isReseller);
+                    const targetSsoScope = isResellerTok ? 'sso:reseller' : 'sso:admin';
+                    const scopeParts = String(token.scopes || '')
+                      .split(',')
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    const hasServerSso = scopeParts.includes(targetSsoScope);
                     return (
                     <tr key={token.id}>
                       <td>
@@ -1405,7 +1572,21 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                         </span>
                       </td>
                       <td>
-                        <code style={{ fontSize: '0.76rem' }}>{token.scopes}</code>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '5px' }}>
+                          <code style={{ fontSize: '0.76rem' }}>{token.scopes}</code>
+                          {token.is_active && !hasServerSso && (
+                            <button
+                              type="button"
+                              className="secondary-light"
+                              style={{ padding: '3px 8px', fontSize: '0.72rem', fontWeight: 600 }}
+                              disabled={!!loading}
+                              onClick={() => enableServerSsoOnToken(token)}
+                              title={`Bật ngay quyền ${targetSsoScope} cho nút Login to SPanel trên WHMCS mà không cần đổi lại mã Token`}
+                            >
+                              + Bật Login to SPanel ({targetSsoScope})
+                            </button>
+                          )}
+                        </div>
                       </td>
                       <td>
                         {token.allowed_ips ? (
@@ -1432,6 +1613,24 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                         {token.last_used_at ? new Date(token.last_used_at).toLocaleString() : 'Chưa từng gọi'}
                       </td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        <button
+                          type="button"
+                          className="secondary-light"
+                          style={{ padding: '6px 10px', fontSize: '0.78rem', marginRight: '6px' }}
+                          disabled={!!loading || !token.is_active}
+                          onClick={() =>
+                            setEditingToken({
+                              id: token.id,
+                              name: token.name || '',
+                              scopes: token.scopes || '',
+                              allowed_ips: token.allowed_ips || '',
+                              rate_limit_per_minute: token.rate_limit_per_minute || 0,
+                            })
+                          }
+                          title="Chỉnh sửa trực tiếp Scopes / IP mà không đổi mã bp_..."
+                        >
+                          <Edit2 size={13} /> Sửa
+                        </button>
                         <button
                           type="button"
                           className="secondary-light"

@@ -330,6 +330,7 @@ stored, so they can be retried with the same key.
 
 Panel token-management endpoints (panel session cookie, `admin` or `reseller` role; Resellers manage only their own tokens while Admins can also pass `owner_user_id` to delegate a token to a Reseller): `GET /api/provisioning/v1/tokens`,
 `POST /api/provisioning/v1/tokens` (`{name, scopes, allowed_ips, expires_in_days, rate_limit_per_minute, owner_user_id?}`),
+`PATCH /api/provisioning/v1/tokens/{token_id}` (`{name?, scopes?, allowed_ips?, rate_limit_per_minute?}` — updates scopes/IPs in place without changing the `bp_...` secret),
 `POST /api/provisioning/v1/tokens/{token_id}/rotate` (`{grace_minutes}`),
 `DELETE /api/provisioning/v1/tokens/{token_id}`, `GET /api/provisioning/v1/scopes`.
 
