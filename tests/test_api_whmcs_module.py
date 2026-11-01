@@ -80,3 +80,14 @@ def test_clientarea_template_renders_only_login_button():
     for unwanted in ("Package:", "Status:", "Username (panel and SFTP):", "Primary domain:", "Disk:", "Bandwidth this month:", "Websites:", "$serviceLabel"):
         assert unwanted not in tpl, f"clientarea.tpl still contains {unwanted}"
 
+
+def test_hooks_preserve_native_whmcs_product_names():
+    """WHMCS Client Area cards and service lists must display the native localized
+    WHMCS product name (e.g. 'WordPress Hosting - Bắt Đầu') without hooks.php
+    overwriting 'product' or 'productname' with technical slugs/service IDs."""
+    hooks_src = (MODULE_DIR / "servers" / "spanel" / "hooks.php").read_text(encoding="utf-8")
+    assert "ClientAreaPageProductDetails" not in hooks_src
+    assert "ClientAreaPageProductsServices" not in hooks_src
+    assert "productname" not in hooks_src
+
+
