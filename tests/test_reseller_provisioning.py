@@ -312,3 +312,77 @@ def test_reseller_provisioning_ownership_quotas_and_tenant_isolation():
         ra.is_active = False
         db.commit()
     assert c.get(f"{BASE}/plans", headers=kit.bearer(tok_a)).status_code == 403
+
+
+def test_reseller_token_all_eight_whmcs_module_actions():
+    """Verify every WHMCS Module Command button works end-to-end with a Reseller API token:
+    1. Create  2. Suspend  3. Unsuspend  4. Change Package  5. Change Password
+    6. Reset SFTP Password  7. Create Backup  8. Terminate (+ Admin Tab & SSO)."""
+    with SessionLocal() as db:
+        reseller = kit.make_user(db, "shost_reseller_ops", role="reseller")
+        pkg_starter = kit.make_package(db, "Starter", storage_limit_mb=2048, website_limit=2)
+        pkg_pro = kit.make_package(db, "Pro", owner_id=reseller.id, storage_limit_mb=4096, website_limit=5)
+        tok = kit.make_token(
+            db,
+            scopes="plans:read,accounts:read,accounts:write,usage:read,sso,sso:reseller",
+            created_by_id=reseller.id,
+            allowed_ips="testclient",
+        )
+
+    c = kit.client()
+    headers = kit.bearer(tok)
+    ext = "whmcs:777"
+
+    with patch("app.services.site_users.ensure_panel_user", side_effect=lambda u, p: u), \
+            patch("app.services.site_users.lock_linux_user"), \
+            patch("app.services.site_users.unlock_linux_user"), \
+            patch("app.services.site_users.retire_shared_login_password", return_value="RotatedSftp123!"), \
+            patch("app.services.site_users.rotate_panel_user_password", return_value="FreshSftp456!"), \
+            patch("app.api.provisioning.queue_account_backup", return_value=True) as mock_backup, \
+            patch("app.api.provisioning.create_panel_login_token", return_value="sso_tok_777"), \
+            patch("app.services.site_users.delete_panel_user"), \
+            patch("app.services.teardown.purge_owned_resources"):
+        # 1. Create
+        r_create = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(external_id=ext, username="sp777_cust0001", package_id=pkg_starter.id),
+            headers=headers,
+        )
+        assert r_create.status_code == 200, r_create.text
+        assert r_create.json()["status"] == "active"
+
+        # Admin Tab + Usage + Client SSO + Server SSO
+        assert c.get(f"{BASE}/accounts/{ext}", headers=headers).status_code == 200
+        assert c.get(f"{BASE}/accounts/{ext}/usage", headers=headers).status_code == 200
+        assert c.post(f"{BASE}/accounts/{ext}/login", headers=headers).status_code == 200
+        assert c.post(f"{BASE}/admin/login", headers=headers).status_code == 200
+
+        # 2. Suspend
+        r_susp = c.post(f"{BASE}/accounts/{ext}/suspend", json={"reason": "Suspended by WHMCS"}, headers=headers)
+        assert r_susp.status_code == 200 and r_susp.json()["status"] == "suspended"
+
+        # 3. Unsuspend
+        r_unsusp = c.post(f"{BASE}/accounts/{ext}/unsuspend", headers=headers)
+        assert r_unsusp.status_code == 200 and r_unsusp.json()["status"] == "active"
+
+        # 4. Change Package
+        r_pkg = c.patch(f"{BASE}/accounts/{ext}/package", json={"package_id": pkg_pro.id}, headers=headers)
+        assert r_pkg.status_code == 200 and r_pkg.json()["package_id"] == pkg_pro.id
+
+        # 5. Change Password
+        r_pwd = c.patch(f"{BASE}/accounts/{ext}/password", json={"password": "NewStrongPassword99!"}, headers=headers)
+        assert r_pwd.status_code == 200 and r_pwd.json()["sftp_password"] == "RotatedSftp123!"
+
+        # 6. Reset SFTP Password
+        r_sftp = c.post(f"{BASE}/accounts/{ext}/sftp-password", headers=headers)
+        assert r_sftp.status_code == 200 and r_sftp.json()["sftp_password"] == "FreshSftp456!"
+
+        # 7. Create Backup
+        r_bkp = c.post(f"{BASE}/accounts/{ext}/backup", headers=headers)
+        assert r_bkp.status_code == 200 and r_bkp.json() == {"ok": True, "queued": True}
+        assert mock_backup.called
+
+        # 8. Terminate
+        r_term = c.delete(f"{BASE}/accounts/{ext}", headers=headers)
+        assert r_term.status_code == 200 and r_term.json()["status"] == "terminated"
+

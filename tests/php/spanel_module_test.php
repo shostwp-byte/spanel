@@ -266,17 +266,20 @@ check(
     'bare IPv6 address is bracketed with default port 2222'
 );
 
-// Simulate WHMCS passing serverport=443 hitting tenant Nginx HTML 404, then succeeding on :2222
+// WHMCS serverport=80/443 targets SPanel :2222 directly without leaking token to tenant Nginx,
+// and falls back to 443 only if :2222 refuses connection (reverse-proxy deployment).
+fake_api([
+    "GET $base/plans" => [200, [['id' => 1, 'name' => 'Starter']]],
+]);
+$tcPort443 = spanel_TestConnection(params(['serverport' => '443']));
+check($tcPort443 === ['success' => true, 'error' => ''], 'TestConnection with serverport=443 succeeds on :2222');
+check(count($GLOBALS['SENT']) === 1 && $GLOBALS['SENT'][0]['url'] === "https://panel.example.com:2222$base/plans", 'serverport=443 goes directly to :2222');
+
 $GLOBALS['SENT'] = [];
 $GLOBALS['SPANEL_TRANSPORT'] = function ($method, $url, $headers, $body) {
     $GLOBALS['SENT'][] = compact('method', 'url', 'headers', 'body');
-    if (strpos($url, 'https://panel.example.com/api/') === 0) {
-        return [
-            'errno' => 0,
-            'error' => '',
-            'status' => 404,
-            'body' => "<html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.24.0 (Ubuntu)</center></body></html>",
-        ];
+    if (strpos($url, 'https://panel.example.com:2222/') === 0) {
+        return ['errno' => 7, 'error' => 'Connection refused', 'status' => 0, 'body' => ''];
     }
     return [
         'errno' => 0,
@@ -285,10 +288,80 @@ $GLOBALS['SPANEL_TRANSPORT'] = function ($method, $url, $headers, $body) {
         'body' => json_encode([['id' => 1, 'name' => 'Starter']]),
     ];
 };
-$tcFallback = spanel_TestConnection(params(['serverport' => '443']));
-check($tcFallback === ['success' => true, 'error' => ''], 'TestConnection falls back from Nginx 443 HTML 404 to 2222');
-check(count($GLOBALS['SENT']) === 2, 'two requests made during 443->2222 fallback');
-check($GLOBALS['SENT'][1]['url'] === "https://panel.example.com:2222$base/plans", 'second request used port 2222');
+$tcProxyFallback = spanel_TestConnection(params(['serverport' => '443']));
+check($tcProxyFallback === ['success' => true, 'error' => ''], 'TestConnection falls back to 443 reverse proxy when :2222 is closed');
+check(count($GLOBALS['SENT']) === 2 && $GLOBALS['SENT'][1]['url'] === "https://panel.example.com$base/plans", 'second request used reverse proxy on 443');
+
+// Auto-upgrade http:// -> https:// on :2222 when WHMCS "Secure" checkbox was left unchecked
+$GLOBALS['SENT'] = [];
+$GLOBALS['SPANEL_TRANSPORT'] = function ($method, $url, $headers, $body) {
+    $GLOBALS['SENT'][] = compact('method', 'url', 'headers', 'body');
+    if (strpos($url, 'http://panel.example.com:2222/') === 0) {
+        return ['errno' => 52, 'error' => 'Empty reply from server', 'status' => 0, 'body' => ''];
+    }
+    return [
+        'errno' => 0,
+        'error' => '',
+        'status' => 200,
+        'body' => json_encode([['id' => 1, 'name' => 'Starter']]),
+    ];
+};
+$tcTlsUpgrade = spanel_TestConnection(params(['serversecure' => '', 'serverport' => '2222']));
+check($tcTlsUpgrade === ['success' => true, 'error' => ''], 'Unchecked Secure auto-upgrades HTTP to HTTPS on :2222');
+check(count($GLOBALS['SENT']) === 2 && $GLOBALS['SENT'][1]['url'] === "https://panel.example.com:2222$base/plans", 'auto-upgraded URL uses https://:2222');
+
+// DirectAdmin / foreign panel on :2222 returning 302 Found. or 405 surfaces endpoint diagnostic
+$GLOBALS['SPANEL_TRANSPORT'] = function ($method, $url, $headers, $body) {
+    if ($method === 'GET') {
+        return ['errno' => 0, 'error' => '', 'status' => 302, 'body' => '<a href="/login">Found</a>.' . "\n\n"];
+    }
+    return ['errno' => 0, 'error' => '', 'status' => 405, 'body' => ''];
+};
+$daTab = spanel_AdminServicesTabFields(params(['serverhostname' => 'da01.example.com']));
+check(isset($daTab['SPanel']) && strpos($daTab['SPanel'], 'da01.example.com:2222') !== false && strpos($daTab['SPanel'], 'DirectAdmin') !== false, '302 Found surfaces endpoint & DirectAdmin hint: ' . json_encode($daTab));
+$daCreate = spanel_CreateAccount(params(['serverhostname' => 'da01.example.com']));
+check(strpos($daCreate, 'HTTP 405') !== false && strpos($daCreate, 'da01.example.com:2222') !== false, '405 surfaces endpoint hint: ' . $daCreate);
+
+// Suspend, Unsuspend, short ChangePassword validation, unprovisioned Admin tab, and package name resolution
+reset_recorders();
+fake_api([
+    "POST $base/accounts/whmcs%3A42/suspend" => [200, ['ok' => true, 'status' => 'suspended']],
+    "POST $base/accounts/whmcs%3A42/unsuspend" => [200, ['ok' => true, 'status' => 'active']],
+]);
+check(spanel_SuspendAccount(params(['suspendreason' => ''])) === 'success', 'suspend with empty reason succeeds');
+$suspPayload = json_decode($GLOBALS['SENT'][0]['body'], true);
+check($suspPayload === ['reason' => 'Suspended by WHMCS'], 'empty suspendreason defaults cleanly');
+check(spanel_SuspendAccount(params(['suspendreason' => 'Overdue invoice'])) === 'success', 'suspend with custom reason succeeds');
+$suspPayload2 = json_decode($GLOBALS['SENT'][1]['body'], true);
+check($suspPayload2 === ['reason' => 'Overdue invoice'], 'custom suspendreason forwarded');
+check(spanel_UnsuspendAccount(params()) === 'success', 'unsuspend succeeds');
+
+reset_recorders();
+fake_api([]);
+check(spanel_ChangePassword(params(['password' => 'short123'])) === 'Password must be between 12 and 72 characters', 'short password rejected cleanly');
+check(count($GLOBALS['SENT']) === 0, 'short password makes no API call');
+
+fake_api(["GET $base/accounts/whmcs%3A42" => [404, ['detail' => 'Account not found']]]);
+$pendingTab = spanel_AdminServicesTabFields(params());
+check(isset($pendingTab['SPanel status']) && strpos($pendingTab['SPanel status'], 'Not provisioned yet') !== false, 'unprovisioned tab shows clean status');
+
+fake_api([
+    "GET $base/plans" => [200, [['id' => 2, 'name' => 'Starter', 'slug' => 'starter'], ['id' => 3, 'name' => 'Business', 'slug' => 'business']]],
+    "POST $base/accounts" => [200, ['external_id' => 'whmcs:42', 'username' => 'sp42_abcdefgh', 'status' => 'active']],
+    "PATCH $base/accounts/whmcs%3A42/package" => [200, ['ok' => true, 'package_id' => 3]],
+]);
+check(spanel_CreateAccount(params(['configoption1' => 'Starter (#2)'])) === 'success', 'create accepts Loader label format');
+check(count($GLOBALS['SENT']) === 1 && json_decode($GLOBALS['SENT'][0]['body'], true)['package_id'] === 2, 'label (#2) resolved without extra GET');
+check(spanel_ChangePackage(params(['configoption1' => 'Business'])) === 'success', 'change package resolves package name via /plans');
+$chgPkgBody = json_decode(end($GLOBALS['SENT'])['body'], true);
+check($chgPkgBody['package_id'] === 3, 'Business resolved to package_id 3');
+
+fake_api([
+    "POST $base/accounts" => [404, ['detail' => 'Package not found']],
+    "GET $base/plans" => [200, [['id' => 2, 'name' => 'Starter']]],
+]);
+$missingPkgErr = spanel_CreateAccount(params(['configoption1' => '1']));
+check(strpos($missingPkgErr, 'Starter (#2)') !== false, 'deleted default package #1 hints available packages: ' . $missingPkgErr);
 
 // Simulate HTML error page when :2222 also fails: strips raw HTML tags
 $GLOBALS['SENT'] = [];
