@@ -238,12 +238,11 @@ check($tab['Disk usage'] === '1.0 GB / 2.0 GB (50%)', 'disk usage ' . $tab['Disk
 check($tab['Bandwidth (this month)'] === '0 B / unlimited', 'bandwidth usage');
 
 // --- client area -------------------------------------------------------------------------------
+$GLOBALS['SENT'] = [];
 $area = spanel_ClientArea(params());
 check($area['templatefile'] === 'clientarea', 'client area template');
 check($area['vars']['loginUrl'] === 'clientarea.php?action=productdetails&id=42&dosinglesignon=1', 'client area uses WHMCS SSO');
-foreach ($GLOBALS['SENT'] as $request) {
-    check(strpos($request['url'], '/login') === false, 'client area does not mint login tokens');
-}
+check(count($GLOBALS['SENT']) === 0, 'client area makes zero API calls on page view');
 
 // --- TestConnection, port 2222 default, Nginx 404 -> :2222 fallback & HTML cleaning ---
 reset_recorders();
