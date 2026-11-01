@@ -363,6 +363,41 @@ fake_api([
 $missingPkgErr = spanel_CreateAccount(params(['configoption1' => '1']));
 check(strpos($missingPkgErr, 'Starter (#2)') !== false, 'deleted default package #1 hints available packages: ' . $missingPkgErr);
 
+// Migrate existing WHMCS Product from DirectAdmin where configoption2..8 hold stale DirectAdmin values
+$cfgOpts = spanel_ConfigOptions();
+foreach ($cfgOpts as $optName => $optDef) {
+    check(!empty($optDef['SimpleMode']), "ConfigOption '$optName' enables SimpleMode so WHMCS saves all 8 fields");
+}
+check(strpos($cfgOpts['PHP Version']['Options'], '8.5') !== false, 'PHP Version options include 8.5');
+
+reset_recorders();
+fake_api([
+    "POST $base/accounts" => [200, ['external_id' => 'whmcs:858', 'username' => 'sp858_fyzalqlb', 'status' => 'active']],
+]);
+$daMigrated = params([
+    'serviceid' => 858,
+    'username' => 'sp858_fyzalqlb',
+    'domain' => 'cokhihoangphan.com',
+    'configoption1' => '2',
+    'configoption2' => 'shared',
+    'configoption3' => 'IPv4 shared; IPv6 none',
+    'configoption4' => 'on',
+    'configoption6' => 'on',
+]);
+check(spanel_CreateAccount($daMigrated) === 'success', 'CreateAccount succeeds even with leftover DirectAdmin configoption2..8');
+$migratedBody = json_decode($GLOBALS['SENT'][0]['body'], true);
+check($migratedBody['php_version'] === '8.4' && $migratedBody['app_type'] === 'php', 'stale DirectAdmin php_version/app_type sanitized to 8.4/php');
+check($migratedBody['install_wordpress'] === false && $migratedBody['is_reseller'] === false, 'stale DirectAdmin boolean flags ignored');
+
+// FastAPI 422 validation error arrays are formatted cleanly instead of raw JSON
+fake_api([
+    "POST $base/accounts" => [422, ['detail' => [
+        ['type' => 'value_error', 'loc' => ['body', 'domain'], 'msg' => 'Value error, Invalid domain'],
+    ]]],
+]);
+$err422 = spanel_CreateAccount(params());
+check($err422 === 'SPanel API error: domain — Invalid domain', 'clean 422 validation message: ' . $err422);
+
 // Simulate HTML error page when :2222 also fails: strips raw HTML tags
 $GLOBALS['SENT'] = [];
 $GLOBALS['SPANEL_TRANSPORT'] = function ($method, $url, $headers, $body) {

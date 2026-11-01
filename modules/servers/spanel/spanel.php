@@ -54,23 +54,28 @@ function spanel_ConfigOptions()
         'App Type' => [
             'Type' => 'dropdown',
             'Options' => 'php,static,wordpress',
+            'SimpleMode' => true,
             'Default' => 'php',
         ],
         'PHP Version' => [
             'Type' => 'dropdown',
-            'Options' => '8.4,8.3,8.2,8.1,8.0,7.4,5.6',
+            'Options' => '8.5,8.4,8.3,8.2,8.1,8.0,7.4,5.6',
+            'SimpleMode' => true,
             'Default' => '8.4',
         ],
         'Install WordPress' => [
             'Type' => 'yesno',
+            'SimpleMode' => true,
             'Description' => 'Install WordPress during provisioning',
         ],
         'Auto SSL' => [
             'Type' => 'yesno',
+            'SimpleMode' => true,
             'Description' => 'Request Let\'s Encrypt SSL after provisioning',
         ],
         'Is Reseller' => [
             'Type' => 'yesno',
+            'SimpleMode' => true,
             'Description' => 'Create a Reseller account instead of a regular user',
         ],
         'Reseller Package' => [
@@ -83,6 +88,7 @@ function spanel_ConfigOptions()
         ],
         'Backup Before Terminate' => [
             'Type' => 'yesno',
+            'SimpleMode' => true,
             'Description' => 'Take a full backup before deleting the account (terminate waits for it)',
         ],
     ];
@@ -136,16 +142,26 @@ function spanel_CreateAccount($params)
         return $pkgResolved['error'] !== '' ? $pkgResolved['error'] : 'Invalid SPanel package selection';
     }
 
+    $foreignOptions = spanel_has_foreign_module_options($params);
+    $normalizedPhp = spanel_normalize_php_version(spanel_config($params, 3, '8.4'));
+    if ($normalizedPhp === '') {
+        $normalizedPhp = '8.4';
+    }
+    $normalizedApp = spanel_normalize_app_type(spanel_config($params, 2, 'php'));
+    if ($normalizedApp === '') {
+        $normalizedApp = 'php';
+    }
+
     $payload = [
         'external_id' => spanel_external_id($params),
         'username' => $username,
         'password' => $password,
         'package_id' => $pkgResolved['id'],
-        'php_version' => spanel_config($params, 3, '8.4'),
-        'app_type' => $domain === '' ? 'php' : spanel_config($params, 2, 'php'),
-        'install_wordpress' => spanel_yesno(spanel_config($params, 4, '')),
-        'enable_ssl' => spanel_yesno(spanel_config($params, 5, '')),
-        'is_reseller' => spanel_yesno(spanel_config($params, 6, '')),
+        'php_version' => $normalizedPhp,
+        'app_type' => $domain === '' ? 'php' : $normalizedApp,
+        'install_wordpress' => !$foreignOptions && spanel_yesno(spanel_config($params, 4, '')),
+        'enable_ssl' => !$foreignOptions && spanel_yesno(spanel_config($params, 5, '')),
+        'is_reseller' => !$foreignOptions && spanel_yesno(spanel_config($params, 6, '')),
     ];
 
     if ($domain !== '') {
@@ -158,7 +174,7 @@ function spanel_CreateAccount($params)
     if ($domain === '' && ($payload['install_wordpress'] || $payload['enable_ssl'])) {
         return 'A domain is required when Install WordPress or Auto SSL is enabled';
     }
-    $rawResellerPkg = spanel_config($params, 7, '');
+    $rawResellerPkg = $foreignOptions ? '' : spanel_config($params, 7, '');
     if ($payload['is_reseller'] && $rawResellerPkg !== '' && $rawResellerPkg !== '0') {
         $resPkgResolved = spanel_resolve_package_id($params, $rawResellerPkg, true);
         if (!$resPkgResolved['ok'] || $resPkgResolved['id'] <= 0) {
@@ -210,7 +226,8 @@ function spanel_TerminateAccount($params)
     // Terminate fully removes the hosting account, its websites, and the
     // Linux/SFTP user and home directory. With "Backup Before Terminate" a
     // full backup is taken first, inside the same request.
-    $query = spanel_yesno(spanel_config($params, 8, '')) ? ['backup' => 'true'] : [];
+    $backup = !spanel_has_foreign_module_options($params) && spanel_yesno(spanel_config($params, 8, ''));
+    $query = $backup ? ['backup' => 'true'] : [];
     $result = spanel_request($params, 'DELETE', spanel_account_path($params), null, $query);
     return $result['ok'] ? 'success' : $result['error'];
 }
@@ -241,9 +258,10 @@ function spanel_ChangePackage($params)
     if (!$pkgResolved['ok'] || $pkgResolved['id'] <= 0) {
         return $pkgResolved['error'] !== '' ? $pkgResolved['error'] : 'Invalid SPanel package selection';
     }
+    $foreignOptions = spanel_has_foreign_module_options($params);
     $payload = ['package_id' => $pkgResolved['id']];
-    $rawResellerPkg = spanel_config($params, 7, '');
-    if (spanel_yesno(spanel_config($params, 6, '')) && $rawResellerPkg !== '' && $rawResellerPkg !== '0') {
+    $rawResellerPkg = $foreignOptions ? '' : spanel_config($params, 7, '');
+    if (!$foreignOptions && spanel_yesno(spanel_config($params, 6, '')) && $rawResellerPkg !== '' && $rawResellerPkg !== '0') {
         $resPkgResolved = spanel_resolve_package_id($params, $rawResellerPkg, true);
         if (!$resPkgResolved['ok'] || $resPkgResolved['id'] <= 0) {
             return $resPkgResolved['error'] !== '' ? $resPkgResolved['error'] : 'Invalid SPanel reseller package selection';
@@ -572,7 +590,7 @@ function spanel_request($params, $method, $path, $payload = null, $query = [], $
             if (isset($data['detail']) && is_array($data['detail']) && isset($data['detail']['error'])) {
                 $message = (string) $data['detail']['error'];
             } elseif (isset($data['detail'])) {
-                $message = is_array($data['detail']) ? json_encode($data['detail']) : (string) $data['detail'];
+                $message = is_array($data['detail']) ? spanel_format_api_detail($data['detail']) : (string) $data['detail'];
             }
         }
         if ($message === '') {
@@ -850,6 +868,68 @@ function spanel_config($params, $index, $default)
 function spanel_yesno($value)
 {
     return in_array(strtolower(trim((string) $value)), ['on', 'yes', 'true', '1'], true);
+}
+
+function spanel_supported_php_versions()
+{
+    return ['8.5', '8.4', '8.3', '8.2', '8.1', '8.0', '7.4', '5.6'];
+}
+
+function spanel_normalize_php_version($value)
+{
+    $clean = strtolower(trim((string) $value));
+    if ($clean === '') {
+        return '';
+    }
+    if (strpos($clean, 'php') === 0) {
+        $clean = ltrim(substr($clean, 3), " \t-");
+    }
+    return in_array($clean, spanel_supported_php_versions(), true) ? $clean : '';
+}
+
+function spanel_normalize_app_type($value)
+{
+    $clean = strtolower(trim((string) $value));
+    return in_array($clean, ['php', 'static', 'wordpress'], true) ? $clean : '';
+}
+
+function spanel_has_foreign_module_options($params)
+{
+    // When a WHMCS product is switched from DirectAdmin/cPanel/Plesk in Simple
+    // Mode, WHMCS saves configoption1 (Package) while leaving stale values such
+    // as DirectAdmin's "IPv4 shared; IPv6 none" in configoption2..8.
+    $rawApp = trim((string) ($params['configoption2'] ?? ''));
+    if ($rawApp !== '' && spanel_normalize_app_type($rawApp) === '') {
+        return true;
+    }
+    $rawPhp = trim((string) ($params['configoption3'] ?? ''));
+    if ($rawPhp !== '' && spanel_normalize_php_version($rawPhp) === '') {
+        return true;
+    }
+    return false;
+}
+
+function spanel_format_api_detail($detail)
+{
+    $parts = [];
+    foreach ($detail as $item) {
+        if (!is_array($item) || !isset($item['msg'])) {
+            continue;
+        }
+        $msg = (string) $item['msg'];
+        if (stripos($msg, 'Value error, ') === 0) {
+            $msg = substr($msg, 13);
+        }
+        $field = '';
+        if (isset($item['loc']) && is_array($item['loc']) && count($item['loc']) > 0) {
+            $last = end($item['loc']);
+            if (is_string($last) && $last !== 'body') {
+                $field = $last;
+            }
+        }
+        $parts[] = $field !== '' ? ($field . ' — ' . $msg) : $msg;
+    }
+    return $parts ? implode('; ', $parts) : (string) json_encode($detail);
 }
 
 function spanel_h($value)
