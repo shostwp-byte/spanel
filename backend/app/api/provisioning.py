@@ -350,35 +350,44 @@ def _create_account(
         install_wp = payload.install_wordpress and app_type_value == "wordpress"
 
         if payload.domain:
+            from app.core.config import settings as app_settings
+
+            effective_php = payload.php_version
+            if not app_settings.command_dry_run:
+                from app.services import php as php_service
+
+                installed_phps = php_service.list_installed_php()
+                if installed_phps and effective_php not in installed_phps:
+                    effective_php = installed_phps[-1]
+
             root_path = site_users.site_root_for_panel_user(payload.username, payload.domain)
             if install_wp:
                 from app.api.databases import enforce_user_database_limit
                 enforce_user_database_limit(db, user)
                 db_info = mariadb.create_database(payload.domain)
-                linux_user = site_users.ensure_site_runtime(payload.domain, root_path, payload.php_version, linux_user)
+                linux_user = site_users.ensure_site_runtime(payload.domain, root_path, effective_php, linux_user)
                 root_path = wordpress.install_wordpress(
                     payload.domain, db_info, payload.domain,
                     "admin", payload.password, account_email,
-                    payload.php_version, linux_user, root_path=root_path,
+                    effective_php, linux_user, root_path=root_path,
                 )
             else:
-                runtime_php = payload.php_version if app_type_value in {"wordpress", "php"} else None
+                runtime_php = effective_php if app_type_value in {"wordpress", "php"} else None
                 linux_user = site_users.ensure_site_runtime(payload.domain, root_path, runtime_php, linux_user)
 
             from app.api.websites import _ensure_default_waf_file, _write_placeholder_page
             _ensure_default_waf_file(payload.domain)
             if not install_wp:
-                from app.core.config import settings as app_settings
                 if not app_settings.command_dry_run:
-                    _write_placeholder_page(payload.domain, root_path, linux_user, payload.php_version)
+                    _write_placeholder_page(payload.domain, root_path, linux_user, effective_php)
                     site_users.fix_site_path(str(site_users.document_root(root_path)), linux_user)
 
             rewrite_mode = "front_controller" if app_type_value == "wordpress" else "none"
-            php_socket = site_users.site_php_fpm_socket(linux_user, root_path, payload.php_version) if app_type_value in {"wordpress", "php"} else None
+            php_socket = site_users.site_php_fpm_socket(linux_user, root_path, effective_php) if app_type_value in {"wordpress", "php"} else None
             nginx.write_vhost(
                 payload.domain, root_path,
                 app_type=app_type_value,
-                php_version=payload.php_version,
+                php_version=effective_php,
                 php_fpm_socket_override=php_socket,
                 document_root="public_html",
                 rewrite_mode=rewrite_mode,
@@ -390,7 +399,7 @@ def _create_account(
                 root_path=root_path,
                 document_root="public_html",
                 linux_user=linux_user,
-                php_version=payload.php_version,
+                php_version=effective_php,
                 app_type=app_type_value,
                 nginx_rewrite_mode=rewrite_mode,
                 status="active",

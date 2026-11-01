@@ -386,3 +386,43 @@ def test_reseller_token_all_eight_whmcs_module_actions():
         r_term = c.delete(f"{BASE}/accounts/{ext}", headers=headers)
         assert r_term.status_code == 200 and r_term.json()["status"] == "terminated"
 
+
+def test_create_account_falls_back_to_installed_php_version_when_default_missing():
+    """When WHMCS requests default php_version='8.4' on a VPS that only has PHP 8.3
+    installed, provisioning automatically binds to the highest installed PHP version."""
+    from app.models.entities import Website
+
+    with SessionLocal() as db:
+        reseller = kit.make_user(db, "php_fallback_res", role="reseller")
+        pkg = kit.make_package(db, "StarterPHP", storage_limit_mb=2048, website_limit=2)
+        tok = kit.make_token(db, created_by_id=reseller.id)
+
+    c = kit.client()
+    with patch("app.core.config.settings.command_dry_run", False), \
+            patch("app.services.php.list_installed_php", return_value=["8.3"]), \
+            patch("app.services.site_users.ensure_panel_user", side_effect=lambda u, p: u), \
+            patch("app.services.site_users.ensure_site_runtime", side_effect=lambda d, r, php_v, lu: lu) as rt_mock, \
+            patch("app.services.site_users.fix_site_path"), \
+            patch("app.api.websites._ensure_default_waf_file"), \
+            patch("app.api.websites._write_placeholder_page"), \
+            patch("app.services.nginx.write_vhost"), \
+            patch("app.services.nginx.vhost_exists", return_value=False), \
+            patch("app.services.dns.zone_for_new_domain"):
+        resp = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(
+                external_id="whmcs:858",
+                username="sp858_fyzalqlb",
+                package_id=pkg.id,
+                domain="cokhihoangphan.com",
+                php_version="8.4",
+            ),
+            headers=kit.bearer(tok),
+        )
+    assert resp.status_code == 200, resp.text
+    assert rt_mock.call_args[0][2] == "8.3"
+    with SessionLocal() as db:
+        w = db.query(Website).filter(Website.domain == "cokhihoangphan.com").one()
+        assert w.php_version == "8.3"
+
+
