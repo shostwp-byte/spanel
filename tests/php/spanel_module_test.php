@@ -10,6 +10,7 @@
 
 require __DIR__ . '/whmcs_stubs.php';
 require __DIR__ . '/../../modules/servers/spanel/spanel.php';
+require __DIR__ . '/../../modules/servers/spanel/hooks.php';
 
 $failures = 0;
 $checks = 0;
