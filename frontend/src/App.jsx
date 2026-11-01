@@ -371,8 +371,6 @@ const RESELLER_ALLOWED_PAGES = new Set([
   'packages',
   'change_passwords',
   'reseller_settings',
-  'settings',
-  'panel-settings',
   'backups',
   'migration',
   'ipmanager',
@@ -3293,7 +3291,6 @@ function AppContent() {
       ]},
       { key: 'reseller_tools', title: 'Reseller Tools', items: [
         ['reseller_settings', 'Customize Skin', SettingsIcon],
-        ['panel-settings', 'API & Billing (WHMCS)', KeyRound],
         ['backups', 'Backup and Restore', Archive],
         ['migration', 'cPanel Import', Copy],
         ['ipmanager', 'IP Management', Network],
@@ -4606,7 +4603,7 @@ function AppContent() {
     if (page === 'maintenance') return isAdmin ? <MaintenancePage request={request} isAdmin={isAdmin} websites={websites} users={users} loadUsers={loadUsers} refreshAll={refreshAll} /> : renderAdminOnly();
     // Administrators only (operator, 2026-09-27): customers get no notifications.
     if (page === 'notifications') return !isAdmin ? renderAdminOnly() : notificationsAddonInstalled ? renderNotificationsPage() : renderAddonMissing('notifications');
-    if (page === 'settings' || page === 'panel-settings') return <SettingsPage request={request} isAdmin={isAdmin} isReseller={isReseller} users={users} loadPanelSettings={loadPanelSettings} currentPanelHost={currentPanelHost} />;
+    if (page === 'settings' || page === 'panel-settings') return isAdmin ? <SettingsPage request={request} isAdmin={isAdmin} users={users} loadPanelSettings={loadPanelSettings} currentPanelHost={currentPanelHost} /> : renderAdminOnly();
     const usersProps = { request, isAdmin, isReseller, mailAddonInstalled, loadUsers, loadPackages, websites, refreshAll, assignWebsiteId, setAssignWebsiteId, assignUserId, setAssignUserId, assignDomainToUser };
     if (page === 'users') return <UsersPage {...usersProps} mode="users" />;
     if (page === 'my_users' || page === 'suspend') return <UsersPage {...usersProps} mode="my_users" />;

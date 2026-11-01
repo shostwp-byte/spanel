@@ -152,7 +152,7 @@ function parseAuditDetail(rawDetail) {
   return { summary: summaryPart, ip, ua, uaShort, raw };
 }
 
-export function SettingsPage({ request, isAdmin, isReseller = false, users = [], loadPanelSettings, currentPanelHost }) {
+export function SettingsPage({ request, isAdmin, users = [], loadPanelSettings, currentPanelHost }) {
   const {
     loading, setLoading, setError, setNotice, currentUser, loadCurrentUser, panelSettings, setPanelSettings,
     clearSession, panelSettingsTab, setPanelSettingsTab,
@@ -170,16 +170,14 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
   // API Tokens state
   const [apiTokens, setApiTokens] = useState([]);
   const [selectedPlatform, setSelectedPlatform] = useState('whmcs');
-  const [newApiToken, setNewApiToken] = useState(() => ({
+  const [newApiToken, setNewApiToken] = useState({
     name: 'WHMCS Billing',
     allowed_ips: '',
-    scopes: !isAdmin
-      ? 'plans:read,accounts:read,accounts:write,usage:read,sso,sso:reseller'
-      : 'plans:read,accounts:read,accounts:write,usage:read,sso',
+    scopes: 'plans:read,accounts:read,accounts:write,usage:read,sso',
     expires_in_days: '',
     rate_limit_per_minute: '',
     owner_user_id: '',
-  }));
+  });
   const [editingToken, setEditingToken] = useState(null);
   const [createdApiToken, setCreatedApiToken] = useState('');
   const [showEndpointsRef, setShowEndpointsRef] = useState(false);
@@ -220,19 +218,17 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
   }, [currentUser?.email]);
 
   useEffect(() => {
-    if (isAdmin || isReseller) {
+    if (isAdmin) {
       loadApiTokens();
       loadWebhooks();
       loadWebhookDeliveries();
       loadWhmcsDiagnostic();
-    }
-    if (isAdmin) {
       loadAuditAndCronSecurity();
       request('/panel-settings').then((data) => {
         if (data) setPanelSettings(data);
       });
     }
-  }, [isAdmin, isReseller]);
+  }, [isAdmin]);
 
   async function loadAuditAndCronSecurity(searchQuery = auditSearch) {
     try {
@@ -567,7 +563,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
   }
 
   async function enableServerSsoOnToken(token) {
-    const isResellerTok = token.owner_role === 'reseller' || (!isAdmin && isReseller);
+    const isResellerTok = token.owner_role === 'reseller';
     const targetScope = isResellerTok ? 'sso:reseller' : 'sso:admin';
     let nextIps = String(token.allowed_ips || '').trim();
     if (!nextIps) {
@@ -765,7 +761,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
     setNotice(data.message || 'Admin account updated.');
   }
 
-  if (!isAdmin && !isReseller) {
+  if (!isAdmin) {
     return (
       <div className="section">
         <h2>{t('Settings')}</h2>
@@ -777,22 +773,17 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
   const resellerAccounts = (users || []).filter(
     (u) => u && u.role === 'reseller' && u.is_active !== false
   );
-  const selectedOwnerIsReseller =
-    !isAdmin || Boolean(Number(newApiToken.owner_user_id) > 0);
+  const selectedOwnerIsReseller = Boolean(Number(newApiToken.owner_user_id) > 0);
   const selectedScopesNeedIp =
     (newApiToken.scopes || '').includes('sso:admin') ||
     (newApiToken.scopes || '').includes('sso:reseller');
 
-  const tabs = isAdmin
-    ? [
-        ['general', 'General', SettingsIcon],
-        ['account', 'Admin account', Lock],
-        ['api', 'API & Billing Integration', KeyRound],
-        ['audit', 'Security Audit & Cron Jail', ShieldCheck],
-      ]
-    : [
-        ['api', 'API & Billing Integration', KeyRound],
-      ];
+  const tabs = [
+    ['general', 'General', SettingsIcon],
+    ['account', 'Admin account', Lock],
+    ['api', 'API & Billing Integration', KeyRound],
+    ['audit', 'Security Audit & Cron Jail', ShieldCheck],
+  ];
   const activeTab = tabs.some(([id]) => id === panelSettingsTab) ? panelSettingsTab : tabs[0][0];
   const taspanel = (id, content) =>
     activeTab === id && (
@@ -1014,11 +1005,11 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
       {/* TAB 3: API & BILLING INTEGRATION (UNIFIED INBOUND TOKENS + OUTBOUND WEBHOOKS) */}
       {taspanel(
         'api',
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', minWidth: 0, maxWidth: '100%' }}>
           {/* CARD 1: INBOUND PROVISIONING API TOKENS */}
-          <div className="pkg-card" style={{ padding: '20px 22px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '14px', marginBottom: '16px' }}>
-              <div>
+          <div className="pkg-card" style={{ padding: '18px 20px', minWidth: 0, maxWidth: '100%' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '12px', marginBottom: '16px', minWidth: 0 }}>
+              <div style={{ minWidth: 0, flex: '1 1 320px' }}>
                 <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
                   <KeyRound size={18} style={{ color: 'var(--accent-primary)' }} />
                   1. Provisioning API Tokens (WHMCS, HostBill, Blesta, Perfex CRM)
@@ -1072,13 +1063,14 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 display: 'flex',
                 flexDirection: 'column',
                 gap: '10px',
+                minWidth: 0,
               }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
                     {whmcsDiagnostic.ready ? (
-                      <CheckCircle size={16} style={{ color: '#10b981' }} />
+                      <CheckCircle size={16} style={{ color: '#10b981', flexShrink: 0 }} />
                     ) : (
-                      <AlertCircle size={16} style={{ color: '#f59e0b' }} />
+                      <AlertCircle size={16} style={{ color: '#f59e0b', flexShrink: 0 }} />
                     )}
                     <strong style={{ fontSize: '0.86rem', color: 'var(--text-main)' }}>
                       Chẩn đoán Độ sẵn sàng Tích hợp WHMCS / HostBill / Perfex CRM ({whmcsDiagnostic.score} hạng mục đạt)
@@ -1095,7 +1087,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                     {whmcsDiagnostic.ready ? 'SẴN SÀNG KẾT NỐI 100%' : 'CẦN BỔ SUNG CẤU HÌNH'}
                   </span>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: '8px' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '8px', minWidth: 0 }}>
                   {(whmcsDiagnostic.checks || []).map((chk) => (
                     <div
                       key={chk.key}
@@ -1105,6 +1097,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                         background: 'var(--surface-1)',
                         border: '1px solid var(--border-subtle)',
                         fontSize: '0.78rem',
+                        minWidth: 0,
                       }}
                     >
                       <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 700, color: chk.ok ? '#10b981' : '#f59e0b', marginBottom: '3px' }}>
@@ -1122,9 +1115,9 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
             <div style={{
               padding: '14px 16px', borderRadius: '10px',
               background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
-              marginBottom: '16px', display: 'flex', flexDirection: 'column', gap: '12px',
+              marginBottom: '16px', display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0,
             }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                   <span style={{ fontSize: '0.79rem', fontWeight: 700, color: 'var(--text-muted)' }}>
                     Hệ thống tích hợp:
@@ -1153,12 +1146,13 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                   })}
                 </div>
 
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', minWidth: 0 }}>
                   <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Base API URL:</span>
                   <code style={{
                     padding: '4px 8px', borderRadius: '6px',
                     background: 'var(--surface-1)', border: '1px solid var(--border-subtle)',
                     fontSize: '0.78rem', color: 'var(--accent-primary)', fontWeight: 600,
+                    wordBreak: 'break-all',
                   }}>
                     {baseProvisioningUrl}
                   </code>
@@ -1184,7 +1178,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
               <div style={{
                 padding: '14px 16px', borderRadius: '10px',
                 background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
-                marginBottom: '16px',
+                marginBottom: '16px', minWidth: 0,
               }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
                   <strong style={{ fontSize: '0.88rem', color: 'var(--text-main)' }}>
@@ -1230,7 +1224,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                             </span>
                           </td>
                           <td><code>/api/provisioning/v1{ep.path}</code></td>
-                          <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{ep.desc}</td>
+                          <td style={{ fontSize: '0.82rem', color: 'var(--text-muted)', whiteSpace: 'normal' }}>{ep.desc}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1244,7 +1238,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
               <div style={{
                 padding: '14px 16px', borderRadius: '10px', marginBottom: '16px',
                 background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.35)',
-                display: 'flex', flexDirection: 'column', gap: '10px',
+                display: 'flex', flexDirection: 'column', gap: '10px', minWidth: 0,
               }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                   <strong style={{ fontSize: '0.88rem', color: '#10b981', display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -1279,7 +1273,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
             {/* Create Token Form */}
             <div style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(195px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))',
               gap: '12px',
               alignItems: 'end',
               padding: '14px 16px',
@@ -1287,8 +1281,9 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
               background: 'var(--surface-2)',
               border: '1px solid var(--border-subtle)',
               marginBottom: '12px',
+              minWidth: 0,
             }}>
-              <label style={{ margin: 0 }}>
+              <label style={{ margin: 0, minWidth: 0 }}>
                 <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                   Tên gợi nhớ (Hệ thống kết nối)
                 </span>
@@ -1300,7 +1295,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
               </label>
 
               {isAdmin && (
-                <label style={{ margin: 0 }}>
+                <label style={{ margin: 0, minWidth: 0 }}>
                   <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                     Tài khoản thực thi (Vai trò Token)
                   </span>
@@ -1339,7 +1334,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 </label>
               )}
 
-              <label style={{ margin: 0 }}>
+              <label style={{ margin: 0, minWidth: 0 }}>
                 <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: selectedScopesNeedIp ? '#f59e0b' : 'var(--text-muted)', marginBottom: '5px' }}>
                   {selectedScopesNeedIp
                     ? 'IP máy chủ WHMCS (Bắt buộc khi bật SSO Server)'
@@ -1353,7 +1348,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 />
               </label>
 
-              <label style={{ margin: 0 }}>
+              <label style={{ margin: 0, minWidth: 0 }}>
                 <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                   Quyền hạn (Scopes)
                 </span>
@@ -1393,9 +1388,9 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 </select>
               </label>
 
-              <label style={{ margin: 0 }}>
+              <label style={{ margin: 0, minWidth: 0 }}>
                 <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                  Hết hạn sau (ngày, để trống = không hết hạn)
+                  Hết hạn sau (ngày, trống = vô hạn)
                 </span>
                 <input
                   type="number"
@@ -1407,9 +1402,9 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 />
               </label>
 
-              <label style={{ margin: 0 }}>
+              <label style={{ margin: 0, minWidth: 0 }}>
                 <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                  Giới hạn request/phút (để trống = 120)
+                  Giới hạn request/phút (trống = 120)
                 </span>
                 <input
                   type="number"
@@ -1425,7 +1420,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 type="button"
                 disabled={!!loading || !newApiToken.name.trim()}
                 onClick={createApiToken}
-                style={{ height: '40px', padding: '0 18px', fontWeight: 600 }}
+                style={{ height: '40px', padding: '0 16px', fontWeight: 600, whiteSpace: 'nowrap' }}
               >
                 <Plus size={15} /> Tạo API Token
               </button>
@@ -1443,7 +1438,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 </span>
               ) : (
                 <span>
-                  <strong>Mẹo bảo mật WHMCS:</strong> Bạn có thể tạo tài khoản phụ vai trò <strong>Reseller</strong> rồi chọn ở mục <em>Tài khoản thực thi</em> (hoặc đăng nhập vào Reseller → <em>API & Billing</em>) để WHMCS chỉ tạo End User trong phạm vi Reseller giống DirectAdmin.
+                  <strong>Mẹo bảo mật WHMCS:</strong> Quản trị viên có thể tạo tài khoản phụ vai trò <strong>Reseller</strong> rồi chọn ngay ở mục <em>Tài khoản thực thi</em> phía trên để WHMCS chỉ tạo End User trong phạm vi Reseller giống DirectAdmin (Reseller không tự truy cập được trang cấu hình API này).
                 </span>
               )}
               {selectedScopesNeedIp && (
@@ -1465,13 +1460,14 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                   display: 'flex',
                   flexDirection: 'column',
                   gap: '12px',
+                  minWidth: 0,
                 }}
               >
                 <div style={{ fontWeight: 700, fontSize: '0.88rem', color: 'var(--text-main)' }}>
                   Chỉnh sửa trực tiếp quyền hạn & IP của Token &ldquo;{editingToken.name}&rdquo; (giữ nguyên mã bp_... trên WHMCS)
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px', alignItems: 'end' }}>
-                  <label style={{ margin: 0 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '12px', alignItems: 'end', minWidth: 0 }}>
+                  <label style={{ margin: 0, minWidth: 0 }}>
                     <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                       Tên gợi nhớ
                     </span>
@@ -1481,7 +1477,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                       required
                     />
                   </label>
-                  <label style={{ margin: 0 }}>
+                  <label style={{ margin: 0, minWidth: 0 }}>
                     <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                       Giới hạn IP (IP máy chủ WHMCS)
                     </span>
@@ -1491,7 +1487,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                       placeholder="VD: 160.191.248.77"
                     />
                   </label>
-                  <label style={{ margin: 0 }}>
+                  <label style={{ margin: 0, minWidth: 0 }}>
                     <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                       Danh sách quyền (Scopes, phân tách dấu phẩy)
                     </span>
@@ -1501,7 +1497,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                       required
                     />
                   </label>
-                  <label style={{ margin: 0 }}>
+                  <label style={{ margin: 0, minWidth: 0 }}>
                     <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                       Giới hạn request/phút (0 = 120)
                     </span>
@@ -1514,7 +1510,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                     />
                   </label>
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', flexWrap: 'wrap' }}>
                   <button type="button" className="secondary-light" onClick={() => setEditingToken(null)}>
                     Hủy
                   </button>
@@ -1526,22 +1522,22 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
             )}
 
             {/* Tokens Table */}
-            <div className="pkg-table-wrap">
-              <table className="pkg-clean-table">
+            <div className="pkg-table-wrap" style={{ minWidth: 0 }}>
+              <table className="pkg-clean-table api-tokens-table">
                 <thead>
                   <tr>
-                    <th>Tên Token / Hệ thống</th>
+                    <th>Tên Token</th>
                     <th>Vai trò thực thi</th>
                     <th>Quyền hạn (Scopes)</th>
-                    <th>IP được phép (Whitelist)</th>
+                    <th>IP cho phép</th>
                     <th>Trạng thái</th>
-                    <th>Lần gọi gần nhất</th>
+                    <th>Gọi gần nhất</th>
                     <th style={{ textAlign: 'right' }}>Thao tác</th>
                   </tr>
                 </thead>
                 <tbody>
                   {apiTokens.map((token) => {
-                    const isResellerTok = token.owner_role === 'reseller' || (!isAdmin && isReseller);
+                    const isResellerTok = token.owner_role === 'reseller';
                     const targetSsoScope = isResellerTok ? 'sso:reseller' : 'sso:admin';
                     const scopeParts = String(token.scopes || '')
                       .split(',')
@@ -1553,16 +1549,16 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                       <td>
                         <strong style={{ color: 'var(--text-main)' }}>{token.name}</strong>
                         {token.created_at && (
-                          <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
-                            Tạo lúc: {new Date(token.created_at).toLocaleString()}
+                          <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                            Tạo: {new Date(token.created_at).toLocaleString()}
                           </div>
                         )}
                       </td>
                       <td>
                         <span style={{
-                          padding: '3px 9px',
+                          padding: '3px 8px',
                           borderRadius: '999px',
-                          fontSize: '0.74rem',
+                          fontSize: '0.72rem',
                           fontWeight: 700,
                           background: isResellerTok ? 'rgba(139, 92, 246, 0.14)' : 'rgba(59, 130, 246, 0.14)',
                           color: isResellerTok ? '#8b5cf6' : '#3b82f6',
@@ -1571,14 +1567,18 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                           {token.owner_username ? `: ${token.owner_username}` : ''}
                         </span>
                       </td>
-                      <td>
+                      <td className="api-token-scopes-cell">
                         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '5px' }}>
-                          <code style={{ fontSize: '0.76rem' }}>{token.scopes}</code>
+                          <div className="api-token-scope-list">
+                            {scopeParts.map((sc) => (
+                              <code key={sc} className="api-token-scope-pill">{sc}</code>
+                            ))}
+                          </div>
                           {token.is_active && !hasServerSso && (
                             <button
                               type="button"
                               className="secondary-light"
-                              style={{ padding: '3px 8px', fontSize: '0.72rem', fontWeight: 600 }}
+                              style={{ padding: '2px 7px', minHeight: '26px', height: '26px', fontSize: '0.71rem', fontWeight: 600 }}
                               disabled={!!loading}
                               onClick={() => enableServerSsoOnToken(token)}
                               title={`Bật ngay quyền ${targetSsoScope} cho nút Login to SPanel trên WHMCS mà không cần đổi lại mã Token`}
@@ -1588,35 +1588,35 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                           )}
                         </div>
                       </td>
-                      <td>
+                      <td className="api-token-ip-cell">
                         {token.allowed_ips ? (
-                          <code style={{ fontSize: '0.78rem', color: 'var(--accent-primary)' }}>{token.allowed_ips}</code>
+                          <code style={{ fontSize: '0.75rem', color: 'var(--accent-primary)' }}>{token.allowed_ips}</code>
                         ) : (
-                          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Tất cả IP (All IPs)</span>
+                          <span style={{ fontSize: '0.76rem', color: 'var(--text-muted)' }}>Tất cả IP</span>
                         )}
                       </td>
                       <td>
                         <span style={{
-                          padding: '3px 9px', borderRadius: '999px', fontSize: '0.74rem', fontWeight: 700,
+                          padding: '3px 8px', borderRadius: '999px', fontSize: '0.72rem', fontWeight: 700,
                           background: token.is_active ? 'rgba(16, 185, 129, 0.14)' : 'rgba(239, 68, 68, 0.14)',
                           color: token.is_active ? '#10b981' : '#ef4444',
                         }}>
                           {token.is_active ? 'Đang hoạt động' : 'Đã thu hồi'}
                         </span>
                         {token.is_active && token.expires_at && (
-                          <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                          <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '4px' }}>
                             Hết hạn: {new Date(`${token.expires_at}${String(token.expires_at).endsWith('Z') ? '' : 'Z'}`).toLocaleString()}
                           </div>
                         )}
                       </td>
-                      <td style={{ fontSize: '0.81rem', color: 'var(--text-muted)' }}>
+                      <td style={{ fontSize: '0.76rem', color: 'var(--text-muted)' }}>
                         {token.last_used_at ? new Date(token.last_used_at).toLocaleString() : 'Chưa từng gọi'}
                       </td>
-                      <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      <td className="api-token-actions-cell" style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                         <button
                           type="button"
                           className="secondary-light"
-                          style={{ padding: '6px 10px', fontSize: '0.78rem', marginRight: '6px' }}
+                          style={{ padding: '0 8px', minHeight: '30px', height: '30px', fontSize: '0.74rem', marginRight: '5px' }}
                           disabled={!!loading || !token.is_active}
                           onClick={() =>
                             setEditingToken({
@@ -1629,25 +1629,25 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                           }
                           title="Chỉnh sửa trực tiếp Scopes / IP mà không đổi mã bp_..."
                         >
-                          <Edit2 size={13} /> Sửa
+                          <Edit2 size={12} /> Sửa
                         </button>
                         <button
                           type="button"
                           className="secondary-light"
-                          style={{ padding: '6px 12px', fontSize: '0.78rem', marginRight: '6px' }}
+                          style={{ padding: '0 9px', minHeight: '30px', height: '30px', fontSize: '0.74rem', marginRight: '5px' }}
                           disabled={!!loading || !token.is_active}
                           onClick={() => rotateApiToken(token)}
                         >
-                          <RotateCcw size={14} /> Xoay vòng
+                          <RotateCcw size={12} /> Xoay vòng
                         </button>
                         <button
                           type="button"
                           className="danger"
-                          style={{ padding: '6px 12px', fontSize: '0.78rem' }}
+                          style={{ padding: '0 9px', minHeight: '30px', height: '30px', fontSize: '0.74rem' }}
                           disabled={!!loading || !token.is_active}
                           onClick={() => revokeApiToken(token)}
                         >
-                          <Trash2 size={14} /> Thu hồi
+                          <Trash2 size={12} /> Thu hồi
                         </button>
                       </td>
                     </tr>
@@ -1670,7 +1670,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
           </div>
 
           {/* CARD 2: OUTBOUND EVENT WEBHOOKS */}
-          <div className="pkg-card" style={{ padding: '20px 22px' }}>
+          <div className="pkg-card" style={{ padding: '18px 20px', minWidth: 0, maxWidth: '100%' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '14px', marginBottom: '16px' }}>
               <div>
                 <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -1737,7 +1737,7 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                   </label>
                 </div>
 
-                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(220px, 1fr) minmax(260px, 1.5fr) auto', gap: '12px', alignItems: 'end' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '12px', alignItems: 'end', minWidth: 0 }}>
                   <label style={{ margin: 0 }}>
                     <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
                       Mẫu bộ lọc sự kiện nhanh
@@ -1811,12 +1811,12 @@ export function SettingsPage({ request, isAdmin, isReseller = false, users = [],
                 <tbody>
                   {webhooks.map((wh) => (
                     <tr key={wh.id}>
-                      <td>
-                        <code style={{ wordBreak: 'break-all', fontSize: '0.82rem', color: 'var(--text-main)' }}>
+                      <td style={{ whiteSpace: 'normal', wordBreak: 'break-all', maxWidth: '300px' }}>
+                        <code style={{ wordBreak: 'break-all', fontSize: '0.8rem', color: 'var(--text-main)' }}>
                           {wh.url}
                         </code>
                       </td>
-                      <td>
+                      <td style={{ whiteSpace: 'normal', wordBreak: 'break-word', maxWidth: '280px' }}>
                         <code style={{ fontSize: '0.76rem', color: 'var(--accent-primary)' }}>
                           {wh.events === '*' ? '* (Tất cả sự kiện)' : wh.events}
                         </code>
