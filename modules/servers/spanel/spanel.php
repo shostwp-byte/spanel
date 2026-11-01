@@ -32,7 +32,7 @@ function spanel_MetaData()
         'DefaultNonSSLPort' => '2222',
         'DefaultSSLPort' => '2222',
         'ServiceSingleSignOnLabel' => 'Login to SPanel',
-        'AdminSingleSignOnLabel' => 'Login to SPanel as Admin',
+        'AdminSingleSignOnLabel' => 'Login to SPanel',
         'ListAccountsUniqueIdentifierDisplayName' => 'Username',
         'ListAccountsUniqueIdentifierField' => 'username',
         'ListAccountsProductField' => 'configoption1',
@@ -316,7 +316,13 @@ function spanel_AdminSingleSignOn($params)
 {
     $result = spanel_request($params, 'POST', SPANEL_API . '/admin/login');
     if (!$result['ok']) {
-        return ['success' => false, 'errorMsg' => $result['error'] . ' (the API token needs the sso:admin scope)'];
+        $err = (string) $result['error'];
+        if (stripos($err, 'IP allowlist') !== false) {
+            $hint = ' (add the WHMCS server IP to the token Allowed IPs in SPanel)';
+        } else {
+            $hint = ' (grant sso:admin for Admin tokens or sso:reseller for Reseller tokens, and set Allowed IPs)';
+        }
+        return ['success' => false, 'errorMsg' => $err . $hint];
     }
     $url = spanel_absolute_url($params, (string) ($result['data']['login_url'] ?? ''));
     if ($url === '') {

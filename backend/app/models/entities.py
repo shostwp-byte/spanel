@@ -665,6 +665,7 @@ class ProvisioningAccount(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     external_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    reseller_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     primary_website_id: Mapped[Optional[int]] = mapped_column(ForeignKey("websites.id"), nullable=True)
     package_id: Mapped[Optional[int]] = mapped_column(ForeignKey("user_packages.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending")

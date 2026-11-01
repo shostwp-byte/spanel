@@ -27,6 +27,17 @@
             "title": "Name",
             "type": "string"
           },
+          "owner_user_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner User Id"
+          },
           "rate_limit_per_minute": {
             "default": 0,
             "maximum": 6000.0,
@@ -81,6 +92,17 @@
             ],
             "title": "Created At"
           },
+          "created_by_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By Id"
+          },
           "expires_at": {
             "anyOf": [
               {
@@ -116,6 +138,28 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "owner_role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Role"
+          },
+          "owner_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Username"
           },
           "rate_limit_per_minute": {
             "default": 0,
@@ -669,7 +713,7 @@
   "info": {
     "description": "Billing-system API for creating and managing hosting accounts. Authenticate with `Authorization: Bearer <token>`; write calls accept an `Idempotency-Key` header. See docs/API_AND_WHMCS.md.",
     "title": "SPanel Provisioning API",
-    "version": "1.0.7"
+    "version": "1.0.8"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -1267,7 +1311,7 @@
     },
     "/api/provisioning/v1/admin/login": {
       "post": {
-        "description": "A one-time login link for the administrator who issued this token.\n\nOnly with the ``sso:admin`` scope, which no legacy token has and which must\nbe granted explicitly: whoever holds such a token can open the panel as\nthat administrator, so it belongs only on a billing server trusted as much.",
+        "description": "A one-time login link for the Admin or Reseller who owns this token.\n\n- Admin tokens require explicit ``sso:admin`` scope and a non-empty IP\n  allowlist, signing in as that Administrator.\n- Reseller tokens require explicit ``sso:reseller`` (or ``sso:admin``) scope\n  and a non-empty IP allowlist, signing in strictly as that Reseller.",
         "operationId": "create_admin_login_url_api_provisioning_v1_admin_login_post",
         "responses": {
           "200": {

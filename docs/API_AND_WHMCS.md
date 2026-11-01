@@ -29,17 +29,19 @@ phát tài khoản, nhận sự kiện qua **Outbound Webhook**, và kết nối
 
 Yêu cầu: WHMCS 7.x/8.x, PHP 7.4 – 8.3, extension cURL. Không cần thư viện ngoài.
 
-### Bước 2: Tạo API Token trên SPanel
+### Bước 2: Tạo API Token trên SPanel (Admin hoặc Reseller)
 
-1. Đăng nhập SPanel bằng tài khoản **Admin**.
-2. Vào **Cài đặt → API & Billing Integration**.
-3. Chọn quyền (scopes), giới hạn IP (chấp nhận IP đơn và dải CIDR như
+1. Đăng nhập SPanel bằng tài khoản **Admin** (vào **Cài đặt → API & Billing Integration**, có thể chọn tạo token cho chính Admin hoặc ủy quyền trực tiếp cho một tài khoản **Reseller**) — hoặc đăng nhập bằng tài khoản **Reseller** và vào **API & Billing (WHMCS)**.
+2. Chọn quyền (scopes), giới hạn IP (chấp nhận IP đơn và dải CIDR như
    `103.1.2.0/24`, cả IPv6), thời hạn và giới hạn request/phút, rồi bấm
    **Tạo API Token**. Token (`bp_...`) chỉ hiện **một lần**.
 
 Token dùng cho WHMCS cần các scope `plans:read,accounts:read,accounts:write,usage:read,sso`
 (hoặc bộ cũ `provisioning:read,provisioning:write`, vẫn hoạt động y như trước).
-Chỉ thêm `sso:admin` nếu muốn nút "Login to SPanel as Admin" trên WHMCS. Token có `sso:admin` **bắt buộc phải có IP Allowlist** (địa chỉ máy chủ WHMCS), vì link đăng nhập bỏ qua 2FA của admin.
+Để bật nút **"Login to SPanel"** ở trang quản lý Server trên WHMCS:
+- Với token của **Admin**: thêm `sso:admin`.
+- Với token của **Reseller** (khuyến nghị để cô lập quyền an toàn kiểu DirectAdmin): thêm `sso:reseller`.
+Token có `sso:admin` hoặc `sso:reseller` **bắt buộc phải có IP Allowlist** (địa chỉ máy chủ WHMCS), vì link đăng nhập bỏ qua 2FA. Token của Reseller chỉ tạo được tài khoản End User nằm trong hạn mức quota của Reseller đó và chỉ quản lý các dịch vụ thuộc sở hữu của Reseller đó.
 
 ### Bước 3: Thêm Server SPanel trong WHMCS
 
@@ -128,12 +130,13 @@ gọi tài khoản theo `external_id` nên không cần đổi username.
 | `accounts:write` | tạo, tạm khoá, mở khoá, xoá, đổi mật khẩu, đổi gói, reset SFTP, sao lưu |
 | `usage:read` | `GET /accounts/usage`, `GET /accounts/{external_id}/usage` |
 | `sso` | `POST /accounts/{external_id}/login` |
-| `sso:admin` | `POST /admin/login`: đăng nhập panel **bằng tài khoản admin đã tạo token** (token phải có IP Allowlist) |
+| `sso:admin` | `POST /admin/login`: đăng nhập panel **bằng tài khoản Admin sở hữu token** (token phải có IP Allowlist) |
+| `sso:reseller` | `POST /admin/login`: đăng nhập panel **bằng tài khoản Reseller sở hữu token** (token phải có IP Allowlist) |
 | `tokens:rotate` | `POST /token/rotate`: token tự xoay vòng |
 
 Token cũ giữ nguyên phạm vi: `provisioning:read` = `plans:read` + `accounts:read`
 + `usage:read`; `provisioning:write` = `accounts:write` + `sso`. Không token cũ nào
-có `sso:admin` hay `tokens:rotate`.
+có `sso:admin`, `sso:reseller` hay `tokens:rotate`.
 
 - **IP allowlist:** địa chỉ đơn hoặc CIDR, IPv4 và IPv6; client IPv4 đến qua
   socket IPv6 (`::ffff:a.b.c.d`) được so như IPv4. Để trống = mọi IP.
@@ -288,7 +291,8 @@ Errors use FastAPI's shape: `{"detail": "..."}`.
 | `accounts:write` | `POST /accounts`, `POST .../suspend`, `POST .../unsuspend`, `DELETE /accounts/{external_id}`, `PATCH .../password`, `PATCH .../package`, `POST .../sftp-password`, `POST .../backup` |
 | `usage:read` | `GET /accounts/usage`, `GET /accounts/{external_id}/usage` |
 | `sso` | `POST /accounts/{external_id}/login` |
-| `sso:admin` | `POST /admin/login` |
+| `sso:admin` | `POST /admin/login` (Admin-owned token + IP allowlist) |
+| `sso:reseller` | `POST /admin/login` (Reseller-owned token + IP allowlist) |
 | `tokens:rotate` | `POST /token/rotate` |
 
 Legacy scopes keep their exact reach: `provisioning:read` = `plans:read`,
@@ -321,11 +325,11 @@ stored, so they can be retried with the same key.
 | `POST /api/provisioning/v1/accounts/{external_id}/sftp-password` | accounts:write | New random SFTP/SSH password → `{ok, sftp_password, sftp_username}` (shown once) |
 | `POST /api/provisioning/v1/accounts/{external_id}/backup` | accounts:write | Queue a full backup → `{ok, queued}`; result in `account.backup_*` webhooks |
 | `POST /api/provisioning/v1/accounts/{external_id}/login` | sso | One-time login link (300 s) → `{login_url, url, path, expires_in}` |
-| `POST /api/provisioning/v1/admin/login` | sso:admin | One-time login link for the administrator who issued the token; 403 unless the token has an IP allowlist |
+| `POST /api/provisioning/v1/admin/login` | sso:admin / sso:reseller | One-time login link for the Admin (`sso:admin`) or Reseller (`sso:reseller`) who owns the token; 403 unless the token has an IP allowlist |
 | `POST /api/provisioning/v1/token/rotate` | tokens:rotate | Body `{"grace_minutes": 0}` → `{token, info}`: replaces the calling token |
 
-Administrator endpoints (panel session cookie, admin role): `GET /api/provisioning/v1/tokens`,
-`POST /api/provisioning/v1/tokens` (`{name, scopes, allowed_ips, expires_in_days, rate_limit_per_minute}`),
+Panel token-management endpoints (panel session cookie, `admin` or `reseller` role; Resellers manage only their own tokens while Admins can also pass `owner_user_id` to delegate a token to a Reseller): `GET /api/provisioning/v1/tokens`,
+`POST /api/provisioning/v1/tokens` (`{name, scopes, allowed_ips, expires_in_days, rate_limit_per_minute, owner_user_id?}`),
 `POST /api/provisioning/v1/tokens/{token_id}/rotate` (`{grace_minutes}`),
 `DELETE /api/provisioning/v1/tokens/{token_id}`, `GET /api/provisioning/v1/scopes`.
 

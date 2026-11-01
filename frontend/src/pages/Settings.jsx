@@ -73,7 +73,7 @@ const PROVISIONING_ENDPOINTS = [
   { method: 'POST', path: '/accounts/{external_id}/sftp-password', desc: 'Đặt lại mật khẩu SFTP/SSH ngẫu nhiên (trả về 1 lần)' },
   { method: 'POST', path: '/accounts/{external_id}/backup', desc: 'Xếp hàng sao lưu toàn bộ tài khoản (chạy nền)' },
   { method: 'GET', path: '/reseller-plans', desc: 'Lấy danh sách gói Reseller' },
-  { method: 'POST', path: '/admin/login', desc: 'Link SSO đăng nhập Admin (chỉ với scope sso:admin)' },
+  { method: 'POST', path: '/admin/login', desc: 'Link SSO đăng nhập trực tiếp Admin/Reseller từ trang WHMCS Server (scope sso:admin hoặc sso:reseller + Allowed IPs)' },
   { method: 'POST', path: '/token/rotate', desc: 'Token tự xoay vòng (scope tokens:rotate)' },
 ];
 
@@ -152,7 +152,7 @@ function parseAuditDetail(rawDetail) {
   return { summary: summaryPart, ip, ua, uaShort, raw };
 }
 
-export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanelHost }) {
+export function SettingsPage({ request, isAdmin, isReseller = false, users = [], loadPanelSettings, currentPanelHost }) {
   const {
     loading, setLoading, setError, setNotice, currentUser, loadCurrentUser, panelSettings, setPanelSettings,
     clearSession, panelSettingsTab, setPanelSettingsTab,
@@ -173,9 +173,10 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
   const [newApiToken, setNewApiToken] = useState({
     name: 'WHMCS Billing',
     allowed_ips: '',
-    scopes: 'provisioning:read,provisioning:write',
+    scopes: 'plans:read,accounts:read,accounts:write,usage:read,sso',
     expires_in_days: '',
     rate_limit_per_minute: '',
+    owner_user_id: '',
   });
   const [createdApiToken, setCreatedApiToken] = useState('');
   const [showEndpointsRef, setShowEndpointsRef] = useState(false);
@@ -216,17 +217,19 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
   }, [currentUser?.email]);
 
   useEffect(() => {
-    if (isAdmin) {
+    if (isAdmin || isReseller) {
       loadApiTokens();
       loadWebhooks();
       loadWebhookDeliveries();
       loadWhmcsDiagnostic();
+    }
+    if (isAdmin) {
       loadAuditAndCronSecurity();
       request('/panel-settings').then((data) => {
         if (data) setPanelSettings(data);
       });
     }
-  }, [isAdmin]);
+  }, [isAdmin, isReseller]);
 
   async function loadAuditAndCronSecurity(searchQuery = auditSearch) {
     try {
@@ -482,17 +485,29 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
       setError(t('Token name is required.'));
       return;
     }
+    const chosenScopes = newApiToken.scopes || 'plans:read,accounts:read,accounts:write,usage:read,sso';
+    const needsPanelSsoIp = chosenScopes.includes('sso:admin') || chosenScopes.includes('sso:reseller');
+    if (needsPanelSsoIp && !newApiToken.allowed_ips.trim()) {
+      setError(
+        'Quyền đăng nhập nhanh từ trang WHMCS Server (sso:admin / sso:reseller) bắt buộc phải nhập địa chỉ IP máy chủ WHMCS vào ô "Giới hạn IP máy chủ gọi API" để bảo vệ an toàn 2FA.'
+      );
+      return;
+    }
+    const bodyPayload = {
+      name: newApiToken.name.trim(),
+      scopes: chosenScopes,
+      allowed_ips: newApiToken.allowed_ips.trim(),
+      expires_in_days: Number(newApiToken.expires_in_days) > 0 ? Number(newApiToken.expires_in_days) : null,
+      rate_limit_per_minute: Number(newApiToken.rate_limit_per_minute) > 0 ? Number(newApiToken.rate_limit_per_minute) : 0,
+    };
+    if (isAdmin && Number(newApiToken.owner_user_id) > 0) {
+      bodyPayload.owner_user_id = Number(newApiToken.owner_user_id);
+    }
     const data = await request(
       '/provisioning/v1/tokens',
       {
         method: 'POST',
-        body: JSON.stringify({
-          name: newApiToken.name.trim(),
-          scopes: newApiToken.scopes || 'provisioning:read,provisioning:write',
-          allowed_ips: newApiToken.allowed_ips.trim(),
-          expires_in_days: Number(newApiToken.expires_in_days) > 0 ? Number(newApiToken.expires_in_days) : null,
-          rate_limit_per_minute: Number(newApiToken.rate_limit_per_minute) > 0 ? Number(newApiToken.rate_limit_per_minute) : 0,
-        }),
+        body: JSON.stringify(bodyPayload),
       },
       t('Creating API token...')
     );
@@ -502,6 +517,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
         t('API token created. Copy it now; it will not be shown again.')
       );
       await loadApiTokens();
+      await loadWhmcsDiagnostic();
     }
   }
 
@@ -667,7 +683,7 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     setNotice(data.message || 'Admin account updated.');
   }
 
-  if (!isAdmin) {
+  if (!isAdmin && !isReseller) {
     return (
       <div className="section">
         <h2>{t('Settings')}</h2>
@@ -676,13 +692,26 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
     );
   }
 
-  const tabs = [
-    ['general', 'General', SettingsIcon],
-    ['account', 'Admin account', Lock],
-    ['api', 'API & Billing Integration', KeyRound],
-    ['audit', 'Security Audit & Cron Jail', ShieldCheck],
-  ];
-  const activeTab = tabs.some(([id]) => id === panelSettingsTab) ? panelSettingsTab : 'general';
+  const resellerAccounts = (users || []).filter(
+    (u) => u && u.role === 'reseller' && u.is_active !== false
+  );
+  const selectedOwnerIsReseller =
+    !isAdmin || Boolean(Number(newApiToken.owner_user_id) > 0);
+  const selectedScopesNeedIp =
+    (newApiToken.scopes || '').includes('sso:admin') ||
+    (newApiToken.scopes || '').includes('sso:reseller');
+
+  const tabs = isAdmin
+    ? [
+        ['general', 'General', SettingsIcon],
+        ['account', 'Admin account', Lock],
+        ['api', 'API & Billing Integration', KeyRound],
+        ['audit', 'Security Audit & Cron Jail', ShieldCheck],
+      ]
+    : [
+        ['api', 'API & Billing Integration', KeyRound],
+      ];
+  const activeTab = tabs.some(([id]) => id === panelSettingsTab) ? panelSettingsTab : tabs[0][0];
   const taspanel = (id, content) =>
     activeTab === id && (
       <div
@@ -1168,14 +1197,14 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
             {/* Create Token Form */}
             <div style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(195px, 1fr))',
               gap: '12px',
               alignItems: 'end',
               padding: '14px 16px',
               borderRadius: '10px',
               background: 'var(--surface-2)',
               border: '1px solid var(--border-subtle)',
-              marginBottom: '16px',
+              marginBottom: '12px',
             }}>
               <label style={{ margin: 0 }}>
                 <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
@@ -1188,14 +1217,50 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                 />
               </label>
 
+              {isAdmin && (
+                <label style={{ margin: 0 }}>
+                  <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
+                    Tài khoản thực thi (Vai trò Token)
+                  </span>
+                  <select
+                    value={newApiToken.owner_user_id}
+                    onChange={(e) => {
+                      const nextOwnerId = e.target.value;
+                      const nextIsReseller = Number(nextOwnerId) > 0;
+                      setNewApiToken((prev) => {
+                        let nextScopes = prev.scopes || '';
+                        if (nextIsReseller && nextScopes.includes('sso:admin')) {
+                          nextScopes = nextScopes.replace('sso:admin', 'sso:reseller');
+                        } else if (!nextIsReseller && nextScopes.includes('sso:reseller')) {
+                          nextScopes = nextScopes.replace('sso:reseller', 'sso:admin');
+                        }
+                        return { ...prev, owner_user_id: nextOwnerId, scopes: nextScopes };
+                      });
+                    }}
+                  >
+                    <option value="">
+                      Admin ({currentUser?.username || 'admin'}) — Toàn quyền máy chủ
+                    </option>
+                    {resellerAccounts.map((resUser) => (
+                      <option key={resUser.id} value={String(resUser.id)}>
+                        Reseller: {resUser.username} — An toàn cho WHMCS End User
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
               <label style={{ margin: 0 }}>
-                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '5px' }}>
-                  Giới hạn IP máy chủ gọi API (Để trống = Cho phép mọi IP)
+                <span style={{ display: 'block', fontSize: '0.78rem', fontWeight: 600, color: selectedScopesNeedIp ? '#f59e0b' : 'var(--text-muted)', marginBottom: '5px' }}>
+                  {selectedScopesNeedIp
+                    ? 'IP máy chủ WHMCS (Bắt buộc khi bật SSO Server)'
+                    : 'Giới hạn IP gọi API (Trống = Cho phép mọi IP)'}
                 </span>
                 <input
                   value={newApiToken.allowed_ips}
                   onChange={(e) => setNewApiToken((prev) => ({ ...prev, allowed_ips: e.target.value }))}
-                  placeholder="Tùy chọn: 103.1.2.3, 103.1.2.0/24"
+                  placeholder={selectedScopesNeedIp ? 'Bắt buộc: VD 103.1.2.3, 103.1.2.0/24' : 'Tùy chọn: 103.1.2.3, 103.1.2.0/24'}
+                  style={selectedScopesNeedIp && !newApiToken.allowed_ips.trim() ? { borderColor: '#f59e0b' } : undefined}
                 />
               </label>
 
@@ -1207,11 +1272,35 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   value={newApiToken.scopes}
                   onChange={(e) => setNewApiToken((prev) => ({ ...prev, scopes: e.target.value }))}
                 >
-                  <option value="provisioning:read,provisioning:write">Toàn quyền (Đọc & Ghi Provisioning)</option>
-                  <option value="provisioning:read">Chỉ đọc (Đồng bộ Gói & Dung lượng)</option>
-                  <option value="plans:read,accounts:read,accounts:write,usage:read,sso">WHMCS chuẩn (phân quyền chi tiết)</option>
-                  <option value="plans:read,accounts:read,accounts:write,usage:read,sso,sso:admin">WHMCS + Đăng nhập Admin (Admin SSO)</option>
-                  <option value="accounts:read,usage:read">Chỉ đồng bộ tài khoản & dung lượng</option>
+                  {selectedOwnerIsReseller ? (
+                    <>
+                      <option value="plans:read,accounts:read,accounts:write,usage:read,sso">
+                        WHMCS Reseller Chuẩn (Tạo End User & SSO Khách hàng)
+                      </option>
+                      <option value="plans:read,accounts:read,accounts:write,usage:read,sso,sso:reseller">
+                        WHMCS Reseller + Nút Login to SPanel (sso:reseller)
+                      </option>
+                      <option value="provisioning:read,provisioning:write">
+                        Đọc & Ghi Provisioning (Phạm vi Reseller)
+                      </option>
+                      <option value="provisioning:read">Chỉ đọc (Đồng bộ Gói & Dung lượng)</option>
+                      <option value="accounts:read,usage:read">Chỉ đồng bộ tài khoản & dung lượng</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value="plans:read,accounts:read,accounts:write,usage:read,sso">
+                        WHMCS Chuẩn (Phân quyền chi tiết — Khuyên dùng)
+                      </option>
+                      <option value="plans:read,accounts:read,accounts:write,usage:read,sso,sso:admin">
+                        WHMCS + Nút Login to SPanel (Admin SSO — sso:admin)
+                      </option>
+                      <option value="provisioning:read,provisioning:write">
+                        Toàn quyền (Đọc & Ghi Provisioning)
+                      </option>
+                      <option value="provisioning:read">Chỉ đọc (Đồng bộ Gói & Dung lượng)</option>
+                      <option value="accounts:read,usage:read">Chỉ đồng bộ tài khoản & dung lượng</option>
+                    </>
+                  )}
                 </select>
               </label>
 
@@ -1253,12 +1342,35 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
               </button>
             </div>
 
+            <div style={{
+              fontSize: '0.79rem',
+              color: selectedScopesNeedIp ? '#f59e0b' : 'var(--text-muted)',
+              marginBottom: '16px',
+              lineHeight: 1.5,
+            }}>
+              {selectedOwnerIsReseller ? (
+                <span>
+                  <strong>Chế độ an toàn chuẩn DirectAdmin Reseller:</strong> Token thuộc vai trò <strong>Reseller</strong> chỉ khởi tạo và quản lý tài khoản End User nằm trong hạn mức (Quota) của Reseller đó, hoàn toàn tách biệt khỏi quyền root Admin.
+                </span>
+              ) : (
+                <span>
+                  <strong>Mẹo bảo mật WHMCS:</strong> Bạn có thể tạo tài khoản phụ vai trò <strong>Reseller</strong> rồi chọn ở mục <em>Tài khoản thực thi</em> (hoặc đăng nhập vào Reseller → <em>API & Billing</em>) để WHMCS chỉ tạo End User trong phạm vi Reseller giống DirectAdmin.
+                </span>
+              )}
+              {selectedScopesNeedIp && (
+                <span>
+                  {' '}• <strong>Lưu ý nút Login to SPanel trên trang WHMCS Server:</strong> Bắt buộc điền IP máy chủ WHMCS vào ô <em>IP máy chủ WHMCS</em> để cấp phép bỏ qua 2FA an toàn.
+                </span>
+              )}
+            </div>
+
             {/* Tokens Table */}
             <div className="pkg-table-wrap">
               <table className="pkg-clean-table">
                 <thead>
                   <tr>
                     <th>Tên Token / Hệ thống</th>
+                    <th>Vai trò thực thi</th>
                     <th>Quyền hạn (Scopes)</th>
                     <th>IP được phép (Whitelist)</th>
                     <th>Trạng thái</th>
@@ -1267,7 +1379,9 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                   </tr>
                 </thead>
                 <tbody>
-                  {apiTokens.map((token) => (
+                  {apiTokens.map((token) => {
+                    const isResellerTok = token.owner_role === 'reseller';
+                    return (
                     <tr key={token.id}>
                       <td>
                         <strong style={{ color: 'var(--text-main)' }}>{token.name}</strong>
@@ -1276,6 +1390,19 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                             Tạo lúc: {new Date(token.created_at).toLocaleString()}
                           </div>
                         )}
+                      </td>
+                      <td>
+                        <span style={{
+                          padding: '3px 9px',
+                          borderRadius: '999px',
+                          fontSize: '0.74rem',
+                          fontWeight: 700,
+                          background: isResellerTok ? 'rgba(139, 92, 246, 0.14)' : 'rgba(59, 130, 246, 0.14)',
+                          color: isResellerTok ? '#8b5cf6' : '#3b82f6',
+                        }}>
+                          {isResellerTok ? 'Reseller' : 'Admin'}
+                          {token.owner_username ? `: ${token.owner_username}` : ''}
+                        </span>
                       </td>
                       <td>
                         <code style={{ fontSize: '0.76rem' }}>{token.scopes}</code>
@@ -1325,10 +1452,11 @@ export function SettingsPage({ request, isAdmin, loadPanelSettings, currentPanel
                         </button>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                   {apiTokens.length === 0 && (
                     <tr>
-                      <td colSpan="6">
+                      <td colSpan="7">
                         <EmptyState
                           icon={KeyRound}
                           title="Chưa có API Token nào"

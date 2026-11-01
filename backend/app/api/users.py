@@ -60,7 +60,7 @@ def _package_for_payload(
     if not package:
         raise HTTPException(status_code=404, detail="Package not found")
     if current_user is not None and current_user.role == Role.reseller.value:
-        if package.owner_id != current_user.id:
+        if bool(getattr(package, "is_reseller_package", False)) or package.owner_id not in (None, current_user.id):
             raise HTTPException(status_code=403, detail="Cannot assign a package you do not own")
     return package
 
