@@ -17,6 +17,7 @@ from app.schemas.schemas import (
     ApiTokenCreatedResponse,
     ApiTokenOut,
     ApiTokenRotate,
+    ApiTokenUpdate,
     ProvisioningAccountCreate,
     ProvisioningAccountList,
     ProvisioningAccountOut,
@@ -957,6 +958,21 @@ def list_scopes(current_user: User = Depends(get_current_user)):
     }
 
 
+def _align_scopes_for_owner_role(scopes: str, owner_role: Optional[str]) -> str:
+    items = [s for s in scopes.split(",") if s]
+    mapped: list[str] = []
+    for s in items:
+        if owner_role == Role.reseller and s == "sso:admin":
+            s_item = "sso:reseller"
+        elif owner_role == Role.admin and s == "sso:reseller":
+            s_item = "sso:admin"
+        else:
+            s_item = s
+        if s_item not in mapped:
+            mapped.append(s_item)
+    return ",".join(sorted(mapped))
+
+
 @router.post("/tokens", response_model=ApiTokenCreatedResponse)
 def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
@@ -976,14 +992,13 @@ def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depend
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if owner_user.role == Role.reseller:
-        # Never store sso:admin on a Reseller-owned token; downgrade/map to sso:reseller.
-        mapped = []
-        for s in scopes.split(","):
-            s_item = "sso:reseller" if s == "sso:admin" else s
-            if s_item not in mapped:
-                mapped.append(s_item)
-        scopes = ",".join(mapped)
+    scopes = _align_scopes_for_owner_role(scopes, owner_user.role)
+    scope_set = set(scopes.split(","))
+    if ("sso:admin" in scope_set or "sso:reseller" in scope_set) and not allowed_ips.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="sso:admin and sso:reseller require a non-empty IP allowlist (WHMCS server IP)",
+        )
 
     expires_at = None
     if payload.expires_in_days:
@@ -1006,6 +1021,58 @@ def create_token(payload: ApiTokenCreate, request: Request, db: Session = Depend
         request=request,
     )
     return {"token": raw, "info": _serialize_token(token, {owner_user.id: owner_user})}
+
+
+@router.patch("/tokens/{token_id}", response_model=ApiTokenOut)
+def update_token(token_id: int, payload: ApiTokenUpdate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Update an active token's name, scopes, allowed IPs or rate limit in place without changing its secret."""
+    ensure_role(current_user.role, Role.reseller)
+    token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
+    if not token or (not is_admin_role(current_user.role) and token.created_by_id != current_user.id):
+        raise HTTPException(status_code=404, detail="Token not found")
+    if not token.is_active or token.revoked_at is not None:
+        raise HTTPException(status_code=400, detail="A revoked token cannot be updated")
+
+    owner = db.query(User).filter(User.id == token.created_by_id).first() if token.created_by_id else None
+    owner_role = owner.role if owner is not None else None
+
+    next_scopes = token.scopes
+    next_ips = token.allowed_ips or ""
+    try:
+        if payload.scopes is not None:
+            next_scopes = normalize_scopes(payload.scopes)
+        if payload.allowed_ips is not None:
+            next_ips = normalize_allowed_ips(payload.allowed_ips)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    next_scopes = _align_scopes_for_owner_role(next_scopes, owner_role)
+    scope_set = set(next_scopes.split(","))
+    if ("sso:admin" in scope_set or "sso:reseller" in scope_set) and not next_ips.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="sso:admin and sso:reseller require a non-empty IP allowlist (WHMCS server IP)",
+        )
+
+    if payload.name is not None:
+        token.name = payload.name.strip()
+    token.scopes = next_scopes
+    token.allowed_ips = next_ips
+    if payload.rate_limit_per_minute is not None:
+        token.rate_limit_per_minute = payload.rate_limit_per_minute
+    db.commit()
+    db.refresh(token)
+
+    owners = {owner.id: owner} if owner is not None else {}
+    log_action(
+        db,
+        current_user.id,
+        "update_api_token",
+        token.name,
+        detail=f"id={token.id} scopes={token.scopes} allowed_ips={token.allowed_ips or 'any'}",
+        request=request,
+    )
+    return _serialize_token(token, owners)
 
 
 @router.post("/tokens/{token_id}/rotate", response_model=ApiTokenCreatedResponse)

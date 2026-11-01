@@ -1783,6 +1783,13 @@ class ApiTokenCreate(BaseModel):
     # Optional delegation target when an Admin creates a Reseller-scoped token.
     owner_user_id: Optional[int] = None
 
+
+class ApiTokenUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    scopes: Optional[str] = None
+    allowed_ips: Optional[str] = None
+    rate_limit_per_minute: Optional[int] = Field(default=None, ge=0, le=6000)
+
 class ApiTokenRotate(BaseModel):
     # How long the old token keeps working after the new one is issued, so the
     # billing system can be switched over without failed calls. 0 = at once.
