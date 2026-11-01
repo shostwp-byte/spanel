@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
 from app.models.entities import ApiToken, DatabaseAccount, ProvisioningAccount, User, Website
-from app.services import backup as backup_service, teardown
+from app.services import backup as backup_service, provisioning_idempotency, teardown
 from app.services import db_backends, mariadb, nginx, site_users, ssl, storage_quota, waf, wordpress
 
 logger = logging.getLogger("spanel.provisioning")
@@ -286,6 +286,7 @@ def discard_failed_account(db: Session, account: ProvisioningAccount) -> None:
     """
     if account.user is not None:
         terminate_account(db, account, backup=False)
+    provisioning_idempotency.clear_account_keys(db, account.external_id)
     db.delete(account)
     db.commit()
 
@@ -623,5 +624,6 @@ def terminate_account(db: Session, account: ProvisioningAccount, backup: bool = 
     account.last_action = "terminate"
     account.user_id = None
     account.primary_website_id = None
+    provisioning_idempotency.clear_account_keys(db, account.external_id)
     db.commit()
     return deleted_domains

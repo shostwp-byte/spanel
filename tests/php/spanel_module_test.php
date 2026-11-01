@@ -388,6 +388,20 @@ check(spanel_CreateAccount($daMigrated) === 'success', 'CreateAccount succeeds e
 $migratedBody = json_decode($GLOBALS['SENT'][0]['body'], true);
 check($migratedBody['php_version'] === '8.4' && $migratedBody['app_type'] === 'php', 'stale DirectAdmin php_version/app_type sanitized to 8.4/php');
 check($migratedBody['install_wordpress'] === false && $migratedBody['is_reseller'] === false, 'stale DirectAdmin boolean flags ignored');
+$keyBeforeChange = (string) header_value($GLOBALS['SENT'][0]['headers'], 'Idempotency-Key');
+reset_recorders();
+fake_api([
+    "POST $base/accounts" => [200, ['external_id' => 'whmcs:858', 'username' => 'sp858_fyzalqlb', 'status' => 'active']],
+]);
+check(spanel_CreateAccount($daMigrated) === 'success', 'CreateAccount identical retry succeeds');
+$keySamePayload = (string) header_value($GLOBALS['SENT'][0]['headers'], 'Idempotency-Key');
+check($keySamePayload === $keyBeforeChange, 'identical CreateAccount payload keeps same Idempotency-Key');
+reset_recorders();
+$daModified = $daMigrated;
+$daModified['configoption1'] = '3';
+check(spanel_CreateAccount($daModified) === 'success', 'CreateAccount modified package succeeds');
+$keyModifiedPayload = (string) header_value($GLOBALS['SENT'][0]['headers'], 'Idempotency-Key');
+check($keyModifiedPayload !== $keyBeforeChange, 'modified CreateAccount payload generates distinct Idempotency-Key');
 
 // FastAPI 422 validation error arrays are formatted cleanly instead of raw JSON
 fake_api([

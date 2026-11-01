@@ -20,6 +20,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
+from urllib.parse import unquote
 
 from fastapi import HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -28,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.secrets import decrypt, encrypt
-from app.models.entities import ApiToken, ProvisioningIdempotencyKey
+from app.models.entities import ApiToken, ProvisioningAccount, ProvisioningIdempotencyKey
 
 HEADER = "Idempotency-Key"
 REPLAY_HEADER = "Idempotent-Replayed"
@@ -68,6 +69,63 @@ def _replay(row: ProvisioningIdempotencyKey) -> JSONResponse:
         # pretending otherwise would hand back something wrong.
         raise HTTPException(status_code=409, detail="Stored response for this Idempotency-Key is no longer readable")
     return JSONResponse(content=content, status_code=row.status_code, headers={REPLAY_HEADER: "true"})
+
+
+def _extract_external_id(row: ProvisioningIdempotencyKey) -> Optional[str]:
+    if not row.response_body:
+        return None
+    try:
+        content = json.loads(decrypt(row.response_body) or "null")
+    except (RuntimeError, ValueError):
+        return None
+    if isinstance(content, dict):
+        ext_id = content.get("external_id")
+        if isinstance(ext_id, str) and ext_id.strip():
+            return ext_id.strip()
+    return None
+
+
+def _is_stale_create_key(db: Session, row: ProvisioningIdempotencyKey) -> bool:
+    """Return True when a stored POST .../accounts response belongs to an
+    account that has since been terminated, failed, or deleted."""
+    if (row.method or "").upper() != "POST" or row.status_code <= 0:
+        return False
+    if not unquote(row.path or "").rstrip("/").endswith("/accounts"):
+        return False
+    ext_id = _extract_external_id(row)
+    if not ext_id:
+        return False
+    acct = db.query(ProvisioningAccount).filter(ProvisioningAccount.external_id == ext_id).first()
+    return acct is None or acct.status in ("terminated", "failed") or acct.user_id is None
+
+
+def clear_account_keys(db: Session, external_id: str) -> int:
+    """Drop completed Idempotency-Key records tied to ``external_id`` so a
+    terminated or failed account can be cleanly recreated within the 24h TTL."""
+    ext = (external_id or "").strip()
+    if not ext:
+        return 0
+    whmcs_prefix = f"whmcs-{ext[6:]}-" if ext.startswith("whmcs:") and ext[6:].isdigit() else None
+    account_suffix = f"/accounts/{ext}"
+    account_segment = f"/accounts/{ext}/"
+    removed = 0
+    rows = db.query(ProvisioningIdempotencyKey).filter(ProvisioningIdempotencyKey.status_code > 0).all()
+    for row in rows:
+        decoded_path = unquote(row.path or "")
+        matched = (
+            decoded_path.endswith(account_suffix)
+            or account_segment in decoded_path
+            or (whmcs_prefix is not None and (row.idem_key or "").startswith(whmcs_prefix))
+            or (
+                (row.method or "").upper() == "POST"
+                and decoded_path.rstrip("/").endswith("/accounts")
+                and _extract_external_id(row) == ext
+            )
+        )
+        if matched:
+            db.delete(row)
+            removed += 1
+    return removed
 
 
 def run(
@@ -110,15 +168,31 @@ def run(
         )
         if existing is None:  # purged between the insert and the read
             raise HTTPException(status_code=409, detail="Idempotency-Key conflict, retry the request")
-        if existing.request_hash != fingerprint:
-            raise HTTPException(status_code=422, detail="Idempotency-Key was already used for a different request")
-        if existing.status_code:
-            return _replay(existing)
-        if existing.created_at and existing.created_at > now - IN_FLIGHT_STALE_AFTER:
-            raise HTTPException(status_code=409, detail="A request with this Idempotency-Key is still in progress")
-        existing.created_at = now
-        db.commit()
-        row = existing
+        if _is_stale_create_key(db, existing):
+            db.delete(existing)
+            db.commit()
+            row = ProvisioningIdempotencyKey(
+                token_id=token.id,
+                idem_key=key,
+                method=request.method.upper(),
+                path=request.url.path[:500],
+                request_hash=fingerprint,
+                status_code=0,
+                response_body="",
+                created_at=now,
+            )
+            db.add(row)
+            db.commit()
+        else:
+            if existing.request_hash != fingerprint:
+                raise HTTPException(status_code=422, detail="Idempotency-Key was already used for a different request")
+            if existing.status_code:
+                return _replay(existing)
+            if existing.created_at and existing.created_at > now - IN_FLIGHT_STALE_AFTER:
+                raise HTTPException(status_code=409, detail="A request with this Idempotency-Key is still in progress")
+            existing.created_at = now
+            db.commit()
+            row = existing
     row_id = row.id
 
     try:

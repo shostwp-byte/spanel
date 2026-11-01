@@ -420,9 +420,181 @@ def test_create_account_falls_back_to_installed_php_version_when_default_missing
             headers=kit.bearer(tok),
         )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["email"] == "admin@cokhihoangphan.com"
     assert rt_mock.call_args[0][2] == "8.3"
     with SessionLocal() as db:
         w = db.query(Website).filter(Website.domain == "cokhihoangphan.com").one()
         assert w.php_version == "8.3"
+
+
+def test_create_account_default_email_uses_admin_at_user_domain():
+    """Provisioned users default to admin@<user_domain> instead of @users.spanel.dev."""
+    with SessionLocal() as db:
+        reseller = kit.make_user(db, "email_res", role="reseller")
+        pkg = kit.make_package(db, "EmailPkg", storage_limit_mb=2048, website_limit=3)
+        tok = kit.make_token(db, created_by_id=reseller.id)
+
+    c = kit.client()
+    with patch("app.services.site_users.ensure_panel_user", side_effect=lambda u, p: u), \
+            patch("app.services.site_users.ensure_site_runtime", side_effect=lambda d, r, php_v, lu: lu), \
+            patch("app.services.nginx.write_vhost"), \
+            patch("app.services.nginx.vhost_exists", return_value=False), \
+            patch("app.services.dns.zone_for_new_domain"):
+        # 1. Domain provided, email omitted -> admin@<domain>
+        r1 = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(
+                external_id="whmcs:901",
+                username="sp901_user",
+                package_id=pkg.id,
+                domain="khachhang.vn",
+            ),
+            headers=kit.bearer(tok),
+        )
+        assert r1.status_code == 200, r1.text
+        assert r1.json()["email"] == "admin@khachhang.vn"
+        assert "spanel.dev" not in r1.json()["email"]
+
+        # 2. Domain omitted, email omitted -> valid admin@ fallback without spanel.dev
+        r2 = c.post(
+            f"{BASE}/accounts",
+            json={
+                "external_id": "whmcs:902",
+                "username": "sp902_nodomain",
+                "password": "StrongPassword123!",
+                "package_id": pkg.id,
+            },
+            headers=kit.bearer(tok),
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["email"].startswith("admin@")
+        assert "spanel.dev" not in r2.json()["email"]
+
+        # 3. Explicit email honored when API caller supplies one
+        r3 = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(
+                external_id="whmcs:903",
+                username="sp903_custom",
+                package_id=pkg.id,
+                domain="custommail.vn",
+                email="billing@custommail.vn",
+            ),
+            headers=kit.bearer(tok),
+        )
+        assert r3.status_code == 200, r3.text
+        assert r3.json()["email"] == "billing@custommail.vn"
+
+
+def test_terminate_and_recreate_never_collides_on_idempotency_key():
+    """Terminating and recreating an account must succeed both after normal
+    termination (which purges old keys) and when a pre-existing stale key
+    remains in SQLite from before the update."""
+    from app.models.entities import ProvisioningIdempotencyKey
+
+    with SessionLocal() as db:
+        reseller = kit.make_user(db, "idem_res", role="reseller")
+        pkg1 = kit.make_package(db, "IdemPkg1", storage_limit_mb=2048, website_limit=2)
+        pkg2 = kit.make_package(db, "IdemPkg2", storage_limit_mb=4096, website_limit=5)
+        tok = kit.make_token(db, created_by_id=reseller.id)
+
+    c = kit.client()
+    idem_headers = {**kit.bearer(tok), "Idempotency-Key": "whmcs-858-create-legacyhash"}
+
+    with patch("app.services.site_users.ensure_panel_user", side_effect=lambda u, p: u), \
+            patch("app.services.site_users.ensure_site_runtime", side_effect=lambda d, r, php_v, lu: lu), \
+            patch("app.services.site_users.delete_panel_user"), \
+            patch("app.services.teardown.purge_owned_resources"), \
+            patch("app.services.nginx.write_vhost"), \
+            patch("app.services.nginx.delete_wordpress_vhost"), \
+            patch("app.services.ssl.release_site_certificates"), \
+            patch("app.services.waf.remove_site_rules"), \
+            patch("app.services.wordpress.delete_wordpress"), \
+            patch("app.services.nginx.vhost_exists", return_value=False), \
+            patch("app.services.dns.zone_for_new_domain"):
+        # Create #1
+        r1 = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(
+                external_id="whmcs:858",
+                username="sp858_fyzalqlb",
+                package_id=pkg1.id,
+                domain="cokhihoangphan.com",
+            ),
+            headers=idem_headers,
+        )
+        assert r1.status_code == 200, r1.text
+
+        # Terminate clears completed Idempotency-Key rows for whmcs:858
+        r_term = c.delete(f"{BASE}/accounts/whmcs:858", headers=kit.bearer(tok))
+        assert r_term.status_code == 200, r_term.text
+        with SessionLocal() as db:
+            assert db.query(ProvisioningIdempotencyKey).filter(
+                ProvisioningIdempotencyKey.idem_key == "whmcs-858-create-legacyhash"
+            ).count() == 0
+
+        # Create #2 with SAME Idempotency-Key and DIFFERENT payload (e.g. pkg2) succeeds 200
+        r2 = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(
+                external_id="whmcs:858",
+                username="sp858_fyzalqlb",
+                package_id=pkg2.id,
+                domain="cokhihoangphan.com",
+            ),
+            headers=idem_headers,
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.headers.get("Idempotent-Replayed") is None
+        assert r2.json()["package_id"] == pkg2.id
+
+        # Simulate pre-update state: account terminated while stale Idempotency-Key row remained in DB
+        with SessionLocal() as db:
+            saved_key = db.query(ProvisioningIdempotencyKey).filter(
+                ProvisioningIdempotencyKey.idem_key == "whmcs-858-create-legacyhash"
+            ).one()
+            saved_snapshot = (
+                saved_key.token_id,
+                saved_key.idem_key,
+                saved_key.method,
+                saved_key.path,
+                saved_key.request_hash,
+                saved_key.status_code,
+                saved_key.response_body,
+                saved_key.created_at,
+            )
+
+        assert c.delete(f"{BASE}/accounts/whmcs:858", headers=kit.bearer(tok)).status_code == 200
+        with SessionLocal() as db:
+            db.add(ProvisioningIdempotencyKey(
+                token_id=saved_snapshot[0],
+                idem_key=saved_snapshot[1],
+                method=saved_snapshot[2],
+                path=saved_snapshot[3],
+                request_hash=saved_snapshot[4],
+                status_code=saved_snapshot[5],
+                response_body=saved_snapshot[6],
+                created_at=saved_snapshot[7],
+            ))
+            db.commit()
+
+        # Recreate against leftover stale key with modified payload -> 200 (not 422!)
+        r3 = c.post(
+            f"{BASE}/accounts",
+            json=_create_payload(
+                external_id="whmcs:858",
+                username="sp858_fyzalqlb",
+                package_id=pkg1.id,
+                domain="cokhihoangphan.com",
+            ),
+            headers=idem_headers,
+        )
+        assert r3.status_code == 200, r3.text
+        assert r3.headers.get("Idempotent-Replayed") is None
+        assert r3.json()["package_id"] == pkg1.id
+        with SessionLocal() as db:
+            u = db.query(User).filter(User.username == "sp858_fyzalqlb").one_or_none()
+            assert u is not None and u.email == "admin@cokhihoangphan.com"
+
 
 

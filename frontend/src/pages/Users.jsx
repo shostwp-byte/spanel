@@ -744,7 +744,7 @@ export function UsersPage({
                 <input
                   value={newUser.email}
                   onChange={e => setNewUser(prev => ({ ...prev, email: e.target.value }))}
-                  placeholder="user@domain.com"
+                  placeholder="admin@domain.com"
                 />
               </label>
               <label>
