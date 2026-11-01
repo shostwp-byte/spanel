@@ -71,3 +71,12 @@ def test_module_stays_php74_compatible():
         (r"\w+:\s*\$", "named arguments (8.0)"),
     ]:
         assert not re.search(pattern, source), what
+
+
+def test_clientarea_template_renders_only_login_button():
+    tpl = (MODULE_DIR / "servers" / "spanel" / "templates" / "clientarea.tpl").read_text(encoding="utf-8")
+    assert "{$loginUrl|escape}" in tpl
+    assert "Login to SPanel" in tpl
+    for unwanted in ("Package:", "Status:", "Username (panel and SFTP):", "Primary domain:", "Disk:", "Bandwidth this month:", "Websites:", "$serviceLabel"):
+        assert unwanted not in tpl, f"clientarea.tpl still contains {unwanted}"
+

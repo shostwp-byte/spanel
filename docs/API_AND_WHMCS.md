@@ -104,7 +104,7 @@ khi bấm nút **Reset SFTP Password**.
 | ListAccounts, GetUserCount (Sync/Import) | `GET /api/provisioning/v1/accounts` |
 | ServiceSingleSignOn ("Login to SPanel") | `POST /api/provisioning/v1/accounts/{external_id}/login` |
 | AdminSingleSignOn | `POST /api/provisioning/v1/admin/login` |
-| AdminServicesTabFields, ClientArea | `GET /api/provisioning/v1/accounts/{external_id}` và `.../usage` |
+| AdminServicesTabFields | `GET /api/provisioning/v1/accounts/{external_id}` và `.../usage` |
 | Nút Reset SFTP Password | `POST /api/provisioning/v1/accounts/{external_id}/sftp-password` |
 | Nút Create Backup | `POST /api/provisioning/v1/accounts/{external_id}/backup` |
 

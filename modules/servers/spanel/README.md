@@ -97,7 +97,7 @@ Create Backup), ClientArea, LoginLink.
 |---|---|
 | Service ID | `external_id = whmcs:{serviceid}` |
 | Username | generated `sp{serviceid}_xxxxxxxx`, stored on the service |
-| Email | generated internal alias per service |
+| Email | defaults to `admin@<domain>` |
 | Domain | primary website, optional |
 | configoption1 | `UserPackage.id` |
 

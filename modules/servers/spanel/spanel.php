@@ -458,18 +458,6 @@ function spanel_LoginLink($params)
 
 function spanel_ClientArea($params)
 {
-    $account = [];
-    $usage = [];
-    if (!empty($params['serviceid'])) {
-        $result = spanel_request($params, 'GET', spanel_account_path($params));
-        if ($result['ok']) {
-            $account = $result['data'];
-        }
-        $usageResult = spanel_request($params, 'GET', spanel_account_path($params, '/usage'));
-        if ($usageResult['ok']) {
-            $usage = $usageResult['data'];
-        }
-    }
     $serviceId = (int) ($params['serviceid'] ?? 0);
 
     return [
@@ -480,16 +468,6 @@ function spanel_ClientArea($params)
             // token is minted on click rather than on every page view.
             'loginUrl' => 'clientarea.php?action=productdetails&id=' . $serviceId . '&dosinglesignon=1',
             'serviceId' => $serviceId,
-            'username' => spanel_username($params),
-            'serviceLabel' => spanel_service_label($params, $account),
-            'packageName' => trim((string) ($account['package_name'] ?? '')),
-            'domain' => trim((string) ($account['domain'] ?? '')),
-            'status' => trim((string) ($account['status'] ?? '')),
-            'isReseller' => !empty($account['is_reseller']),
-            'diskUsage' => $usage ? spanel_format_usage((int) ($usage['storage_used_bytes'] ?? 0), (int) ($usage['storage_limit_bytes'] ?? 0)) : '',
-            'bandwidthUsage' => $usage ? spanel_format_usage((int) ($usage['bandwidth_used_bytes'] ?? 0), (int) ($usage['bandwidth_limit_bytes'] ?? 0)) : '',
-            'websiteCount' => (int) ($usage['website_count'] ?? 0),
-            'resellerUserCount' => (int) ($usage['user_count'] ?? 0),
         ],
     ];
 }
