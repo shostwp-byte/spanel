@@ -2925,6 +2925,19 @@ export const vi = {
   "Create administrator": "Tạo Quản trị viên",
   "Clear search": "Xóa tìm kiếm",
   "Panel user sections": "Phân mục người dùng",
+  "Move Users Between Resellers": "Chuyển người dùng giữa các Reseller",
+  "Move Users": "Chuyển người dùng",
+  "Move {count} Users": "Chuyển {count} người dùng",
+  "Target Reseller / Admin": "Reseller / Admin đích",
+  "Target Reseller / Admin...": "Chọn Reseller / Admin đích...",
+  "Current Owner": "Người quản lý hiện tại",
+  "{count} selected": "Đã chọn {count}",
+  "Select all users": "Chọn tất cả người dùng",
+  "Please select at least one user to move.": "Vui lòng chọn ít nhất một người dùng để chuyển.",
+  "Please select a target reseller.": "Vui lòng chọn Reseller hoặc Admin đích.",
+  "Moving users...": "Đang chuyển người dùng...",
+  "Users successfully moved.": "Đã chuyển người dùng thành công.",
+  "You do not have permission to access this page.": "Bạn không có quyền truy cập trang này.",
 };
 
 /* Said in English by the people who run these servers. Translating them

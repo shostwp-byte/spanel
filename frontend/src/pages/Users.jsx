@@ -553,7 +553,7 @@ export function UsersPage({
                 <div className="user-search-wrap">
                   <Search size={14} className="user-search-icon" />
                   <input
-                    type="search"
+                    type="text"
                     placeholder={showDomainCol ? t('Search user, email, domain...') : t('Search users...')}
                     value={searchQuery}
                     onChange={e => setSearchQuery(e.target.value)}

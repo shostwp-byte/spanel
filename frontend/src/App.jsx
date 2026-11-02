@@ -1004,7 +1004,7 @@ function CodeEditor({ value, mode, disabled, onChange, onCursorChange }) {
 
 function AppContent() {
   const baseContext = useAppContext();
-  const { loading, setLoading, error, setError, notice, setNotice, currentUser, setCurrentUser, packages, setPackages, users, setUsers, appVersion, setAppVersion, databases, setDatabases, dbSearch, setDbSearch, dbCreateOpen, setDbCreateOpen, phpVersion, setPhpVersion, phpVersions, setPhpVersions, fileAppId, setFileAppId, filePath, setFilePath, fileListPath, setFileListPath, websites, setWebsites, selectedWebsiteId, setSelectedWebsiteId, siteApps, setSiteApps, panelSettings, setPanelSettings, copiedField, setCopiedField } = baseContext;
+  const { loading, setLoading: rawSetLoading, error, setError, notice, setNotice, currentUser, setCurrentUser, packages, setPackages, users, setUsers, appVersion, setAppVersion, databases, setDatabases, dbSearch, setDbSearch, dbCreateOpen, setDbCreateOpen, phpVersion, setPhpVersion, phpVersions, setPhpVersions, fileAppId, setFileAppId, filePath, setFilePath, fileListPath, setFileListPath, websites, setWebsites, selectedWebsiteId, setSelectedWebsiteId, siteApps, setSiteApps, panelSettings, setPanelSettings, copiedField, setCopiedField } = baseContext;
   // Auth is now cookie-based (HttpOnly spanel_session). The SPA does not see
   // the JWT at all. We track only whether the user is authenticated in memory.
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -1467,6 +1467,201 @@ function AppContent() {
   const signedOutRef = useRef(false);
   const noticeTimer = useRef(null);
   const activeLoadingStackRef = useRef([]);
+  const pendingActionBtnRef = useRef(null);
+  const pendingActionClearTimerRef = useRef(null);
+  const activeActionBtnRef = useRef(null);
+  const actionOpBtnMapRef = useRef(new Map());
+  const btnActiveCountMapRef = useRef(new Map());
+  const btnReleaseTimerMapRef = useRef(new Map());
+  const externalLoadingOpRef = useRef(null);
+  const loginInFlightRef = useRef(false);
+
+  const isActionButtonCandidate = useCallback((el) => {
+    if (!el || typeof el.closest !== 'function') return false;
+    if (el.disabled || el.classList.contains('disabled') || el.getAttribute('aria-disabled') === 'true') return false;
+    if (el.closest(
+      '.sidebar, .topbar, .top-actions, .user-menu, .mobile-nav-toggle, ' +
+      '[role="tab"], [role="tablist"], [role="menuitem"], [role="switch"], ' +
+      '.segmented-control, .user-mgmt-tabs, .user-mgmt-tab, .backup-tabs, ' +
+      '.da-grid-card, .da-cat-header, .da-tree-Caret, .da-tree-label, .da-crumb-link, ' +
+      '.file-name, .da-fm-name-btn, .sp-pw-btn, .sp-copy-btn, .sp-result-close, ' +
+      '.file-job-dismiss, .settings-link, .user-search-clear, .cron-example, ' +
+      '.app-toast, .notice, .error, [data-no-btn-loader]'
+    )) {
+      return false;
+    }
+    return true;
+  }, []);
+
+  const clearPendingActionButton = useCallback(() => {
+    if (pendingActionClearTimerRef.current) {
+      clearTimeout(pendingActionClearTimerRef.current);
+      pendingActionClearTimerRef.current = null;
+    }
+    pendingActionBtnRef.current = null;
+  }, []);
+
+  const recordPendingActionButton = useCallback((btn) => {
+    if (!isActionButtonCandidate(btn)) {
+      clearPendingActionButton();
+      return;
+    }
+    if (pendingActionClearTimerRef.current) {
+      clearTimeout(pendingActionClearTimerRef.current);
+    }
+    pendingActionBtnRef.current = btn;
+    pendingActionClearTimerRef.current = setTimeout(() => {
+      if (pendingActionBtnRef.current === btn) {
+        pendingActionBtnRef.current = null;
+      }
+      pendingActionClearTimerRef.current = null;
+    }, 0);
+  }, [isActionButtonCandidate, clearPendingActionButton]);
+
+  const beginActionOp = useCallback(() => {
+    const candidate = pendingActionBtnRef.current || activeActionBtnRef.current;
+    if (!candidate) return null;
+    pendingActionBtnRef.current = null;
+    if (pendingActionClearTimerRef.current) {
+      clearTimeout(pendingActionClearTimerRef.current);
+      pendingActionClearTimerRef.current = null;
+    }
+    const existingRelease = btnReleaseTimerMapRef.current.get(candidate);
+    if (existingRelease) {
+      clearTimeout(existingRelease);
+      btnReleaseTimerMapRef.current.delete(candidate);
+    }
+    const nextCount = (btnActiveCountMapRef.current.get(candidate) || 0) + 1;
+    btnActiveCountMapRef.current.set(candidate, nextCount);
+    activeActionBtnRef.current = candidate;
+    try {
+      candidate.setAttribute('data-sp-loading', 'true');
+      candidate.setAttribute('aria-busy', 'true');
+    } catch { }
+    const opToken = Symbol('sp-btn-op');
+    actionOpBtnMapRef.current.set(opToken, candidate);
+    return opToken;
+  }, []);
+
+  const endActionOp = useCallback((opToken) => {
+    if (!opToken) return;
+    const btn = actionOpBtnMapRef.current.get(opToken);
+    actionOpBtnMapRef.current.delete(opToken);
+    if (!btn) return;
+    const remaining = (btnActiveCountMapRef.current.get(btn) || 1) - 1;
+    if (remaining > 0) {
+      btnActiveCountMapRef.current.set(btn, remaining);
+      return;
+    }
+    btnActiveCountMapRef.current.delete(btn);
+    const releaseTimer = setTimeout(() => {
+      btnReleaseTimerMapRef.current.delete(btn);
+      if ((btnActiveCountMapRef.current.get(btn) || 0) > 0) return;
+      try {
+        btn.removeAttribute('data-sp-loading');
+        btn.removeAttribute('aria-busy');
+      } catch { }
+      if (activeActionBtnRef.current === btn) {
+        activeActionBtnRef.current = null;
+      }
+    }, 45);
+    btnReleaseTimerMapRef.current.set(btn, releaseTimer);
+  }, []);
+
+  const setLoading = useCallback((nextVal) => {
+    rawSetLoading(nextVal);
+    const isBusy = typeof nextVal === 'function' ? false : Boolean(nextVal);
+    if (isBusy) {
+      if (!externalLoadingOpRef.current) {
+        externalLoadingOpRef.current = beginActionOp();
+      }
+    } else if (externalLoadingOpRef.current) {
+      const prevOp = externalLoadingOpRef.current;
+      externalLoadingOpRef.current = null;
+      endActionOp(prevOp);
+    }
+  }, [rawSetLoading, beginActionOp, endActionOp]);
+
+  useEffect(() => {
+    const handleCaptureClick = (event) => {
+      const btn = event.target?.closest?.('button, .upload-button');
+      if (!btn) {
+        clearPendingActionButton();
+        return;
+      }
+      if (btn.getAttribute('data-sp-loading') === 'true') {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+        return;
+      }
+      if (btn.classList.contains('upload-button')) {
+        clearPendingActionButton();
+        return;
+      }
+      recordPendingActionButton(btn);
+    };
+
+    const handleCaptureChange = (event) => {
+      if (event.target?.tagName === 'INPUT' && event.target.type === 'file') {
+        const uploadBtn = event.target.closest?.('.upload-button');
+        if (uploadBtn) recordPendingActionButton(uploadBtn);
+      }
+    };
+
+    const handleCaptureSubmit = (event) => {
+      const form = event.target;
+      const submitter = event.submitter || form?.querySelector?.('button[type="submit"], button:not([type="button"])');
+      if (submitter?.getAttribute?.('data-sp-loading') === 'true') {
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+        return;
+      }
+      if (submitter) recordPendingActionButton(submitter);
+    };
+
+    const handleCaptureKeydown = (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        const busyBtn = event.target?.closest?.('button[data-sp-loading="true"], .upload-button[data-sp-loading="true"]');
+        if (busyBtn) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+          return;
+        }
+      }
+      if (event.key === 'Enter' && event.target?.tagName === 'INPUT') {
+        const loginWrap = event.target.closest?.('.login-form');
+        if (loginWrap) {
+          const loginBtn = loginWrap.querySelector('button:last-of-type');
+          if (loginBtn?.getAttribute('data-sp-loading') === 'true') {
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+            return;
+          }
+          if (loginBtn) recordPendingActionButton(loginBtn);
+        }
+      }
+    };
+
+    document.addEventListener('click', handleCaptureClick, true);
+    document.addEventListener('change', handleCaptureChange, true);
+    document.addEventListener('submit', handleCaptureSubmit, true);
+    document.addEventListener('keydown', handleCaptureKeydown, true);
+    return () => {
+      document.removeEventListener('click', handleCaptureClick, true);
+      document.removeEventListener('change', handleCaptureChange, true);
+      document.removeEventListener('submit', handleCaptureSubmit, true);
+      document.removeEventListener('keydown', handleCaptureKeydown, true);
+      clearPendingActionButton();
+      for (const timer of btnReleaseTimerMapRef.current.values()) {
+        clearTimeout(timer);
+      }
+      btnReleaseTimerMapRef.current.clear();
+    };
+  }, [clearPendingActionButton, recordPendingActionButton]);
   const mcpAddonInstalled = !!addons.items.find(item => item.slug === 'mcp')?.installed;
   const notificationsAddonInstalled = !!addons.items.find(item => item.slug === 'notifications')?.installed;
   const malwareAddonInstalled = !!addons.items.find(item => item.slug === 'malware')?.installed;
@@ -1512,8 +1707,10 @@ function AppContent() {
     }
     // The sidebar's DNS Manager opens the list, not the zone last looked at.
     if (resolvedPage === 'dns') { setDnsZone(null); setDnsTab('zones'); }
+    clearPendingActionButton();
+    activeActionBtnRef.current = null;
     setPage(resolvedPage);
-  }, [currentUser, effectiveRole]);
+  }, [currentUser, effectiveRole, clearPendingActionButton]);
 
   // Every page opens at its top. The window is the scroller and nothing
   // reset it, so the next page opened at the last one's offset - part-way
@@ -1638,11 +1835,12 @@ function AppContent() {
 
   async function request(path, options = {}, label = '') {
     const reqToken = label ? Symbol(label) : null;
+    const btnOpToken = beginActionOp();
     try {
       setError('');
       if (label && reqToken) {
         activeLoadingStackRef.current.push({ token: reqToken, label });
-        setLoading(label);
+        rawSetLoading(label);
       }
       const { silent, ...fetchOptions } = options;
       const method = (fetchOptions.method || 'GET').toUpperCase();
@@ -1681,18 +1879,22 @@ function AppContent() {
       setError(`Cannot connect to the ${panelSettings.app_name || 'spanel'} API at ${API}. Check spanel-api and the panel port.`);
       return null;
     } finally {
+      endActionOp(btnOpToken);
       if (label && reqToken) {
         activeLoadingStackRef.current = activeLoadingStackRef.current.filter(item => item.token !== reqToken);
         const remaining = activeLoadingStackRef.current;
-        setLoading(remaining.length > 0 ? remaining[remaining.length - 1].label : '');
+        rawSetLoading(remaining.length > 0 ? remaining[remaining.length - 1].label : '');
       }
     }
   }
 
   async function login(passkeyAssertion = '', credentials = null) {
+    if (loginInFlightRef.current && !passkeyAssertion) return;
+    loginInFlightRef.current = true;
+    const btnOpToken = beginActionOp();
     try {
       setError('');
-      setLoading('Logging in...');
+      rawSetLoading('Logging in...');
       // credentials: a demo account's button on the login page, which signs in
       // without the visitor typing what the button already shows.
       if (credentials) setUsername(credentials.username);
@@ -1736,7 +1938,9 @@ function AppContent() {
     } catch (err) {
       setError(`Cannot connect to the ${panelSettings.app_name || 'spanel'} API at ${API}. Check spanel-api and the panel port.`);
     } finally {
-      setLoading('');
+      loginInFlightRef.current = false;
+      endActionOp(btnOpToken);
+      rawSetLoading('');
     }
   }
 
@@ -2751,9 +2955,10 @@ function AppContent() {
 
   async function downloadFile(path) {
     if (!hasFileTarget()) return;
+    const btnOpToken = beginActionOp();
     try {
       setError('');
-      setLoading('Downloading file...');
+      rawSetLoading('Downloading file...');
       const res = await fetch(`${API}/maintenance/files/download?${fileTargetQuery()}&path=${encodeURIComponent(path)}`, {
         credentials: 'include',
       });
@@ -2775,7 +2980,8 @@ function AppContent() {
     } catch {
       setError(t('Download failed.'));
     } finally {
-      setLoading('');
+      endActionOp(btnOpToken);
+      rawSetLoading('');
     }
   }
 
@@ -4475,7 +4681,6 @@ function AppContent() {
         </div>
 
       </header>
-      {loading && <div className="loading">{t(loading)}</div>}
       {renderNotifications()}
       <section className="standalone-editor-body">
         <CodeEditor
@@ -4524,6 +4729,7 @@ function AppContent() {
 
   const sharedContextValue = {
     ...baseContext,
+    setLoading,
     websites: roleScopedWebsites,
     request, API, clearSession, handleAuthExpired, formatApiError, readCookie,
     copyText, copiedField, setCopiedField, generateRandomPassword,
@@ -5134,11 +5340,10 @@ function AppContent() {
         {currentUser?.demo && <div className="demo-strip" role="status"><Eye size={15} /><span>{t('This is a demo: you can look at everything, but changes are not saved.')}</span></div>}
         <div className="content-body">
           <ChunkErrorBoundary resetKey={page}>
-            <React.Suspense fallback={<div className="loading"><span></span>{t('Loading...')}</div>}>
+            <React.Suspense fallback={<div className="loading sp-chunk-loading"><span></span>{t('Loading...')}</div>}>
               {renderPage()}
             </React.Suspense>
           </ChunkErrorBoundary>
-          {loading && <div className="loading"><span></span>{t(loading)}</div>}
         </div>
       </div>
     </section>
