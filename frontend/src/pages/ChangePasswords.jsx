@@ -26,6 +26,9 @@ export function ChangePasswords({ request }) {
     if (!newPassword || newPassword.length < 12) {
       return setError(t('Password must be at least 12 characters.'));
     }
+    if (newPassword.includes(':')) {
+      return setError(t("Password cannot contain ':'."));
+    }
 
     const targetUser = manageableUsers.find(u => String(u.id) === String(selectedUserId));
     const submittedPassword = newPassword;

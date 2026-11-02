@@ -10,7 +10,7 @@ from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, normalize_role
 from app.core.rate_limit import enforce_rate_limit
-from app.core.security import hash_password
+from app.core.security import hash_password, verify_password
 from app.core.step_up import require_sensitive_action_step_up
 from app.models.entities import AuditLog, BackupSchedule, DatabaseAccount, McpToken, User, UserPackage, Website, MessageTemplate
 from app.schemas import schemas
@@ -26,6 +26,18 @@ from app.services.audit import log_action
 from app.services import db_backends, demo_mode, mail, nginx, site_users, ssl, storage_quota, teardown, waf, wordpress, notifications, panel_settings
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+def _attach_user_domains(data: dict, user_domains: list[str]) -> None:
+    lower_set = {d.lower() for d in user_domains if d}
+    root_domains = [
+        d for d in user_domains
+        if d and not any(d.lower() != parent and d.lower().endswith("." + parent) for parent in lower_set)
+    ]
+    effective_domains = root_domains if root_domains else [d for d in user_domains if d]
+    data["domains"] = effective_domains
+    data["domains_count"] = len(effective_domains)
+    data["primary_domain"] = effective_domains[0] if effective_domains else None
 
 
 def _user_out(user: User, db: Session, *, cached_usage: bool = False) -> dict:
@@ -47,6 +59,11 @@ def _user_out(user: User, db: Session, *, cached_usage: bool = False) -> dict:
         data["reseller_id"] = owner.id
         data["owner_username"] = owner.username
         data["owner_role"] = owner.role
+    owned_domains = [
+        d for (d,) in db.query(Website.domain).filter(Website.owner_id == user.id).order_by(Website.id.asc()).all()
+        if d
+    ]
+    _attach_user_domains(data, owned_domains)
     data.update(storage_quota.storage_usage_summary(db, user, use_cache=cached_usage))
     return data
 
@@ -247,18 +264,33 @@ def _delete_owned_website(db: Session, website: Website) -> None:
 @router.post("", response_model=UserOut)
 def create_user(payload: UserCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     ensure_role(current_user.role, Role.reseller)
-    if current_user.role == Role.reseller and payload.role != Role.end_user:
+    if normalize_role(current_user.role) == Role.reseller and payload.role != Role.end_user:
         raise HTTPException(status_code=403, detail="Resellers can only create end_user accounts")
+    if payload.domain and payload.role != Role.end_user:
+        raise HTTPException(status_code=400, detail="A primary domain can only be assigned to end_user accounts")
     # Only the username has to be unique — several panel users may share one
     # contact email (a reseller managing many accounts, for example).
     if db.query(User.id).filter(User.username == payload.username).first():
         raise HTTPException(status_code=409, detail="Username already exists")
-    # The same account name on another node of the cluster (when the
-    # cluster's username guard is on): a later transfer between the two
-    # would collide.
+    if payload.domain:
+        from app.api.websites import _reserved_hostnames
+
+        safe_domain = payload.domain.strip().lower()
+        if (
+            {safe_domain, f"www.{safe_domain}"} & _reserved_hostnames(db)
+            or nginx.vhost_exists(safe_domain)
+        ):
+            raise HTTPException(status_code=409, detail="Domain already exists")
+        if mail.webmail_host_taken(db, safe_domain):
+            raise HTTPException(status_code=409, detail="That name is the webmail address of a mail domain here.")
+    # The same account name or domain on another node of the cluster: a later
+    # transfer between the two would collide.
     from app.services import multi_server
 
-    cluster_check = multi_server.check_cluster_conflict(username=payload.username)
+    cluster_check = multi_server.check_cluster_conflict(
+        domain=payload.domain or "",
+        username=payload.username,
+    )
     if cluster_check.get("conflict"):
         raise HTTPException(status_code=multi_server.conflict_http_status(cluster_check),
                             detail=cluster_check.get("message") or "Username already exists in the cluster")
@@ -266,12 +298,19 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
     effective_website_limit = package.website_limit if package else payload.website_limit
     effective_storage_mb = package.storage_limit_mb if package else payload.storage_limit_mb
     effective_database_limit = package.database_limit if package else None
+    if payload.domain:
+        from app.services import quota as quota_service
+
+        if quota_service.is_quota_reached(0, effective_website_limit):
+            raise HTTPException(status_code=403, detail="Website limit reached")
+        if effective_storage_mb == 0:
+            raise HTTPException(status_code=403, detail="Storage limit reached")
     effective_terminal = (
         bool(payload.terminal_enabled)
         if payload.terminal_enabled is not None
         else (bool(package.terminal_enabled) if package else False)
     )
-    if current_user.role == Role.reseller.value:
+    if normalize_role(current_user.role) == Role.reseller:
         if effective_terminal and not _reseller_can_grant_terminal(current_user):
             raise HTTPException(status_code=403, detail="You are not allowed to enable terminal access")
         _enforce_reseller_quotas(
@@ -282,40 +321,131 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
             target_database_limit=effective_database_limit,
             is_create=True,
         )
-    # The Linux account gets its own secret from the start. It used to be given
-    # the panel password, which put that password on port 22 behind sshd.
-    sftp_password = site_users.generate_login_password()
+
+    from app.services.provisioning import linux_user_exists, undo_failed_create
+
+    created_linux_user = not linux_user_exists(payload.username)
+    # Unified password on creation: Panel login and SFTP share payload.password.
+    sftp_password = payload.password
+    website = None
     try:
-        site_users.ensure_panel_user(payload.username, sftp_password)
+        linux_user = site_users.ensure_panel_user(payload.username, sftp_password)
+        user = User(
+            username=payload.username,
+            email=payload.email,
+            hashed_password=hash_password(payload.password),
+            role=payload.role,
+            package_id=package.id if package else None,
+            reseller_package_id=payload.reseller_package_id if normalize_role(current_user.role) == Role.admin else None,
+            reseller_id=current_user.id if payload.role == Role.end_user else None,
+            website_limit=payload.website_limit,
+            storage_limit_mb=payload.storage_limit_mb,
+            database_limit=payload.database_limit,
+            sftp_accounts_limit=payload.sftp_accounts_limit,
+            mail_accounts_limit=payload.mail_accounts_limit,
+            terminal_enabled=bool(payload.terminal_enabled) if payload.terminal_enabled is not None else False,
+            sftp_password_set_at=None,
+        )
+        # After the explicit value, so a package still wins when one is assigned.
+        _apply_package_limits(user, package)
+        if payload.terminal_enabled is not None:
+            user.terminal_enabled = payload.terminal_enabled
+        db.add(user)
+        db.flush()
+
+        if payload.domain:
+            from app.api.websites import _ensure_default_waf_file, _write_placeholder_page
+            from app.core.config import settings as app_settings
+
+            effective_php = payload.php_version or "8.4"
+            if not app_settings.command_dry_run:
+                from app.services import php as php_service
+
+                installed_phps = php_service.list_installed_php()
+                if installed_phps and effective_php not in installed_phps:
+                    effective_php = installed_phps[-1]
+
+            root_path = site_users.site_root_for_panel_user(payload.username, payload.domain)
+            linux_user = site_users.ensure_site_runtime(payload.domain, root_path, effective_php, linux_user)
+            if not app_settings.command_dry_run:
+                _write_placeholder_page(payload.domain, root_path, linux_user, effective_php)
+                site_users.fix_site_path(str(site_users.document_root(root_path)), linux_user)
+            _ensure_default_waf_file(payload.domain)
+            nginx.write_vhost(
+                payload.domain,
+                root_path,
+                app_type="php",
+                php_version=effective_php,
+                php_fpm_socket_override=site_users.site_php_fpm_socket(linux_user, root_path, effective_php),
+                document_root="public_html",
+                rewrite_mode="none",
+            )
+            website = Website(
+                domain=payload.domain,
+                owner_id=user.id,
+                root_path=root_path,
+                document_root="public_html",
+                linux_user=linux_user,
+                php_version=effective_php,
+                app_type="php",
+                nginx_rewrite_mode="none",
+                status="active",
+            )
+            db.add(website)
+            db.flush()
+
+        db.commit()
+        db.refresh(user)
+    except HTTPException:
+        db.rollback()
+        undo_failed_create(
+            username=payload.username,
+            domain=payload.domain,
+            db_info=None,
+            delete_linux_user=created_linux_user,
+        )
+        raise
     except ValueError as exc:
+        db.rollback()
+        undo_failed_create(
+            username=payload.username,
+            domain=payload.domain,
+            db_info=None,
+            delete_linux_user=created_linux_user,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
+        db.rollback()
+        undo_failed_create(
+            username=payload.username,
+            domain=payload.domain,
+            db_info=None,
+            delete_linux_user=created_linux_user,
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    user = User(
-        username=payload.username,
-        email=payload.email,
-        hashed_password=hash_password(payload.password),
-        role=payload.role,
-        package_id=package.id if package else None,
-        reseller_package_id=payload.reseller_package_id if current_user.role == Role.admin.value else None,
-        reseller_id=current_user.id if payload.role == Role.end_user else None,
-        website_limit=payload.website_limit,
-        storage_limit_mb=payload.storage_limit_mb,
-        database_limit=payload.database_limit,
-        sftp_accounts_limit=payload.sftp_accounts_limit,
-        mail_accounts_limit=payload.mail_accounts_limit,
-        terminal_enabled=bool(payload.terminal_enabled) if payload.terminal_enabled is not None else False,
-        sftp_password_set_at=datetime.utcnow(),
-    )
-    # After the explicit value, so a package still wins when one is assigned.
-    _apply_package_limits(user, package)
-    if payload.terminal_enabled is not None:
-        user.terminal_enabled = payload.terminal_enabled
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    except Exception:
+        db.rollback()
+        undo_failed_create(
+            username=payload.username,
+            domain=payload.domain,
+            db_info=None,
+            delete_linux_user=created_linux_user,
+        )
+        raise
+
     from app.services import resource_monitor
     resource_monitor.apply_user_cgroup_limits_async(user.id)
+
+    if website is not None:
+        from app.services import dns
+
+        storage_quota.forget_user_storage(user.id)
+        try:
+            dns.zone_for_new_website(db, website)
+        except Exception:  # noqa: BLE001 - DNS sync retries on start
+            db.rollback()
+            db.refresh(user)
+        log_action(db, current_user.id, "create_site", payload.domain, request=request)
 
     # Send welcome email if configured
     if user.email:
@@ -345,8 +475,13 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
                 or "https://your-server-ip:2222"
             )
 
-            subject = subject.replace("{username}", user.username)
-            body = body.replace("{username}", user.username).replace("{password}", payload.password).replace("{login_url}", login_url)
+            subject = subject.replace("{username}", user.username).replace("{domain}", payload.domain or "")
+            body = (
+                body.replace("{username}", user.username)
+                .replace("{password}", payload.password)
+                .replace("{domain}", payload.domain or "")
+                .replace("{login_url}", login_url)
+            )
             
             try:
                 notifications.send_email(config, user.email, subject, body)
@@ -403,7 +538,19 @@ def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_c
 
     from app.services import quota
 
-    for user in query.order_by(User.id.desc()).all():
+    users_list = query.order_by(User.id.desc()).all()
+    domains_by_owner: dict[int, list[str]] = {}
+    if users_list:
+        for owner_id, domain_val in (
+            db.query(Website.owner_id, Website.domain)
+            .filter(Website.owner_id.in_([u.id for u in users_list]))
+            .order_by(Website.id.asc())
+            .all()
+        ):
+            if domain_val:
+                domains_by_owner.setdefault(owner_id, []).append(domain_val)
+
+    for user in users_list:
         data = UserOut.model_validate(user).model_dump()
         data["package_name"] = user.package.name if user.package else None
         data["website_limit"] = quota.effective_limit(user, "website_limit")
@@ -418,6 +565,7 @@ def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_c
             data["reseller_id"] = owner.id
             data["owner_username"] = owner.username
             data["owner_role"] = owner.role
+        _attach_user_domains(data, domains_by_owner.get(user.id, []))
         known = storage_quota.cached_storage_used_bytes(user.id)
         limit_bytes = storage_quota.user_storage_limit_bytes(user)
         from app.services import resource_monitor
@@ -637,12 +785,15 @@ def update_user_password(user_id: int, payload: UserPasswordUpdate, request: Req
     user = query.first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    # The panel password no longer reaches the Linux account. It used to, which
-    # meant sshd offered the panel password to the internet on port 22.
+    minted = None
+    linux_safe = not any(ch in payload.password for ch in (":", "\r", "\n", "\x00"))
     try:
-        minted = site_users.retire_shared_login_password(
-            user.username, already_separate=user.sftp_password_set_at is not None
-        )
+        if user.sftp_password_set_at is None and linux_safe:
+            site_users.set_panel_user_password(user.username, payload.password)
+        else:
+            minted = site_users.retire_shared_login_password(
+                user.username, already_separate=user.sftp_password_set_at is not None
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -719,7 +870,8 @@ def set_sftp_password(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     was_shared = user.sftp_password_set_at is None
-    user.sftp_password_set_at = datetime.utcnow()
+    matches_panel = (not generated) and bool(user.hashed_password) and verify_password(sftp_password, user.hashed_password)
+    user.sftp_password_set_at = None if matches_panel else datetime.utcnow()
     db.commit()
     log_action(db, current_user.id, "set_sftp_password", user.username, request=request)
     return {
@@ -728,7 +880,7 @@ def set_sftp_password(
         # user chose is never echoed back.
         "password": sftp_password if generated else None,
         # True when this call is what finally separated the two secrets.
-        "separated_from_panel_password": was_shared,
+        "separated_from_panel_password": False if matches_panel else was_shared,
     }
 
 

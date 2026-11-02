@@ -1787,3 +1787,351 @@ button.file-mode:disabled {
   }
 }
 
+/* ============================================================================
+   Multi-File Drag-and-Drop Sequential Upload Modal & Workspace Drop Overlay
+   ============================================================================ */
+
+.da-fm-main {
+  position: relative;
+}
+
+.da-fm-drop-overlay {
+  position: absolute;
+  inset: 6px;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--primary);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface) 88%, var(--primary) 12%);
+  pointer-events: none;
+}
+
+.da-fm-drop-overlay-inner {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 20px 28px;
+  color: var(--primary);
+  text-align: center;
+  font-size: 14px;
+}
+
+.da-upload-dialog {
+  width: min(560px, 100%);
+  gap: 14px;
+}
+
+.da-upload-dialog .chmod-head code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--primary);
+  background: transparent;
+  padding: 0;
+  border: 0;
+}
+
+.da-upload-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 22px 18px;
+  border: 1.5px dashed var(--border-hover, var(--border));
+  border-radius: var(--radius-md);
+  background: var(--surface-alt);
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.da-upload-dropzone:hover:not(.is-disabled),
+.da-upload-dropzone:focus-visible:not(.is-disabled),
+.da-upload-dropzone.is-dragging:not(.is-disabled) {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 9%, var(--surface));
+  outline: none;
+}
+
+.da-upload-dropzone.is-disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+
+.da-upload-dropzone-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+  margin-bottom: 2px;
+}
+
+.da-upload-dropzone strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.da-upload-dropzone span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.da-upload-queue-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.da-upload-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+.da-upload-summary-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.da-upload-summary-text {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.da-upload-summary-pct {
+  font-weight: 700;
+  color: var(--primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.da-upload-clear-btn {
+  height: auto !important;
+  min-height: 0 !important;
+  padding: 2px 6px !important;
+  border: 0 !important;
+  background: transparent !important;
+  color: var(--text-muted) !important;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.da-upload-clear-btn:hover:not(:disabled) {
+  color: var(--danger) !important;
+  transform: none !important;
+}
+
+.da-upload-overall-track {
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--surface-alt);
+  overflow: hidden;
+}
+
+.da-upload-overall-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+  transition: width 0.18s ease;
+}
+
+.da-upload-overall-fill.is-done {
+  background: #16a34a;
+}
+
+.da-upload-overall-fill.is-error {
+  background: var(--danger);
+}
+
+.da-upload-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  scrollbar-gutter: stable;
+}
+
+.da-upload-item {
+  display: grid;
+  gap: 6px;
+  padding: 10px 4px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+
+.da-upload-item:last-child {
+  border-bottom: 0;
+}
+
+.da-upload-item.is-uploading {
+  background: color-mix(in srgb, var(--primary) 5%, transparent);
+  padding-left: 8px;
+  padding-right: 8px;
+  border-radius: 6px;
+}
+
+.da-upload-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.da-upload-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.da-upload-item-index {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+.da-upload-item-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.da-upload-item-size {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+.da-upload-item-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.da-upload-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.da-upload-state.muted {
+  color: var(--text-muted);
+}
+
+.da-upload-state.active {
+  color: var(--primary);
+}
+
+.da-upload-state.ok {
+  color: #16a34a;
+}
+
+.da-upload-state.err {
+  color: var(--danger);
+}
+
+.da-upload-remove-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px !important;
+  min-width: 22px !important;
+  height: 22px !important;
+  min-height: 22px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 4px;
+  background: transparent !important;
+  color: var(--text-muted) !important;
+  box-shadow: none !important;
+  cursor: pointer;
+}
+
+.da-upload-remove-btn:hover:not(:disabled) {
+  background: var(--surface-alt) !important;
+  color: var(--danger) !important;
+  transform: none !important;
+}
+
+.da-upload-bar-track {
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-alt);
+  overflow: hidden;
+}
+
+.da-upload-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--primary);
+  transition: width 0.14s linear, background-color 0.18s ease;
+}
+
+.da-upload-bar-fill.is-done {
+  background: #16a34a;
+}
+
+.da-upload-bar-fill.is-error {
+  background: var(--danger);
+}
+
+.da-upload-item-error {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--danger);
+  line-height: 1.4;
+}
+
+.da-upload-lock-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.da-upload-lock-note svg {
+  color: var(--primary);
+  flex: 0 0 auto;
+}
+
+.da-upload-actions button {
+  width: auto !important;
+}
+

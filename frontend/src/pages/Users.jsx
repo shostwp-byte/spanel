@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
-  Ban, HardDrive, LogIn, Pencil, Play, Plus, RefreshCw,
-  Save, Trash2, Users, X
+  Ban, Globe, LogIn, Pencil, Play, Plus, RefreshCw,
+  Save, Search, Trash2, Users, X
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { PasswordField, PasswordResultBox } from '../components/PasswordField.jsx';
@@ -9,11 +9,40 @@ import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 import { roleLabel } from '../utils/helpers.js';
 
+const DOMAIN_VALID_RE = /^(?!-)([a-z0-9-]{1,63}\.)+[a-z]{2,}$/;
+
 function defaultRoleForMode(currentMode, isResellerRole = false) {
   if (isResellerRole) return 'end_user';
   if (currentMode === 'resellers' || currentMode === 'create_reseller') return 'reseller';
   if (currentMode === 'administrators' || currentMode === 'create_admin') return 'admin';
   return 'end_user';
+}
+
+function sanitizeDomainTyping(raw) {
+  let val = String(raw || '').replace(/^\s+/, '').toLowerCase();
+  val = val.replace(/^https?:\/\//i, '');
+  val = val.split('/')[0].split('?')[0].split('#')[0];
+  return val;
+}
+
+function normalizeDomainFinal(raw) {
+  return sanitizeDomainTyping(raw)
+    .trim()
+    .replace(/:\d+$/, '')
+    .replace(/^\.+|\.+$/g, '');
+}
+
+function formatPackageSummary(pkg) {
+  if (!pkg) return '';
+  const storageText = Number(pkg.storage_limit_mb) < 0
+    ? t('Unlimited disk')
+    : Number(pkg.storage_limit_mb) >= 1024
+      ? `${(Number(pkg.storage_limit_mb) / 1024).toFixed(Number(pkg.storage_limit_mb) % 1024 === 0 ? 0 : 1)} GB`
+      : `${pkg.storage_limit_mb} MB`;
+  const siteText = Number(pkg.website_limit) < 0
+    ? t('Unlimited domains')
+    : `${pkg.website_limit} ${t('Domains').toLowerCase()}`;
+  return `${pkg.name} (${storageText} · ${siteText})`;
 }
 
 export function UsersPage({
@@ -30,6 +59,7 @@ export function UsersPage({
   const isCreateMode = mode.startsWith('create_');
   const [ownerFilter, setOwnerFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [emailTouched, setEmailTouched] = useState(false);
 
   const managersById = React.useMemo(() => {
     const map = new Map();
@@ -74,6 +104,15 @@ export function UsersPage({
     return { id: null, username: 'admin', role: 'admin' };
   }
 
+  function getUserDomains(u) {
+    if (Array.isArray(u.domains) && u.domains.length > 0) return u.domains;
+    if (u.primary_domain) return [u.primary_domain];
+    return (websites || [])
+      .filter(w => Number(w.owner_id) === Number(u.id))
+      .map(w => w.domain)
+      .filter(Boolean);
+  }
+
   const displayUsers = (users || []).filter(u => {
     if (isResellerMode) return u.role === 'reseller';
     if (isAdminMode) return u.role === 'admin';
@@ -95,10 +134,12 @@ export function UsersPage({
 
     if (searchQuery.trim()) {
       const q = searchQuery.trim().toLowerCase();
+      const userDomains = getUserDomains(u);
       const matchName = (u.username || '').toLowerCase().includes(q);
       const matchEmail = (u.email || '').toLowerCase().includes(q);
       const matchOwner = (creator.username || '').toLowerCase().includes(q);
-      if (!matchName && !matchEmail && !matchOwner) return false;
+      const matchDomain = userDomains.some(d => d.toLowerCase().includes(q));
+      if (!matchName && !matchEmail && !matchOwner && !matchDomain) return false;
     }
     return true;
   });
@@ -110,6 +151,7 @@ export function UsersPage({
   const [userTab, setUserTab] = useState(isCreateMode ? 'add' : 'list');
   const [newUser, setNewUser] = useState({
     username: '',
+    domain: '',
     password: '',
     email: '',
     role: defaultRoleForMode(mode, isReseller),
@@ -123,7 +165,7 @@ export function UsersPage({
   React.useEffect(() => {
     if (!isAdmin && !isReseller) return;
     if (loadUsers) loadUsers();
-    if (loadPackages && packages.length === 0) loadPackages();
+    if (loadPackages) loadPackages();
   }, []);
 
   React.useEffect(() => {
@@ -139,9 +181,28 @@ export function UsersPage({
       mail_accounts_limit: firstPkg ? (firstPkg.mail_accounts_limit ?? 10) : 10,
     }));
     setOwnerFilter('all');
+    setEditingUser(null);
     if (isCreateMode) setUserTab('add');
     else setUserTab('list');
-  }, [mode, isCreateMode, isReseller, packages.length]);
+  }, [mode, isCreateMode, isReseller]);
+
+  React.useEffect(() => {
+    if (!availablePackages.length) return;
+    setNewUser(prev => {
+      if (prev.package_id && availablePackages.some(p => String(p.id) === String(prev.package_id))) {
+        return prev;
+      }
+      const firstPkg = availablePackages[0];
+      return {
+        ...prev,
+        package_id: String(firstPkg.id),
+        website_limit: firstPkg.website_limit,
+        storage_limit_mb: firstPkg.storage_limit_mb,
+        sftp_accounts_limit: firstPkg.sftp_accounts_limit ?? 3,
+        mail_accounts_limit: firstPkg.mail_accounts_limit ?? 10,
+      };
+    });
+  }, [packages.length, isResellerMode]);
 
   const [editingUser, setEditingUser] = useState(null);
   const [passwordBanner, setPasswordBanner] = useState(null);
@@ -159,11 +220,11 @@ export function UsersPage({
       setError(t('A package must be selected.'));
       return;
     }
-    if (!Number.isInteger(websiteLimit) || websiteLimit < 0 || websiteLimit > 1000) {
+    if (!Number.isInteger(websiteLimit) || websiteLimit < -1 || websiteLimit > 1000) {
       setError(t('Website limit must be between 0 and 1000.'));
       return;
     }
-    if (!Number.isInteger(storageLimitMb) || storageLimitMb < 0 || storageLimitMb > 1024 * 1024) {
+    if (!Number.isInteger(storageLimitMb) || storageLimitMb < -1 || storageLimitMb > 1024 * 1024) {
       setError(t('Storage limit must be between 0 and 1048576 MB.'));
       return;
     }
@@ -218,15 +279,61 @@ export function UsersPage({
     }));
   }
 
+  function handleDomainChange(rawValue) {
+    const typed = sanitizeDomainTyping(rawValue);
+    const cleaned = normalizeDomainFinal(typed);
+    setNewUser(prev => {
+      const next = { ...prev, domain: typed };
+      if (!emailTouched) {
+        next.email = DOMAIN_VALID_RE.test(cleaned) ? `admin@${cleaned}` : '';
+      }
+      return next;
+    });
+  }
+
   async function createUser() {
     const assignedRole = defaultRoleForMode(mode, isReseller);
+    const cleanUsername = String(newUser.username || '').trim().toLowerCase();
+    const cleanDomain = assignedRole === 'end_user' ? normalizeDomainFinal(newUser.domain) : '';
+    const cleanEmail = String(newUser.email || '').trim().toLowerCase()
+      || (cleanDomain && DOMAIN_VALID_RE.test(cleanDomain) ? `admin@${cleanDomain}` : '');
+
+    if (!cleanUsername) {
+      setError(t('Username is required.'));
+      return;
+    }
+    if (assignedRole === 'end_user') {
+      if (!cleanDomain) {
+        setError(t('Primary domain is required when creating a user.'));
+        return;
+      }
+      if (!DOMAIN_VALID_RE.test(cleanDomain)) {
+        setError(t('Please enter a valid domain name (e.g. example.com).'));
+        return;
+      }
+    }
+    if (!cleanEmail) {
+      setError(t('Email is required.'));
+      return;
+    }
+    if (!newUser.password || newUser.password.length < 12) {
+      setError(t('Password must be at least 12 characters.'));
+      return;
+    }
+    if (newUser.password.includes(':')) {
+      setError(t("Password cannot contain ':'."));
+      return;
+    }
     if (!newUser.package_id && assignedRole !== 'admin') {
       setError(t('A package must be selected.'));
       return;
     }
     const payload = {
-      ...newUser,
+      username: cleanUsername,
+      email: cleanEmail,
+      password: newUser.password,
       role: assignedRole,
+      ...(cleanDomain ? { domain: cleanDomain } : {}),
       package_id: assignedRole === 'admin' ? null : (newUser.package_id ? Number(newUser.package_id) : null),
       website_limit: Number(newUser.website_limit),
       storage_limit_mb: Number(newUser.storage_limit_mb),
@@ -236,21 +343,28 @@ export function UsersPage({
     const createdPassword = newUser.password;
     const data = await request('/users', { method: 'POST', body: JSON.stringify(payload) }, t('Creating user...'));
     if (data) {
-      setNotice(`Created user ${data.username}`);
+      const assignedDomain = data.primary_domain || cleanDomain;
+      setNotice(
+        assignedDomain
+          ? t('Created user {name} with domain {domain}.', { name: data.username, domain: assignedDomain })
+          : `Created user ${data.username}`
+      );
       setPasswordBanner({
         userId: null,
         title: `${t('Credentials ready')} — ${data.username}`,
         items: [
           { label: t('Username'), value: data.username, noticeMessage: t('Copied username.') },
-          { label: t('Panel password'), value: createdPassword },
-          ...(data.sftp_password
-            ? [{ label: t('SFTP password'), value: data.sftp_password, noticeMessage: t('SFTP password copied to clipboard.') }]
+          ...(assignedDomain
+            ? [{ label: t('Primary domain'), value: assignedDomain, noticeMessage: t('Copied.') }]
             : []),
+          { label: t('Password (Panel & SFTP)'), value: createdPassword },
         ],
       });
       const firstPkg = availablePackages[0];
+      setEmailTouched(false);
       setNewUser({
         username: '',
+        domain: '',
         email: '',
         password: '',
         role: assignedRole,
@@ -261,6 +375,7 @@ export function UsersPage({
         mail_accounts_limit: firstPkg ? (firstPkg.mail_accounts_limit ?? 10) : 10,
       });
       await loadUsers();
+      if (refreshAll) await refreshAll();
       setUserTab('list');
     }
   }
@@ -313,7 +428,7 @@ export function UsersPage({
 
   async function suspendUser(user) {
     if (!user || user.id === currentUser?.id) return;
-    const siteCount = websites.filter(w => w.owner_id === user.id).length;
+    const siteCount = getUserDomains(user).length;
     if (!confirm(t('Suspend user {name}? This will block login, disable all {n} website(s), lock SFTP, and kill active sessions.', { name: user.username, n: siteCount }))) return;
     const data = await request(`/users/${user.id}/suspend`, { method: 'POST' }, `Suspending user ${user.username}...`);
     if (data) {
@@ -393,10 +508,10 @@ export function UsersPage({
       );
     }
     const activeUserTab = userTab || 'list';
-    const userTabButton = (key, Icon, label) => (
+    const userTabButton = (key, Icon, label, extra = null) => (
       <button
         type="button"
-        className={activeUserTab === key ? 'active' : ''}
+        className={`user-mgmt-tab${key === 'add' ? ' add-tab' : ''}${activeUserTab === key ? ' active' : ''}`}
         role="tab"
         aria-selected={activeUserTab === key}
         aria-controls={`users-tab-${key}`}
@@ -405,57 +520,61 @@ export function UsersPage({
       >
         <Icon size={14} />
         {t(label)}
+        {extra}
       </button>
     );
 
     const addTabLabel = isResellerMode ? 'Add Reseller' : isAdminMode ? 'Add Administrator' : 'Add User';
     const listTabLabel = isResellerMode ? 'List Resellers' : isAdminMode ? 'List Administrators' : 'List user';
     const assignedRole = defaultRoleForMode(mode, isReseller);
+    const showDomainCol = !isResellerMode && !isAdminMode;
+    const showPackageAndDiskCols = !isAdminMode;
+    const showCreatorSubtext = isAdmin && mode === 'users' && !isResellerMode && !isAdminMode;
+    const tableColCount = 3 + (showDomainCol ? 1 : 0) + (showPackageAndDiskCols ? 2 : 0);
+    const canSubmitCreate =
+      !loading &&
+      !!newUser.username.trim() &&
+      !!newUser.password &&
+      newUser.password.length >= 12 &&
+      (assignedRole !== 'end_user' || !!normalizeDomainFinal(newUser.domain)) &&
+      (assignedRole === 'admin' || !!newUser.package_id);
 
     return (
-      <div className="users-page">
-        <div className="section-title">
-          <div>
-            <h2>{t(isResellerMode ? 'Resellers' : isAdminMode ? 'Administrators' : 'Panel users')}</h2>
-            <p className="hint">{t('Manage users, packages, and domain ownership.')}</p>
-          </div>
-        </div>
+      <div className="users-page user-clean-shell">
+        <div className="pkg-list-card user-mgmt-card">
+          <div className="user-mgmt-toolbar">
+            <div className="user-mgmt-tabs" role="tablist" aria-label={t('Panel user sections')}>
+              {userTabButton('list', Users, listTabLabel, <span className="user-mgmt-count">{displayUsers.length}</span>)}
+              {userTabButton('add', Plus, addTabLabel)}
+            </div>
 
-        <div className="segmented-control backup-tabs user-tabs" role="tablist" aria-label={t('Panel user sections')}>
-          {userTabButton('list', Users, listTabLabel)}
-          {userTabButton('add', Plus, addTabLabel)}
-        </div>
-
-        {activeUserTab === 'list' && (
-          <div className="user-tab-panel" id="users-tab-list" role="tabpanel" aria-labelledby="users-tab-button-list">
-            <div className="section-title user-panel-title" style={{ flexWrap: 'wrap', gap: '12px' }}>
-              <div>
-                <h2>{t(isResellerMode ? 'Reseller list' : isAdminMode ? 'Administrator list' : mode === 'my_users' ? 'My Users' : (isAdmin ? 'Show All Users' : 'User list'))}</h2>
-                <p className="hint">
-                  {isResellerMode || isAdminMode
-                    ? t('Current panel users and service limits.')
-                    : mode === 'my_users'
-                      ? t('Users initialized by your account ({name}).', { name: currentUser?.username || '' })
-                      : isAdmin
-                        ? t('All user accounts created by Admin and Reseller accounts.')
-                        : t('Current panel users and service limits.')}
-                </p>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                {!isResellerMode && !isAdminMode && (
+            {activeUserTab === 'list' && (
+              <div className="user-mgmt-controls">
+                <div className="user-search-wrap">
+                  <Search size={14} className="user-search-icon" />
                   <input
                     type="text"
-                    placeholder={t('Search users...')}
+                    placeholder={showDomainCol ? t('Search user, email, domain...') : t('Search users...')}
                     value={searchQuery}
                     onChange={e => setSearchQuery(e.target.value)}
-                    style={{ width: '190px', padding: '6px 10px', fontSize: '13px' }}
+                    aria-label={t('Search users...')}
                   />
-                )}
-                {isAdmin && mode === 'users' && !isResellerMode && !isAdminMode && (
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      className="user-search-clear"
+                      onClick={() => setSearchQuery('')}
+                      aria-label={t('Clear search')}
+                    >
+                      <X size={13} />
+                    </button>
+                  )}
+                </div>
+                {showCreatorSubtext && (
                   <select
                     value={ownerFilter}
                     onChange={e => setOwnerFilter(e.target.value)}
-                    style={{ width: 'auto', minWidth: '210px', padding: '6px 10px', fontSize: '13px' }}
+                    className="user-owner-select"
                   >
                     <option value="all">{t('All Creators (Admin & Reseller)')}</option>
                     <option value="admin">{t('Created by Admin')}</option>
@@ -467,61 +586,121 @@ export function UsersPage({
                     ))}
                   </select>
                 )}
-                <button className="secondary-light" disabled={!!loading} onClick={loadUsers}>
+                <button type="button" className="secondary-light user-refresh-btn" disabled={!!loading} onClick={loadUsers}>
                   <RefreshCw size={14} />
-                  {t('Refresh')}
+                  <span>{t('Refresh')}</span>
                 </button>
               </div>
-            </div>
-            {passwordBanner && (!editingUser || editingUser.id !== passwordBanner.userId) && (
+            )}
+          </div>
+
+          {passwordBanner && (!editingUser || editingUser.id !== passwordBanner.userId) && (
+            <div className="user-banner-slot">
               <PasswordResultBox
                 title={passwordBanner.title}
                 items={passwordBanner.items}
                 onDismiss={() => setPasswordBanner(null)}
               />
-            )}
-            {displayUsers.length === 0 && <EmptyState icon={Users} message={t('No users found.')} />}
-            <div className="table">
-              {displayUsers.map(user => (
-                <div className="row user-row" key={user.id}>
-                  <div className="user-main">
-                    <strong>{user.username}</strong>
-                    <small>{user.email}</small>
-                  </div>
-                  <div className="user-badges">
-                    <span className={user.is_active ? 'badge ok' : 'badge danger'}>
-                      {user.is_active ? t('Active') : t('Suspended')}
-                    </span>
-                    <span className="badge">{t(roleLabel(user.role))}</span>
-                    {(user.role === 'user' || user.role === 'end_user') && (() => {
-                      const creator = getUserCreatorInfo(user);
-                      return (
-                        <span
-                          className="badge"
-                          title={`${t('Created by')}: ${creator.username} (${t(roleLabel(creator.role))})`}
-                        >
-                          {t('Created by')}: {creator.username} ({t(roleLabel(creator.role))})
-                        </span>
-                      );
-                    })()}
-                    <span className="badge">{user.package_name || t('Custom')}</span>
-                    {user.totp_enabled && <span className="badge ok">2FA</span>}
-                  </div>
-                  <span className="user-metric">
-                    <HardDrive size={13} />
-                    {storageUsageText(user)}
-                  </span>
-                  <div className="row-actions">
-                    <button className="mini secondary-light" disabled={!!loading} onClick={() => startEditingUser(user)}>
-                      <Pencil size={14} />
-                      {t('Edit')}
-                    </button>
+            </div>
+          )}
+
+          {activeUserTab === 'list' && (
+            <div id="users-tab-list" role="tabpanel" aria-labelledby="users-tab-button-list">
+              {displayUsers.length === 0 ? (
+                <div className="user-empty-slot">
+                  <EmptyState icon={Users} message={t('No users found.')} />
+                </div>
+              ) : (
+                <div className="pkg-table-wrap">
+                  <table className="pkg-clean-table user-clean-table">
+                    <thead>
+                      <tr>
+                        <th>{t('Account')}</th>
+                        {showDomainCol && <th>{t('Domain')}</th>}
+                        {showPackageAndDiskCols && <th>{t('Package')}</th>}
+                        {showPackageAndDiskCols && <th>{t('Disk Usage')}</th>}
+                        <th>{t('Status')}</th>
+                        <th style={{ textAlign: 'right' }}>{t('Actions')}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {displayUsers.map(user => {
+                        const domains = getUserDomains(user);
+                        const creator = getUserCreatorInfo(user);
+                        const isEditingThis = editingUser?.id === user.id;
+                        const pct = Math.min(100, Math.max(0, Number(user.storage_percent || 0)));
+                        return (
+                          <React.Fragment key={user.id}>
+                            <tr className={isEditingThis ? 'is-editing' : ''}>
+                              <td>
+                                <div className="user-cell-primary">
+                                  <strong>{user.username}</strong>
+                                  {user.totp_enabled && <span className="user-2fa-tag">2FA</span>}
+                                </div>
+                                <div className="user-cell-sub">{user.email}</div>
+                              </td>
+                              {showDomainCol && (
+                                <td>
+                                  {domains.length > 0 ? (
+                                    <div className="user-domain-cell" title={domains.join(', ')}>
+                                      <Globe size={13} className="user-domain-icon" />
+                                      <span className="user-domain-name">{domains[0]}</span>
+                                      {domains.length > 1 && <span className="user-domain-extra">+{domains.length - 1}</span>}
+                                    </div>
+                                  ) : (
+                                    <span className="user-cell-muted">—</span>
+                                  )}
+                                </td>
+                              )}
+                              {showPackageAndDiskCols && (
+                                <td>
+                                  <div className="user-pkg-text">{user.package_name || t('Custom')}</div>
+                                  {showCreatorSubtext && (
+                                    <div className="user-cell-sub">
+                                      {t('Created by')}: {creator.username}
+                                    </div>
+                                  )}
+                                </td>
+                              )}
+                              {showPackageAndDiskCols && (
+                                <td>
+                                  <div className="user-disk-cell">
+                                    <span className="user-disk-text">{storageUsageText(user)}</span>
+                                    {Number(user.storage_limit_bytes) > 0 && Number(user.storage_used_bytes) >= 0 && (
+                                      <div className="user-disk-bar" aria-hidden="true">
+                                        <div
+                                          className={`user-disk-fill${pct >= 90 ? ' danger' : pct >= 75 ? ' warn' : ''}`}
+                                          style={{ width: `${pct}%` }}
+                                        />
+                                      </div>
+                                    )}
+                                  </div>
+                                </td>
+                              )}
+                              <td>
+                                <span className={`user-status-label ${user.is_active ? 'is-active' : 'is-suspended'}`}>
+                                  <span className="user-status-dot" />
+                                  {user.is_active ? t('Active') : t('Suspended')}
+                                </span>
+                              </td>
+                              <td>
+                                <div className="user-clean-actions">
                     {user.id !== currentUser?.id && (
-                      <button className="mini secondary-light" disabled={!!loading} onClick={() => quickLoginUser(user)}>
+                      <button className="mini secondary-light user-login-as-btn" disabled={!!loading} onClick={() => quickLoginUser(user)}>
                         <LogIn size={14} />
                         {t('Login as')}
                       </button>
                     )}
+                    <button
+                      type="button"
+                      className={`user-icon-btn${isEditingThis ? ' active' : ''}`}
+                      disabled={!!loading}
+                      onClick={() => (isEditingThis ? cancelEditingUser() : startEditingUser(user))}
+                      title={t('Edit')}
+                      aria-label={t('Edit')}
+                    >
+                      <Pencil size={14} />
+                    </button>
                     {user.totp_enabled && user.id !== currentUser?.id && (
                       <button className="mini secondary-light" disabled={!!loading} onClick={() => resetUserTwoFactor(user)}>
                         {t('Reset 2FA')}
@@ -529,36 +708,38 @@ export function UsersPage({
                     )}
                     {user.id !== currentUser?.id &&
                       (user.is_active ? (
-                        <button className="mini secondary-light" disabled={!!loading} onClick={() => suspendUser(user)}>
+                        <button type="button" className="user-icon-btn warn-hover" disabled={!!loading} onClick={() => suspendUser(user)} title={t('Suspend')} aria-label={t('Suspend')}>
                           <Ban size={14} />
-                          {t('Suspend')}
                         </button>
                       ) : (
-                        <button className="mini secondary-light" disabled={!!loading} onClick={() => unsuspendUser(user)}>
+                        <button type="button" className="user-icon-btn ok-hover" disabled={!!loading} onClick={() => unsuspendUser(user)} title={t('Unsuspend')} aria-label={t('Unsuspend')}>
                           <Play size={14} />
-                          {t('Unsuspend')}
                         </button>
                       ))}
                     {user.id !== currentUser?.id && (
-                      <button className="mini danger" disabled={!!loading} onClick={() => deletePanelUser(user)}>
+                      <button type="button" className="user-icon-btn danger-hover" disabled={!!loading} onClick={() => deletePanelUser(user)} title={t('Delete')} aria-label={t('Delete')}>
                         <Trash2 size={14} />
                       </button>
                     )}
-                  </div>
-                  {editingUser?.id === user.id && (
-                    <div className="user-edit-panel">
+                                </div>
+                              </td>
+                            </tr>
+                            {isEditingThis && (
+                              <tr className="user-edit-expand-tr">
+                                <td colSpan={tableColCount}>
+                    <div className="user-edit-inline">
                       <div className="user-edit-heading">
                         <div>
-                          <strong>Edit {user.username}</strong>
+                          <strong>{t('Edit')} {user.username}</strong>
                           <small>
                             {user.id === currentUser?.id
-                              ? 'Role is locked for the active admin session.'
-                              : 'Role changes sign the user out of existing sessions.'}
-                            {editingUserForm.role === 'admin' ? ' Admin accounts bypass website and storage limits.' : ''}
+                              ? t('Role is locked for the active admin session.')
+                              : t('Package or role updates apply immediately.')}
                           </small>
                         </div>
                         <button
-                          className="user-edit-close secondary-light"
+                          type="button"
+                          className="user-icon-btn"
                           onClick={cancelEditingUser}
                           aria-label={t('Close user editor')}
                           title={t('Close user editor')}
@@ -575,7 +756,7 @@ export function UsersPage({
                             onChange={e => setEditingUserForm(prev => ({ ...prev, email: e.target.value }))}
                           />
                         </label>
-                        <label>
+                        <label style={!isAdmin ? { display: 'none' } : undefined}>
                           <span>{t('Role')}</span>
                           <select
                             value={editingUserForm.role === 'user' ? 'end_user' : editingUserForm.role}
@@ -602,11 +783,12 @@ export function UsersPage({
                                   .filter(p => (editingUserForm.role === 'reseller' ? p.is_reseller_package : !p.is_reseller_package))
                                   .map(item => (
                                     <option key={item.id} value={item.id}>
-                                      {item.name}
+                                      {formatPackageSummary(item)}
                                     </option>
                                   ))}
                               </select>
                             </label>
+                            {!editingUserForm.package_id && <>
                             <label>
                               <span>{t('Website limit')}</span>
                               <input
@@ -653,16 +835,16 @@ export function UsersPage({
                                 />
                               </label>
                             )}
+                            </>}
                           </>
                         )}
                       </div>
-                      <div className="user-edit-section">
+                      <div className="user-edit-pw-block">
                         <div className="user-edit-heading">
                           <div>
-                            <strong>{t('Change password')}</strong>
+                            <strong>{t('Change password')} (Panel &amp; SFTP)</strong>
                             <small>
-                              {t('Minimum 12 characters.')}{' '}
-                              {t(user.id === currentUser?.id ? 'Requires current password + 2FA.' : 'Admin can set directly.')}
+                              {t('Updates both SPanel login and SFTP password at once (minimum 12 characters).')}
                             </small>
                           </div>
                         </div>
@@ -689,6 +871,7 @@ export function UsersPage({
                         </div>
                         <div className="user-edit-actions">
                           <button
+                            type="button"
                             disabled={!!loading || !editingUserForm.new_password || editingUserForm.new_password.length < 12}
                             onClick={async () => {
                               const res = await submitPasswordChange(user);
@@ -698,10 +881,7 @@ export function UsersPage({
                                   title: `${t('Password updated')} — ${res.username}`,
                                   items: [
                                     { label: t('Username'), value: res.username, noticeMessage: t('Copied username.') },
-                                    { label: t('Panel password'), value: res.password },
-                                    ...(res.sftp_password
-                                      ? [{ label: t('SFTP password'), value: res.sftp_password, noticeMessage: t('SFTP password copied to clipboard.') }]
-                                      : []),
+                                    { label: t('Password (Panel & SFTP)'), value: res.password },
                                   ],
                                 });
                               }
@@ -719,22 +899,29 @@ export function UsersPage({
                         )}
                       </div>
                       <div className="user-edit-actions">
-                        <button className="secondary-light" onClick={cancelEditingUser}>
+                        <button type="button" className="secondary-light" onClick={cancelEditingUser}>
                           {t('Cancel')}
                         </button>
-                        <button disabled={!!loading || !editingUserForm.email.trim()} onClick={updatePanelUser}>
+                        <button type="button" disabled={!!loading || !editingUserForm.email.trim()} onClick={updatePanelUser}>
                           <Save size={14} />
                           {t('Save changes')}
                         </button>
                       </div>
                     </div>
-                  )}
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
-              ))}
-            </div>
-            {websites.length > 0 && <div className="user-action-panel">
+              )}
+
+            {isAdmin && !isResellerMode && !isAdminMode && websites.length > 0 && <div className="user-assign-footer">
               <div>
-                <h3>{t('Assign domain to user')}</h3>
+                <strong>{t('Assign domain to user')}</strong>
                 <p className="hint">{t('Move an existing domain under a selected panel user.')}</p>
               </div>
               <div className="assign-row">
@@ -754,45 +941,65 @@ export function UsersPage({
                     </option>
                   ))}
                 </select>
-                <button disabled={!assignWebsiteId || !assignUserId || !!loading} onClick={assignDomainToUser}>
+                <button type="button" disabled={!assignWebsiteId || !assignUserId || !!loading} onClick={assignDomainToUser}>
                   {t('Assign')}
                 </button>
               </div>
             </div>}
-          </div>
-        )}
+            </div>
+          )}
 
         {activeUserTab === 'add' && (
-          <div className="user-tab-panel" id="users-tab-add" role="tabpanel" aria-labelledby="users-tab-button-add">
-            <div className="section-title user-panel-title">
-              <div>
-                <h2>
-                  {t(isResellerMode ? 'Create Reseller' : isAdminMode ? 'Create Administrator' : 'Add User')}
-                </h2>
-                <p className="hint">
-                  {t('Panel username is also the Linux user. Login as a user before creating websites for that account.')}
-                </p>
-              </div>
+          <div className="user-add-body" id="users-tab-add" role="tabpanel" aria-labelledby="users-tab-button-add">
+            <div className="user-add-intro">
+              <h3>
+                {t(isResellerMode ? 'Create Reseller' : isAdminMode ? 'Create Administrator' : 'Add User')}
+              </h3>
+              <p className="hint">
+                {assignedRole === 'end_user'
+                  ? t('Enter the username, primary domain, and unified password (used for both SPanel login and SFTP). The domain will be ready under Domains as soon as the user signs in.')
+                  : t('Use one unified password for both SPanel login and SFTP access.')}
+              </p>
             </div>
-            <div className="user-create-card">
+            <div className="user-add-grid">
               <label>
                 <span>{t('Username')}</span>
                 <input
                   value={newUser.username}
-                  onChange={e => setNewUser(prev => ({ ...prev, username: e.target.value.toLowerCase() }))}
+                  onChange={e => setNewUser(prev => ({ ...prev, username: e.target.value.toLowerCase().replace(/\s+/g, '') }))}
                   placeholder="johndoe"
                 />
               </label>
+              {assignedRole === 'end_user' && (
+                <label>
+                  <span>{t('Primary domain')}</span>
+                  <input
+                    value={newUser.domain}
+                    onChange={e => handleDomainChange(e.target.value)}
+                    onBlur={e => setNewUser(prev => ({ ...prev, domain: normalizeDomainFinal(e.target.value) }))}
+                    placeholder="domain.com"
+                  />
+                </label>
+              )}
               <label>
                 <span>{t('Email')}</span>
                 <input
+                  type="email"
                   value={newUser.email}
-                  onChange={e => setNewUser(prev => ({ ...prev, email: e.target.value }))}
-                  placeholder="admin@domain.com"
+                  onChange={e => {
+                    const val = e.target.value;
+                    setEmailTouched(val.trim().length > 0);
+                    setNewUser(prev => ({ ...prev, email: val }));
+                  }}
+                  placeholder={
+                    assignedRole === 'end_user' && normalizeDomainFinal(newUser.domain)
+                      ? `admin@${normalizeDomainFinal(newUser.domain)}`
+                      : 'admin@domain.com'
+                  }
                 />
               </label>
               <label>
-                <span>{t('Password')}</span>
+                <span>{t('Password (Panel & SFTP)')}</span>
                 <PasswordField
                   value={newUser.password}
                   onChange={e => setNewUser(prev => ({ ...prev, password: e.target.value }))}
@@ -801,7 +1008,7 @@ export function UsersPage({
               </label>
               {assignedRole !== 'admin' && (
                 <>
-                  <label>
+                  <label className={assignedRole === 'end_user' ? 'user-add-span-full' : ''}>
                     <span>{t('Package')}</span>
                     <select value={newUser.package_id} onChange={e => applyPackageToNewUser(e.target.value)}>
                       <option value="" disabled>
@@ -809,11 +1016,12 @@ export function UsersPage({
                       </option>
                       {availablePackages.map(item => (
                         <option key={item.id} value={item.id}>
-                          {item.name}
+                          {formatPackageSummary(item)}
                         </option>
                       ))}
                     </select>
                   </label>
+                  {!newUser.package_id && <>
                   <label>
                     <span>{t('Site limit')}</span>
                     <input
@@ -856,15 +1064,22 @@ export function UsersPage({
                       />
                     </label>
                   )}
+                  </>}
                 </>
               )}
-              <button disabled={!!loading || !newUser.username || !newUser.password} onClick={createUser}>
+            </div>
+            <div className="user-add-footer">
+              <button type="button" className="secondary-light" onClick={() => setUserTab('list')}>
+                {t('Cancel')}
+              </button>
+              <button type="button" disabled={!canSubmitCreate} onClick={createUser}>
                 <Plus size={14} />
                 {t(isResellerMode ? 'Create reseller' : isAdminMode ? 'Create administrator' : 'Create user')}
               </button>
             </div>
           </div>
         )}
+        </div>
       </div>
     );
   }

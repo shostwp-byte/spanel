@@ -209,7 +209,7 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
   const {
     loading, setLoading, setError, setNotice, fileAppId, setFileAppId, filePath, setFilePath, fileListPath, setFileListPath,
     websites, selectedWebsiteId, setSelectedWebsiteId, siteApps,
-    currentUser, isAdmin, storageUsageText, loadCurrentUser,
+    currentUser, isAdmin, effectiveRole, storageUsageText, loadCurrentUser,
     clearSession, readCookie, upsertFileJob, dismissFileJob, formatFileTime, fileJobs, setFileJobs,
   } = useAppContext();
   const currentSite = websites.find(site => String(site.id) === String(selectedWebsiteId));
@@ -257,6 +257,19 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
   const [contextMenu, setContextMenu] = useState(null);
   const [actionDialog, setActionDialog] = useState(null);
   const uploadInputRef = useRef(null);
+
+  // Multi-file sequential Upload Modal & Drag-and-Drop states
+  const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [uploadQueue, setUploadQueue] = useState([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isDropzoneDragging, setIsDropzoneDragging] = useState(false);
+  const [isWorkspaceDragging, setIsWorkspaceDragging] = useState(false);
+  const [uploadWarning, setUploadWarning] = useState('');
+  const uploadModalInputRef = useRef(null);
+  const dropzoneDragCountRef = useRef(0);
+  const workspaceDragCountRef = useRef(0);
+  const activeUploadRowRef = useRef(null);
+  const isUploadingRef = useRef(false);
 
   const fetchTreeSubdirs = useCallback(async (targetPrefix, baseApi, dirPath = '') => {
     const nodeKey = `${targetPrefix}:${dirPath}`;
@@ -820,6 +833,267 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
     if (data?.jobs) setFileJobs(data.jobs.filter(job => job.status !== 'done').slice(0, 6));
   }
 
+  function makeUploadQueueEntry(file) {
+    return {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}-${file.name}`,
+      file,
+      name: file.name,
+      size: Number(file.size) || 0,
+      status: 'pending',
+      progress: 0,
+      loadedBytes: 0,
+      error: '',
+    };
+  }
+
+  function enqueueUploadFiles(rawFiles, skippedDirectory = false) {
+    const incoming = Array.from(rawFiles || []).filter(Boolean);
+    if (skippedDirectory) {
+      setUploadWarning(t('Folders cannot be uploaded directly — please select files or upload a .zip/.tar.gz archive.'));
+    } else if (incoming.length > 0) {
+      setUploadWarning('');
+    }
+    if (incoming.length === 0) return;
+
+    setUploadQueue(prev => {
+      const next = [...prev];
+      for (const file of incoming) {
+        const entry = makeUploadQueueEntry(file);
+        const existingIdx = next.findIndex(
+          item => item.name === file.name && (item.status === 'pending' || item.status === 'error')
+        );
+        if (existingIdx !== -1) {
+          next[existingIdx] = entry;
+        } else {
+          next.push(entry);
+        }
+      }
+      return next;
+    });
+  }
+
+  function extractFilesFromDataTransfer(dataTransfer) {
+    if (!dataTransfer) return { files: [], skippedDirectory: false };
+    let skippedDirectory = false;
+    const extracted = [];
+    if (dataTransfer.items && dataTransfer.items.length > 0) {
+      for (const item of Array.from(dataTransfer.items)) {
+        if (item.kind !== 'file') continue;
+        const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null;
+        if (entry && entry.isDirectory) {
+          skippedDirectory = true;
+          continue;
+        }
+        const file = item.getAsFile();
+        if (file) extracted.push(file);
+      }
+      return { files: extracted, skippedDirectory };
+    }
+    return { files: Array.from(dataTransfer.files || []), skippedDirectory: false };
+  }
+
+  function openUploadModal(initialFiles = null, skippedDirectory = false) {
+    if (!hasFileTarget()) {
+      setError(t('Please select a website or application first.'));
+      return;
+    }
+    if (!uploadModalOpen && !isUploadingRef.current) {
+      setUploadQueue([]);
+      setUploadWarning('');
+    }
+    setUploadModalOpen(true);
+    if (initialFiles && initialFiles.length > 0) {
+      enqueueUploadFiles(initialFiles, skippedDirectory);
+    } else if (skippedDirectory) {
+      setUploadWarning(t('Folders cannot be uploaded directly — please select files or upload a .zip/.tar.gz archive.'));
+    }
+  }
+
+  function closeUploadModal() {
+    if (isUploading || isUploadingRef.current) return;
+    setUploadModalOpen(false);
+    setUploadQueue([]);
+    setUploadWarning('');
+    setIsDropzoneDragging(false);
+    dropzoneDragCountRef.current = 0;
+  }
+
+  function removeUploadQueueItem(id) {
+    if (isUploading || isUploadingRef.current) return;
+    setUploadQueue(prev => prev.filter(item => item.id !== id));
+  }
+
+  function clearUploadQueue() {
+    if (isUploading || isUploadingRef.current) return;
+    setUploadQueue([]);
+    setUploadWarning('');
+  }
+
+  useEffect(() => {
+    if (!uploadModalOpen) return undefined;
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!isUploading && !isUploadingRef.current) {
+          closeUploadModal();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [uploadModalOpen, isUploading]);
+
+  useEffect(() => {
+    if (!isUploading) return undefined;
+    const handleBeforeUnload = (e) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isUploading]);
+
+  const activeUploadingId = uploadQueue.find(item => item.status === 'uploading')?.id || '';
+  useEffect(() => {
+    if (activeUploadingId && activeUploadRowRef.current) {
+      activeUploadRowRef.current.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, [activeUploadingId]);
+
+  function uploadSingleFileWithProgress(item, uploadDir) {
+    return new Promise((resolve) => {
+      const form = new FormData();
+      form.append('file', item.file);
+      const xhr = new XMLHttpRequest();
+      const url = `${API}${fileTargetBase()}/upload?path=${encodeURIComponent(uploadDir)}`;
+      xhr.open('POST', url, true);
+      xhr.withCredentials = true;
+
+      const csrfToken = readCookie('spanel_csrf');
+      if (csrfToken) xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+      if (effectiveRole) xhr.setRequestHeader('X-Access-Role', effectiveRole);
+
+      xhr.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable && event.total > 0) {
+          const pct = Math.min(99, Math.max(1, Math.round((event.loaded / event.total) * 100)));
+          setUploadQueue(prev => prev.map(q => (
+            q.id === item.id
+              ? { ...q, loadedBytes: event.loaded, progress: pct }
+              : q
+          )));
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        let data = {};
+        try {
+          data = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+        } catch {
+          data = { detail: xhr.responseText || `HTTP ${xhr.status}` };
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve({ ok: true, data });
+        } else {
+          resolve({
+            ok: false,
+            status: xhr.status,
+            authExpired: handleAuthExpired(xhr.status, data?.detail),
+            error: formatApiError(data?.detail, t('File upload failed.')),
+          });
+        }
+      });
+
+      xhr.addEventListener('error', () => {
+        resolve({ ok: false, status: 0, authExpired: false, error: t('File upload failed.') });
+      });
+
+      xhr.addEventListener('abort', () => {
+        resolve({ ok: false, status: 0, authExpired: false, error: t('File upload failed.') });
+      });
+
+      xhr.send(form);
+    });
+  }
+
+  async function startSequentialUpload(onlyRetryErrors = false) {
+    if (isUploadingRef.current) return;
+    if (!hasFileTarget()) {
+      setError(t('Please select a website or application first.'));
+      return;
+    }
+
+    const sourceQueue = onlyRetryErrors
+      ? uploadQueue.map(q => (q.status === 'error' ? { ...q, status: 'pending', progress: 0, loadedBytes: 0, error: '' } : q))
+      : uploadQueue;
+    const itemsToRun = sourceQueue.filter(q => q.status === 'pending');
+    if (itemsToRun.length === 0) return;
+
+    if (onlyRetryErrors) {
+      setUploadQueue(sourceQueue);
+    }
+
+    const uploadDir = String(fileListPath ?? '').trim();
+    isUploadingRef.current = true;
+    setIsUploading(true);
+    setUploadWarning('');
+    setError('');
+    setLoading(t('Uploading files...'));
+
+    let doneCount = 0;
+    let failedCount = 0;
+
+    try {
+      for (const item of itemsToRun) {
+        setUploadQueue(prev => prev.map(q => (
+          q.id === item.id
+            ? { ...q, status: 'uploading', progress: item.size === 0 ? 35 : 1, loadedBytes: 0, error: '' }
+            : q
+        )));
+
+        const result = await uploadSingleFileWithProgress(item, uploadDir);
+        if (result.authExpired) break;
+
+        if (result.ok) {
+          doneCount += 1;
+          setUploadQueue(prev => prev.map(q => (
+            q.id === item.id
+              ? { ...q, status: 'done', progress: 100, loadedBytes: item.size, error: '' }
+              : q
+          )));
+        } else {
+          failedCount += 1;
+          setUploadQueue(prev => prev.map(q => (
+            q.id === item.id
+              ? { ...q, status: 'error', error: result.error || t('File upload failed.') }
+              : q
+          )));
+        }
+      }
+
+      if (doneCount > 0) {
+        if (String(fileListPath ?? '') === uploadDir) {
+          await listFiles(uploadDir);
+        }
+        await loadCurrentUser();
+      }
+
+      if (failedCount === 0 && doneCount > 0) {
+        setNotice(t('Uploaded {n} file(s) successfully.', { n: doneCount }));
+      } else if (doneCount > 0 && failedCount > 0) {
+        setNotice(t('Uploaded {done} of {total} file(s) ({failed} failed).', {
+          done: doneCount,
+          total: doneCount + failedCount,
+          failed: failedCount,
+        }));
+      }
+    } finally {
+      isUploadingRef.current = false;
+      setIsUploading(false);
+      setLoading('');
+    }
+  }
+
   async function uploadSiteFile(file) {
     if (!file) return;
     if (!hasFileTarget()) { setError(t('Please select a website or application first.')); return; }
@@ -870,6 +1144,7 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
 
     return <div className="section">
       {renderChmodDialog()}
+      {renderUploadModalDialog()}
       <div className="section-title">
         <div><h2>{t('File manager')}</h2></div>
         <button className="secondary-light" disabled={!isTargetActive || !!loading} onClick={() => listFiles(fileListPath)}><RefreshCw size={14}/>{t('Refresh')}</button>
@@ -959,9 +1234,9 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
               <button className="secondary" disabled={virtualView === 'home' || !!loading} onClick={navigateUpDirectory}>{t('Up')}</button>
               <button className="secondary" disabled={!isTargetActive || !!loading} onClick={makeFileDirectory}><Plus size={14}/>{t('Folder')}</button>
               <button className="secondary" disabled={!isTargetActive || !!loading} onClick={makeFile}><FileText size={14}/>{t('File')}</button>
-              <label className={`upload-button ${(!isTargetActive || !!loading) ? 'disabled' : ''}`}>
-                <Upload size={14}/>{t('Upload')}<input type="file" disabled={!isTargetActive || !!loading} onChange={e => { uploadSiteFile(e.target.files?.[0]); e.target.value = ''; }} />
-              </label>
+              <button type="button" className="secondary" disabled={!isTargetActive || !!loading} onClick={() => openUploadModal()}>
+                <Upload size={14}/>{t('Upload')}
+              </button>
               <select value={archiveFormat} onChange={e => setArchiveFormat(e.target.value)} disabled={!isTargetActive || !!loading}>
                 <option value="zip">zip</option>
                 <option value="tar.gz">tar.gz</option>
@@ -1570,6 +1845,295 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
     );
   }
 
+  function renderUploadModalDialog() {
+    if (!uploadModalOpen) return null;
+    const activeApp = currentFileApp();
+    const sub = String(fileListPath ?? '').trim();
+    const targetDisplayPath = activeApp
+      ? `/applications/${activeApp.name}${sub ? `/${sub}` : ''}`
+      : `/domains/${currentSite?.domain || ''}${sub ? `/${sub}` : ''}`;
+
+    const totalFiles = uploadQueue.length;
+    const pendingCount = uploadQueue.filter(i => i.status === 'pending').length;
+    const doneCount = uploadQueue.filter(i => i.status === 'done').length;
+    const errorCount = uploadQueue.filter(i => i.status === 'error').length;
+    const finishedCount = doneCount + errorCount;
+    const uploadingIdx = uploadQueue.findIndex(i => i.status === 'uploading');
+    const currentStep = uploadingIdx !== -1 ? uploadingIdx + 1 : Math.min(totalFiles, finishedCount + 1);
+    const pendingBytes = uploadQueue.filter(i => i.status === 'pending').reduce((sum, i) => sum + (i.size || 0), 0);
+    const allFinished = totalFiles > 0 && !isUploading && pendingCount === 0;
+    const overallPercent = totalFiles === 0
+      ? 0
+      : Math.round(
+          uploadQueue.reduce((acc, item) => {
+            if (item.status === 'done' || item.status === 'error') return acc + 100;
+            if (item.status === 'uploading') return acc + (item.progress || 0);
+            return acc;
+          }, 0) / totalFiles
+        );
+
+    const handleDropzoneDragEnter = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isUploading) return;
+      dropzoneDragCountRef.current += 1;
+      setIsDropzoneDragging(true);
+    };
+
+    const handleDropzoneDragOver = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = isUploading ? 'none' : 'copy';
+      }
+    };
+
+    const handleDropzoneDragLeave = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropzoneDragCountRef.current = Math.max(0, dropzoneDragCountRef.current - 1);
+      if (dropzoneDragCountRef.current === 0) {
+        setIsDropzoneDragging(false);
+      }
+    };
+
+    const handleDropzoneDrop = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropzoneDragCountRef.current = 0;
+      setIsDropzoneDragging(false);
+      if (isUploading) return;
+      const { files: droppedFiles, skippedDirectory } = extractFilesFromDataTransfer(e.dataTransfer);
+      enqueueUploadFiles(droppedFiles, skippedDirectory);
+    };
+
+    return (
+      <div
+        className="chmod-backdrop da-upload-backdrop"
+        role="presentation"
+        onClick={() => { if (!isUploading && !isUploadingRef.current) closeUploadModal(); }}
+      >
+        <div
+          className="chmod-dialog da-upload-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-busy={isUploading ? 'true' : undefined}
+          aria-label={t('Upload Files')}
+          onClick={e => e.stopPropagation()}
+        >
+          <div className="chmod-head">
+            <div>
+              <h3><Upload size={16} /> {t('Upload Files')}</h3>
+              <p><code>{targetDisplayPath}</code></p>
+            </div>
+            <button
+              type="button"
+              className="mini secondary-light"
+              disabled={isUploading}
+              onClick={closeUploadModal}
+              aria-label={t('Close')}
+              title={isUploading ? t('Cannot close while uploading') : t('Close')}
+            >
+              <X size={14} />
+            </button>
+          </div>
+
+          <div
+            className={`da-upload-dropzone${isDropzoneDragging ? ' is-dragging' : ''}${isUploading ? ' is-disabled' : ''}`}
+            role="button"
+            tabIndex={isUploading ? -1 : 0}
+            aria-disabled={isUploading ? 'true' : 'false'}
+            onClick={() => { if (!isUploading) uploadModalInputRef.current?.click(); }}
+            onKeyDown={e => {
+              if (!isUploading && (e.key === 'Enter' || e.key === ' ')) {
+                e.preventDefault();
+                uploadModalInputRef.current?.click();
+              }
+            }}
+            onDragEnter={handleDropzoneDragEnter}
+            onDragOver={handleDropzoneDragOver}
+            onDragLeave={handleDropzoneDragLeave}
+            onDrop={handleDropzoneDrop}
+          >
+            <input
+              ref={uploadModalInputRef}
+              type="file"
+              multiple
+              style={{ display: 'none' }}
+              disabled={isUploading}
+              onChange={e => {
+                enqueueUploadFiles(e.target.files, false);
+                e.target.value = '';
+              }}
+            />
+            <div className="da-upload-dropzone-icon">
+              <Upload size={22} />
+            </div>
+            <strong>{t('Drag & drop files here, or click to select files')}</strong>
+            <span>{t('Supports selecting and uploading multiple files sequentially')}</span>
+          </div>
+
+          {uploadWarning && (
+            <p className="chmod-note warn">
+              <AlertCircle size={14} />
+              <span>{uploadWarning}</span>
+            </p>
+          )}
+
+          {totalFiles > 0 && (
+            <div className="da-upload-queue-section">
+              <div className="da-upload-summary">
+                <span className="da-upload-summary-text">
+                  {isUploading
+                    ? t('Uploading {current} of {total}...', { current: currentStep, total: totalFiles })
+                    : allFinished
+                      ? t('Completed {done} / {total} file(s)', { done: doneCount, total: totalFiles })
+                      : t('{n} file(s) ready ({size})', { n: pendingCount, size: formatBytes(pendingBytes) })}
+                </span>
+                <div className="da-upload-summary-actions">
+                  {(isUploading || finishedCount > 0) && (
+                    <span className="da-upload-summary-pct">{overallPercent}%</span>
+                  )}
+                  {!isUploading && (
+                    <button type="button" className="da-upload-clear-btn" disabled={isUploading} onClick={clearUploadQueue}>
+                      {t('Clear list')}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {(isUploading || finishedCount > 0) && (
+                <div className="da-upload-overall-track" aria-hidden="true">
+                  <div
+                    className={`da-upload-overall-fill${allFinished && errorCount === 0 ? ' is-done' : ''}${allFinished && errorCount > 0 && doneCount === 0 ? ' is-error' : ''}`}
+                    style={{ width: `${overallPercent}%` }}
+                  />
+                </div>
+              )}
+
+              <div className="da-upload-list" role="list">
+                {uploadQueue.map((item, idx) => {
+                  const isActiveRow = item.status === 'uploading';
+                  return (
+                    <div
+                      key={item.id}
+                      ref={isActiveRow ? activeUploadRowRef : null}
+                      role="listitem"
+                      className={`da-upload-item is-${item.status}`}
+                    >
+                      <div className="da-upload-item-top">
+                        <div className="da-upload-item-meta">
+                          <span className="da-upload-item-index">{idx + 1}.</span>
+                          <TableEntryIcon item={{ is_dir: false, name: item.name }} />
+                          <strong className="da-upload-item-name" title={item.name}>{item.name}</strong>
+                          <span className="da-upload-item-size">
+                            {item.status === 'uploading' && item.size > 0
+                              ? `${formatBytes(item.loadedBytes)} / ${formatBytes(item.size)}`
+                              : formatBytes(item.size)}
+                          </span>
+                        </div>
+
+                        <div className="da-upload-item-right">
+                          {item.status === 'pending' && (
+                            <span className="da-upload-state muted">{t('Waiting')}</span>
+                          )}
+                          {item.status === 'uploading' && (
+                            <span className="da-upload-state active">{item.progress}%</span>
+                          )}
+                          {item.status === 'done' && (
+                            <span className="da-upload-state ok">
+                              <CheckCircle size={14} />
+                              <span>100%</span>
+                            </span>
+                          )}
+                          {item.status === 'error' && (
+                            <span className="da-upload-state err">
+                              <AlertCircle size={14} />
+                              <span>{t('Failed')}</span>
+                            </span>
+                          )}
+                          {!isUploading && (
+                            <button
+                              type="button"
+                              className="da-upload-remove-btn"
+                              onClick={() => removeUploadQueueItem(item.id)}
+                              aria-label={t('Remove from queue')}
+                              title={t('Remove from queue')}
+                            >
+                              <X size={13} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div
+                        className="da-upload-bar-track"
+                        role="progressbar"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={item.status === 'done' ? 100 : item.progress}
+                        aria-label={item.name}
+                      >
+                        <div
+                          className={`da-upload-bar-fill is-${item.status}`}
+                          style={{ width: `${item.status === 'error' ? 100 : item.progress}%` }}
+                        />
+                      </div>
+
+                      {item.status === 'error' && item.error && (
+                        <small className="da-upload-item-error">{item.error}</small>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {isUploading && (
+            <p className="da-upload-lock-note">
+              <Lock size={13} />
+              <span>{t('Window closing is locked until the upload queue finishes.')}</span>
+            </p>
+          )}
+
+          <div className="chmod-actions da-upload-actions">
+            <button
+              type="button"
+              className="secondary-light"
+              disabled={isUploading}
+              onClick={closeUploadModal}
+            >
+              {allFinished && errorCount === 0 ? t('Done') : t('Close')}
+            </button>
+
+            {!isUploading && errorCount > 0 && pendingCount === 0 && (
+              <button type="button" onClick={() => startSequentialUpload(true)}>
+                <RotateCcw size={14} />
+                <span>{t('Retry failed ({n})', { n: errorCount })}</span>
+              </button>
+            )}
+
+            {(isUploading || pendingCount > 0) && (
+              <button
+                type="button"
+                disabled={isUploading || pendingCount === 0}
+                onClick={() => startSequentialUpload(false)}
+              >
+                <Upload size={14} />
+                <span>
+                  {isUploading
+                    ? t('Uploading ({done}/{total})...', { done: finishedCount, total: totalFiles })
+                    : t('Upload {n} file(s)', { n: pendingCount })}
+                </span>
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderInPageEditor() {
     const fileName = editingFilePath.split('/').pop() || editingFilePath;
     const langMode = editorLanguageForPath(editingFilePath);
@@ -1640,16 +2204,65 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
     const ownerName = currentSite?.linux_user || activeFileApp?.linux_user || currentUser?.username || 'user';
     const uidGidLabel = `${ownerName}/${ownerName}`;
 
+    const canDropOnWorkspace = isTargetActive && !editingFilePath && !isUploading && !uploadModalOpen;
+    const hasDraggedFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+
+    const handleWorkspaceDragEnter = (e) => {
+      if (!canDropOnWorkspace || !hasDraggedFiles(e)) return;
+      e.preventDefault();
+      workspaceDragCountRef.current += 1;
+      setIsWorkspaceDragging(true);
+    };
+
+    const handleWorkspaceDragOver = (e) => {
+      if (!canDropOnWorkspace || !hasDraggedFiles(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    };
+
+    const handleWorkspaceDragLeave = (e) => {
+      if (!canDropOnWorkspace) return;
+      workspaceDragCountRef.current = Math.max(0, workspaceDragCountRef.current - 1);
+      if (workspaceDragCountRef.current === 0) {
+        setIsWorkspaceDragging(false);
+      }
+    };
+
+    const handleWorkspaceDrop = (e) => {
+      if (!canDropOnWorkspace || !hasDraggedFiles(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      workspaceDragCountRef.current = 0;
+      setIsWorkspaceDragging(false);
+      const { files: droppedFiles, skippedDirectory } = extractFilesFromDataTransfer(e.dataTransfer);
+      openUploadModal(droppedFiles, skippedDirectory);
+    };
+
     return (
       <div className="section da-fm-section">
         {renderChmodDialog()}
         {renderContextMenuDialog()}
         {renderActionModalDialog()}
+        {renderUploadModalDialog()}
 
         <div className="da-fm-layout">
           {renderLeftDirectoryTree()}
 
-          <div className="da-fm-main">
+          <div
+            className={`da-fm-main${isWorkspaceDragging ? ' is-workspace-drop' : ''}`}
+            onDragEnter={handleWorkspaceDragEnter}
+            onDragOver={handleWorkspaceDragOver}
+            onDragLeave={handleWorkspaceDragLeave}
+            onDrop={handleWorkspaceDrop}
+          >
+            {isWorkspaceDragging && (
+              <div className="da-fm-drop-overlay" aria-hidden="true">
+                <div className="da-fm-drop-overlay-inner">
+                  <Upload size={26} />
+                  <strong>{t('Drop files here to add to upload queue')}</strong>
+                </div>
+              </div>
+            )}
             <div className="da-fm-topbar">
               <nav className="da-file-breadcrumb" aria-label={t('File path')}>
                 <button type="button" className={`da-crumb-home ${virtualView === 'home' && !editingFilePath ? 'da-crumb-current' : ''}`} onClick={openVirtualHome} title={t('Home')}>
@@ -1699,10 +2312,9 @@ export function FilesPage({ request, API, navigateToPage, standaloneEditor }) {
                 <button type="button" className="secondary-light da-quick-btn" disabled={!isTargetActive || !!loading || !!editingFilePath} onClick={openNewFileModal} title={t('New File')}>
                   <FilePlus size={14} /><span>{t('New File')}</span>
                 </button>
-                <button type="button" className="secondary-light da-quick-btn" disabled={!isTargetActive || !!loading || !!editingFilePath} onClick={() => uploadInputRef.current?.click()} title={t('Upload File')}>
+                <button type="button" className="secondary-light da-quick-btn" disabled={!isTargetActive || !!loading || !!editingFilePath} onClick={() => openUploadModal()} title={t('Upload Files')}>
                   <Upload size={14} /><span>{t('Upload')}</span>
                 </button>
-                <input ref={uploadInputRef} type="file" style={{ display: 'none' }} disabled={!isTargetActive || !!loading} onChange={e => { uploadSiteFile(e.target.files?.[0]); e.target.value = ''; }} />
                 <button type="button" className="secondary-light da-quick-btn" disabled={!isTargetActive || !!loading} onClick={() => (editingFilePath ? reloadInlineFile() : listFiles(fileListPath))} title={t('Refresh')}>
                   <RefreshCw size={14} />
                 </button>
