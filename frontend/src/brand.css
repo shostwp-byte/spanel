@@ -769,3 +769,113 @@ button:disabled,.upload-button.disabled{background:var(--disabled-bg);color:var(
 .form-grid label span { font-size: 13px; color: var(--text); }
 .form-grid input { width: 100%; box-sizing: border-box; }
 
+/* Standardized PasswordField & PasswordResultBox across SPanel */
+.sp-password-field {
+  display: flex;
+  align-items: stretch;
+  gap: 5px;
+  min-width: 0;
+  width: 100%;
+}
+.sp-password-field > input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100% !important;
+  margin: 0;
+}
+.sp-password-field > input.sp-pw-visible {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.sp-password-field > .sp-pw-btn {
+  flex: 0 0 38px !important;
+  width: 38px !important;
+  min-width: 38px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch !important;
+}
+.sp-password-field.compact > .sp-pw-btn {
+  flex: 0 0 34px !important;
+  width: 34px !important;
+  min-width: 34px !important;
+}
+.sp-copy-check {
+  color: var(--green, #10b981);
+  flex-shrink: 0;
+}
+.sp-pw-btn.is-copied,
+.sp-copy-btn.is-copied {
+  border-color: rgba(16, 185, 129, 0.45) !important;
+  color: var(--green, #10b981) !important;
+}
+.sp-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.sp-password-result {
+  margin-top: 10px;
+  margin-bottom: 12px;
+  border-color: rgba(16, 185, 129, 0.4);
+  background: var(--surface);
+}
+.sp-password-result-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+}
+.sp-password-result-val {
+  display: inline-flex !important;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px !important;
+  min-width: 0;
+}
+.sp-password-result-hint {
+  margin: 2px 0 0 !important;
+  font-size: 12.5px;
+}
+.sp-result-close {
+  width: 28px !important;
+  min-width: 28px !important;
+  padding: 0 !important;
+  flex: 0 0 28px !important;
+}
+.db-create-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) minmax(250px, 1.5fr) max-content;
+  gap: 10px;
+  align-items: center;
+}
+.db-create-row.with-host {
+  grid-template-columns: minmax(130px, 0.9fr) minmax(130px, 0.9fr) minmax(240px, 1.45fr) minmax(140px, 0.9fr) max-content;
+}
+.sftp-form.sftp-create-row {
+  grid-template-columns: minmax(180px, 1fr) minmax(130px, 0.75fr) minmax(250px, 1.4fr) max-content;
+}
+@media (max-width: 1100px) {
+  .db-create-row,
+  .db-create-row.with-host,
+  .sftp-form.sftp-create-row {
+    grid-template-columns: 1fr 1fr;
+  }
+  .db-create-row > button,
+  .sftp-form.sftp-create-row > button {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 640px) {
+  .db-create-row,
+  .db-create-row.with-host,
+  .sftp-form.sftp-create-row {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+

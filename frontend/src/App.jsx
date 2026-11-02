@@ -12,6 +12,7 @@ import './ui.css';
 import { formatBytes, roleLabel } from './utils/helpers.js';
 import { AppContext, AppProvider, useAppContext, dnsTtlLabel } from './contexts/AppContext.jsx';
 import { WebsiteSelect } from './components/WebsiteSelect.jsx';
+import { PasswordField, PasswordResultBox, generateStrongPassword } from './components/PasswordField.jsx';
 
 const CHUNK_RELOAD_KEY = 'spanel_chunk_reload_ts';
 
@@ -1407,6 +1408,7 @@ function AppContent() {
   const [createSiteAppId, setCreateSiteAppId] = useState('');
 
   const [adminAccountForm, setAdminAccountForm] = useState(null);
+  const [justChangedLoginCreds, setJustChangedLoginCreds] = useState(null);
   const [mailDns, setMailDns] = useState(null);
   const [mailRelays, setMailRelays] = useState([]);
   const [dnsTab, setDnsTab] = useState('zones');
@@ -1560,7 +1562,8 @@ function AppContent() {
 
 
 
-  function clearSession(message = 'Your session expired. Please log in again.') {
+  function clearSession(message = 'Your session expired. Please log in again.', meta = null) {
+    const prevUsername = currentUserRef.current?.username || username || 'admin';
     // Old localStorage token from a previous deploy: nuke it for safety.
     try { localStorage.removeItem('token'); } catch { }
     try { localStorage.removeItem('spanel-view-level'); } catch { }
@@ -1571,6 +1574,14 @@ function AppContent() {
     setCurrentUser(null);
     setNeedsTwoFactor(false);
     setOtpCode('');
+    if (meta?.newPassword) {
+      const nextUser = meta.username || prevUsername;
+      setUsername(nextUser);
+      setPassword('');
+      setJustChangedLoginCreds({ username: nextUser, password: meta.newPassword });
+    } else {
+      setJustChangedLoginCreds(null);
+    }
     setWebsites([]);
     setDatabases([]);
     setUsers([]);
@@ -1712,6 +1723,7 @@ function AppContent() {
         // Don't keep the token anywhere: the HttpOnly cookie just got set by
         // the response. JS code MUST NOT touch the JWT.
         signedOutRef.current = false;
+        setJustChangedLoginCreds(null);
         setViewLevel(null);
         setNeedsTwoFactor(false);
         setPasskeyPrompt(null);
@@ -2142,18 +2154,18 @@ function AppContent() {
 
 
   async function submitPasswordChange(user) {
-    if (!user) return;
+    if (!user) return null;
     const pw = editingUserForm.new_password;
-    if (pw.length < 12) { setError(t('Password must be at least 12 characters.')); return; }
-    if (pw !== editingUserForm.confirm_password) { setError(t('Passwords do not match.')); return; }
+    if (pw.length < 12) { setError(t('Password must be at least 12 characters.')); return null; }
+    if (pw !== editingUserForm.confirm_password) { setError(t('Passwords do not match.')); return null; }
     const payload = { password: pw };
     if (user.id === currentUser?.id) {
       const currentPassword = prompt('Enter your current password to confirm this change:');
-      if (!currentPassword) return;
+      if (!currentPassword) return null;
       payload.current_password = currentPassword;
       if (currentUser?.totp_enabled) {
         const code = prompt('Enter the 6-digit code from your authenticator:');
-        if (!code) return;
+        if (!code) return null;
         payload.code = code.trim();
       }
     }
@@ -2161,7 +2173,15 @@ function AppContent() {
     if (data?.message) {
       setNotice(data.message);
       setEditingUserForm(prev => ({ ...prev, new_password: '', confirm_password: '' }));
+      return {
+        ok: true,
+        username: user.username,
+        password: pw,
+        sftp_password: data.sftp_password || null,
+        sftp_password_rotated: !!data.sftp_password_rotated,
+      };
     }
+    return null;
   }
 
 
@@ -2663,10 +2683,7 @@ function AppContent() {
 
 
   function generateRandomPassword(length = 20) {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^*_+-';
-    const arr = new Uint8Array(length);
-    crypto.getRandomValues(arr);
-    return Array.from(arr, b => chars[b % chars.length]).join('');
+    return generateStrongPassword(length);
   }
 
 
@@ -4256,7 +4273,13 @@ function AppContent() {
             </select>
           </label>
           <label><span>{t('Password shown on the login page')}</span>
-            <input value={draftSlot.password} disabled={!!loading || !draftSlot.username} onChange={e => setSlot(slot, 'password', e.target.value)} placeholder={t('At least 6 characters')} autoComplete="off" spellCheck={false} data-lpignore="true" data-1p-ignore="true"/>
+            <PasswordField
+              value={draftSlot.password}
+              disabled={!!loading || !draftSlot.username}
+              onChange={e => setSlot(slot, 'password', e.target.value)}
+              placeholder={t('At least 6 characters')}
+              defaultRevealed
+            />
           </label>
         </div>;
       })}
@@ -4653,6 +4676,16 @@ function AppContent() {
           <LanguageToggle language={language} onChange={changeLanguage} />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
+        {justChangedLoginCreds && (
+          <PasswordResultBox
+            title={t('New password ready to sign in')}
+            items={[
+              { label: t('Username'), value: justChangedLoginCreds.username, noticeMessage: t('Copied username.') },
+              { label: t('New password'), value: justChangedLoginCreds.password },
+            ]}
+            onDismiss={() => setJustChangedLoginCreds(null)}
+          />
+        )}
         <div className="login-form">
           <input value={username} onChange={e => setUsername(e.target.value)} placeholder={t('Username')} autoComplete="username" />
           <input value={password} onChange={e => setPassword(e.target.value)} placeholder={t('Password')} type="password" autoComplete="current-password" onKeyDown={e => { if (e.key === 'Enter') login(); }} />

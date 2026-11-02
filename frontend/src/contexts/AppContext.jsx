@@ -1,6 +1,7 @@
 import React, { createContext, useState, useContext } from 'react';
 import { t } from '../i18n.js';
 import { formatBytes } from '../utils/helpers.js';
+import { generateStrongPassword } from '../components/PasswordField.jsx';
 
 export const AppContext = createContext();
 
@@ -94,10 +95,7 @@ export function normalizeHttpFloodConfig(config = {}) {
 }
 
 export function generateRandomPassword(length = 20) {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^*_+-';
-  const arr = new Uint8Array(length);
-  crypto.getRandomValues(arr);
-  return Array.from(arr, b => chars[b % chars.length]).join('');
+  return generateStrongPassword(length);
 }
 
 export function readCookie(name) {

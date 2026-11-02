@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
+import { PasswordField, PasswordResultBox } from '../components/PasswordField.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
@@ -32,6 +33,7 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   const [showCreateMailbox, setShowCreateMailbox] = useState(false);
   const [mailboxForm, setMailboxForm] = useState({ domain_id: '', local_part: '', password: '', quota_mb: '' });
   const [mailboxEdit, setMailboxEdit] = useState(null);
+  const [lastMailboxCreds, setLastMailboxCreds] = useState(null);
   const [mailDomainForm, setMailDomainForm] = useState({ domain: '', owner_id: '' });
   const [mailSettings, setMailSettings] = useState(null);
   const [mailSettingsForm, setMailSettingsForm] = useState(null);
@@ -110,10 +112,17 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     if (mailTab === 'forwarders') loadForwarders();
   }
 
-  function mailPassword() {
-    // The server wants at least one letter and one digit.
+  function mailPassword(localPart = '') {
+    // The server wants at least one letter, one digit, and must not contain the mailbox local-part.
+    const needle = String(localPart || '').trim().toLowerCase();
     let value = '';
-    do { value = generateRandomPassword(16); } while (!/[A-Za-z]/.test(value) || !/\d/.test(value));
+    do {
+      value = generateRandomPassword(20);
+    } while (
+      !/[A-Za-z]/.test(value) ||
+      !/\d/.test(value) ||
+      (needle.length >= 3 && value.toLowerCase().includes(needle))
+    );
     return value;
   }
 
@@ -288,11 +297,17 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
   }
 
   async function createMailbox() {
-    const body = { domain_id: Number(mailboxForm.domain_id), local_part: mailboxForm.local_part.trim().toLowerCase(), password: mailboxForm.password };
+    const createdPassword = mailboxForm.password;
+    const body = { domain_id: Number(mailboxForm.domain_id), local_part: mailboxForm.local_part.trim().toLowerCase(), password: createdPassword };
     if (String(mailboxForm.quota_mb).trim() !== '') body.quota_mb = Number(mailboxForm.quota_mb);
     const data = await request('/mail/mailboxes', { method: 'POST', body: JSON.stringify(body) }, t('Creating mailbox...'));
     if (data) {
       setNotice(t('{address} created.', { address: data.address }));
+      setLastMailboxCreds({
+        title: `${t('Mailbox created')} — ${data.address}`,
+        address: data.address,
+        password: createdPassword,
+      });
       setMailboxForm(prev => ({ ...prev, local_part: '', password: '' }));
       setShowCreateMailbox(false);
       loadMailboxes();
@@ -307,7 +322,19 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
     if (String(edit.quota_mb) !== String(edit.box.quota_mb)) body.quota_mb = Number(edit.quota_mb);
     if (!Object.keys(body).length) { setMailboxEdit(null); return; }
     const data = await request(`/mail/mailboxes/${edit.box.id}`, { method: 'PUT', body: JSON.stringify(body) }, t('Saving...'));
-    if (data) { setNotice(t('{address} saved.', { address: data.address })); setMailboxEdit(null); loadMailboxes(); }
+    if (data) {
+      setNotice(t('{address} saved.', { address: data.address }));
+      if (edit.password) {
+        const addr = data.address || edit.box.address;
+        setLastMailboxCreds({
+          title: `${t('Mailbox password updated')} — ${addr}`,
+          address: addr,
+          password: edit.password,
+        });
+      }
+      setMailboxEdit(null);
+      loadMailboxes();
+    }
   }
 
   async function setMailboxEnabled(box, enabled) {
@@ -519,11 +546,13 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
             </div>
           </div>
           <div className="field"><span className="field-label">{t('Password')}</span>
-            <div className="password-with-generate">
-              <input value={mailboxForm.password} autoComplete="new-password" spellCheck={false} placeholder={t('8+ characters, letters and digits')} onChange={e => setMailboxForm(prev => ({ ...prev, password: e.target.value }))} data-lpignore="true" data-1p-ignore="true" />
-              <button type="button" className="secondary-light icon-only" title={t('Generate random password')} aria-label={t('Generate random password')} onClick={() => setMailboxForm(prev => ({ ...prev, password: mailPassword() }))}><Dices size={15}/></button>
-              <button type="button" className="secondary-light icon-only" title={t('Copy')} aria-label={t('Copy')} onClick={() => copyText(mailboxForm.password, t('Copied.'))}><Copy size={15}/></button>
-            </div>
+            <PasswordField
+              value={mailboxForm.password}
+              onChange={e => setMailboxForm(prev => ({ ...prev, password: e.target.value }))}
+              generator={() => mailPassword(mailboxForm.local_part)}
+              placeholder={t('8+ characters, letters and digits')}
+              defaultRevealed
+            />
           </div>
           <div className="field mail-quota-field"><span className="field-label">{t('Size (MB)')}{isAdmin && <em> {t('0 = unlimited')}</em>}</span>
             <input type="number" min={isAdmin ? 0 : 1} max={isAdmin ? 1048576 : info.max_user_quota_mb} value={mailboxForm.quota_mb} onChange={e => setMailboxForm(prev => ({ ...prev, quota_mb: e.target.value }))} />
@@ -532,6 +561,16 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
         </div>
         <p className="hint">{t('Copy the password now — it is not shown again. It signs in to webmail and to any mail app, with the full address as the username.')}</p>
       </div>}
+      {lastMailboxCreds && (
+        <PasswordResultBox
+          title={lastMailboxCreds.title}
+          items={[
+            { label: 'Email', value: lastMailboxCreds.address, noticeMessage: t('Copied.') },
+            { label: t('Password'), value: lastMailboxCreds.password },
+          ]}
+          onDismiss={() => setLastMailboxCreds(null)}
+        />
+      )}
       {list === null && <p className="hint">{t('Loading…')}</p>}
       {list && items.length === 0 && <EmptyState icon={Inbox} message={mailFilter.q || mailFilter.domain_id ? t('No mailbox matches.') : t('No mailboxes yet.')} />}
       {items.length > 0 && <div className="table">
@@ -1044,11 +1083,12 @@ export function MailPage({ request, API, isAdmin, users, isReseller, renderCopyB
           </div>
           <div className="modal-body">
             <label className="field"><span className="field-label">{t('New password')} <small>{t('(leave empty to keep)')}</small></span>
-              <div className="password-with-generate">
-                <input value={mailboxEdit.password} autoComplete="new-password" spellCheck={false} onChange={e => setMailboxEdit(prev => ({ ...prev, password: e.target.value }))} data-lpignore="true" data-1p-ignore="true" />
-                <button type="button" className="secondary-light icon-only" title={t('Generate random password')} aria-label={t('Generate random password')} onClick={() => setMailboxEdit(prev => ({ ...prev, password: mailPassword() }))}><Dices size={15}/></button>
-                <button type="button" className="secondary-light icon-only" title={t('Copy')} aria-label={t('Copy')} onClick={() => copyText(mailboxEdit.password, t('Copied.'))}><Copy size={15}/></button>
-              </div>
+              <PasswordField
+                value={mailboxEdit.password}
+                onChange={e => setMailboxEdit(prev => ({ ...prev, password: e.target.value }))}
+                generator={() => mailPassword(mailboxEdit.box?.address?.split('@')[0] || '')}
+                placeholder={t('8+ characters, letters and digits')}
+              />
             </label>
             <label className="field"><span className="field-label">{t('Size (MB)')}{isAdmin && <em> {t('0 = unlimited')}</em>}</span>
               <input type="number" min={isAdmin ? 0 : 1} value={mailboxEdit.quota_mb} onChange={e => setMailboxEdit(prev => ({ ...prev, quota_mb: e.target.value }))} />
