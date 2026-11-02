@@ -181,8 +181,8 @@ export function SftpPage({ request, currentUser, appVersion }) {
           <label>{t('Port')}</label><span>22 (SFTP)</span>
           <label>{t('Reaches')}</label><span>every website on this account</span>
         </div>
-        {!currentUser?.sftp_password_set_at && <p className="hint" style={{color:'var(--red)'}}>
-          {t('This login still uses your panel password. Anyone who guesses it over SFTP is also in the panel. Set a separate password — your panel password will stop working for SFTP the moment you do.')}
+        {!currentUser?.sftp_password_set_at && <p className="hint">
+          {t('Uses the same password as your panel login. Click Set password if you prefer a separate SFTP password.')}
         </p>}
         {currentUser?.sftp_password_set_at && <p className="hint">{t('Separate from your panel password. Changing one does not change the other.')}</p>}
         {ownSftpPassword && <div className="db-created-grid" style={{marginTop:'0.5rem'}}>

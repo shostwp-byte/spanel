@@ -432,6 +432,8 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=12, max_length=72)  # bcrypt 72-byte limit
     role: Literal["admin", "reseller", "end_user"] = "end_user"
+    domain: Optional[str] = None
+    php_version: str = "8.4"
     package_id: Optional[int] = Field(default=None, ge=1)
     reseller_package_id: Optional[int] = Field(default=None, ge=1)
     website_limit: int = Field(default=5, ge=-1, le=1000)
@@ -467,6 +469,34 @@ class UserCreate(BaseModel):
         if value in RESERVED_LINUX_USERNAMES:
             raise ValueError("username is reserved by the system")
         return value
+
+    @field_validator("password")
+    @classmethod
+    def validate_unified_password(cls, value: str) -> str:
+        return _validate_linux_login_password(value)
+
+    @field_validator("domain")
+    @classmethod
+    def validate_domain(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip().lower()
+        if value == "":
+            return None
+        if not DOMAIN_RE.fullmatch(value):
+            raise ValueError("Invalid domain")
+        return value
+
+    @field_validator("php_version")
+    @classmethod
+    def validate_php(cls, value: str) -> str:
+        return _validate_php_version(value) or "8.4"
+
+    @model_validator(mode="after")
+    def validate_domain_role(self):
+        if self.domain is not None and self.role != "end_user":
+            raise ValueError("domain can only be assigned to end_user accounts")
+        return self
 
 
 class UserUpdate(BaseModel):
@@ -588,6 +618,9 @@ class UserOut(BaseModel):
     sftp_password_set_at: Optional[datetime] = None
     # Only ever populated on create, and only in that one response.
     sftp_password: Optional[str] = None
+    primary_domain: Optional[str] = None
+    domains: list[str] = Field(default_factory=list)
+    domains_count: int = 0
 
     class Config:
         from_attributes = True
@@ -1707,6 +1740,11 @@ class ProvisioningAccountCreate(BaseModel):
         if value in RESERVED_LINUX_USERNAMES:
             raise ValueError("username is reserved by the system")
         return value
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return _validate_linux_login_password(value)
 
     @field_validator("domain")
     @classmethod

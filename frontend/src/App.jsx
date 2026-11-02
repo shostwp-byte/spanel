@@ -2157,6 +2157,7 @@ function AppContent() {
     if (!user) return null;
     const pw = editingUserForm.new_password;
     if (pw.length < 12) { setError(t('Password must be at least 12 characters.')); return null; }
+    if (pw.includes(':')) { setError(t("Password cannot contain ':'.")); return null; }
     if (pw !== editingUserForm.confirm_password) { setError(t('Passwords do not match.')); return null; }
     const payload = { password: pw };
     if (user.id === currentUser?.id) {
@@ -2171,14 +2172,17 @@ function AppContent() {
     }
     const data = await request(`/users/${user.id}/password`, { method: 'POST', body: JSON.stringify(payload) }, `Changing password for ${user.username}...`);
     if (data?.message) {
-      setNotice(data.message);
+      if (user.id !== currentUser?.id && user.sftp_password_set_at) {
+        await request(`/users/${user.id}/sftp-password`, { method: 'POST', body: JSON.stringify({ password: pw }) }, null);
+      }
+      setNotice(t('Passwords updated successfully.'));
       setEditingUserForm(prev => ({ ...prev, new_password: '', confirm_password: '' }));
       return {
         ok: true,
         username: user.username,
         password: pw,
-        sftp_password: data.sftp_password || null,
-        sftp_password_rotated: !!data.sftp_password_rotated,
+        sftp_password: null,
+        sftp_password_rotated: false,
       };
     }
     return null;

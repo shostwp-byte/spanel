@@ -336,8 +336,8 @@ def _create_account(
         return HTTPException(status_code=400, detail=str(exc))
 
     try:
-        # Its own secret from the start: the panel password is not an SFTP password.
-        sftp_password = site_users.generate_login_password()
+        # Unified password on creation: Panel login and SFTP share payload.password.
+        sftp_password = payload.password
         linux_user = site_users.ensure_panel_user(payload.username, sftp_password)
 
         user = User(
@@ -348,7 +348,7 @@ def _create_account(
             package_id=package.id,
             website_limit=package.website_limit,
             storage_limit_mb=package.storage_limit_mb,
-            sftp_password_set_at=datetime.utcnow(),
+            sftp_password_set_at=None,
             reseller_package_id=payload.reseller_package_id if payload.is_reseller else None,
             reseller_id=reseller.id if reseller is not None else None,
         )
