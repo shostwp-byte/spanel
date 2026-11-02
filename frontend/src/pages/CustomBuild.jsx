@@ -237,18 +237,21 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
 
   async function handleInstallPhpExt(phpVer, extName) {
     if (busyRef.current) return;
+    const label = extName === 'ioncube' ? `ionCube Loader (PHP ${phpVer})` : `php${phpVer}-${extName}`;
     await runLocked(`ext-${phpVer}-${extName}`, async () => {
       const res = await request(
         '/maintenance/php-extensions',
         { method: 'POST', body: JSON.stringify({ php_version: phpVer, extension: extName }) }
       );
       if (res) {
-        appendLog(`Install php${phpVer}-${extName}`, res.output || `Installed php${phpVer}-${extName}.`, 'ok');
+        appendLog(`Install ${label}`, res.output || `Installed ${label}.`, 'ok');
         setPhpExtensions({
           versions: res.versions || phpExtensions.versions,
           extensions: res.extensions || phpExtensions.extensions,
         });
-        setNotice(t('Installed php{v}-{e}.', { v: phpVer, e: extName }));
+        setNotice(extName === 'ioncube'
+          ? t('{extension} installed for PHP {versions}.', { extension: 'ionCube Loader', versions: phpVer })
+          : t('Installed php{v}-{e}.', { v: phpVer, e: extName }));
       }
     });
   }
@@ -257,18 +260,19 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
     if (busyRef.current || !missingVers.length) return;
     await runLocked(`ext-all-${extName}`, async () => {
       for (const v of missingVers) {
+        const label = extName === 'ioncube' ? `ionCube Loader (PHP ${v})` : `php${v}-${extName}`;
         const res = await request(
           '/maintenance/php-extensions',
           { method: 'POST', body: JSON.stringify({ php_version: v, extension: extName }) }
         );
         if (!res) break;
-        appendLog(`Install php${v}-${extName}`, res.output || `Installed php${v}-${extName}.`, 'ok');
+        appendLog(`Install ${label}`, res.output || `Installed ${label}.`, 'ok');
         setPhpExtensions({
           versions: res.versions || phpExtensions.versions,
           extensions: res.extensions || phpExtensions.extensions,
         });
       }
-      setNotice(t('Installed {e} across PHP versions.', { e: extName }));
+      setNotice(t('Installed {e} across PHP versions.', { e: extName === 'ioncube' ? 'ionCube Loader' : extName }));
     });
   }
 
@@ -925,7 +929,7 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
               <input
                 value={extFilter}
                 onChange={e => setExtFilter(e.target.value)}
-                placeholder={t('Filter extensions (e.g. redis, imagick, intl)...')}
+                placeholder={t('Filter extensions (e.g. ioncube, redis, imagick)...')}
                 style={{ maxWidth: '280px' }}
               />
             </div>
@@ -941,6 +945,7 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                   const extName = row.name || row.extension;
                   const verMap = row.versions || row.installed || {};
                   const missingVers = extVersions.filter(v => verMap[v] === 'available' || verMap[v] === false);
+                  const installedCount = extVersions.filter(v => verMap[v] === 'installed' || verMap[v] === 'builtin' || verMap[v] === true).length;
                   const isInstallingAll = busyKey === `ext-all-${extName}`;
                   return (
                     <div className="php-ext-row" role="row" key={extName}>
@@ -950,10 +955,14 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                         const isInstalled = state === 'installed' || state === 'builtin' || state === true;
                         const isUnavailable = state === 'unavailable';
                         const isInstallingCell = busyKey === `ext-${v}-${extName}` || isInstallingAll;
+                        const extLabel = extName === 'ioncube' ? `ionCube Loader (PHP ${v})` : `php${v}-${extName}`;
+                        const unavailTitle = extName === 'ioncube' && v === '8.0'
+                          ? t('Upstream ionCube skipped PHP 8.0 (supported: PHP 5.6, 7.4, 8.1-8.5)')
+                          : t('Not in the package repository for this version');
                         return (
                           <span role="cell" key={v}>
                             {isInstalled && (
-                              <span className="badge ok" title={state === 'builtin' ? t('Built into PHP') : `php${v}-${extName} installed`}>
+                              <span className="badge ok" title={state === 'builtin' ? t('Built into PHP') : `${extLabel} installed`}>
                                 <Check size={12} />
                               </span>
                             )}
@@ -962,14 +971,14 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                                 type="button"
                                 className="mini secondary php-ext-install"
                                 disabled={isBusy}
-                                title={`${t('Install')} php${v}-${extName}`}
+                                title={`${t('Install')} ${extLabel}`}
                                 onClick={() => handleInstallPhpExt(v, extName)}
                               >
                                 {isInstallingCell ? <RefreshCw size={13} className="spin" /> : <Plus size={14} />}
                               </button>
                             )}
                             {isUnavailable && (
-                              <span className="php-ext-none" title={t('Not in the package repository for this version')}>—</span>
+                              <span className="php-ext-none" title={unavailTitle}>—</span>
                             )}
                           </span>
                         );
@@ -985,8 +994,10 @@ export function CustomBuildPage({ request, isAdmin, loadPhpVersions, loadService
                             {isInstallingAll && <RefreshCw size={12} className="spin" />}
                             {isInstallingAll ? t('Installing...') : t('All versions')}
                           </button>
-                        ) : (
+                        ) : installedCount > 0 ? (
                           <span className="hint" style={{ fontSize: '12px' }}>{t('Installed')}</span>
+                        ) : (
+                          <span className="php-ext-none">—</span>
                         )}
                       </span>
                     </div>

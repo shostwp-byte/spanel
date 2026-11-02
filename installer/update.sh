@@ -1807,6 +1807,9 @@ if [[ -f "$SOURCE_DIR/installer/files/spanel-helper.sh" ]]; then
       echo "  (PHP-FPM and MariaDB tuning unchanged for this release; skipping the retune)"
     fi
     systemctl enable spanel-autotune.service >/dev/null 2>&1 || true
+    log "Ensuring ionCube Loader across installed PHP versions"
+    sudo -u spanel env HOME="$APP_DIR" sudo -n /usr/local/sbin/spanel-helper php-ioncube-sync | sed 's/^/  /' || \
+      echo "  (warning: could not sync ionCube Loader; you can install/repair it later from PHP Settings or CustomBuild)"
     # clamd is only wanted by scan-on-upload, and that is off unless someone
     # turned it on. maldet - which runs every scheduled, on-demand and
     # real-time scan - calls `clamscan` and never opens clamd's socket, so an

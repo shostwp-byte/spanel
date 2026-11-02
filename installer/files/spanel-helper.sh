@@ -116,7 +116,10 @@ SPANEL_PHP_RUN_ROOT="/run/spanel-php"
 SYSTEMD_UNIT_DIR="/etc/systemd/system"
 PHP_ETC_ROOT="/etc/php"
 PHP_LOG_DIR="/var/log/php"
+PHP_CLI_BIN_DIR="/usr/bin"
 PHP_FPM_SBIN_DIR="/usr/sbin"
+IONCUBE_TARGET_DIR="/usr/local/ioncube"
+IONCUBE_CACHE_DIR="/var/cache/spanel/ioncube"
 # Both socket layouts, as they appear in a vhost's fastcgi_pass.
 PHP_FPM_SOCKET_GREP='(/run/php/[A-Za-z0-9._-]+|/run/spanel-php/[a-z0-9_-]+/[A-Za-z0-9._-]+)\.sock'
 MARIADB_TUNING_CONF="/etc/mysql/mariadb.conf.d/90-spanel-tuning.cnf"
@@ -5809,12 +5812,12 @@ maldet_scan_progress() {
   printf 'stage=%s\ntotal=%s\nscanned=%s\n' "$stage" "${total:-0}" "${scanned:-0}"
 }
 
-# The PHP extensions the panel offers to install, one apt package each
-# (php<version>-<name>). The list is the boundary, not a convenience: the same
-# repository carries php<v>-cgi and libapache2-mod-php<v>, which bring Apache
-# and a second web server onto the ports nginx owns. backend/app/services/php.py
-# keeps the same list for the page; a test holds the two together.
-PHP_EXTENSION_WHITELIST=(apcu bcmath bz2 curl enchant gd gmp igbinary imagick imap intl ldap mailparse mbstring memcached mongodb msgpack mysql opcache pgsql redis soap sqlite3 ssh2 tidy uuid xml xsl yaml zip)
+# The PHP extensions the panel offers to install. Standard entries map to one
+# apt package each (php<version>-<name>); "ioncube" is installed from the
+# official ionCube Loader binary bundle. The list is the security boundary:
+# backend/app/services/php.py keeps the same list; a test holds the two together.
+PHP_EXTENSION_WHITELIST=(apcu bcmath bz2 curl enchant gd gmp igbinary imagick imap intl ioncube ldap mailparse mbstring memcached mongodb msgpack mysql opcache pgsql redis soap sqlite3 ssh2 tidy uuid xml xsl yaml zip)
+IONCUBE_SUPPORTED_VERSIONS=(5.6 7.4 8.1 8.2 8.3 8.4 8.5)
 
 install_php_extension() {
   # install_php_extension <version> <extension>
@@ -5822,7 +5825,18 @@ install_php_extension() {
   require_php_version "$version"
   [[ "$ext" =~ ^[a-z0-9]{2,20}$ ]] || deny "invalid PHP extension name"
   [[ " ${PHP_EXTENSION_WHITELIST[*]} " == *" ${ext} "* ]] || deny "PHP extension not offered by the panel: $ext"
-  [[ -f "/etc/php/${version}/fpm/php-fpm.conf" ]] || deny "PHP ${version} is not installed"
+  [[ -f "${PHP_ETC_ROOT}/${version}/fpm/php-fpm.conf" ]] || deny "PHP ${version} is not installed"
+  if [[ "$ext" == "ioncube" ]]; then
+    install_ioncube_loader "$version" strict
+    if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
+      systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm"
+    else
+      systemctl start "php${version}-fpm" 2>/dev/null || true
+    fi
+    reload_user_php_fpm_masters "$version"
+    echo "ionCube Loader is ready; php${version}-fpm reloaded."
+    return 0
+  fi
   local pkg="php${version}-${ext}"
   export DEBIAN_FRONTEND=noninteractive
   if pkg_installed "$pkg"; then
@@ -5855,7 +5869,7 @@ install_php_version() {
   local version="$1"
   export DEBIAN_FRONTEND=noninteractive
   require_php_version "$version"
-  if [[ -f /etc/php/"$version"/fpm/php-fpm.conf ]]; then
+  if [[ -f "${PHP_ETC_ROOT}/${version}/fpm/php-fpm.conf" ]]; then
     echo "PHP $version is already installed; ensuring SPanel extension set..."
   fi
   if ! apt-cache show "php${version}-fpm" >/dev/null 2>&1; then
@@ -5898,14 +5912,15 @@ install_php_version() {
   fi
   [[ ${#available_packages[@]} -gt 0 ]] || deny "No package found for PHP ${version}"
   apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y "${available_packages[@]}" || { echo "Failed to install PHP $version"; return 1; }
-  install_ioncube_loader "$version"
-  # Enable and start/reload PHP-FPM
+  install_ioncube_loader "$version" best_effort
+  # Enable and start/reload PHP-FPM and any per-account PHP-FPM masters
   systemctl enable "php${version}-fpm" 2>/dev/null || true
   if systemctl is-active --quiet "php${version}-fpm" 2>/dev/null; then
     "php-fpm${version}" -t >/dev/null 2>&1 && systemctl reload "php${version}-fpm" 2>/dev/null || systemctl restart "php${version}-fpm" 2>/dev/null || true
   else
     systemctl start "php${version}-fpm" 2>/dev/null || true
   fi
+  reload_user_php_fpm_masters "$version"
   echo "PHP $version installed successfully"
 }
 
@@ -5913,7 +5928,7 @@ upgrade_php_version() {
   local version="$1"
   export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
   require_php_version "$version"
-  [[ -f "/etc/php/${version}/fpm/php-fpm.conf" ]] || deny "PHP ${version} is not installed"
+  [[ -f "${PHP_ETC_ROOT}/${version}/fpm/php-fpm.conf" ]] || deny "PHP ${version} is not installed"
   apt-get update --allow-releaseinfo-change -qq >/dev/null 2>&1 || true
   local installed_pkgs=() pkg
   while IFS= read -r pkg; do
@@ -5924,6 +5939,7 @@ upgrade_php_version() {
     apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install --only-upgrade -y "${installed_pkgs[@]}" || \
       deny "Failed to upgrade PHP ${version} packages"
   fi
+  install_ioncube_loader "$version" best_effort
   if command -v "php-fpm${version}" >/dev/null 2>&1; then
     "php-fpm${version}" -t >/dev/null 2>&1 || deny "php-fpm${version} configuration test failed after upgrade"
   fi
@@ -5993,12 +6009,12 @@ uninstall_php_version() {
   if [[ "$version" == "8.4" ]]; then
     deny "cannot uninstall default PHP version 8.4"
   fi
-  if [[ ! -f /etc/php/"$version"/fpm/php-fpm.conf ]] && ! dpkg -l "php${version}-*" >/dev/null 2>&1; then
+  if [[ ! -f "${PHP_ETC_ROOT}/${version}/fpm/php-fpm.conf" ]] && ! dpkg -l "php${version}-*" >/dev/null 2>&1; then
     echo "PHP $version is not installed; nothing to remove."
     return 0
   fi
   shopt -s nullglob
-  local pools=(/etc/php/"$version"/fpm/pool.d/spanel-*.conf "$SPANEL_PHP_FPM_ROOT/$version"/*/pool.d/spanel-*.conf)
+  local pools=("${PHP_ETC_ROOT}/${version}"/fpm/pool.d/spanel-*.conf "$SPANEL_PHP_FPM_ROOT/$version"/*/pool.d/spanel-*.conf)
   shopt -u nullglob
   if [[ ${#pools[@]} -gt 0 ]]; then
     deny "cannot uninstall PHP ${version}: ${#pools[@]} website pool(s) still use this PHP version"
@@ -6022,62 +6038,317 @@ uninstall_php_version() {
   if [[ ${#installed_pkgs[@]} -gt 0 ]]; then
     apt-get remove --purge -y "${installed_pkgs[@]}" || deny "Failed to uninstall PHP $version"
   fi
-  rm -rf "/etc/php/${version}"
+  rm -rf -- "${PHP_ETC_ROOT:?}/${version}"
+  rm -f -- "${IONCUBE_TARGET_DIR}/ioncube_loader_lin_${version}.so" "${IONCUBE_TARGET_DIR}/ioncube_loader_lin_${version}_ts.so"
   echo "PHP $version uninstalled successfully"
 }
 
-install_ioncube_loader() {
-  local version="$1" arch url tmp archive loader target_dir target loader_ini_dir
-  require_php_version "$version"
-  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+ioncube_resolve_arch() {
+  local arch="${SPANEL_HOST_ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
   case "$arch" in
     amd64|x86_64)
-      url="https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_x86-64.tar.gz"
-      ;;
-    *)
-      echo "Skipping ionCube Loader: unsupported architecture ${arch}"
+      IONCUBE_ARCH_KEY="x86-64"
+      IONCUBE_ARCHIVE_URL="https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_x86-64.tar.gz"
       return 0
       ;;
+    arm64|aarch64)
+      IONCUBE_ARCH_KEY="aarch64"
+      IONCUBE_ARCHIVE_URL="https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_aarch64.tar.gz"
+      return 0
+      ;;
+    *)
+      IONCUBE_ARCH_KEY="$arch"
+      IONCUBE_ARCHIVE_URL=""
+      return 1
+      ;;
   esac
+}
 
-  apt-get install -y ca-certificates curl tar >/dev/null
-  tmp="$(mktemp -d)" || deny "cannot create ionCube temporary directory"
-  archive="${tmp}/ioncube_loaders.tar.gz"
-  if ! curl -fsSL --connect-timeout 10 --max-time 300 "$url" -o "$archive"; then
-    rm -rf -- "$tmp"
-    deny "failed to download ionCube Loader"
+resolve_php_cli_bin() {
+  local ver="$1"
+  if [[ -x "${PHP_CLI_BIN_DIR}/php${ver}" ]]; then
+    echo "${PHP_CLI_BIN_DIR}/php${ver}"
+  else
+    command -v "php${ver}" 2>/dev/null || true
   fi
-  if ! tar -xzf "$archive" -C "$tmp"; then
-    rm -rf -- "$tmp"
-    deny "failed to unpack ionCube Loader"
+}
+
+resolve_php_fpm_bin() {
+  local ver="$1"
+  if [[ -x "${PHP_FPM_SBIN_DIR}/php-fpm${ver}" ]]; then
+    echo "${PHP_FPM_SBIN_DIR}/php-fpm${ver}"
+  else
+    command -v "php-fpm${ver}" 2>/dev/null || true
   fi
-  loader="${tmp}/ioncube/ioncube_loader_lin_${version}.so"
-  if [[ ! -f "$loader" ]]; then
-    rm -rf -- "$tmp"
-    echo "Skipping ionCube Loader: no loader found for PHP ${version}"
+}
+
+neutralize_php_tune_jit_for_ioncube() {
+  # PHP 8.1+ refuses to enable OPcache JIT alongside ionCube Loader and emits a
+  # warning on every CLI / worker startup when opcache.jit_buffer_size > 0.
+  local version="$1" tune_file conf_dir tmp
+  for tune_file in "${PHP_ETC_ROOT}/${version}/fpm/conf.d/95-spanel-tune.ini" "${PHP_ETC_ROOT}/${version}/cli/conf.d/95-spanel-tune.ini"; do
+    [[ -f "$tune_file" ]] || continue
+    if ! awk -F= '
+      /^[[:space:]]*opcache\.jit[[:space:]]*=/ {
+        v = tolower($2); gsub(/[[:space:]]/, "", v)
+        if (v != "off" && v != "0" && v != "disable" && v != "disabled") found = 1
+      }
+      /^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=/ {
+        v = tolower($2); gsub(/[[:space:]]/, "", v)
+        if (v != "0" && v != "0m" && v != "0k") found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    ' "$tune_file"; then
+      continue
+    fi
+    conf_dir="$(dirname "$tune_file")"
+    tmp="$(mktemp "${conf_dir}/.95-spanel-tune.ini.XXXXXX")" || continue
+    if awk '
+      /^[[:space:]]*opcache\.jit[[:space:]]*=/ { print "opcache.jit = off"; next }
+      /^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=/ { print "opcache.jit_buffer_size = 0"; next }
+      { print }
+    ' "$tune_file" >"$tmp"; then
+      chmod 0644 "$tmp"
+      [[ "$(id -u)" -eq 0 ]] && chown root:root "$tmp"
+      mv -f -- "$tmp" "$tune_file"
+    else
+      rm -f -- "$tmp"
+    fi
+  done
+}
+
+ensure_ioncube_archive() {
+  # ensure_ioncube_archive <arch_key> <url> <loader_member>
+  local arch_key="$1" url="$2" loader_member="$3" cache_archive tmp_dl
+  if [[ "$(id -u)" -eq 0 ]]; then
+    install -d -o root -g root -m 0755 "$IONCUBE_CACHE_DIR"
+  else
+    install -d -m 0755 "$IONCUBE_CACHE_DIR"
+  fi
+  cache_archive="${IONCUBE_CACHE_DIR}/ioncube_loaders_lin_${arch_key}.tar.gz"
+
+  if [[ -n "$(find "$cache_archive" -maxdepth 0 -type f -size +0c -mmin -720 2>/dev/null || true)" ]] \
+    && tar -tzf "$cache_archive" "$loader_member" >/dev/null 2>&1; then
     return 0
   fi
 
-  target_dir="/usr/local/ioncube"
-  target="${target_dir}/ioncube_loader_lin_${version}.so"
-  install -d -o root -g root -m 0755 "$target_dir"
-  install -m 0644 -o root -g root "$loader" "$target"
-  rm -rf -- "$tmp"
+  _download_ioncube_locked() {
+    if [[ -n "$(find "$cache_archive" -maxdepth 0 -type f -size +0c -mmin -720 2>/dev/null || true)" ]] \
+      && tar -tzf "$cache_archive" "$loader_member" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+      apt-get install -y ca-certificates curl tar >/dev/null
+    fi
+    tmp_dl="${IONCUBE_CACHE_DIR}/.ioncube_${arch_key}.$$.tmp"
+    if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 "$url" -o "$tmp_dl" \
+      && [[ -s "$tmp_dl" ]] \
+      && tar -tzf "$tmp_dl" >/dev/null 2>&1; then
+      chmod 0644 "$tmp_dl"
+      [[ "$(id -u)" -eq 0 ]] && chown root:root "$tmp_dl"
+      mv -f -- "$tmp_dl" "$cache_archive"
+      return 0
+    fi
+    rm -f -- "$tmp_dl"
+    if [[ -s "$cache_archive" ]] && tar -tzf "$cache_archive" "$loader_member" >/dev/null 2>&1; then
+      echo "Warning: using cached ionCube archive after download failure" >&2
+      return 0
+    fi
+    return 1
+  }
 
-  for loader_ini_dir in /etc/php/"$version"/cli/conf.d /etc/php/"$version"/fpm/conf.d; do
-    [[ -d "$loader_ini_dir" ]] || continue
-    printf 'zend_extension=%s\n' "$target" >"${loader_ini_dir}/00-ioncube.ini"
-    chown root:root "${loader_ini_dir}/00-ioncube.ini"
-    chmod 0644 "${loader_ini_dir}/00-ioncube.ini"
-  done
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -w 120 9 || exit 1
+      _download_ioncube_locked
+    ) 9>"${IONCUBE_CACHE_DIR}/.download.lock"
+    return $?
+  fi
+  _download_ioncube_locked
+}
 
-  if command -v "php${version}" >/dev/null 2>&1; then
-    if ! grep -qi 'ionCube' <<<"$("php${version}" -v 2>&1 || true)"; then
-      rm -f /etc/php/"$version"/cli/conf.d/00-ioncube.ini /etc/php/"$version"/fpm/conf.d/00-ioncube.ini
-      deny "ionCube Loader failed to load for PHP ${version}"
+install_ioncube_loader() {
+  # install_ioncube_loader <version> [strict|best_effort]
+  local version="$1" mode="${2:-best_effort}"
+  local cli_bin fpm_bin ts_suffix loader_name loader_member cache_archive
+  local tmp loader target tmp_so loader_ini_dir dup_ini ini_tmp cli_out fpm_out
+  require_php_version "$version"
+
+  if [[ " ${IONCUBE_SUPPORTED_VERSIONS[*]} " != *" ${version} "* ]]; then
+    if [[ "$mode" == "strict" ]]; then
+      deny "ionCube Loader is not available for PHP ${version} (upstream ionCube supports PHP 5.6, 7.4, and 8.1-8.5)"
+    fi
+    echo "Skipping ionCube Loader for PHP ${version}: not released by upstream ionCube"
+    return 0
+  fi
+
+  if ! ioncube_resolve_arch; then
+    if [[ "$mode" == "strict" ]]; then
+      deny "ionCube Loader is not supported on CPU architecture: ${IONCUBE_ARCH_KEY}"
+    fi
+    echo "Skipping ionCube Loader: unsupported architecture ${IONCUBE_ARCH_KEY}"
+    return 0
+  fi
+
+  cli_bin="$(resolve_php_cli_bin "$version")"
+  ts_suffix=""
+  if [[ -n "$cli_bin" ]]; then
+    if [[ "$("$cli_bin" -n -r 'echo PHP_ZTS ? "1" : "0";' 2>/dev/null || echo 0)" == "1" ]]; then
+      ts_suffix="_ts"
     fi
   fi
+  loader_name="ioncube_loader_lin_${version}${ts_suffix}.so"
+  loader_member="ioncube/${loader_name}"
+
+  if ! ensure_ioncube_archive "$IONCUBE_ARCH_KEY" "$IONCUBE_ARCHIVE_URL" "$loader_member"; then
+    if [[ "$mode" == "strict" ]]; then
+      deny "failed to download or verify ionCube Loader archive"
+    fi
+    echo "Warning: skipping ionCube Loader for PHP ${version} (download failed)" >&2
+    return 0
+  fi
+
+  cache_archive="${IONCUBE_CACHE_DIR}/ioncube_loaders_lin_${IONCUBE_ARCH_KEY}.tar.gz"
+  tmp="$(mktemp -d)" || deny "cannot create ionCube temporary directory"
+  if ! tar -xzf "$cache_archive" -C "$tmp" "$loader_member" 2>/dev/null; then
+    rm -rf -- "$tmp"
+    if [[ "$mode" == "strict" ]]; then
+      deny "ionCube archive does not contain ${loader_name}"
+    fi
+    echo "Skipping ionCube Loader: no loader found for PHP ${version}"
+    return 0
+  fi
+  loader="${tmp}/${loader_member}"
+  if [[ ! -s "$loader" ]]; then
+    rm -rf -- "$tmp"
+    if [[ "$mode" == "strict" ]]; then
+      deny "extracted ionCube Loader binary is empty for PHP ${version}"
+    fi
+    echo "Skipping ionCube Loader: empty loader binary for PHP ${version}"
+    return 0
+  fi
+
+  if [[ "$(id -u)" -eq 0 ]]; then
+    install -d -o root -g root -m 0755 "$IONCUBE_TARGET_DIR"
+  else
+    install -d -m 0755 "$IONCUBE_TARGET_DIR"
+  fi
+  target="${IONCUBE_TARGET_DIR}/${loader_name}"
+  tmp_so="${IONCUBE_TARGET_DIR}/.${loader_name}.tmp.$$"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    install -m 0644 -o root -g root "$loader" "$tmp_so"
+  else
+    install -m 0644 "$loader" "$tmp_so"
+  fi
+  mv -f -- "$tmp_so" "$target"
+  rm -rf -- "$tmp"
+
+  shopt -s nullglob
+  for loader_ini_dir in "${PHP_ETC_ROOT}/${version}/cli/conf.d" "${PHP_ETC_ROOT}/${version}/fpm/conf.d"; do
+    [[ -d "$loader_ini_dir" ]] || continue
+    for dup_ini in "${loader_ini_dir}"/*ioncube*.ini; do
+      [[ "$(basename "$dup_ini")" == "00-ioncube.ini" ]] && continue
+      rm -f -- "$dup_ini"
+    done
+    ini_tmp="$(mktemp "${loader_ini_dir}/.00-ioncube.ini.XXXXXX")" || deny "cannot write temporary 00-ioncube.ini"
+    printf 'zend_extension=%s\n' "$target" >"$ini_tmp"
+    chmod 0644 "$ini_tmp"
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "$ini_tmp"
+    mv -f -- "$ini_tmp" "${loader_ini_dir}/00-ioncube.ini"
+  done
+  shopt -u nullglob
+
+  neutralize_php_tune_jit_for_ioncube "$version"
+
+  if [[ -n "$cli_bin" ]]; then
+    cli_out="$(PHP_INI_SCAN_DIR="${PHP_ETC_ROOT}/${version}/cli/conf.d" "$cli_bin" -v 2>&1 || true)"
+    if ! grep -qi 'ioncube' <<<"$cli_out" || grep -qiE 'unable to load|cannot open shared object|undefined symbol|already loaded' <<<"$cli_out"; then
+      rm -f -- "${PHP_ETC_ROOT}/${version}/cli/conf.d/00-ioncube.ini" "${PHP_ETC_ROOT}/${version}/fpm/conf.d/00-ioncube.ini"
+      if [[ "$mode" == "strict" ]]; then
+        deny "ionCube Loader failed CLI validation for PHP ${version}"
+      fi
+      echo "Warning: ionCube Loader failed CLI validation for PHP ${version}; rolled back 00-ioncube.ini" >&2
+      return 0
+    fi
+  fi
+
+  fpm_bin="$(resolve_php_fpm_bin "$version")"
+  if [[ -n "$fpm_bin" && -f "${PHP_ETC_ROOT}/${version}/fpm/php-fpm.conf" ]]; then
+    if ! fpm_out="$(PHP_INI_SCAN_DIR="${PHP_ETC_ROOT}/${version}/fpm/conf.d" "$fpm_bin" -t --fpm-config "${PHP_ETC_ROOT}/${version}/fpm/php-fpm.conf" 2>&1)"; then
+      rm -f -- "${PHP_ETC_ROOT}/${version}/cli/conf.d/00-ioncube.ini" "${PHP_ETC_ROOT}/${version}/fpm/conf.d/00-ioncube.ini"
+      if [[ "$mode" == "strict" ]]; then
+        echo "$fpm_out" | head -n 3 >&2
+        deny "php-fpm${version} configuration test failed with ionCube Loader"
+      fi
+      echo "Warning: php-fpm${version} test failed with ionCube Loader; rolled back 00-ioncube.ini" >&2
+      return 0
+    fi
+  fi
+
   echo "ionCube Loader enabled for PHP ${version}"
+}
+
+ioncube_is_healthy() {
+  local version="$1" fpm_ini cli_ini so_path cli_bin cli_out dup_count
+  fpm_ini="${PHP_ETC_ROOT}/${version}/fpm/conf.d/00-ioncube.ini"
+  cli_ini="${PHP_ETC_ROOT}/${version}/cli/conf.d/00-ioncube.ini"
+  [[ -f "$fpm_ini" && -f "$cli_ini" ]] || return 1
+  so_path="$(awk -F= '/^[[:space:]]*zend_extension[[:space:]]*=/ { gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", $2); print $2; exit }' "$fpm_ini")"
+  [[ -n "$so_path" && -s "$so_path" ]] || return 1
+  shopt -s nullglob
+  local fpm_dups=("${PHP_ETC_ROOT}/${version}/fpm/conf.d"/*ioncube*.ini)
+  local cli_dups=("${PHP_ETC_ROOT}/${version}/cli/conf.d"/*ioncube*.ini)
+  shopt -u nullglob
+  dup_count=$(( ${#fpm_dups[@]} + ${#cli_dups[@]} ))
+  (( dup_count == 2 )) || return 1
+  if [[ -f "${PHP_ETC_ROOT}/${version}/fpm/conf.d/95-spanel-tune.ini" ]]; then
+    if awk -F= '
+      /^[[:space:]]*opcache\.jit[[:space:]]*=/ {
+        v = tolower($2); gsub(/[[:space:]]/, "", v)
+        if (v != "off" && v != "0" && v != "disable" && v != "disabled") found = 1
+      }
+      /^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=/ {
+        v = tolower($2); gsub(/[[:space:]]/, "", v)
+        if (v != "0" && v != "0m" && v != "0k") found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    ' "${PHP_ETC_ROOT}/${version}/fpm/conf.d/95-spanel-tune.ini"; then
+      return 1
+    fi
+  fi
+  cli_bin="$(resolve_php_cli_bin "$version")"
+  if [[ -n "$cli_bin" ]]; then
+    cli_out="$(PHP_INI_SCAN_DIR="${PHP_ETC_ROOT}/${version}/cli/conf.d" "$cli_bin" -v 2>&1 || true)"
+    grep -qi 'ioncube' <<<"$cli_out" || return 1
+    ! grep -qiE 'unable to load|cannot open shared object|undefined symbol|already loaded|jit is incompatible' <<<"$cli_out" || return 1
+  fi
+  return 0
+}
+
+sync_ioncube_loaders() {
+  # Backfill or repair ionCube Loader across every installed supported PHP
+  # version without re-downloading when already healthy.
+  if ! ioncube_resolve_arch; then
+    echo "Skipping ionCube sync: unsupported architecture ${IONCUBE_ARCH_KEY}"
+    return 0
+  fi
+  local ver synced=0 already_ok=0
+  for ver in "${IONCUBE_SUPPORTED_VERSIONS[@]}"; do
+    [[ -f "${PHP_ETC_ROOT}/${ver}/fpm/php-fpm.conf" ]] || continue
+    if ioncube_is_healthy "$ver"; then
+      already_ok=$((already_ok + 1))
+      continue
+    fi
+    install_ioncube_loader "$ver" best_effort
+    if [[ -f "${PHP_ETC_ROOT}/${ver}/fpm/conf.d/00-ioncube.ini" ]]; then
+      if systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+        systemctl reload "php${ver}-fpm" 2>/dev/null || systemctl restart "php${ver}-fpm" 2>/dev/null || true
+      fi
+      reload_user_php_fpm_masters "$ver"
+      synced=$((synced + 1))
+    fi
+  done
+  echo "ionCube sync complete: ${synced} enabled/repaired, ${already_ok} already healthy."
 }
 
 validate_php_config_file() {
@@ -11083,6 +11354,11 @@ case "$cmd" in
   php-ext-install)
     [[ $# -eq 2 ]] || deny "usage: php-ext-install <version> <extension>"
     install_php_extension "$1" "$2"
+    ;;
+
+  php-ioncube-sync)
+    [[ $# -eq 0 ]] || deny "usage: php-ioncube-sync"
+    sync_ioncube_loaders
     ;;
 
   php-opcache-set)

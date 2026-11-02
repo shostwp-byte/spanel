@@ -282,20 +282,24 @@ export function PhpConfigPage({ request, isAdmin, loadServiceNames, loadPhpVersi
                 {phpExtensions.versions.map(v => {
                   const state = ext.versions[v];
                   const isInstallingCell = busyAction === `ext-${v}-${ext.name}` || isInstallingAll;
+                  const extLabel = ext.name === 'ioncube' ? `ionCube Loader (PHP ${v})` : `php${v}-${ext.name}`;
+                  const unavailTitle = ext.name === 'ioncube' && v === '8.0'
+                    ? t('Upstream ionCube skipped PHP 8.0 (supported: PHP 5.6, 7.4, 8.1-8.5)')
+                    : t('Not in the package repository for this version');
                   return <span role="cell" key={v}>
-                    {(state === 'installed' || state === 'builtin') && <span className="badge ok" title={state === 'builtin' ? t('Built into PHP') : t('Installed')}><Check size={12}/></span>}
+                    {(state === 'installed' || state === 'builtin') && <span className="badge ok" title={state === 'builtin' ? t('Built into PHP') : `${extLabel} — ${t('Installed')}`}><Check size={12}/></span>}
                     {state === 'available' && (
                       <button
                         className="mini secondary php-ext-install"
                         disabled={isBusy}
-                        aria-label={`${t('Install')} php${v}-${ext.name}`}
-                        title={`${t('Install')} php${v}-${ext.name}`}
+                        aria-label={`${t('Install')} ${extLabel}`}
+                        title={`${t('Install')} ${extLabel}`}
                         onClick={() => installPhpExtension(ext.name, [v])}
                       >
                         {isInstallingCell ? <RefreshCw size={13} className="spin" /> : <Plus size={14}/>}
                       </button>
                     )}
-                    {state === 'unavailable' && <span className="php-ext-none" title={t('Not in the package repository for this version')}>—</span>}
+                    {state === 'unavailable' && <span className="php-ext-none" title={unavailTitle}>—</span>}
                   </span>;
                 })}
                 <span role="cell" className="php-ext-all">
