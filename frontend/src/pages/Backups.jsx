@@ -10,6 +10,7 @@ import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 import { WebsiteSelect } from '../components/WebsiteSelect.jsx';
 import { ServerBackupTab } from '../components/ServerBackupTab.jsx';
+import { PasswordField, PasswordResultBox, CopyPasswordButton, generateStrongPassword } from '../components/PasswordField.jsx';
 import { formatBytes, BACKUP_SCHEDULE_PRESETS, isPresetSchedule } from '../utils/helpers.js';
 
 const S3_PRESETS = [
@@ -59,6 +60,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
   const [siteRestoreMode, setSiteRestoreMode] = useState('full');
   const [siteBackupPassphrase, setSiteBackupPassphrase] = useState('');
   const [lastRestoredUserCredentials, setLastRestoredUserCredentials] = useState(null);
+  const [backupSecretBanner, setBackupSecretBanner] = useState(null);
+  const [encryptModalTarget, setEncryptModalTarget] = useState(null);
 
   // Schedule Builder / Editor state
   const [editingScheduleId, setEditingScheduleId] = useState(null);
@@ -218,7 +221,8 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
 
   async function createBackup() {
     if (!selectedWebsiteId) return;
-    if (siteBackupPassphrase && siteBackupPassphrase.trim().length > 0 && siteBackupPassphrase.trim().length < 12) {
+    const usedPassphrase = siteBackupPassphrase.trim();
+    if (usedPassphrase.length > 0 && usedPassphrase.length < 12) {
       setError('Mật khẩu mã hóa AES-256 phải có tối thiểu 12 ký tự.');
       return;
     }
@@ -230,11 +234,23 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         body: JSON.stringify({
           website_id: Number(selectedWebsiteId),
           backup_mode: siteBackupMode,
-          passphrase: siteBackupPassphrase.trim() || undefined,
+          passphrase: usedPassphrase || undefined,
         }),
       });
-      queueBackupJob(data, t('websiteBackupRunningInBackground'));
-      setSiteBackupPassphrase('');
+      if (data) {
+        queueBackupJob(data, t('websiteBackupRunningInBackground'));
+        if (usedPassphrase) {
+          const siteObj = (websites || []).find((w) => String(w.id) === String(selectedWebsiteId));
+          setBackupSecretBanner({
+            title: t('Backup encryption passphrase ready'),
+            items: [
+              { label: 'Website', value: siteObj?.domain || String(selectedWebsiteId), copyable: false },
+              { label: t('Encryption passphrase'), value: usedPassphrase },
+            ],
+          });
+        }
+        setSiteBackupPassphrase('');
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -354,11 +370,21 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
     }
   }
 
-  async function encryptBackupArchiveItem(backupFile, websiteId = null) {
+  function encryptBackupArchiveItem(backupFile, websiteId = null) {
     if (!backupFile) return;
-    const passphrase = window.prompt('Nhập mật khẩu mã hóa AES-256-CBC + HMAC-SHA256 (tối thiểu 12 ký tự):');
-    if (!passphrase) return;
-    if (passphrase.trim().length < 12) {
+    setEncryptModalTarget({
+      backupFile,
+      websiteId,
+      passphrase: generateStrongPassword(20),
+    });
+  }
+
+  async function submitEncryptBackupArchive(e) {
+    if (e) e.preventDefault();
+    if (!encryptModalTarget?.backupFile) return;
+    const { backupFile, websiteId, passphrase } = encryptModalTarget;
+    const trimmedPassphrase = String(passphrase || '').trim();
+    if (trimmedPassphrase.length < 12) {
       setError('Mật khẩu mã hóa AES-256 phải có tối thiểu 12 ký tự.');
       return;
     }
@@ -370,12 +396,22 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         body: JSON.stringify({
           backup_file: backupFile,
           website_id: websiteId ? Number(websiteId) : null,
-          passphrase: passphrase.trim(),
+          passphrase: trimmedPassphrase,
         }),
       });
-      if (websiteId) await loadBackups(websiteId);
-      else await loadUserBackups();
-      setNotice(`Đã mã hóa AES-256-CBC + HMAC-SHA256 cho ${res?.filename || backupFile}.`);
+      if (res) {
+        if (websiteId) await loadBackups(websiteId);
+        else await loadUserBackups();
+        setEncryptModalTarget(null);
+        setBackupSecretBanner({
+          title: t('Backup encryption passphrase ready'),
+          items: [
+            { label: 'File', value: res?.filename || backupFile, noticeMessage: false },
+            { label: t('Encryption passphrase'), value: trimmedPassphrase },
+          ],
+        });
+        setNotice(`Đã mã hóa AES-256-CBC + HMAC-SHA256 cho ${res?.filename || backupFile}.`);
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -938,6 +974,14 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
         )}
       </div>
 
+      {backupSecretBanner && (
+        <PasswordResultBox
+          title={backupSecretBanner.title}
+          items={backupSecretBanner.items}
+          onDismiss={() => setBackupSecretBanner(null)}
+        />
+      )}
+
       {/* =====================================================================
           TAB 1: USER BACKUPS (Full Account Backup)
          ===================================================================== */}
@@ -1026,16 +1070,12 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   <strong>Tài khoản mới được khôi phục:</strong> <code>{lastRestoredUserCredentials.username}</code> ·
                   Mật khẩu tạm thời: <code style={{ fontWeight: 700, color: 'var(--accent-primary)' }}>{lastRestoredUserCredentials.password}</code>
                 </div>
-                <button
-                  type="button"
-                  className="secondary-light"
-                  onClick={() => {
-                    navigator.clipboard?.writeText(lastRestoredUserCredentials.password);
-                    setNotice('Đã sao chép mật khẩu vào bộ nhớ tạm.');
-                  }}
-                >
-                  <Copy size={14} /> Sao chép mật khẩu
-                </button>
+                <CopyPasswordButton
+                  value={lastRestoredUserCredentials.password}
+                  label="Sao chép mật khẩu"
+                  className="secondary-light sp-copy-btn"
+                  size={14}
+                />
               </div>
             )}
           </div>
@@ -1288,14 +1328,18 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
                   <option value="full">Full Backup (Đầy đủ)</option>
                   <option value="incremental">Incremental (Gia tăng)</option>
                 </select>
-                <input
-                  type="password"
-                  value={siteBackupPassphrase}
-                  onChange={(e) => setSiteBackupPassphrase(e.target.value)}
-                  placeholder="Mật khẩu AES-256 (≥12 ký tự, tùy chọn)"
-                  style={{ height: '38px', width: '240px', fontSize: '0.82rem' }}
+                <div
+                  style={{ width: '320px', maxWidth: '100%' }}
                   title="Nếu nhập mật khẩu (tối thiểu 12 ký tự), bản sao lưu sẽ được mã hóa AES-256-CBC + HMAC-SHA256"
-                />
+                >
+                  <PasswordField
+                    value={siteBackupPassphrase}
+                    onChange={(e) => setSiteBackupPassphrase(e.target.value)}
+                    placeholder="Mật khẩu AES-256 (≥12 ký tự, tùy chọn)"
+                    inputStyle={{ height: '38px', fontSize: '0.82rem' }}
+                    compact
+                  />
+                </div>
                 <label className="button secondary-light" style={{ margin: 0, cursor: selectedWebsiteId ? 'pointer' : 'not-allowed', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                   <Upload size={15} /> Tải lên file .tar.gz
                   <input type="file" accept=".tar.gz,application/gzip" onChange={uploadBackupArchive} hidden disabled={loading || !selectedWebsiteId} />
@@ -2517,6 +2561,45 @@ export function BackupsPage({ request, isAdmin, isReseller, API }) {
           </div>
         );
       })()}
+      {encryptModalTarget && (
+        <div className="modal-overlay" onClick={() => setEncryptModalTarget(null)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>{t('Encrypt backup archive (AES-256)')}</h3>
+              <button type="button" className="secondary-light mini" onClick={() => setEncryptModalTarget(null)} aria-label={t('Close')}>
+                <X size={14} />
+              </button>
+            </div>
+            <form onSubmit={submitEncryptBackupArchive}>
+              <div className="modal-body" style={{ display: 'grid', gap: '12px' }}>
+                <div className="hint">
+                  File: <code>{encryptModalTarget.backupFile}</code>
+                </div>
+                <label className="field">
+                  <span className="field-label">{t('Encryption passphrase')}</span>
+                  <PasswordField
+                    value={encryptModalTarget.passphrase}
+                    onChange={(e) => setEncryptModalTarget((prev) => ({ ...prev, passphrase: e.target.value }))}
+                    placeholder="Tối thiểu 12 ký tự..."
+                    defaultRevealed
+                  />
+                </label>
+                <p className="hint">
+                  Bản sao lưu sẽ được mã hóa chuẩn AES-256-CBC + HMAC-SHA256. Hãy lưu lại mật khẩu này để giải mã khi khôi phục.
+                </p>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="secondary-light" onClick={() => setEncryptModalTarget(null)}>
+                  {t('Cancel')}
+                </button>
+                <button type="submit" disabled={!!loading || String(encryptModalTarget.passphrase || '').trim().length < 12}>
+                  <KeyRound size={14} /> Mã hóa ngay
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

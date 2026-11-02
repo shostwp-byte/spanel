@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Eye, EyeOff, Dices, HelpCircle } from 'lucide-react';
+import { HelpCircle } from 'lucide-react';
+import { PasswordField, PasswordResultBox } from '../components/PasswordField.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
@@ -14,18 +15,8 @@ export function ChangePasswords({ request }) {
   
   const [selectedUserId, setSelectedUserId] = useState('');
   const [newPassword, setNewPassword] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
+  const [updatedCreds, setUpdatedCreds] = useState(null);
   const [loading, setLoading] = useState(false);
-
-  const generatePassword = () => {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?';
-    let pass = '';
-    for (let i = 0; i < 16; i++) {
-      pass += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    setNewPassword(pass);
-    setShowPassword(true);
-  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -36,24 +27,33 @@ export function ChangePasswords({ request }) {
       return setError(t('Password must be at least 12 characters.'));
     }
 
+    const targetUser = manageableUsers.find(u => String(u.id) === String(selectedUserId));
+    const submittedPassword = newPassword;
+
     setLoading(true);
     let successCount = 0;
 
     try {
       const res1 = await request(`/users/${selectedUserId}/password`, {
         method: 'POST',
-        body: JSON.stringify({ password: newPassword })
+        body: JSON.stringify({ password: submittedPassword })
       }, t('Changing panel password...'));
       if (res1) successCount++;
       
       const res2 = await request(`/users/${selectedUserId}/sftp-password`, {
         method: 'POST',
-        body: JSON.stringify({ password: newPassword })
+        body: JSON.stringify({ password: submittedPassword })
       }, t('Changing SFTP password...'));
       if (res2) successCount++;
 
       if (successCount > 0) {
         setNotice(t('Passwords updated successfully.'));
+        setUpdatedCreds({
+          username: targetUser?.username || String(selectedUserId),
+          password: submittedPassword,
+          panelOk: !!res1,
+          sftpOk: !!res2,
+        });
         setNewPassword('');
         setSelectedUserId('');
       }
@@ -98,33 +98,11 @@ export function ChangePasswords({ request }) {
               {t('Enter Password:')}
             </div>
             <div className="resp-form-control">
-              <div style={{ display: 'flex', width: '100%', border: '1px solid var(--border)', borderRadius: '4px', overflow: 'hidden', background: 'var(--surface)' }}>
-                <button 
-                  type="button" 
-                  onClick={generatePassword}
-                  style={{ background: 'var(--surface)', border: 'none', borderRight: '1px solid var(--border)', padding: '0 15px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#3b82f6' }}
-                  title={t('Generate random password')}
-                >
-                  <Dices size={18} />
-                </button>
-                
-                <input 
-                  type={showPassword ? "text" : "password"} 
-                  value={newPassword}
-                  onChange={e => setNewPassword(e.target.value)}
-                  style={{ flex: 1, minWidth: 0, border: 'none', padding: '10px 15px', fontSize: '14px', outline: 'none', color: 'var(--text)', background: 'var(--surface)' }}
-                  placeholder="********"
-                />
-
-                <button 
-                  type="button" 
-                  onClick={() => setShowPassword(!showPassword)}
-                  style={{ background: 'var(--surface)', border: 'none', borderLeft: '1px solid var(--border)', padding: '0 15px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: 'var(--text-muted)' }}
-                  title={t('Toggle visibility')}
-                >
-                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
-                </button>
-              </div>
+              <PasswordField
+                value={newPassword}
+                onChange={e => setNewPassword(e.target.value)}
+                placeholder={t('Min 12 characters')}
+              />
             </div>
           </div>
 
@@ -140,6 +118,22 @@ export function ChangePasswords({ request }) {
 
         </form>
       </div>
+
+      {updatedCreds && (
+        <PasswordResultBox
+          title={`${t('Password updated')} — ${updatedCreds.username}`}
+          items={[
+            { label: t('Username'), value: updatedCreds.username, noticeMessage: t('Copied username.') },
+            {
+              label: updatedCreds.panelOk && updatedCreds.sftpOk
+                ? `${t('Panel password')} & SFTP`
+                : t('New password'),
+              value: updatedCreds.password,
+            },
+          ]}
+          onDismiss={() => setUpdatedCreds(null)}
+        />
+      )}
     </div>
   );
 }

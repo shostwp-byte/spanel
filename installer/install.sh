@@ -290,11 +290,21 @@ NODE
 }
 
 install_ioncube_loader() {
-  local version="$1" arch url tmp archive loader target_dir target loader_ini_dir
+  local version="$1" arch arch_key url cache_dir cache_archive tmp_dl tmp
+  local ts_suffix="" loader_name loader_member loader target_dir target tmp_so loader_ini_dir ini_tmp cli_out
+  if [[ "$version" == "8.0" ]]; then
+    echo "Skipping ionCube Loader for PHP 8.0 (not released by upstream ionCube)"
+    return 0
+  fi
   arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
   case "$arch" in
     amd64|x86_64)
+      arch_key="x86-64"
       url="https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_x86-64.tar.gz"
+      ;;
+    arm64|aarch64)
+      arch_key="aarch64"
+      url="https://downloads.ioncube.com/loader_downloads/ioncube_loaders_lin_aarch64.tar.gz"
       ;;
     *)
       echo "Skipping ionCube Loader: unsupported architecture ${arch}"
@@ -302,41 +312,76 @@ install_ioncube_loader() {
       ;;
   esac
 
-  apt_get install -y ca-certificates curl tar >/dev/null
+  if command -v "php${version}" >/dev/null 2>&1; then
+    if [[ "$("php${version}" -n -r 'echo PHP_ZTS ? "1" : "0";' 2>/dev/null || echo 0)" == "1" ]]; then
+      ts_suffix="_ts"
+    fi
+  fi
+  loader_name="ioncube_loader_lin_${version}${ts_suffix}.so"
+  loader_member="ioncube/${loader_name}"
+
+  if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+    apt_get install -y ca-certificates curl tar >/dev/null
+  fi
+
+  cache_dir="/var/cache/spanel/ioncube"
+  install -d -o root -g root -m 0755 "$cache_dir"
+  cache_archive="${cache_dir}/ioncube_loaders_lin_${arch_key}.tar.gz"
+  if [[ ! -s "$cache_archive" ]] || ! tar -tzf "$cache_archive" "$loader_member" >/dev/null 2>&1; then
+    tmp_dl="${cache_dir}/.ioncube_${arch_key}.$$.tmp"
+    if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 "$url" -o "$tmp_dl" \
+      || [[ ! -s "$tmp_dl" ]] \
+      || ! tar -tzf "$tmp_dl" >/dev/null 2>&1; then
+      rm -f -- "$tmp_dl"
+      echo "Warning: failed to download ionCube Loader from ${url}; can be installed later from PHP Settings" >&2
+      return 0
+    fi
+    chown root:root "$tmp_dl"
+    chmod 0644 "$tmp_dl"
+    mv -f -- "$tmp_dl" "$cache_archive"
+  fi
+
   tmp="$(mktemp -d)" || fail "Cannot create ionCube temporary directory"
-  archive="${tmp}/ioncube_loaders.tar.gz"
-  if ! curl -fsSL --connect-timeout 10 --max-time 300 "$url" -o "$archive"; then
-    rm -rf -- "$tmp"
-    fail "Failed to download ionCube Loader"
-  fi
-  if ! tar -xzf "$archive" -C "$tmp"; then
-    rm -rf -- "$tmp"
-    fail "Failed to unpack ionCube Loader"
-  fi
-  loader="${tmp}/ioncube/ioncube_loader_lin_${version}.so"
-  if [[ ! -f "$loader" ]]; then
+  if ! tar -xzf "$cache_archive" -C "$tmp" "$loader_member" 2>/dev/null; then
     rm -rf -- "$tmp"
     echo "Skipping ionCube Loader: no loader found for PHP ${version}"
     return 0
   fi
+  loader="${tmp}/${loader_member}"
+  if [[ ! -s "$loader" ]]; then
+    rm -rf -- "$tmp"
+    echo "Skipping ionCube Loader: empty loader binary for PHP ${version}"
+    return 0
+  fi
 
   target_dir="/usr/local/ioncube"
-  target="${target_dir}/ioncube_loader_lin_${version}.so"
+  target="${target_dir}/${loader_name}"
+  tmp_so="${target_dir}/.${loader_name}.tmp.$$"
   install -d -o root -g root -m 0755 "$target_dir"
-  install -m 0644 -o root -g root "$loader" "$target"
+  install -m 0644 -o root -g root "$loader" "$tmp_so"
+  mv -f -- "$tmp_so" "$target"
   rm -rf -- "$tmp"
 
   for loader_ini_dir in /etc/php/"$version"/cli/conf.d /etc/php/"$version"/fpm/conf.d; do
     [[ -d "$loader_ini_dir" ]] || continue
-    printf 'zend_extension=%s\n' "$target" >"${loader_ini_dir}/00-ioncube.ini"
-    chown root:root "${loader_ini_dir}/00-ioncube.ini"
-    chmod 0644 "${loader_ini_dir}/00-ioncube.ini"
+    ini_tmp="$(mktemp "${loader_ini_dir}/.00-ioncube.ini.XXXXXX")" || fail "Cannot write temporary 00-ioncube.ini"
+    printf 'zend_extension=%s\n' "$target" >"$ini_tmp"
+    chown root:root "$ini_tmp"
+    chmod 0644 "$ini_tmp"
+    mv -f -- "$ini_tmp" "${loader_ini_dir}/00-ioncube.ini"
   done
 
   if command -v "php${version}" >/dev/null 2>&1; then
-    if ! "php${version}" -v 2>&1 | grep -qi 'ionCube'; then
+    cli_out="$("php${version}" -v 2>&1 || true)"
+    if ! grep -qi 'ioncube' <<<"$cli_out" || grep -qiE 'unable to load|cannot open shared object|undefined symbol' <<<"$cli_out"; then
       rm -f /etc/php/"$version"/cli/conf.d/00-ioncube.ini /etc/php/"$version"/fpm/conf.d/00-ioncube.ini
-      fail "ionCube Loader failed to load for PHP ${version}"
+      fail "ionCube Loader failed CLI validation for PHP ${version}"
+    fi
+  fi
+  if command -v "php-fpm${version}" >/dev/null 2>&1 && [[ -f "/etc/php/${version}/fpm/php-fpm.conf" ]]; then
+    if ! "php-fpm${version}" -t >/dev/null 2>&1; then
+      rm -f /etc/php/"$version"/cli/conf.d/00-ioncube.ini /etc/php/"$version"/fpm/conf.d/00-ioncube.ini
+      fail "php-fpm${version} configuration test failed with ionCube Loader"
     fi
   fi
   echo "ionCube Loader enabled for PHP ${version}"

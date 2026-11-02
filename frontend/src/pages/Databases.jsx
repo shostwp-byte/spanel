@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
+import { PasswordField, PasswordResultBox } from '../components/PasswordField.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 import { NoAutofillInput } from '../components/NoAutofillInput.jsx';
@@ -18,6 +19,7 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
   const [dbHosts, setDbHosts] = useState([]);
   const [createdDbInfo, setCreatedDbInfo] = useState(null);
   const [tableModal, setTableModal] = useState(null);
+  const [pwModalDb, setPwModalDb] = useState(null);
 
   const userPkg = React.useMemo(
     () => (packages || []).find(p => p.id === currentUser?.package_id || (currentUser?.package_name && p.name === currentUser.package_name)),
@@ -64,10 +66,39 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
     if (data) setDatabases(data);
   }
 
-  async function changeDbPassword(id) {
-    const newPass = prompt('Enter a new database password, minimum 12 characters:');
-    if (!newPass) return;
-    await request(`/databases/${id}/password`, { method: 'POST', body: JSON.stringify({ password: newPass }) }, t('Changing database password...'));
+  function changeDbPassword(db) {
+    setPwModalDb({ db, password: generateRandomPassword(20) });
+  }
+
+  async function submitChangeDbPassword(e) {
+    if (e) e.preventDefault();
+    if (!pwModalDb?.db) return;
+    const newPass = String(pwModalDb.password || '').trim();
+    if (newPass.length < 12) {
+      setError(t('Password must be at least 12 characters.'));
+      return;
+    }
+    if (/[^\x20-\x7E]/.test(newPass)) {
+      setError(t('Password contains invalid characters. Use only ASCII characters.'));
+      return;
+    }
+    const targetDb = pwModalDb.db;
+    const data = await request(
+      `/databases/${targetDb.id}/password`,
+      { method: 'POST', body: JSON.stringify({ password: newPass }) },
+      t('Changing database password...')
+    );
+    if (data) {
+      setPwModalDb(null);
+      setCreatedDbInfo({
+        isReset: true,
+        db_name: targetDb.db_name,
+        db_user: targetDb.db_user,
+        db_password: newPass,
+        db_host_address: targetDb.db_host_address || 'localhost',
+      });
+      setNotice(data.message || t('Database password updated'));
+    }
   }
 
   async function deleteDatabase(id, dbName) {
@@ -190,12 +221,17 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
           <strong>{t('Create database')}</strong>
           {databases.length > 0 && <button type="button" className="secondary icon-only mini" onClick={() => setDbCreateOpen(false)} aria-label={t('Close')} title={t('Close')}><X size={15}/></button>}
         </div>
-        <div className="form-row">
+        <div className={`db-create-row${dbHosts.length > 1 ? ' with-host' : ''}`}>
           <input name="new-db-name" autoComplete="off" value={newDatabase.db_name} onChange={e => setNewDatabase(prev => ({ ...prev, db_name: e.target.value }))} placeholder="database_name" />
           <input name="new-db-user" autoComplete="off" value={newDatabase.db_user} onChange={e => setNewDatabase(prev => ({ ...prev, db_user: e.target.value }))} placeholder={t('db_user (default = db_name)')} />
           {/* new-password, or the browser offers the panel's own password here. */}
-          <input name="new-db-password" autoComplete="new-password" value={newDatabase.db_password} onChange={e => setNewDatabase(prev => ({ ...prev, db_password: e.target.value }))} placeholder={t('password (min 12 chars)')} />
-          <button type="button" className="mini secondary-light" title={t('Generate random password')} onClick={() => setNewDatabase(prev => ({ ...prev, db_password: generateRandomPassword() }))}><Dices size={13}/></button>
+          <PasswordField
+            name="new-db-password"
+            value={newDatabase.db_password}
+            onChange={e => setNewDatabase(prev => ({ ...prev, db_password: e.target.value }))}
+            placeholder={t('password (min 12 chars)')}
+            compact
+          />
           {dbHosts.length > 1 && (
             <select name="new-db-host" value={newDatabase.db_host_id} onChange={e => setNewDatabase(prev => ({ ...prev, db_host_id: e.target.value }))} aria-label={t('Database server')} title={t('Database server')}>
               {dbHosts.map(h => <option key={h.id ?? 'local'} value={h.id ?? ''}>{h.id == null ? t('This server (localhost)') : `${h.name} (${h.address})`}</option>)}
@@ -221,15 +257,18 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
             : t('{count} databases', { count: databases.length })}
         </span>
       </div>
-      {createdDbInfo && <div className="info-box db-created-box">
-        <div className="db-created-head"><strong>{t('Database created successfully')}</strong><button className="mini secondary-light" onClick={() => setCreatedDbInfo(null)}><X size={13}/></button></div>
-        <div className="db-created-grid">
-          <label>{t('Database')}</label><span>{createdDbInfo.db_name} <button className="mini secondary-light" title={copiedField === 'db_name' ? 'Copied!' : 'Copy'} onClick={() => copyToClipboard(createdDbInfo.db_name, 'db_name')}>{copiedField === 'db_name' ? <Check size={12} style={{color:'var(--green)'}}/> : <Copy size={12}/>}</button></span>
-          <label>{t('User')}</label><span>{createdDbInfo.db_user} <button className="mini secondary-light" title={copiedField === 'db_user' ? 'Copied!' : 'Copy'} onClick={() => copyToClipboard(createdDbInfo.db_user, 'db_user')}>{copiedField === 'db_user' ? <Check size={12} style={{color:'var(--green)'}}/> : <Copy size={12}/>}</button></span>
-          <label>{t('Host')}</label><span><code>{createdDbInfo.db_host_address}</code></span>
-          <label>{t('Password')}</label><span><code>{createdDbInfo.db_password}</code> <button className="mini secondary-light" title={copiedField === 'db_password' ? 'Copied!' : 'Copy'} onClick={() => copyToClipboard(createdDbInfo.db_password, 'db_password')}>{copiedField === 'db_password' ? <Check size={12} style={{color:'var(--green)'}}/> : <Copy size={12}/>}</button></span>
-        </div>
-      </div>}
+      {createdDbInfo && (
+        <PasswordResultBox
+          title={createdDbInfo.isReset ? t('Database password updated') : t('Database created successfully')}
+          items={[
+            { label: t('Database'), value: createdDbInfo.db_name, noticeMessage: false },
+            { label: t('User'), value: createdDbInfo.db_user, noticeMessage: t('Copied username.') },
+            { label: t('Host'), value: createdDbInfo.db_host_address, copyable: false },
+            { label: t('Password'), value: createdDbInfo.db_password },
+          ]}
+          onDismiss={() => setCreatedDbInfo(null)}
+        />
+      )}
       {databases.length === 0 && !createdDbInfo && <EmptyState icon={Database} message={dbSearchActive ? 'No databases match this search.' : 'No databases found.'} />}
       <div className="table">
         {databases.map(db => {
@@ -259,12 +298,43 @@ export function DatabasesPage({ request, API, navigateToPage, refreshAll }) {
             <button className="mini secondary-light icon-only" disabled={!!loading} onClick={() => handleInspectDbTables(db)} title={t('Inspect table sizes')}><Eye size={14}/></button>
             <button className="mini secondary-light icon-only" disabled={!!loading} onClick={() => handleOptimizeDb(db)} title={t('Optimize database tables')}><RotateCcw size={14}/></button>
             <button className="mini secondary-light icon-only" disabled={!!loading} onClick={() => downloadDatabase(db.id, db.db_name)} title={t('Download SQL dump')} aria-label={`${t('Download SQL dump')} ${db.db_name}`}><Download size={14}/></button>
-            <button className="mini secondary-light icon-only" disabled={!!loading} onClick={() => changeDbPassword(db.id)} title={t('Change password')} aria-label={`${t('Change password')} ${db.db_name}`}><KeyRound size={14}/></button>
+            <button className="mini secondary-light icon-only" disabled={!!loading} onClick={() => changeDbPassword(db)} title={t('Change password')} aria-label={`${t('Change password')} ${db.db_name}`}><KeyRound size={14}/></button>
             <button className="mini danger icon-only" disabled={!!loading} onClick={() => deleteDatabase(db.id, db.db_name)} title={t('Delete')} aria-label={`${t('Delete')} ${db.db_name}`}><Trash2 size={14}/></button>
           </span>
         </div>})}
       </div>
       <p className="hint">{t('Click phpMyAdmin to sign in directly. Token expires after 60s.')}</p>
+      {pwModalDb && (
+        <div className="modal-overlay" onClick={() => setPwModalDb(null)}>
+          <div className="modal-card" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>{t('Change database password')}: <code>{pwModalDb.db.db_name}</code></h3>
+              <button type="button" className="secondary-light mini" onClick={() => setPwModalDb(null)} aria-label={t('Close')}><X size={14}/></button>
+            </div>
+            <form onSubmit={submitChangeDbPassword}>
+              <div className="modal-body" style={{ display: 'grid', gap: '12px' }}>
+                <div className="hint">{t('User')}: <code>{pwModalDb.db.db_user}</code></div>
+                <label className="field">
+                  <span className="field-label">{t('New database password')}</span>
+                  <PasswordField
+                    value={pwModalDb.password}
+                    onChange={e => setPwModalDb(prev => ({ ...prev, password: e.target.value }))}
+                    placeholder={t('password (min 12 chars)')}
+                    defaultRevealed
+                  />
+                </label>
+                <p className="hint">{t('Minimum 12 characters.')}</p>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="secondary-light" onClick={() => setPwModalDb(null)}>{t('Cancel')}</button>
+                <button type="submit" disabled={!!loading || String(pwModalDb.password || '').trim().length < 12}>
+                  <Save size={14}/> {t('Set password')}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
       {tableModal && (
         <div className="modal-backdrop" onClick={() => setTableModal(null)}>
           <div className="modal" style={{ maxWidth: '640px', width: '95%' }} onClick={e => e.stopPropagation()}>

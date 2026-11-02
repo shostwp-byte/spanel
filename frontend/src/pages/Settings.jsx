@@ -5,6 +5,7 @@ import {
   Trash2, Zap, ExternalLink
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
+import { PasswordField } from '../components/PasswordField.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
@@ -747,7 +748,10 @@ export function SettingsPage({ request, isAdmin, users = [], loadPanelSettings, 
     );
     if (!data) return;
     if (data.password_changed) {
-      clearSession('Password changed. Please log in again.');
+      clearSession('Password changed. Please log in again.', {
+        newPassword: password,
+        username: currentUser?.username || 'admin',
+      });
       return;
     }
     setAdminAccountForm((prev) => ({
@@ -959,22 +963,23 @@ export function SettingsPage({ request, isAdmin, users = [], loadPanelSettings, 
             </label>
             <label>
               <span>{t('New password')}</span>
-              <input
-                type="password"
+              <PasswordField
                 value={adminAccountForm.password}
                 onChange={(e) => setAdminAccountForm((prev) => ({ ...prev, password: e.target.value }))}
+                onGenerate={(gen) =>
+                  setAdminAccountForm((prev) => ({ ...prev, password: gen, confirm_password: gen }))
+                }
                 placeholder={t('New password')}
-                autoComplete="new-password"
               />
             </label>
             <label>
               <span>{t('Confirm password')}</span>
-              <input
-                type="password"
+              <PasswordField
+                showGenerator={false}
+                showCopy={false}
                 value={adminAccountForm.confirm_password}
                 onChange={(e) => setAdminAccountForm((prev) => ({ ...prev, confirm_password: e.target.value }))}
                 placeholder={t('Repeat new password')}
-                autoComplete="new-password"
               />
             </label>
             <label>

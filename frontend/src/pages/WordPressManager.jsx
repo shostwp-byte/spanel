@@ -44,6 +44,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { useAppContext, WordPressIcon } from '../contexts/AppContext.jsx';
+import { PasswordField, PasswordResultBox, CopyPasswordButton } from '../components/PasswordField.jsx';
 import { t } from '../i18n.js';
 
 const DEFAULT_MAINTENANCE_TITLE = 'Website đang được bảo trì & nâng cấp';
@@ -116,6 +117,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     starter_set: 'essential_speed_seo',
   });
   const [installedCredsModal, setInstalledCredsModal] = useState(null);
+  const [wpPasswordBanner, setWpPasswordBanner] = useState(null);
 
   // Contextual modals for a specific instance
   const [generalModalInst, setGeneralModalInst] = useState(null);
@@ -431,7 +433,9 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       if (res?.instance) {
         updateSingleInstanceState(res.instance);
         setNotice(res.message || 'Đã cập nhật thiết lập.');
+        return true;
       }
+      return false;
     } finally {
       setBusyAction('');
     }
@@ -475,6 +479,16 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       if (res?.instance) {
         updateSingleInstanceState(res.instance);
         setNotice(res.message);
+        if (payload.admin_password) {
+          setWpPasswordBanner({
+            title: `Đã cập nhật mật khẩu Admin WordPress — ${generalModalInst.domain}`,
+            items: [
+              { label: 'WP Admin', value: `https://${generalModalInst.domain}/wp-admin` },
+              { label: 'Admin User', value: payload.admin_user, noticeMessage: t('Copied username.') },
+              { label: 'Mật khẩu Admin mới', value: payload.admin_password },
+            ],
+          });
+        }
         setGeneralModalInst(null);
       }
     } finally {
@@ -1235,6 +1249,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
       </div>
 
       {/* 3. Global Action Toolbar (When on Instances Tab) */}
+      {wpPasswordBanner && (
+        <PasswordResultBox
+          title={wpPasswordBanner.title}
+          items={wpPasswordBanner.items}
+          onDismiss={() => setWpPasswordBanner(null)}
+        />
+      )}
       {globalTab === 'instances' && (
         <div
           style={{
@@ -3463,25 +3484,12 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
 
                 <label style={{ gridColumn: 'span 1' }}>
                   <span>Mật khẩu Admin (Tối thiểu 10 ký tự)</span>
-                  <div style={{ display: 'flex', gap: '6px' }}>
-                    <input
-                      type="text"
-                      value={installForm.admin_password}
-                      onChange={e => setInstallForm(prev => ({ ...prev, admin_password: e.target.value }))}
-                      required
-                    />
-                    <button
-                      type="button"
-                      className="secondary-light"
-                      onClick={() =>
-                        setInstallForm(prev => ({ ...prev, admin_password: generateStrongPassword(16) }))
-                      }
-                      title="Tạo mật khẩu ngẫu nhiên mới"
-                      style={{ padding: '0 10px' }}
-                    >
-                      <RefreshCw size={13} />
-                    </button>
-                  </div>
+                  <PasswordField
+                    value={installForm.admin_password}
+                    onChange={e => setInstallForm(prev => ({ ...prev, admin_password: e.target.value }))}
+                    defaultRevealed
+                    required
+                  />
                 </label>
 
                 <label style={{ gridColumn: 'span 1' }}>
@@ -3558,17 +3566,24 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               </button>
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '13.5px' }}>
-              <div>
-                Website: <strong>{installedCredsModal.url}</strong>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span>Website:</span>
+                <strong>{installedCredsModal.url}</strong>
               </div>
-              <div>
-                Tài khoản Admin: <code>{installedCredsModal.admin_user}</code>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span>Tài khoản Admin:</span>
+                <code>{installedCredsModal.admin_user}</code>
+                <CopyPasswordButton value={installedCredsModal.admin_user} label={t('Copy')} noticeMessage={t('Copied username.')} size={12} />
               </div>
-              <div>
-                Mật khẩu Admin: <code>{installedCredsModal.admin_password}</code>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span>Mật khẩu Admin:</span>
+                <code>{installedCredsModal.admin_password}</code>
+                <CopyPasswordButton value={installedCredsModal.admin_password} label={t('Copy')} size={12} />
               </div>
-              <div>
-                Database tự động tạo: <code>{installedCredsModal.db_name}</code>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span>Database tự động tạo:</span>
+                <code>{installedCredsModal.db_name}</code>
+                <CopyPasswordButton value={installedCredsModal.db_name} label={t('Copy')} noticeMessage={false} size={12} />
               </div>
             </div>
             <div className="modal-footer">
@@ -3663,24 +3678,11 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                 </label>
                 <label>
                   <span>Đặt mật khẩu Admin mới (Để trống nếu không đổi)</span>
-                  <div style={{ display: 'flex', gap: '6px' }}>
-                    <input
-                      type="text"
-                      placeholder="Nhập mật khẩu mới tối thiểu 10 ký tự..."
-                      value={generalForm.admin_password}
-                      onChange={e => setGeneralForm(prev => ({ ...prev, admin_password: e.target.value }))}
-                    />
-                    <button
-                      type="button"
-                      className="secondary-light"
-                      onClick={() =>
-                        setGeneralForm(prev => ({ ...prev, admin_password: generateStrongPassword(16) }))
-                      }
-                      style={{ padding: '0 10px' }}
-                    >
-                      <RefreshCw size={13} />
-                    </button>
-                  </div>
+                  <PasswordField
+                    placeholder="Nhập mật khẩu mới tối thiểu 10 ký tự..."
+                    value={generalForm.admin_password}
+                    onChange={e => setGeneralForm(prev => ({ ...prev, admin_password: e.target.value }))}
+                  />
                 </label>
               </div>
               <div className="modal-footer">
@@ -4260,10 +4262,11 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
               </label>
               <label>
                 <span>Mật khẩu bảo vệ</span>
-                <input
-                  type="password"
+                <PasswordField
                   value={basicAuthForm.password}
                   onChange={e => setBasicAuthForm(prev => ({ ...prev, password: e.target.value }))}
+                  placeholder="Nhập hoặc bấm Xí ngầu tạo mật khẩu..."
+                  defaultRevealed
                 />
               </label>
             </div>
@@ -4279,11 +4282,23 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
                     setError('Vui lòng nhập đầy đủ Tên đăng nhập và Mật khẩu bảo vệ.');
                     return;
                   }
-                  await handleToggleSwitch(passwordAuthModalInst, 'password_protection', true, {
-                    basic_auth_user: basicAuthForm.user.trim(),
-                    basic_auth_password: basicAuthForm.password,
+                  const authUser = basicAuthForm.user.trim();
+                  const authPass = basicAuthForm.password;
+                  const targetDomain = passwordAuthModalInst.domain;
+                  const ok = await handleToggleSwitch(passwordAuthModalInst, 'password_protection', true, {
+                    basic_auth_user: authUser,
+                    basic_auth_password: authPass,
                   });
-                  setPasswordAuthModalInst(null);
+                  if (ok) {
+                    setWpPasswordBanner({
+                      title: `Đã bật bảo vệ mật khẩu HTTP Basic Auth — ${targetDomain}`,
+                      items: [
+                        { label: 'Tên đăng nhập', value: authUser, noticeMessage: t('Copied username.') },
+                        { label: 'Mật khẩu bảo vệ', value: authPass },
+                      ],
+                    });
+                    setPasswordAuthModalInst(null);
+                  }
                 }}
                 style={{
                   background: 'var(--primary)',

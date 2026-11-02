@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Archive, ArchiveRestore, ArrowLeft, Ban, Bot, Boxes, Check, ChevronDown, Clock, Code2, Copy, Cpu, Database, Dices, ExternalLink, Eye, FileText, FolderOpen, Globe, HardDrive, Home, Image, KeyRound, Lock, LogIn, LogOut, MemoryStick, Menu, Moon, MoveRight, Network, Pencil, Save, Search, Server, Settings as SettingsIcon, Shield, Sun, Trash2, TerminalIcon, Users, X, RefreshCw, Plus, Download, Upload, Play, Square, RotateCcw, AlertCircle, Activity, BrickWall, Bug, LockKeyhole, PackageOpen, ScrollText, ShieldAlert, CheckCircle, Zap, Bell, Mail, Send, Cloud, Inbox, Forward, ShieldCheck } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
 import { NoAutofillInput } from '../components/NoAutofillInput.jsx';
+import { PasswordField, PasswordResultBox } from '../components/PasswordField.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 
@@ -50,6 +51,7 @@ export function WebsitesPage({
   const [websiteSettingsForm, setWebsiteSettingsForm] = useState(websiteConfigForm());
   const [logViewer, setLogViewer] = useState(null);
   const [terminalViewer, setTerminalViewer] = useState(null);
+  const [installedWpCreds, setInstalledWpCreds] = useState(null);
   const [websiteList, setWebsiteList] = useState([]);
   const [websiteSearch, setWebsiteSearch] = useState('');
   const [websiteSearching, setWebsiteSearching] = useState(false);
@@ -340,6 +342,7 @@ export function WebsitesPage({
       setError(t('WordPress admin password must be at least 10 characters.'));
       return;
     }
+    const targetDomain = wordpressInstaller.domain;
     const data = await request(`/websites/${wordpressInstaller.website_id}/wordpress`, {
       method: 'POST',
       body: JSON.stringify({
@@ -348,9 +351,14 @@ export function WebsitesPage({
         admin_email: adminEmailValue,
         admin_password: adminPasswordValue,
       }),
-    }, `Installing WordPress for ${wordpressInstaller.domain}...`);
+    }, `Installing WordPress for ${targetDomain}...`);
     if (data) {
-      setNotice(`Installed WordPress: https://${wordpressInstaller.domain}\nAdmin: ${adminUser} | Password: ${adminPasswordValue}`);
+      setNotice(`Installed WordPress: https://${targetDomain}`);
+      setInstalledWpCreds({
+        domain: targetDomain,
+        admin_user: adminUser,
+        admin_password: adminPasswordValue,
+      });
       setWordpressInstaller(null);
       await refreshAll();
     }
@@ -563,13 +571,15 @@ export function WebsitesPage({
           onChange={e => setWordpressInstaller(prev => ({ ...prev, admin_email: e.target.value }))}
           disabled={!!loading}
         /></label>
-        <label><span>{t('Admin password')}</span><input
-          value={wordpressInstaller.admin_password}
-          onChange={e => setWordpressInstaller(prev => ({ ...prev, admin_password: e.target.value }))}
-          disabled={!!loading}
-        /></label>
+        <label><span>{t('Admin password')}</span>
+          <PasswordField
+            value={wordpressInstaller.admin_password}
+            onChange={e => setWordpressInstaller(prev => ({ ...prev, admin_password: e.target.value }))}
+            disabled={!!loading}
+            defaultRevealed
+          />
+        </label>
         <div className="website-settings-actions">
-          <button className="secondary-light" disabled={!!loading} onClick={() => setWordpressInstaller(prev => prev ? ({ ...prev, admin_password: generateRandomPassword(20) }) : prev)}><Dices size={14}/>{t('Generate')}</button>
           <button disabled={!!loading || !wordpressInstaller.admin_user || !wordpressInstaller.admin_email || !wordpressInstaller.admin_password} onClick={installWordPressOnSite}><WordPressIcon size={14}/>{t('Install')}</button>
         </div>
       </div>
@@ -2186,6 +2196,20 @@ export function WebsitesPage({
             </div>
           </div>
 
+          {installedWpCreds && (
+            <div style={{ padding: '0 16px' }}>
+              <PasswordResultBox
+                title={`WordPress — ${installedWpCreds.domain}`}
+                items={[
+                  { label: 'WP Admin', value: `https://${installedWpCreds.domain}/wp-admin` },
+                  { label: t('Admin user'), value: installedWpCreds.admin_user, noticeMessage: t('Copied username.') },
+                  { label: t('Admin password'), value: installedWpCreds.admin_password },
+                ]}
+                onDismiss={() => setInstalledWpCreds(null)}
+              />
+            </div>
+          )}
+
           {/* DirectAdmin-Style Domains Table */}
           <div style={{ overflowX: 'auto' }}>
             <table
@@ -2523,12 +2547,14 @@ export function WebsitesPage({
                         </tr>
                         {(nginxCustomEditing?.id === site.id ||
                           logViewer?.id === site.id ||
-                          terminalViewer?.id === site.id) && (
+                          terminalViewer?.id === site.id ||
+                          wordpressInstaller?.website_id === site.id) && (
                           <tr>
                             <td colSpan={domainVisibleColCount} style={{ padding: '12px 16px', background: 'var(--surface-alt)' }}>
                               {nginxCustomEditing?.id === site.id && renderNginxEditor()}
                               {logViewer?.id === site.id && renderWebsiteLogViewer()}
                               {terminalViewer?.id === site.id && renderWebsiteTerminal()}
+                              {wordpressInstaller?.website_id === site.id && renderWordPressInstaller()}
                             </td>
                           </tr>
                         )}

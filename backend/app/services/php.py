@@ -1,4 +1,5 @@
 import json
+import platform
 import threading
 from pathlib import Path
 
@@ -108,9 +109,17 @@ def read_php_ini(php_version: str) -> dict:
     return values
 
 
-# The extensions the PHP config page offers, one apt package each
-# (php<version>-<name>). The helper keeps the same list and enforces it.
-PHP_EXTENSIONS = tuple("apcu bcmath bz2 curl enchant gd gmp igbinary imagick imap intl ldap mailparse mbstring memcached mongodb msgpack mysql opcache pgsql redis soap sqlite3 ssh2 tidy uuid xml xsl yaml zip".split())
+# The extensions the PHP config page offers. Standard entries map to one apt
+# package each (php<version>-<name>); "ioncube" is installed from the official
+# ionCube Loader binary bundle. The helper keeps the same list and enforces it.
+PHP_EXTENSIONS = tuple("apcu bcmath bz2 curl enchant gd gmp igbinary imagick imap intl ioncube ldap mailparse mbstring memcached mongodb msgpack mysql opcache pgsql redis soap sqlite3 ssh2 tidy uuid xml xsl yaml zip".split())
+
+# Upstream ionCube skipped PHP 8.0 and ships loaders for 5.6, 7.4, and 8.1-8.5
+# on Linux x86_64 and aarch64.
+IONCUBE_SUPPORTED_PHP_VERSIONS = ("5.6", "7.4", "8.1", "8.2", "8.3", "8.4", "8.5")
+IONCUBE_SUPPORTED_ARCHES = ("x86_64", "amd64", "aarch64", "arm64")
+PHP_ETC_DIR = Path("/etc/php")
+IONCUBE_DIR = Path("/usr/local/ioncube")
 
 # `php -m` names where they differ from the package: php-mysql brings mysqli
 # and pdo_mysql, php-xml brings dom and friends, and OPcache is built into
@@ -120,6 +129,48 @@ _MODULE_NAMES = {
     "xml": ("dom",),
     "opcache": ("zend opcache",),
 }
+
+
+def _host_arch() -> str:
+    return (platform.machine() or "").strip().lower()
+
+
+def _ioncube_ini_has_existing_binary(conf_dir: Path) -> bool:
+    if not conf_dir.is_dir():
+        return False
+    for ini_file in sorted(conf_dir.glob("*ioncube*.ini")):
+        try:
+            lines = ini_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith((";", "#")) or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            if key.strip().lower() != "zend_extension":
+                continue
+            so_raw = val.strip().strip('"').strip("'")
+            if "ioncube" not in so_raw.lower():
+                continue
+            so_path = Path(so_raw) if Path(so_raw).is_absolute() else (IONCUBE_DIR / so_raw)
+            try:
+                if so_path.is_file() and so_path.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _ioncube_state(version: str, cli_modules: set[str]) -> str:
+    cli_loaded = any("ioncube" in mod for mod in cli_modules)
+    fpm_ready = _ioncube_ini_has_existing_binary(PHP_ETC_DIR / version / "fpm" / "conf.d")
+    cli_ready = _ioncube_ini_has_existing_binary(PHP_ETC_DIR / version / "cli" / "conf.d")
+    if cli_loaded and fpm_ready and cli_ready:
+        return "installed"
+    if version in IONCUBE_SUPPORTED_PHP_VERSIONS and _host_arch() in IONCUBE_SUPPORTED_ARCHES:
+        return "available"
+    return "unavailable"
 
 
 def _command_output(args: list[str]) -> str:
@@ -133,10 +184,9 @@ def _command_output(args: list[str]) -> str:
 def list_extensions() -> dict:
     """Every offered extension against every installed PHP version.
 
-    A cell is "installed" (its package is), "builtin" (PHP loads the module
-    without a package, OPcache on 8.5), "available" (the repository has it)
-    or "unavailable". Read-only, and needs no root: dpkg-query, apt-cache and
-    php -m are open to anyone.
+    A cell is "installed" (its package or loader is active), "builtin" (PHP
+    loads the module without a package, OPcache on 8.5), "available" (can be
+    installed for this PHP version) or "unavailable". Read-only, needs no root.
     """
     versions = list_installed_php()
     installed = set()
@@ -153,6 +203,9 @@ def list_extensions() -> dict:
     for ext in PHP_EXTENSIONS:
         states = {}
         for version in versions:
+            if ext == "ioncube":
+                states[version] = _ioncube_state(version, modules[version])
+                continue
             package = f"php{version}-{ext}"
             if package in installed:
                 states[version] = "installed"
@@ -169,8 +222,9 @@ def list_extensions() -> dict:
 def install_extension(php_version: str, extension: str) -> str:
     """Install one offered extension for an installed PHP version.
 
-    apt, then a PHP-FPM reload so sites load it at once. Raises ValueError for
-    anything the panel does not offer, RuntimeError when apt or PHP refuse.
+    apt (or the official ionCube Loader bundle for ioncube), then a PHP-FPM
+    reload so sites load it at once. Raises ValueError for anything the panel
+    does not offer, RuntimeError when installation or validation fails.
     """
     # What reaches the command line is the panel's own constant, picked by the
     # request's value, never the request's string itself - and there is no
@@ -181,23 +235,37 @@ def install_extension(php_version: str, extension: str) -> str:
         raise ValueError("PHP extension not offered by the panel")
     if version is None or version not in list_installed_php():
         raise ValueError("That PHP version is not installed")
-    package = f"php{version}-{name}"
-    result = shell.privileged(
-        "php-ext-install",
-        helper_args=[version, name],
-        check=False,
-        timeout=600,
-        fallback=[
+    if name == "ioncube":
+        if version not in IONCUBE_SUPPORTED_PHP_VERSIONS:
+            raise ValueError(
+                f"ionCube Loader is not available for PHP {version} "
+                "(upstream ionCube supports PHP 5.6, 7.4, and 8.1-8.5)"
+            )
+        if _host_arch() not in IONCUBE_SUPPORTED_ARCHES:
+            raise ValueError(f"ionCube Loader is not supported on CPU architecture {_host_arch()}")
+        helper_script = Path(__file__).resolve().parents[3] / "installer" / "files" / "spanel-helper.sh"
+        fallback = ["bash", str(helper_script), "php-ext-install", version, name]
+        label = f"ionCube Loader (PHP {version})"
+    else:
+        package = f"php{version}-{name}"
+        fallback = [
             "bash",
             "-lc",
             _APT_LOCK_PREAMBLE
             + 'apt-get -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install -y "$1" </dev/null',
             "spanel-php-ext-install",
             package,
-        ],
+        ]
+        label = package
+    result = shell.privileged(
+        "php-ext-install",
+        helper_args=[version, name],
+        check=False,
+        timeout=600,
+        fallback=fallback,
     )
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or f"Could not install {package}").strip()[-600:])
+        raise RuntimeError((result.stderr or result.stdout or f"Could not install {label}").strip()[-600:])
     return (result.stdout or "").strip()
 
 

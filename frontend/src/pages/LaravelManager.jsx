@@ -50,6 +50,7 @@ import {
   Boxes,
 } from 'lucide-react';
 import { useAppContext } from '../contexts/AppContext.jsx';
+import { PasswordField, CopyPasswordButton } from '../components/PasswordField.jsx';
 import { t } from '../i18n.js';
 
 function LaravelBrandIcon({ size = 18 }) {
@@ -2779,11 +2780,17 @@ export function LaravelManagerPage({
             </strong>
             <span>
               Database: <code>{installedCredentials.db_name}</code> · User:{' '}
-              <code>{installedCredentials.db_user}</code> · Document Root:{' '}
+              <code>{installedCredentials.db_user}</code> · Mật khẩu DB:{' '}
+              <code>{installedCredentials.db_password}</code> · Document Root:{' '}
               <code>/{installedCredentials.document_root}</code>
             </span>
           </div>
-          <div style={{ display: 'flex', gap: '8px' }}>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+            <CopyPasswordButton
+              value={installedCredentials.db_password}
+              label="Copy mật khẩu DB"
+              size={13}
+            />
             <button
               type="button"
               className="secondary-light mini"
@@ -2795,7 +2802,7 @@ export function LaravelManagerPage({
               }
             >
               <Copy size={13} />
-              <span>Copy thông tin DB</span>
+              <span>Copy khối .env</span>
             </button>
             <button
               type="button"
@@ -3672,8 +3679,8 @@ export function LaravelManagerPage({
                   </label>
                   <label>
                     <span>DB_PASSWORD</span>
-                    <input
-                      type="password"
+                    <PasswordField
+                      showGenerator={false}
                       value={envDraft.parsed?.db_password || ''}
                       onChange={e =>
                         setEnvDraft(prev => ({

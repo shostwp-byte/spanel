@@ -4,6 +4,7 @@ import {
   Save, Trash2, Users, X
 } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState.jsx';
+import { PasswordField, PasswordResultBox } from '../components/PasswordField.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
 import { roleLabel } from '../utils/helpers.js';
@@ -143,6 +144,7 @@ export function UsersPage({
   }, [mode, isCreateMode, isReseller, packages.length]);
 
   const [editingUser, setEditingUser] = useState(null);
+  const [passwordBanner, setPasswordBanner] = useState(null);
 
   async function updatePanelUser() {
     if (!editingUser) return;
@@ -231,9 +233,21 @@ export function UsersPage({
       sftp_accounts_limit: Number(newUser.sftp_accounts_limit || 0),
       mail_accounts_limit: Number(newUser.mail_accounts_limit || 0),
     };
+    const createdPassword = newUser.password;
     const data = await request('/users', { method: 'POST', body: JSON.stringify(payload) }, t('Creating user...'));
     if (data) {
       setNotice(`Created user ${data.username}`);
+      setPasswordBanner({
+        userId: null,
+        title: `${t('Credentials ready')} — ${data.username}`,
+        items: [
+          { label: t('Username'), value: data.username, noticeMessage: t('Copied username.') },
+          { label: t('Panel password'), value: createdPassword },
+          ...(data.sftp_password
+            ? [{ label: t('SFTP password'), value: data.sftp_password, noticeMessage: t('SFTP password copied to clipboard.') }]
+            : []),
+        ],
+      });
       const firstPkg = availablePackages[0];
       setNewUser({
         username: '',
@@ -459,6 +473,13 @@ export function UsersPage({
                 </button>
               </div>
             </div>
+            {passwordBanner && (!editingUser || editingUser.id !== passwordBanner.userId) && (
+              <PasswordResultBox
+                title={passwordBanner.title}
+                items={passwordBanner.items}
+                onDismiss={() => setPasswordBanner(null)}
+              />
+            )}
             {displayUsers.length === 0 && <EmptyState icon={Users} message={t('No users found.')} />}
             <div className="table">
               {displayUsers.map(user => (
@@ -648,17 +669,18 @@ export function UsersPage({
                         <div className="user-edit-grid">
                           <label>
                             <span>{t('New password')}</span>
-                            <input
-                              type="password"
+                            <PasswordField
                               placeholder={t('Min 12 characters')}
                               value={editingUserForm.new_password}
                               onChange={e => setEditingUserForm(prev => ({ ...prev, new_password: e.target.value }))}
+                              onGenerate={gen => setEditingUserForm(prev => ({ ...prev, new_password: gen, confirm_password: gen }))}
                             />
                           </label>
                           <label>
                             <span>{t('Confirm password')}</span>
-                            <input
-                              type="password"
+                            <PasswordField
+                              showGenerator={false}
+                              showCopy={false}
                               placeholder={t('Repeat password')}
                               value={editingUserForm.confirm_password}
                               onChange={e => setEditingUserForm(prev => ({ ...prev, confirm_password: e.target.value }))}
@@ -668,11 +690,33 @@ export function UsersPage({
                         <div className="user-edit-actions">
                           <button
                             disabled={!!loading || !editingUserForm.new_password || editingUserForm.new_password.length < 12}
-                            onClick={() => submitPasswordChange(user)}
+                            onClick={async () => {
+                              const res = await submitPasswordChange(user);
+                              if (res?.ok) {
+                                setPasswordBanner({
+                                  userId: user.id,
+                                  title: `${t('Password updated')} — ${res.username}`,
+                                  items: [
+                                    { label: t('Username'), value: res.username, noticeMessage: t('Copied username.') },
+                                    { label: t('Panel password'), value: res.password },
+                                    ...(res.sftp_password
+                                      ? [{ label: t('SFTP password'), value: res.sftp_password, noticeMessage: t('SFTP password copied to clipboard.') }]
+                                      : []),
+                                  ],
+                                });
+                              }
+                            }}
                           >
                             {t('Set password')}
                           </button>
                         </div>
+                        {passwordBanner && passwordBanner.userId === user.id && (
+                          <PasswordResultBox
+                            title={passwordBanner.title}
+                            items={passwordBanner.items}
+                            onDismiss={() => setPasswordBanner(null)}
+                          />
+                        )}
                       </div>
                       <div className="user-edit-actions">
                         <button className="secondary-light" onClick={cancelEditingUser}>
@@ -749,11 +793,10 @@ export function UsersPage({
               </label>
               <label>
                 <span>{t('Password')}</span>
-                <input
+                <PasswordField
                   value={newUser.password}
                   onChange={e => setNewUser(prev => ({ ...prev, password: e.target.value }))}
                   placeholder={t('Min 12 characters')}
-                  type="password"
                 />
               </label>
               {assignedRole !== 'admin' && (

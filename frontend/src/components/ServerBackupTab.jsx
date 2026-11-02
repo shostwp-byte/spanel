@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Copy, KeyRound, Play, RefreshCw, Save, ShieldCheck } from 'lucide-react';
+import { KeyRound, Play, RefreshCw, Save, ShieldCheck } from 'lucide-react';
+import { CopyPasswordButton } from './PasswordField.jsx';
 import { t } from '../i18n.js';
 
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -115,9 +116,12 @@ function PanelDrCard({ request, setNotice, loading, targets }) {
           <strong>{t('Store this passphrase outside this server now. It is not shown again.')}</strong>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', margin: '8px 0' }}>
             <code style={{ fontSize: '1rem', userSelect: 'all' }}>{shownPassphrase}</code>
-            <button type="button" className="secondary-light" onClick={() => navigator.clipboard?.writeText(shownPassphrase)}>
-              <Copy size={13} /> {t('Copy')}
-            </button>
+            <CopyPasswordButton
+              value={shownPassphrase}
+              label={t('Copy')}
+              className="secondary-light sp-copy-btn"
+              size={13}
+            />
           </div>
           <span className="hint">{t('Put it in your password manager or print it. Then type it below to prove the copy works.')}</span>
         </div>
