@@ -11,7 +11,9 @@ APP_JSX = SRC / "App.jsx"
 USERS_JSX = SRC / "pages" / "Users.jsx"
 MOVE_USERS_JSX = SRC / "pages" / "MoveUsers.jsx"
 WAF_JSX = SRC / "pages" / "Waf.jsx"
+FILES_JSX = SRC / "pages" / "Files.jsx"
 BRAND_CSS = SRC / "brand.css"
+FILE_MANAGER_CSS = SRC / "file-manager.css"
 VI_JS = SRC / "locales" / "vi.js"
 
 
@@ -308,7 +310,65 @@ def test_vi_locale_covers_logs_and_waf_keys_once():
         "Filter websites...",
         "Bad Bots",
         "Allow",
+        "Upload Files",
+        "Drag & drop files here, or click to select files",
+        "Supports selecting and uploading multiple files sequentially",
+        "Cannot close while uploading",
+        "Window closing is locked until the upload queue finishes.",
+        "Uploading {current} of {total}...",
+        "Completed {done} / {total} file(s)",
+        "{n} file(s) ready ({size})",
+        "Upload {n} file(s)",
+        "Uploading ({done}/{total})...",
+        "Retry failed ({n})",
+        "Uploading files...",
+        "Uploaded {n} file(s) successfully.",
+        "Uploaded {done} of {total} file(s) ({failed} failed).",
+        "Drop files here to add to upload queue",
+        "Folders cannot be uploaded directly — please select files or upload a .zip/.tar.gz archive.",
+        "Remove from queue",
     ):
         assert expected_key not in kept, f"{expected_key!r} is in keptInEnglish"
         count = keys.count(expected_key)
         assert count == 1, f"Expected key {expected_key!r} once in vi.js, found {count}"
+
+
+def test_file_manager_multi_upload_drag_drop_sequential_and_close_lock():
+    """Verify multi-file selection, drag-and-drop, sequential XHR progress, and non-closable modal while uploading."""
+    files_src = FILES_JSX.read_text(encoding="utf-8")
+    fm_css = FILE_MANAGER_CSS.read_text(encoding="utf-8")
+
+    # 1. Multi-file input inside dedicated Upload modal
+    assert "renderUploadModalDialog" in files_src
+    assert re.search(r'<input[\s\S]{0,180}?ref=\{uploadModalInputRef\}[\s\S]{0,120}?type="file"[\s\S]{0,60}?multiple', files_src)
+
+    # 2. Drag-and-drop handlers on both dropzone and File Manager workspace
+    for handler in (
+        "handleDropzoneDragEnter",
+        "handleDropzoneDragOver",
+        "handleDropzoneDragLeave",
+        "handleDropzoneDrop",
+        "handleWorkspaceDragEnter",
+        "handleWorkspaceDrop",
+        "da-upload-dropzone",
+        "da-fm-drop-overlay",
+    ):
+        assert handler in files_src, f"Missing {handler} in Files.jsx"
+
+    # 3. Real per-file sequential XHR progress
+    assert "new XMLHttpRequest()" in files_src
+    assert "xhr.upload.addEventListener('progress'" in files_src
+    assert "for (const item of itemsToRun)" in files_src
+    assert "await uploadSingleFileWithProgress(item, uploadDir)" in files_src
+
+    # 4. Strict close lock across closeUploadModal, Escape key, beforeunload, backdrop, X, and footer Close
+    close_fn = re.search(r"function closeUploadModal\(\)\s*\{([\s\S]{0,260}?)\n  \}", files_src)
+    assert close_fn is not None
+    assert "if (isUploading || isUploadingRef.current) return;" in close_fn.group(1)
+    assert "window.addEventListener('beforeunload', handleBeforeUnload)" in files_src
+    assert "if (e.key === 'Escape')" in files_src
+    assert "Window closing is locked until the upload queue finishes." in files_src
+
+    # 5. CSS rules present in file-manager.css
+    for selector in (".da-upload-dialog", ".da-upload-dropzone", ".da-upload-bar-fill", ".da-fm-drop-overlay"):
+        assert selector in fm_css, f"Missing {selector} in file-manager.css"

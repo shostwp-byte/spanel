@@ -2949,6 +2949,23 @@ export const vi = {
   "Filter websites...": "Lọc tên miền...",
   "Bad Bots": "Chặn Bot xấu",
   "Allow": "Cho phép",
+  "Upload Files": "Tải tập tin lên",
+  "Drag & drop files here, or click to select files": "Kéo thả tập tin vào đây, hoặc bấm để chọn tập tin",
+  "Supports selecting and uploading multiple files sequentially": "Hỗ trợ chọn nhiều tập tin và hiển thị tiến độ tải lên tuần tự từng tập tin",
+  "Cannot close while uploading": "Không thể đóng cửa sổ khi đang tải tập tin lên",
+  "Window closing is locked until the upload queue finishes.": "Cửa sổ tạm khóa đóng cho đến khi toàn bộ tập tin tải lên hoàn tất.",
+  "Uploading {current} of {total}...": "Đang tải lên tập tin {current} / {total}...",
+  "Completed {done} / {total} file(s)": "Hoàn tất {done} / {total} tập tin",
+  "{n} file(s) ready ({size})": "{n} tập tin sẵn sàng ({size})",
+  "Upload {n} file(s)": "Tải lên {n} tập tin",
+  "Uploading ({done}/{total})...": "Đang tải ({done}/{total})...",
+  "Retry failed ({n})": "Thử lại file lỗi ({n})",
+  "Uploading files...": "Đang tải tập tin lên...",
+  "Uploaded {n} file(s) successfully.": "Đã tải lên thành công {n} tập tin.",
+  "Uploaded {done} of {total} file(s) ({failed} failed).": "Đã tải lên {done}/{total} tập tin ({failed} lỗi).",
+  "Drop files here to add to upload queue": "Thả tập tin vào đây để đưa vào hàng đợi tải lên",
+  "Folders cannot be uploaded directly — please select files or upload a .zip/.tar.gz archive.": "Không hỗ trợ kéo thả trực tiếp thư mục — vui lòng chọn tập tin lẻ hoặc nén .zip/.tar.gz rồi Giải nén.",
+  "Remove from queue": "Xóa khỏi hàng đợi",
 };
 
 /* Said in English by the people who run these servers. Translating them
