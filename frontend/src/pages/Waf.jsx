@@ -28,6 +28,7 @@ export function WafPage({ request, API, setPage, page, isReseller, WAF_ACCESS_LO
   const [globalBotPaste, setGlobalBotPaste] = useState('');
   const [globalBotFilter, setGlobalBotFilter] = useState('');
   const [siteBotText, setSiteBotText] = useState('');
+  const [wafSiteSearch, setWafSiteSearch] = useState('');
 
   async function toggleWebsiteWaf(site) {
     const nextValue = !site.waf_enabled;
@@ -181,16 +182,33 @@ export function WafPage({ request, API, setPage, page, isReseller, WAF_ACCESS_LO
     }
   }
 
-  async function loadWafAccessLogs(filters = wafAccessLogFilters, showLoading = true) {
+  async function loadWafAccessLogs(filters = wafAccessLogFilters, showLoading = true, silent = false) {
     const params = new URLSearchParams();
     if (filters.websiteId) params.set('website_id', filters.websiteId);
     params.set('verdict', filters.verdict || 'all');
     params.set('limit', String(filters.limit || 50));
     params.set('lines', '5000');
     if (filters.query?.trim()) params.set('q', filters.query.trim());
-    const data = await request(`/waf/access-logs?${params.toString()}`, {}, showLoading ? 'Loading access logs...' : '');
+    const data = await request(`/waf/access-logs?${params.toString()}`, silent ? { silent: true } : {}, showLoading ? t('Loading access logs...') : '');
     if (data) setWafAccessLogs(data);
   }
+
+  function changeLogFilters(patch, shouldReload = false) {
+    const next = { ...wafAccessLogFilters, ...patch };
+    updateWafAccessLogFilters(patch);
+    if (shouldReload) {
+      loadWafAccessLogs(next, false);
+    }
+  }
+
+  useEffect(() => {
+    const sec = Number(wafAccessLogFilters.refresh) || 0;
+    if ((page !== 'access-logs' && page !== 'waf-logs') || sec <= 0) return undefined;
+    const timer = setInterval(() => {
+      loadWafAccessLogs(wafAccessLogFilters, false, true);
+    }, sec * 1000);
+    return () => clearInterval(timer);
+  }, [page, wafAccessLogFilters.refresh, wafAccessLogFilters.websiteId, wafAccessLogFilters.verdict, wafAccessLogFilters.limit, wafAccessLogFilters.query]);
 
   async function applyWafAccessLogFilters() {
     await loadWafAccessLogs(wafAccessLogFilters, true);
@@ -217,27 +235,32 @@ export function WafPage({ request, API, setPage, page, isReseller, WAF_ACCESS_LO
     const rowFor = id => botBlocks?.websites?.find(w => w.website_id === id);
     const botCountFor = id => (rowFor(id)?.effective_blocked_bots || []).length;
     const ownCountFor = id => (rowFor(id)?.blocked_bots || []).length;
+    const siteQuery = wafSiteSearch.trim().toLowerCase();
+    const filteredWafSites = (websites || []).filter(site => !siteQuery || (site.domain || '').toLowerCase().includes(siteQuery));
+    const refreshWafOverview = () => {
+      refreshAll();
+      if (loadBotBlocks) loadBotBlocks();
+      if (isAdmin) { loadWafRules(); loadCrs(); }
+    };
     return <>
-      <div className="section">
+      {isAdmin && <div className="section">
         <div className="section-title">
           <div>
             <h2>WAF</h2>
-            <p className="hint">{isAdmin
-              ? t('Protection for each website. Open one to set its rules, flood limit and blocked bots.')
-              : t('Protection for your websites. Open one to set its rules and blocked bots.')}</p>
+            <p className="hint">{t('Protection for each website. Open one to set its rules, flood limit and blocked bots.')}</p>
           </div>
-          <button className="secondary-light" disabled={!!loading} onClick={() => { loadBotBlocks(); if (isAdmin) { loadWafRules(); loadCrs(); } }}><RefreshCw size={14}/>{t('Refresh')}</button>
+          <button className="secondary-light" disabled={!!loading} onClick={refreshWafOverview}><RefreshCw size={14}/>{t('Refresh')}</button>
         </div>
         {/* Folded. This is systemctl and timer output - the first thing on the
             page was eleven lines of paths and a timer table, above the
             controls somebody came to use. What the WAF is actually doing is
             said by the badges below in words; this is here for the operator
             who is diagnosing, and they know to open it. */}
-        {isAdmin && <details className="info-box firewall-status output-details">
+        <details className="info-box firewall-status output-details">
           <summary><strong>{t('Status')}</strong><span>{t('Module, rule files and timers')}</span></summary>
           <pre>{statusText}</pre>
-        </details>}
-      </div>
+        </details>
+      </div>}
 
       {isAdmin && <div className="section">
         <div className="section-title">
@@ -284,28 +307,111 @@ export function WafPage({ request, API, setPage, page, isReseller, WAF_ACCESS_LO
         </>}
       </div>}
 
-      <div className="section">
-        <div className="section-title"><h2>{t('Websites')}</h2></div>
-        {websites.length === 0 && <EmptyState icon={Globe} message={t('No websites yet.')} />}
-        <div className="table waf-overview-list">
-          {websites.map(site => {
-            const bots = botCountFor(site.id);
-            // No CRS here: "WAF on" beside "CRS block" read as two things to
-            // worry about. CRS is switched on the site's own page.
-            return <div className="waf-overview-row" key={site.id}>
-              <span className="waf-overview-domain"><strong>{site.domain}</strong></span>
-              <div className="waf-overview-badges">
-                <span className={site.waf_enabled ? 'badge ok' : 'badge'}>{site.waf_enabled ? t('WAF on') : t('WAF off')}</span>
-                <span className={site.http_flood_enabled ? 'badge ok' : 'badge'}>{site.http_flood_enabled ? t('Flood on') : t('Flood off')}</span>
-                <span
-                  className={bots > 0 ? 'badge ok' : 'badge'}
-                  title={ownCountFor(site.id) > 0 ? `${ownCountFor(site.id)} set on this site, the rest from the global list` : 'All from the global list'}
-                >{bots > 0 ? t('{n} bot(s)', { n: bots }) : t('No bots')}</span>
+      <div className="pkg-list-card user-mgmt-card waf-websites-card">
+        <div className="user-mgmt-toolbar waf-websites-toolbar">
+          <div className="waf-websites-toolbar-left">
+            <strong className="waf-websites-heading">{t('Websites')}</strong>
+            <span className="user-mgmt-count">{filteredWafSites.length}</span>
+          </div>
+          <div className="user-mgmt-controls">
+            {websites.length > 0 && (
+              <div className="user-search-wrap">
+                <Search size={14} className="user-search-icon" />
+                <input
+                  type="text"
+                  value={wafSiteSearch}
+                  onChange={e => setWafSiteSearch(e.target.value)}
+                  placeholder={t('Filter websites...')}
+                  aria-label={t('Filter websites...')}
+                />
+                {wafSiteSearch && (
+                  <button
+                    type="button"
+                    className="user-search-clear"
+                    onClick={() => setWafSiteSearch('')}
+                    aria-label={t('Clear search')}
+                  >
+                    <X size={13} />
+                  </button>
+                )}
               </div>
-              <button className="secondary" disabled={!!loading} onClick={() => openWafSite(site.id)}><SettingsIcon size={14}/>{t('Configure')}</button>
-            </div>;
-          })}
+            )}
+            <button type="button" className="secondary-light user-refresh-btn" disabled={!!loading} onClick={refreshWafOverview}>
+              <RefreshCw size={14} />
+              <span>{t('Refresh')}</span>
+            </button>
+          </div>
         </div>
+
+        {websites.length === 0 ? (
+          <div className="user-empty-slot">
+            <EmptyState icon={Globe} message={t('No websites yet.')} />
+          </div>
+        ) : filteredWafSites.length === 0 ? (
+          <div className="user-empty-slot">
+            <EmptyState icon={Search} message={t('No websites match this search.')} />
+          </div>
+        ) : (
+          <div className="pkg-table-wrap">
+            <table className="pkg-clean-table user-clean-table waf-websites-clean-table">
+              <thead>
+                <tr>
+                  <th>{t('Domain')}</th>
+                  <th>WAF</th>
+                  <th>{t('HTTP Flood')}</th>
+                  <th>{t('Bad Bots')}</th>
+                  <th style={{ textAlign: 'right' }}>{t('Actions')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredWafSites.map(site => {
+                  const bots = botCountFor(site.id);
+                  // No CRS here: "WAF on" beside "CRS block" read as two things to
+                  // worry about. CRS is switched on the site's own page.
+                  return (
+                    <tr key={site.id}>
+                      <td>
+                        <div className="user-domain-cell">
+                          <Globe size={14} className="user-domain-icon" />
+                          <span>{site.domain}</span>
+                        </div>
+                      </td>
+                      <td>
+                        <span className={`user-status-label ${site.waf_enabled ? 'is-active' : 'is-muted'}`}>
+                          <span className="user-status-dot" />
+                          {site.waf_enabled ? t('WAF on') : t('WAF off')}
+                        </span>
+                      </td>
+                      <td>
+                        <span className={`user-status-label ${site.http_flood_enabled ? 'is-active' : 'is-muted'}`}>
+                          <span className="user-status-dot" />
+                          {site.http_flood_enabled ? t('Flood on') : t('Flood off')}
+                        </span>
+                      </td>
+                      <td>
+                        <span
+                          className={`user-status-label ${bots > 0 ? 'is-active' : 'is-muted'}`}
+                          title={ownCountFor(site.id) > 0 ? `${ownCountFor(site.id)} set on this site, the rest from the global list` : 'All from the global list'}
+                        >
+                          <span className="user-status-dot" />
+                          {bots > 0 ? t('{n} bot(s)', { n: bots }) : t('No bots')}
+                        </span>
+                      </td>
+                      <td>
+                        <div className="user-clean-actions">
+                          <button type="button" className="mini secondary-light user-login-as-btn" disabled={!!loading} onClick={() => openWafSite(site.id)}>
+                            <SettingsIcon size={13} />
+                            <span>{t('Configure')}</span>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {isAdmin && <div className="section">
@@ -545,79 +651,163 @@ export function WafPage({ request, API, setPage, page, isReseller, WAF_ACCESS_LO
   function renderWafAccessLogs() {
     const rows = wafAccessLogs.items || [];
     const selectedSite = websites.find(site => String(site.id) === String(wafAccessLogFilters.websiteId));
-    const entryLabel = wafAccessLogs.total >= 1000 ? `${(wafAccessLogs.total / 1000).toFixed(1)}k entries` : `${wafAccessLogs.total || 0} entries`;
-    return <div className="section access-logs-">
-      <div className="section-title access-logs-title">
-        <div><h2>{t('Access Logs')}</h2><p className="hint">{t('Protected Nginx traffic across all websites.')}</p></div>
-        <div className="access-log-icon-actions">
-          <button className="secondary-light icon-button" disabled={!!loading} onClick={() => loadWafAccessLogs(wafAccessLogFilters, true)} aria-label={t('Refresh access logs')} title={t('Refresh access logs')}><RefreshCw size={15}/></button>
-          <button className="secondary-light icon-button" onClick={() => selectedSite && window.open(websiteUrl(selectedSite), '_blank', 'noopener,noreferrer')} disabled={!selectedSite} aria-label={t('Open website')} title={t('Open website')}><ExternalLink size={15}/></button>
+    const totalCount = wafAccessLogs.total || 0;
+    const entryLabel = totalCount >= 1000
+      ? t('{n} entries', { n: `${(totalCount / 1000).toFixed(1)}k` })
+      : t('{n} entries', { n: totalCount });
+    return (
+      <div className="access-logs-shell user-clean-shell">
+        <div className="pkg-list-card user-mgmt-card access-logs-card">
+          <div className="user-mgmt-toolbar access-logs-toolbar">
+            <div className="access-logs-toolbar-left">
+              <div className="user-search-wrap access-logs-search-wrap">
+                <Search size={14} className="user-search-icon" />
+                <input
+                  type="text"
+                  value={wafAccessLogFilters.query || ''}
+                  onChange={e => changeLogFilters({ query: e.target.value })}
+                  onKeyDown={e => { if (e.key === 'Enter') applyWafAccessLogFilters(); }}
+                  placeholder={t('Filter IP, path, domain...')}
+                  aria-label={t('Filter IP, path, domain...')}
+                />
+                {wafAccessLogFilters.query && (
+                  <button
+                    type="button"
+                    className="user-search-clear"
+                    onClick={() => changeLogFilters({ query: '' }, true)}
+                    aria-label={t('Clear search')}
+                  >
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+              <span className="move-selected-pill">{entryLabel}</span>
+            </div>
+
+            <div className="user-mgmt-controls access-logs-controls">
+              <select
+                className="access-log-select site-select"
+                value={wafAccessLogFilters.websiteId || ''}
+                onChange={e => changeLogFilters({ websiteId: e.target.value }, true)}
+                aria-label={t('All websites')}
+              >
+                <option value="">{t('All websites')}</option>
+                {websites.map(site => <option key={site.id} value={site.id}>{site.domain}</option>)}
+              </select>
+              <select
+                className="access-log-select"
+                value={wafAccessLogFilters.verdict || 'all'}
+                onChange={e => changeLogFilters({ verdict: e.target.value }, true)}
+                aria-label={t('Verdict')}
+              >
+                <option value="all">{t('All verdicts')}</option>
+                <option value="block">{t('Blocked')}</option>
+                <option value="allow">{t('Allowed')}</option>
+                <option value="error">{t('Errors')}</option>
+              </select>
+              <select
+                className="access-log-select"
+                value={wafAccessLogFilters.limit || 50}
+                onChange={e => changeLogFilters({ limit: Number(e.target.value) }, true)}
+                aria-label="Limit"
+              >
+                <option value={50}>{t('50 / page')}</option>
+                <option value={100}>{t('100 / page')}</option>
+                <option value={200}>{t('200 / page')}</option>
+                <option value={500}>{t('500 / page')}</option>
+              </select>
+              <select
+                className="access-log-select"
+                value={wafAccessLogFilters.refresh || 0}
+                onChange={e => changeLogFilters({ refresh: Number(e.target.value) })}
+                aria-label={t('Manual refresh')}
+              >
+                <option value={0}>{t('Manual refresh')}</option>
+                <option value={5}>{t('Refresh 5s')}</option>
+                <option value={10}>{t('Refresh 10s')}</option>
+                <option value={30}>{t('Refresh 30s')}</option>
+              </select>
+              <button type="button" className="user-refresh-btn" disabled={!!loading} onClick={applyWafAccessLogFilters}>
+                <RefreshCw size={14} />
+                <span>{t('Refresh')}</span>
+              </button>
+              {selectedSite && (
+                <button
+                  type="button"
+                  className="secondary-light icon-button access-log-open-btn"
+                  onClick={() => window.open(websiteUrl(selectedSite), '_blank', 'noopener,noreferrer')}
+                  aria-label={t('Open website')}
+                  title={t('Open website')}
+                >
+                  <ExternalLink size={14} />
+                </button>
+              )}
+              <button type="button" className="secondary-light user-refresh-btn" disabled={rows.length === 0} onClick={exportWafAccessLogs}>
+                <Download size={14} />
+                <span>{t('Export')}</span>
+              </button>
+              <button type="button" className="danger light user-refresh-btn" disabled={!!loading || websites.length === 0} onClick={clearWafAccessLogs}>
+                <Trash2 size={14} />
+                <span>{t('Clear')}</span>
+              </button>
+            </div>
+          </div>
+
+          {rows.length === 0 ? (
+            <div className="user-empty-slot">
+              <EmptyState icon={FileText} message={t('No access log entries match these filters.')} />
+            </div>
+          ) : (
+            <div className="pkg-table-wrap">
+              <table className="pkg-clean-table user-clean-table access-logs-clean-table">
+                <thead>
+                  <tr>
+                    <th>{t('Verdict')}</th>
+                    <th>{t('Time')}</th>
+                    <th>{t('Site')}</th>
+                    <th>{t('Method')}</th>
+                    <th>{t('Path')}</th>
+                    <th>IP</th>
+                    <th>{t('Country')}</th>
+                    <th>{t('Reason')}</th>
+                    <th>{t('Status')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map(item => (
+                    <tr key={item.id}>
+                      <td data-label={t('Verdict')}>
+                        <span className={accessLogBadgeClass(item.verdict)}>
+                          <span className="user-status-dot" />
+                          {t(accessLogVerdictLabel(item.verdict))}
+                        </span>
+                      </td>
+                      <td data-label={t('Time')}>
+                        <span className="access-log-time">{formatAccessLogTime(item.timestamp)}</span>
+                        <small className="access-log-sub">{item.duration_ms || 0} ms</small>
+                      </td>
+                      <td data-label={t('Site')}><span className="access-log-site">{item.domain}</span></td>
+                      <td data-label={t('Method')}><span className="access-log-method">{item.method || '-'}</span></td>
+                      <td data-label={t('Path')}><code className="access-log-path" title={item.path || ''}>{item.path || '-'}</code></td>
+                      <td data-label="IP"><span className="access-log-ip">{item.ip || '-'}</span></td>
+                      <td data-label={t('Country')}>{accessLogCountryLabel(item)}</td>
+                      <td data-label={t('Reason')}><span className="access-log-reason" title={item.reason || ''}>{item.reason || '-'}</span></td>
+                      <td data-label={t('Status')}><span className="access-log-http-status">{item.status || '-'}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {(wafAccessLogs.missing || []).length > 0 && (
+            <div className="access-logs-footer-note hint">
+              {t('Missing log files:')} {wafAccessLogs.missing.join(', ')}
+            </div>
+          )}
         </div>
       </div>
-      <div className="access-log-panel">
-        <div className="access-log-toolbar">
-          <div className="access-log-toolbar-label"><strong>{t('Access Logs')}</strong><span>{entryLabel}</span></div>
-          <button className="secondary-light" disabled={rows.length === 0} onClick={exportWafAccessLogs}><Download size={14}/>{t('Export')}</button>
-          <button className="danger light" disabled={!!loading || websites.length === 0} onClick={clearWafAccessLogs}><Trash2 size={14}/>{t('Clear')}</button>
-          <select value={wafAccessLogFilters.websiteId} onChange={e => updateWafAccessLogFilters({ websiteId: e.target.value }, true)}>
-            <option value="">{t('All websites')}</option>
-            {websites.map(site => <option key={site.id} value={site.id}>{site.domain}</option>)}
-          </select>
-          <select value={wafAccessLogFilters.verdict} onChange={e => updateWafAccessLogFilters({ verdict: e.target.value }, true)}>
-            <option value="all">{t('All verdicts')}</option>
-            <option value="block">{t('Blocked')}</option>
-            <option value="allow">{t('Allowed')}</option>
-            <option value="error">{t('Errors')}</option>
-          </select>
-          <input value={wafAccessLogFilters.query} onChange={e => updateWafAccessLogFilters({ query: e.target.value })} onKeyDown={e => { if (e.key === 'Enter') applyWafAccessLogFilters(); }} placeholder={t('Filter logs')} />
-          <select value={wafAccessLogFilters.limit} onChange={e => updateWafAccessLogFilters({ limit: Number(e.target.value) }, true)}>
-            <option value={50}>50 / page</option>
-            <option value={100}>100 / page</option>
-            <option value={200}>200 / page</option>
-            <option value={500}>500 / page</option>
-          </select>
-          <select value={wafAccessLogFilters.refresh} onChange={e => updateWafAccessLogFilters({ refresh: Number(e.target.value) })}>
-            <option value={0}>{t('Manual refresh')}</option>
-            <option value={5}>{t('Refresh 5s')}</option>
-            <option value={10}>{t('Refresh 10s')}</option>
-            <option value={30}>{t('Refresh 30s')}</option>
-          </select>
-          <button disabled={!!loading} onClick={applyWafAccessLogFilters}><Search size={14}/>{t('Apply')}</button>
-        </div>
-        <div className="access-log-table-wrap">
-          <table className="access-log-table">
-            <thead>
-              <tr>
-                <th>{t('Verdict')}</th>
-                <th>{t('Time')}</th>
-                <th>{t('Site')}</th>
-                <th>{t('Method')}</th>
-                <th>{t('Path')}</th>
-                <th>IP</th>
-                <th>{t('Country')}</th>
-                <th>{t('Reason')}</th>
-                <th>{t('Status')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map(item => <tr key={item.id}>
-                <td data-label={t('Verdict')}><span className={accessLogBadgeClass(item.verdict)}>{accessLogVerdictLabel(item.verdict)}</span></td>
-                <td data-label={t('Time')}><span className="access-log-time">{formatAccessLogTime(item.timestamp)}</span><small>{item.duration_ms || 0} ms</small></td>
-                <td data-label={t('Site')}><span className="access-log-site">{item.domain}</span></td>
-                <td data-label={t('Method')}>{item.method || '-'}</td>
-                <td data-label={t('Path')}><code>{item.path || '-'}</code></td>
-                <td data-label="IP"><span className="access-log-ip">{item.ip || '-'}</span></td>
-                <td data-label={t('Country')}>{accessLogCountryLabel(item)}</td>
-                <td data-label={t('Reason')}>{item.reason || '-'}</td>
-                <td data-label={t('Status')}>{item.status || '-'}</td>
-              </tr>)}
-            </tbody>
-          </table>
-          {rows.length === 0 && <EmptyState icon={FileText} message={t('No access log entries match these filters.')} />}
-        </div>
-        {(wafAccessLogs.missing || []).length > 0 && <p className="hint">{t('Missing log files:')} {wafAccessLogs.missing.join(', ')}</p>}
-      </div>
-    </div>;
+    );
   }
   if (page === 'waf-site') return renderWafSite();
   if (page === 'waf-logs' || page === 'access-logs') return renderWafAccessLogs();

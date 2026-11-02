@@ -10,6 +10,7 @@ SRC = ROOT / "frontend" / "src"
 APP_JSX = SRC / "App.jsx"
 USERS_JSX = SRC / "pages" / "Users.jsx"
 MOVE_USERS_JSX = SRC / "pages" / "MoveUsers.jsx"
+WAF_JSX = SRC / "pages" / "Waf.jsx"
 BRAND_CSS = SRC / "brand.css"
 VI_JS = SRC / "locales" / "vi.js"
 
@@ -232,3 +233,82 @@ function endOp(tok) {
 """
     res = subprocess.run([node_bin, "-e", script], capture_output=True, text=True, check=False)
     assert res.returncode == 0, f"Node runtime test failed: {res.stderr or res.stdout}"
+
+
+def test_access_logs_and_log_viewer_deduplicated_across_roles():
+    """Ensure Log Viewer menu duplication is removed and Access & Error Logs appears once per role."""
+    app_src = APP_JSX.read_text(encoding="utf-8")
+
+    assert "Log Viewer" not in app_src
+    assert "['log_viewer'" not in app_src
+    assert "['/log-viewer', 'access-logs']" in app_src
+
+    access_log_items = re.findall(r"\['access-logs',\s*'Access & Error Logs',\s*FileText\]", app_src)
+    assert len(access_log_items) == 3, (
+        f"Expected 1 Access & Error Logs nav item per role (3 total), found {len(access_log_items)}"
+    )
+
+    # Admin's Access & Error Logs must live under System Info & Files, not duplicated in Admin Tools
+    admin_tools_block = re.search(
+        r"\{\s*key:\s*'admin_tools',\s*title:\s*'Admin Tools',\s*items:\s*\[([\s\S]*?)\]\}",
+        app_src,
+    )
+    assert admin_tools_block is not None
+    assert "'access-logs'" not in admin_tools_block.group(1)
+
+    # App.jsx updateWafAccessLogFilters must not call undefined loadWafAccessLogs
+    updater_block = re.search(r"function updateWafAccessLogFilters\([\s\S]{0,220}?\n  \}", app_src)
+    assert updater_block is not None
+    assert "loadWafAccessLogs" not in updater_block.group(0)
+
+
+def test_access_logs_and_waf_websites_use_flat_single_card_tables():
+    """Ensure Access & Error Logs and WAF Websites use flat single-card tables without nested borders."""
+    waf_src = WAF_JSX.read_text(encoding="utf-8")
+    brand_css = BRAND_CSS.read_text(encoding="utf-8")
+
+    # Access & Error Logs flattened into 1 card + clean table
+    assert "pkg-list-card user-mgmt-card access-logs-card" in waf_src
+    assert "pkg-clean-table user-clean-table access-logs-clean-table" in waf_src
+    assert "access-log-panel" not in waf_src
+    assert "access-log-table-wrap" not in waf_src
+
+    # WAF Websites list flattened into 1 card + clean table without per-row bordered cards
+    assert "pkg-list-card user-mgmt-card waf-websites-card" in waf_src
+    assert "pkg-clean-table user-clean-table waf-websites-clean-table" in waf_src
+    assert "waf-overview-row" not in waf_src
+
+    # Inline toolbar selects override global width: 100%, and verdict cells have no pill border
+    select_block = re.search(r"\.access-log-select\s*\{([^}]*)\}", brand_css)
+    assert select_block is not None
+    assert "width: auto !important" in select_block.group(1)
+
+    verdict_block = re.search(r"\.access-logs-clean-table\s+\.access-log-verdict\s*\{([^}]*)\}", brand_css)
+    assert verdict_block is not None
+    assert "border: none !important" in verdict_block.group(1)
+    assert "background: transparent !important" in verdict_block.group(1)
+
+
+def test_vi_locale_covers_logs_and_waf_keys_once():
+    """Ensure new Vietnamese locale keys for Access & Error Logs and WAF appear once and avoid keptInEnglish."""
+    vi_src = VI_JS.read_text(encoding="utf-8")
+    keys = re.findall(r'^\s*"((?:\\.|[^"\\])*)"\s*:', vi_src, re.M)
+    kept_block = vi_src.split("export const keptInEnglish = [", 1)[1]
+    kept = set(re.findall(r'"((?:\\.|[^"\\])*)"', kept_block))
+
+    for expected_key in (
+        "Access & Error Logs",
+        "Web Application Firewall",
+        "Filter IP, path, domain...",
+        "{n} entries",
+        "50 / page",
+        "100 / page",
+        "200 / page",
+        "500 / page",
+        "Filter websites...",
+        "Bad Bots",
+        "Allow",
+    ):
+        assert expected_key not in kept, f"{expected_key!r} is in keptInEnglish"
+        count = keys.count(expected_key)
+        assert count == 1, f"Expected key {expected_key!r} once in vi.js, found {count}"

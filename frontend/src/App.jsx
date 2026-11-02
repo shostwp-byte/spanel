@@ -558,7 +558,7 @@ const WAF_ACCESS_LOG_DEFAULTS = {
   verdict: 'all',
   query: '',
   limit: 50,
-  refresh: 5,
+  refresh: 0,
 };
 const ROUTE_PAGES = new Map([
   ...Object.entries(PAGE_ROUTES).map(([pageName, path]) => [path, pageName]),
@@ -569,6 +569,7 @@ const ROUTE_PAGES = new Map([
   ['/files', 'files'],
   ['/file-manager', 'files'],
   ['/website', 'websites'],
+  ['/log-viewer', 'access-logs'],
   // API tokens moved into Panel settings. Old links still land somewhere real.
   ['/api-token', 'panel-settings'],
   ['/api-tokens', 'panel-settings'],
@@ -1348,7 +1349,7 @@ function AppContent() {
   const [mailTab, setMailTab] = useState('mailboxes');
   const [mailPage, setMailPage] = useState(1);
   const [mailFilter, setMailFilter] = useState({ domain_id: '' });
-  const [wafAccessLogFilters, setWafAccessLogFilters] = useState({ websiteId: '', q: '', page: 1, action: '', refresh: 0 });
+  const [wafAccessLogFilters, setWafAccessLogFilters] = useState(() => ({ ...WAF_ACCESS_LOG_DEFAULTS }));
   const [selectedWafWebsiteId, setSelectedWafWebsiteId] = useState('');
 
   // File Manager states that were missing
@@ -3245,12 +3246,8 @@ function AppContent() {
 
 
 
-  function updateWafAccessLogFilters(patch, shouldLoad = false) {
-    setWafAccessLogFilters(prev => {
-      const next = { ...prev, ...patch };
-      if (shouldLoad) loadWafAccessLogs(next, false);
-      return next;
-    });
+  function updateWafAccessLogFilters(patch) {
+    setWafAccessLogFilters(prev => ({ ...prev, ...patch }));
   }
 
 
@@ -3485,11 +3482,10 @@ function AppContent() {
         ['migration', 'cPanel Import', Copy],
         ['message_all', 'Message All Users', Mail],
         ['reseller_settings', 'Customize Skin', SettingsIcon],
-        ['access-logs', 'Access & Error Logs', FileText],
         ['maintenance', 'Maintenance', Wrench],
       ]},
       { key: 'system_info', title: 'System Info & Files', items: [
-        ['log_viewer', 'Log Viewer', FileText],
+        ['access-logs', 'Access & Error Logs', FileText],
         ['all_crons', 'All User Cron Jobs', Clock],
         ['server_statistics', 'Server Statistics', BarChart],
       ]},

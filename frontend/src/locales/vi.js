@@ -2938,6 +2938,17 @@ export const vi = {
   "Moving users...": "Đang chuyển người dùng...",
   "Users successfully moved.": "Đã chuyển người dùng thành công.",
   "You do not have permission to access this page.": "Bạn không có quyền truy cập trang này.",
+  "Access & Error Logs": "Nhật ký truy cập & lỗi",
+  "Web Application Firewall": "Tường lửa ứng dụng Web (WAF)",
+  "Filter IP, path, domain...": "Lọc IP, đường dẫn, tên miền...",
+  "{n} entries": "{n} bản ghi",
+  "50 / page": "50 / trang",
+  "100 / page": "100 / trang",
+  "200 / page": "200 / trang",
+  "500 / page": "500 / trang",
+  "Filter websites...": "Lọc tên miền...",
+  "Bad Bots": "Chặn Bot xấu",
+  "Allow": "Cho phép",
 };
 
 /* Said in English by the people who run these servers. Translating them
