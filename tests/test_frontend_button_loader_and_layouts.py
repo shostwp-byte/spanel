@@ -372,3 +372,38 @@ def test_file_manager_multi_upload_drag_drop_sequential_and_close_lock():
     # 5. CSS rules present in file-manager.css
     for selector in (".da-upload-dialog", ".da-upload-dropzone", ".da-upload-bar-fill", ".da-fm-drop-overlay"):
         assert selector in fm_css, f"Missing {selector} in file-manager.css"
+
+
+def test_disk_quota_card_i18n_and_reconciling_ui():
+    """Verify DiskQuotaCard localized hints, reconciling spinner state, and vi.js keys."""
+    card_src = (SRC / "components" / "DiskQuotaCard.jsx").read_text(encoding="utf-8")
+    vi_src = VI_JS.read_text(encoding="utf-8")
+    keys = re.findall(r'^\s*"((?:\\.|[^"\\])*)"\s*:', vi_src, re.M)
+    kept_block = vi_src.split("export const keptInEnglish =", 1)[1]
+    kept = set(re.findall(r'"((?:\\.|[^"\\])*)"', kept_block))
+
+    for token in (
+        "formatQuotaHint",
+        "quota.reconciling",
+        "quota.last_error",
+        "quota?.state === 'needs-quotaon'",
+        "Switching on...",
+    ):
+        assert token in card_src, f"Missing {token} in DiskQuotaCard.jsx"
+
+    for expected_key in (
+        "Kernel",
+        "Switching on...",
+        "Build the quota files and switch on kernel disk quota enforcement for {mount} now?",
+        "Install the quota tools and add user quota to /etc/fstab for {mount}? Nothing is remounted or rebooted; if a reboot is needed, SPanel will finish switching kernel quota on automatically after reboot.",
+        "Initializing quota files and switching on kernel quota on {mount}...",
+        "Kernel quota enforces each account's disk and inode limits on {mount}.",
+        "Quota options are mounted on {mount}; enable kernel quota to build the quota files and switch it on.",
+        "Quota options are in /etc/fstab for {mount}. Reboot the server (or run mount -o remount {mount}); SPanel will automatically finish switching kernel quota on.",
+        "/ is XFS: add rootflags=uquota to GRUB_CMDLINE_LINUX in /etc/default/grub, run update-grub and reboot.",
+        "Only the panel's own accounting applies; PHP and SFTP can write past the limit.",
+        "Kernel quota needs ext4 or xfs; {mount} is on {fstype}.",
+    ):
+        assert expected_key not in kept, f"{expected_key!r} is in keptInEnglish"
+        count = keys.count(expected_key)
+        assert count == 1, f"Expected key {expected_key!r} once in vi.js, found {count}"

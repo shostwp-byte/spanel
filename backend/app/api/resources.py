@@ -579,6 +579,8 @@ def get_disk_quota_status(
 ):
     ensure_role(current_user.role, Role.admin)
     current = disk_quota.status()
+    if disk_quota._use_helper() and not disk_quota.settings.command_dry_run:
+        disk_quota.maybe_trigger_auto_enable(current, async_run=True)
     # Kernel quota turns up after the remount/reboot that quota-enable asked
     # for; that is when every account's limit has to be set once.
     current["accounts_queued"] = disk_quota.reconcile_account_limits(db, current)
@@ -593,7 +595,7 @@ def enable_disk_quota(
 ):
     ensure_role(current_user.role, Role.admin)
     try:
-        current = disk_quota.enable()
+        current = disk_quota.enable(manual=True)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     current["accounts_queued"] = disk_quota.reconcile_account_limits(db, current)
