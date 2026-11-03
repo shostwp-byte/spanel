@@ -2966,6 +2966,17 @@ export const vi = {
   "Drop files here to add to upload queue": "Thả tập tin vào đây để đưa vào hàng đợi tải lên",
   "Folders cannot be uploaded directly — please select files or upload a .zip/.tar.gz archive.": "Không hỗ trợ kéo thả trực tiếp thư mục — vui lòng chọn tập tin lẻ hoặc nén .zip/.tar.gz rồi Giải nén.",
   "Remove from queue": "Xóa khỏi hàng đợi",
+  "Kernel": "Mức kernel",
+  "Switching on...": "Đang kích hoạt...",
+  "Build the quota files and switch on kernel disk quota enforcement for {mount} now?": "Khởi tạo dữ liệu quota và bật thực thi giới hạn dung lượng mức nhân (Kernel Quota) cho {mount} ngay bây giờ?",
+  "Install the quota tools and add user quota to /etc/fstab for {mount}? Nothing is remounted or rebooted; if a reboot is needed, SPanel will finish switching kernel quota on automatically after reboot.": "Cài đặt công cụ quota và thêm cấu hình user quota vào /etc/fstab cho {mount}? Hệ thống sẽ không tự mount lại hay khởi động lại ngay; nếu cần khởi động lại máy chủ, SPanel sẽ tự động hoàn tất bật Kernel Quota ngay khi máy chủ khởi động xong.",
+  "Initializing quota files and switching on kernel quota on {mount}...": "Đang khởi tạo dữ liệu quota và kích hoạt Kernel Quota trên {mount}...",
+  "Kernel quota enforces each account's disk and inode limits on {mount}.": "Kernel Quota đang thực thi giới hạn dung lượng đĩa và số lượng inode cho từng tài khoản trên {mount}.",
+  "Quota options are mounted on {mount}; enable kernel quota to build the quota files and switch it on.": "Tùy chọn quota đã được mount trên {mount}; hãy bấm Bật quota của kernel để khởi tạo dữ liệu và kích hoạt.",
+  "Quota options are in /etc/fstab for {mount}. Reboot the server (or run mount -o remount {mount}); SPanel will automatically finish switching kernel quota on.": "Cấu hình quota đã được ghi vào /etc/fstab cho {mount}. Hãy khởi động lại máy chủ (hoặc chạy mount -o remount {mount}); SPanel sẽ tự động hoàn tất kích hoạt Kernel Quota.",
+  "/ is XFS: add rootflags=uquota to GRUB_CMDLINE_LINUX in /etc/default/grub, run update-grub and reboot.": "Phân vùng / dùng XFS: hãy thêm rootflags=uquota vào GRUB_CMDLINE_LINUX trong /etc/default/grub, chạy update-grub rồi khởi động lại máy chủ.",
+  "Only the panel's own accounting applies; PHP and SFTP can write past the limit.": "Hiện chỉ áp dụng bộ đếm của Panel; các tiến trình PHP và SFTP vẫn có thể ghi vượt hạn mức nếu chưa bật Kernel Quota.",
+  "Kernel quota needs ext4 or xfs; {mount} is on {fstype}.": "Kernel Quota yêu cầu hệ thống tập tin ext4 hoặc xfs; {mount} hiện đang dùng {fstype}.",
 };
 
 /* Said in English by the people who run these servers. Translating them

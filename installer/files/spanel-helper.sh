@@ -10300,6 +10300,9 @@ retune_mariadb() {
 # effect at the administrator's next remount or reboot, and the status says so.
 QUOTA_HOME="/home"
 FSTAB_FILE="/etc/fstab"
+QUOTA_MODULES_CONF="${QUOTA_MODULES_CONF:-/etc/modules-load.d/spanel-quota.conf}"
+QUOTA_LOCK_FILE="${QUOTA_LOCK_FILE:-/run/lock/spanel-quota-enable.lock}"
+QUOTA_ROOT_PREFIX="${QUOTA_ROOT_PREFIX:-}"
 
 quota_mount_field() {
   # spanel-api.service's ReadWritePaths=/home creates a bind mount at /home
@@ -10417,8 +10420,8 @@ quota_status() {
   state="$(quota_state "$fstype" "$mp" "$active" "$fstab" "$on")"
   case "$state" in
     active) hint="Kernel quota enforces each account's disk and inode limits on ${mp}." ;;
-    needs-quotaon) hint="Quota options are mounted on ${mp}; enable kernel quota again to build the quota files and switch it on." ;;
-    remount-required) hint="Quota options are in /etc/fstab for ${mp}. Remount it (mount -o remount ${mp}) or reboot, then enable again." ;;
+    needs-quotaon) hint="Quota options are mounted on ${mp}; enable kernel quota to build the quota files and switch it on." ;;
+    remount-required) hint="Quota options are in /etc/fstab for ${mp}. Reboot the server (or run mount -o remount ${mp}); SPanel will automatically finish switching kernel quota on." ;;
     kernel-cmdline-required) hint="/ is XFS: add rootflags=uquota to GRUB_CMDLINE_LINUX in /etc/default/grub, run update-grub and reboot." ;;
     not-configured) hint="Only the panel's own accounting applies; PHP and SFTP can write past the limit." ;;
     unsupported) hint="Kernel quota needs ext4 or xfs; ${mp:-/home} is on ${fstype:-an unknown filesystem}." ;;
@@ -10429,7 +10432,13 @@ quota_status() {
 }
 
 quota_enable() {
-  local mp fstype options state backup tmp
+  local mp fstype options state backup tmp lock_dir lock_fd=""
+  lock_dir="$(dirname "$QUOTA_LOCK_FILE")"
+  if [[ "${SPANEL_QUOTA_LOCKED:-0}" != "1" && -d "$lock_dir" && -w "$lock_dir" ]] && command -v flock >/dev/null 2>&1; then
+    exec {lock_fd}>"$QUOTA_LOCK_FILE"
+    flock -w 300 -x "$lock_fd" || deny "another quota-enable operation is currently running"
+    SPANEL_QUOTA_LOCKED=1
+  fi
   mp="$(quota_mount_field TARGET)"
   fstype="$(quota_mount_field FSTYPE)"
   options="$(quota_mount_field OPTIONS)"
@@ -10438,19 +10447,49 @@ quota_enable() {
     ext4|xfs) ;;
     *) deny "kernel quota needs ext4 or xfs; ${mp} is ${fstype:-unknown}" ;;
   esac
-  if ! command -v setquota >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y quota >/dev/null || deny "apt-get could not install the quota tools"
-  fi
   # spanel-api.service runs with PrivateDevices=true and ProtectKernelModules=true,
-  # which attaches a cgroup BPF device filter (DevicePolicy=closed) and hides
-  # /dev/disk inside the service namespace. Run host-level verification and quota
-  # commands in a transient unit outside the restricted cgroup when available.
+  # which attaches a cgroup BPF device filter (DevicePolicy=closed), mounts
+  # /usr/lib/modules read-only, and hides /dev/disk inside the service namespace.
+  # Run host-level package, module, verification, and quota commands in a
+  # transient unit outside the restricted cgroup when available.
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none
   local -a host_run=()
   if [[ "$(type -t findmnt)" == "file" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
-    host_run=(systemd-run --wait --pipe --collect --quiet -p PrivateDevices=no -p ProtectKernelModules=no --)
+    host_run=(
+      systemd-run --wait --pipe --collect --quiet
+      -p PrivateDevices=no -p ProtectKernelModules=no
+      -p Environment=DEBIAN_FRONTEND=noninteractive
+      -p Environment=NEEDRESTART_MODE=l
+      -p Environment=APT_LISTCHANGES_FRONTEND=none
+      --
+    )
   elif [[ "$(type -t findmnt)" == "file" && ! -d /dev/disk && -r /proc/1/ns/mnt ]] && command -v nsenter >/dev/null 2>&1; then
     host_run=(nsenter -t 1 -m --)
+  fi
+  if ! command -v setquota >/dev/null 2>&1; then
+    "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y quota >/dev/null || deny "apt-get could not install the quota tools"
+  fi
+  if [[ "$fstype" == ext4 ]]; then
+    local mod_dir
+    mod_dir="$(dirname "$QUOTA_MODULES_CONF")"
+    mkdir -p "$mod_dir" 2>/dev/null || true
+    if [[ -d "$mod_dir" && -w "$mod_dir" ]]; then
+      printf 'quota_v1\nquota_v2\n' >"$QUOTA_MODULES_CONF" 2>/dev/null || true
+      chmod 0644 "$QUOTA_MODULES_CONF" 2>/dev/null || true
+    fi
+    # Pre-install linux-modules-extra before reboot when quota_v2 is missing on
+    # a stripped cloud/virtual kernel, so quotaon succeeds right after reboot.
+    if [[ "${QUOTA_FORCE_MODULE_CHECK:-0}" == "1" || "$(type -t setquota)" == "file" ]]; then
+      if command -v modinfo >/dev/null 2>&1 && [[ "${QUOTA_FORCE_MODULE_CHECK:-0}" == "1" || -d "/lib/modules/$(uname -r)" ]]; then
+        if ! "${host_run[@]}" modinfo quota_v2 >/dev/null 2>&1 && [[ ! -d /sys/module/quota_v2 ]]; then
+          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
+          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
+          "${host_run[@]}" depmod -a >/dev/null 2>&1 || true
+          "${host_run[@]}" modprobe quota_v1 >/dev/null 2>&1 || true
+          "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
   fi
   if ! quota_options_active "$options"; then
     if [[ "$fstype" == xfs && "$mp" == / ]]; then
@@ -10504,14 +10543,43 @@ quota_enable() {
   fi
   if [[ "$fstype" == ext4 ]]; then
     # Journaled quota: build the quota file once, then switch it on. -m keeps
-    # the filesystem mounted read-write while it is counted.
-    if [[ ! -s "${mp%/}/aquota.user" ]]; then
-      "${host_run[@]}" quotacheck -cum "$mp" || deny "quotacheck failed on ${mp}"
+    # the filesystem mounted read-write while it is counted. Fall back to -cfum
+    # when quotacheck refuses a live journaled mountpoint without --force, and
+    # tolerate native ext4 superblock quota (-O quota) where quotaon works
+    # directly without external aquota.user files.
+    local q_err="" need_quotacheck=0
+    if [[ ! -s "${QUOTA_ROOT_PREFIX}${mp%/}/aquota.user" ]]; then
+      if ! "${host_run[@]}" quotacheck -cum "$mp" 2>/dev/null; then
+        "${host_run[@]}" quotaoff -u "$mp" >/dev/null 2>&1 || true
+        if ! q_err="$("${host_run[@]}" quotacheck -cfum "$mp" 2>&1)"; then
+          need_quotacheck=1
+        fi
+      fi
     fi
     if [[ "$("${host_run[@]}" quotaon -pu "$mp" 2>/dev/null || true)" != *" is on"* ]]; then
-      if ! "${host_run[@]}" quotaon -u "$mp" 2>/dev/null; then
+      if ! q_err="$("${host_run[@]}" quotaon -u "$mp" 2>&1)"; then
+        "${host_run[@]}" modprobe quota_v1 >/dev/null 2>&1 || true
         "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
-        "${host_run[@]}" quotaon -u "$mp" || deny "quotaon failed on ${mp}; install linux-modules-extra-$(uname -r) so the quota_v2 kernel module is available"
+        if ! q_err="$("${host_run[@]}" quotaon -u "$mp" 2>&1)"; then
+          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
+          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
+          "${host_run[@]}" depmod -a >/dev/null 2>&1 || true
+          "${host_run[@]}" modprobe quota_v1 >/dev/null 2>&1 || true
+          "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
+          if ! q_err="$("${host_run[@]}" quotaon -u "$mp" 2>&1)"; then
+            if (( need_quotacheck == 0 )); then
+              "${host_run[@]}" quotaoff -u "$mp" >/dev/null 2>&1 || true
+              "${host_run[@]}" quotacheck -cfum "$mp" >/dev/null 2>&1 || true
+              if ! q_err="$("${host_run[@]}" quotaon -u "$mp" 2>&1)"; then
+                local detail="${q_err//$'\n'/ }"
+                deny "quotaon failed on ${mp}${detail:+: ${detail}}"
+              fi
+            else
+              local detail="${q_err//$'\n'/ }"
+              deny "quotaon failed on ${mp}${detail:+: ${detail}}"
+            fi
+          fi
+        fi
       fi
     fi
   fi
