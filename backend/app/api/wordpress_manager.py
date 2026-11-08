@@ -718,7 +718,35 @@ def reconcile_wordpress_databases(db: Session, website_id: Optional[int] = None,
     return wordpress_live.safe_reconcile_wordpress_databases(db, website_id=website_id, provision_missing=False)
 
 
-def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _dir_mtime_sig(path: Path) -> str:
+    try:
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return ""
+        parts: List[str] = []
+        with os.scandir(path) as it:
+            for entry in it:
+                name = entry.name
+                if not name or name.startswith(".") or name.lower() == "index.php":
+                    continue
+                try:
+                    est = entry.stat(follow_symlinks=False)
+                    parts.append(f"{name}:{est.st_mtime_ns}")
+                except OSError:
+                    parts.append(name)
+        parts.sort()
+        return f"{st.st_mtime_ns}:{len(parts)}:{','.join(parts)}"
+    except OSError:
+        return ""
+
+
+def _build_instance_summary(
+    site: Website,
+    db: Session,
+    state: Dict[str, Any],
+    *,
+    refresh: bool = False,
+) -> Optional[Dict[str, Any]]:
     inst_key = str(site.id)
     saved = (state.get("instances") or {}).get(inst_key) or {}
     if saved.get("detached"):
@@ -759,18 +787,34 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
     db_acc = wordpress_live.resolve_owned_wp_database(db, site, cfg.get("db_name") or saved.get("db_name"))
     db_name = db_acc.db_name if db_acc else ""
     db_user = db_acc.db_user if db_acc else ""
-    try:
-        tables = mariadb.get_database_tables_breakdown(db_acc.db_name if db_acc else db_name)
-        table_count = len(tables)
-        sz_bytes = sum(int(t.get("total_bytes") or 0) for t in tables)
-        if db_acc and sz_bytes > 0 and getattr(db_acc, "size_bytes", 0) != sz_bytes:
-            db_acc.size_bytes = sz_bytes
-            db.commit()
-        if sz_bytes > 0:
-            db_size_mb = round(float(sz_bytes) / (1024 * 1024), 2)
-    except Exception:
-        if db_acc and int(getattr(db_acc, "size_bytes", 0) or 0) > 0:
-            db_size_mb = round(float(db_acc.size_bytes) / (1024 * 1024), 2)
+    now_ts = time.time()
+    if (
+        not refresh
+        and db_name
+        and saved.get("_db_stats_db") == db_name
+        and saved.get("table_count") is not None
+        and (now_ts - float(saved.get("_db_stats_ts") or 0)) < 180
+    ):
+        table_count = int(saved.get("table_count") or 0)
+        db_size_mb = float(saved.get("db_size_mb") or 0.0)
+    else:
+        try:
+            tables = mariadb.get_database_tables_breakdown(db_acc.db_name if db_acc else db_name)
+            table_count = len(tables)
+            sz_bytes = sum(int(t.get("total_bytes") or 0) for t in tables)
+            if db_acc and sz_bytes > 0 and getattr(db_acc, "size_bytes", 0) != sz_bytes:
+                db_acc.size_bytes = sz_bytes
+                db.commit()
+            if sz_bytes > 0:
+                db_size_mb = round(float(sz_bytes) / (1024 * 1024), 2)
+            if inst_key in (state.get("instances") or {}):
+                saved["_db_stats_db"] = db_name
+                saved["_db_stats_ts"] = round(now_ts, 1)
+                saved["table_count"] = table_count
+                saved["db_size_mb"] = db_size_mb
+        except Exception:
+            if db_acc and int(getattr(db_acc, "size_bytes", 0) or 0) > 0:
+                db_size_mb = round(float(db_acc.size_bytes) / (1024 * 1024), 2)
 
     db_meta = wordpress_live.query_wp_db_live_meta(db_name, table_prefix, owner_id=site.owner_id, site_id=site.id, db=db)
     live_site_title = db_meta.get("site_title") or saved.get("site_title") or site.domain
@@ -816,18 +860,98 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
     critical_failed = any(c["critical"] and not c["passed"] for c in sec_checks)
     security_status = "ok" if passed_count == len(sec_checks) else ("warning" if not critical_failed or passed_count >= 5 else "critical")
 
+    plugins_sig = _dir_mtime_sig(wp_dir / "wp-content" / "plugins")
+    themes_sig = _dir_mtime_sig(wp_dir / "wp-content" / "themes")
+    prev_plugins_by_slug = {
+        str(p.get("slug") or "").lower(): p
+        for p in (saved.get("plugins") or [])
+        if isinstance(p, dict) and p.get("slug")
+    }
+    prev_themes_by_slug = {
+        str(th.get("slug") or "").lower(): th
+        for th in (saved.get("themes") or [])
+        if isinstance(th, dict) and th.get("slug")
+    }
+
     if settings.command_dry_run and "plugins" in saved:
         plugins_list = list(saved.get("plugins") or [])
+    elif (
+        not refresh
+        and plugins_sig
+        and saved.get("_plugins_dir_sig") == plugins_sig
+        and isinstance(saved.get("plugins"), list)
+    ):
+        active_set = (
+            {s.lower() for s in (db_meta.get("active_plugin_slugs") or [])}
+            if db_meta.get("active_plugin_slugs") is not None
+            else None
+        )
+        auto_set = {s.lower() for s in (db_meta.get("auto_update_plugin_slugs") or [])}
+        plugins_list = []
+        for p in saved.get("plugins") or []:
+            if not isinstance(p, dict):
+                continue
+            item = dict(p)
+            slug_l = str(item.get("slug") or "").lower()
+            if active_set is not None and slug_l:
+                item["status"] = "active" if slug_l in active_set else "inactive"
+            if db_meta.get("active_plugin_slugs") is not None and slug_l:
+                item["auto_update"] = slug_l in auto_set
+            plugins_list.append(item)
     else:
         plugins_list = _default_plugins_for_instance(
-            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta
+            wp_dir,
+            linux_user=linux_user,
+            php_version=php_ver,
+            site_root=site_root,
+            db_meta=db_meta,
+            use_wp_cli=refresh,
         )
+        if not refresh and prev_plugins_by_slug:
+            for item in plugins_list:
+                prev = prev_plugins_by_slug.get(str(item.get("slug") or "").lower())
+                if prev and prev.get("version") == item.get("version"):
+                    if prev.get("latest_version"):
+                        item["latest_version"] = prev["latest_version"]
+                    if "update_available" in prev:
+                        item["update_available"] = bool(prev["update_available"])
+
     if settings.command_dry_run and "themes" in saved:
         themes_list = list(saved.get("themes") or [])
+    elif (
+        not refresh
+        and themes_sig
+        and saved.get("_themes_dir_sig") == themes_sig
+        and isinstance(saved.get("themes"), list)
+    ):
+        active_stylesheet = str(db_meta.get("stylesheet") or "").strip().lower()
+        themes_list = []
+        for th in saved.get("themes") or []:
+            if not isinstance(th, dict):
+                continue
+            item = dict(th)
+            slug_l = str(item.get("slug") or "").lower()
+            if active_stylesheet and slug_l:
+                item["status"] = "active" if slug_l == active_stylesheet else "inactive"
+            themes_list.append(item)
     else:
         themes_list = _default_themes_for_instance(
-            wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta
+            wp_dir,
+            linux_user=linux_user,
+            php_version=php_ver,
+            site_root=site_root,
+            db_meta=db_meta,
+            use_wp_cli=refresh,
         )
+        if not refresh and prev_themes_by_slug:
+            for item in themes_list:
+                prev = prev_themes_by_slug.get(str(item.get("slug") or "").lower())
+                if prev and prev.get("version") == item.get("version"):
+                    if prev.get("latest_version"):
+                        item["latest_version"] = prev["latest_version"]
+                    if "update_available" in prev:
+                        item["update_available"] = bool(prev["update_available"])
+
     active_theme = next(
         (th["name"] for th in themes_list if th.get("status") == "active"),
         (themes_list[0]["name"] if themes_list else (db_meta.get("stylesheet") or "None")),
@@ -835,6 +959,10 @@ def _build_instance_summary(site: Website, db: Session, state: Dict[str, Any]) -
     if inst_key in (state.get("instances") or {}):
         saved["plugins"] = plugins_list
         saved["themes"] = themes_list
+        if plugins_sig:
+            saved["_plugins_dir_sig"] = plugins_sig
+        if themes_sig:
+            saved["_themes_dir_sig"] = themes_sig
 
     snapshots = _list_site_snapshots(site_root, saved)
 
@@ -903,9 +1031,16 @@ def _default_plugins_for_instance(
     php_version: str = "8.4",
     site_root: Optional[Path] = None,
     db_meta: Optional[Dict[str, Any]] = None,
+    *,
+    use_wp_cli: bool = True,
 ) -> List[Dict[str, Any]]:
     live = wordpress_live.discover_live_plugins(
-        wp_dir, linux_user=linux_user, php_version=php_version, site_root=site_root, db_meta=db_meta
+        wp_dir,
+        linux_user=linux_user,
+        php_version=php_version,
+        site_root=site_root,
+        db_meta=db_meta,
+        use_wp_cli=use_wp_cli,
     )
     if live or not settings.command_dry_run:
         return live
@@ -935,9 +1070,16 @@ def _default_themes_for_instance(
     php_version: str = "8.4",
     site_root: Optional[Path] = None,
     db_meta: Optional[Dict[str, Any]] = None,
+    *,
+    use_wp_cli: bool = True,
 ) -> List[Dict[str, Any]]:
     live = wordpress_live.discover_live_themes(
-        wp_dir, linux_user=linux_user, php_version=php_version, site_root=site_root, db_meta=db_meta
+        wp_dir,
+        linux_user=linux_user,
+        php_version=php_version,
+        site_root=site_root,
+        db_meta=db_meta,
+        use_wp_cli=use_wp_cli,
     )
     if live or not settings.command_dry_run:
         return live
@@ -1180,6 +1322,7 @@ def _evaluate_user_app_quota(
 
 @router.get("/instances")
 def list_wp_instances(
+    refresh: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1188,16 +1331,23 @@ def list_wp_instances(
     query = db.query(Website).filter(Website.owner_id == current_user.id)
     websites = query.order_by(Website.id.desc()).all()
 
+    do_refresh = (
+        bool(refresh)
+        if isinstance(refresh, (bool, int, str)) and str(refresh).lower() not in ("0", "false", "")
+        else False
+    )
     state = _load_toolkit_state()
+    state_before = json.dumps(state, sort_keys=True, ensure_ascii=False)
     instances: List[Dict[str, Any]] = []
     for site in websites:
         try:
-            summary = _build_instance_summary(site, db, state)
+            summary = _build_instance_summary(site, db, state, refresh=do_refresh)
             if summary:
                 instances.append(summary)
         except Exception as exc:
             logger.error("Error building WordPress instance summary for %s: %s", getattr(site, "domain", site.id), exc)
-    _save_toolkit_state(state)
+    if json.dumps(state, sort_keys=True, ensure_ascii=False) != state_before:
+        _save_toolkit_state(state)
 
     active_wp_ids = {inst.get("website_id") or inst.get("id") for inst in instances}
     quota, occupied_ids = _evaluate_user_app_quota(
@@ -2323,6 +2473,7 @@ def manage_instance_plugins(
             wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta_after
         )
     inst["plugins"] = plugins
+    inst["_plugins_dir_sig"] = _dir_mtime_sig(wp_dir / "wp-content" / "plugins")
     _save_toolkit_state(state)
     return {
         "message": msg,
@@ -2485,6 +2636,7 @@ def manage_instance_themes(
             wp_dir, linux_user=linux_user, php_version=php_ver, site_root=site_root, db_meta=db_meta_after
         )
     inst["themes"] = themes
+    inst["_themes_dir_sig"] = _dir_mtime_sig(wp_dir / "wp-content" / "themes")
     _save_toolkit_state(state)
     return {
         "message": msg,

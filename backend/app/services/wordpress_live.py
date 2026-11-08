@@ -427,6 +427,8 @@ def read_wp_file_text(
         )
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
             return handle.read()
+    except (FileNotFoundError, NotADirectoryError):
+        return ""
     except Exception:
         pass
     if linux_user and site_root and not settings.command_dry_run:
@@ -622,8 +624,14 @@ def wp_path_exists(
 ) -> bool:
     target = wp_dir / rel_path
     try:
-        if not _has_symlink_component(target, site_root) and target.exists():
+        st = os.lstat(target)
+        if stat.S_ISLNK(st.st_mode):
+            return False
+        if not _has_symlink_component(target, site_root):
             return True
+        return False
+    except (FileNotFoundError, NotADirectoryError):
+        return False
     except Exception:
         pass
     if linux_user and site_root and not settings.command_dry_run:
@@ -952,10 +960,12 @@ def discover_live_plugins(
     php_version: str = "8.4",
     site_root: Optional[Path] = None,
     db_meta: Optional[Dict[str, Any]] = None,
+    *,
+    use_wp_cli: bool = True,
 ) -> List[Dict[str, Any]]:
     """Return the exact live plugins installed on this WordPress site. Never returns fake/mock plugins."""
     try:
-        if linux_user and not settings.command_dry_run:
+        if use_wp_cli and linux_user and not settings.command_dry_run:
             res = run_wp_cli(
                 linux_user,
                 php_version or "8.4",
@@ -1050,10 +1060,12 @@ def discover_live_themes(
     php_version: str = "8.4",
     site_root: Optional[Path] = None,
     db_meta: Optional[Dict[str, Any]] = None,
+    *,
+    use_wp_cli: bool = True,
 ) -> List[Dict[str, Any]]:
     """Return the exact live themes installed on this WordPress site. Never returns fake/mock themes."""
     try:
-        if linux_user and not settings.command_dry_run:
+        if use_wp_cli and linux_user and not settings.command_dry_run:
             res = run_wp_cli(
                 linux_user,
                 php_version or "8.4",

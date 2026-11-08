@@ -747,6 +747,150 @@ class WordPressManagerOverhaulTests(unittest.TestCase):
             active_user[0] = end_user
             self.assertEqual(asyncio.run(_call()), 200)
 
+    def test_7_fast_instance_list_cache_and_no_missing_file_subprocesses(self):
+        test_fast_instance_list_cache_and_no_missing_file_subprocesses()
+
+
+def test_fast_instance_list_cache_and_no_missing_file_subprocesses():
+    fe_src = (REPO_ROOT / "frontend" / "src" / "pages" / "WordPressManager.jsx").read_text(encoding="utf-8")
+    for token in (
+        "_wpToolkitSessionCache",
+        "WP_TOOLKIT_CACHE_SOFT_TTL_MS",
+        "buildWebsitesSignature",
+        "invalidateWordPressToolkitCache",
+        "/wordpress-manager/instances?refresh=1",
+    ):
+        assert token in fe_src, f"Missing {token} in WordPressManager.jsx"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        state_file = tmp / "wordpress_toolkit.json"
+        home_base = tmp / "home"
+        site_root = home_base / "shostc" / "shost.com.vn"
+        wp_dir = site_root / "public_html"
+        _seed_wp_files(wp_dir, db_name="shostc_wp_fast", db_user="shostc_u_fast")
+        (wp_dir / "wp-content" / "plugins" / "classic-editor").mkdir(parents=True, exist_ok=True)
+        (wp_dir / "wp-content" / "plugins" / "classic-editor" / "classic-editor.php").write_text(
+            "<?php\n/*\nPlugin Name: Classic Editor\nVersion: 1.6.7\n*/\n",
+            encoding="utf-8",
+        )
+
+        db, test_engine = _make_db()
+        owner = User(
+            username="shostc",
+            email="shostc@shost.com.vn",
+            hashed_password="x",
+            role="user",
+            is_active=True,
+        )
+        db.add(owner)
+        db.commit()
+
+        site = Website(
+            domain="shost.com.vn",
+            root_path=str(site_root),
+            document_root="public_html",
+            linux_user="shostc",
+            php_version="8.4",
+            app_type="wordpress",
+            ssl_enabled=True,
+            owner_id=owner.id,
+        )
+        db.add(site)
+        db.commit()
+
+        db_acc = DatabaseAccount(
+            db_name="shostc_wp_fast",
+            db_user="shostc_u_fast",
+            db_password="x",
+            owner_id=owner.id,
+            website_id=site.id,
+        )
+        db.add(db_acc)
+        db.commit()
+
+        priv_calls: list[tuple[str, list[str]]] = []
+        base_priv = _make_fake_privileged([])
+
+        def tracking_priv(command_key: str, *, helper_args=None, **kwargs):
+            args = list(helper_args or [])
+            priv_calls.append((command_key, args))
+            if command_key == "wp-site" and "plugin" in args and "list" in args:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='[{"name":"classic-editor","title":"Classic Editor","version":"1.6.7","update_version":"1.6.8","update":"available","status":"active","auto_update":"on"}]',
+                    stderr="",
+                )
+            if command_key == "wp-site" and "theme" in args and "list" in args:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='[{"name":"twentytwentyfive","title":"Twenty Twenty-Five","version":"1.1","update_version":"1.1","update":"none","status":"active"}]',
+                    stderr="",
+                )
+            return base_priv(command_key, helper_args=helper_args, **kwargs)
+
+        orig_dry = settings.command_dry_run
+        settings.command_dry_run = False
+        try:
+            with (
+                patch.object(wordpress_live, "engine", test_engine),
+                patch.object(wordpress_live, "toolkit_state_path", return_value=state_file),
+                patch.object(wordpress_manager.site_users, "HOME_ROOT", home_base),
+                patch.object(wordpress_live.shell, "privileged", side_effect=tracking_priv),
+                patch.object(wordpress_manager.shell, "privileged", side_effect=tracking_priv),
+                patch.object(
+                    wordpress_live,
+                    "query_wp_db_live_meta",
+                    return_value={
+                        "site_title": "Fast WP",
+                        "admin_user": "wpadmin",
+                        "admin_email": "admin@shost.com.vn",
+                        "active_plugin_slugs": ["classic-editor"],
+                        "auto_update_plugin_slugs": ["classic-editor"],
+                        "stylesheet": "twentytwentyfive",
+                    },
+                ),
+            ):
+                # 1. Missing files must NEVER trigger terminal-exec stat/cat
+                priv_calls.clear()
+                assert wordpress_live.wp_path_exists(wp_dir, ".maintenance", "shostc", site_root) is False
+                assert wordpress_live.wp_path_exists(wp_dir, ".htpasswd", "shostc", site_root) is False
+                assert wordpress_live.read_wp_file_text(wp_dir, ".htaccess", "shostc", site_root) == ""
+                assert priv_calls == [], f"Missing files must not spawn privileged subprocesses: {priv_calls}"
+
+                # 2. Default list_wp_instances (refresh=False) must NOT spawn wp-site (wp-cli) processes
+                wordpress_manager.scan_wp_instances(db=db, current_user=owner)
+                priv_calls.clear()
+                res_fast = wordpress_manager.list_wp_instances(db=db, current_user=owner)
+                wp_cli_calls = [c for c in priv_calls if c[0] == "wp-site"]
+                assert wp_cli_calls == [], f"Default list_wp_instances must not spawn wp-cli: {wp_cli_calls}"
+                assert len(res_fast["instances"]) == 1
+                inst_fast = res_fast["instances"][0]
+                assert inst_fast["plugins_count"] == 1
+                assert inst_fast["plugins"][0]["slug"] == "classic-editor"
+                assert inst_fast["plugins"][0]["status"] == "active"
+                assert inst_fast["themes_count"] == 1
+                assert inst_fast["active_theme"] == "Twenty Twenty-Five"
+
+                # 3. Explicit refresh=True runs wp-cli discovery and caches update_available metadata
+                priv_calls.clear()
+                res_refresh = wordpress_manager.list_wp_instances(refresh=True, db=db, current_user=owner)
+                wp_cli_calls_refresh = [c for c in priv_calls if c[0] == "wp-site"]
+                assert len(wp_cli_calls_refresh) == 2
+                inst_ref = res_refresh["instances"][0]
+                assert inst_ref["plugins"][0]["update_available"] is True
+                assert inst_ref["plugins"][0]["latest_version"] == "1.6.8"
+
+                # 4. Subsequent default list_wp_instances reuses cached plugins/themes & update flags without wp-cli
+                priv_calls.clear()
+                res_cached = wordpress_manager.list_wp_instances(db=db, current_user=owner)
+                assert [c for c in priv_calls if c[0] == "wp-site"] == []
+                assert res_cached["instances"][0]["plugins"][0]["update_available"] is True
+        finally:
+            settings.command_dry_run = orig_dry
+            db.close()
+            test_engine.dispose()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
