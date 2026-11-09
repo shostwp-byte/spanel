@@ -816,7 +816,7 @@ export function NodejsManagerPage({
     const installedPkgSet = new Set((inst.packages || []).map(p => p.name));
 
     return (
-      <div className="wp-instance-body" style={{ borderTop: '1px solid var(--border-subtle)', padding: '18px 20px' }}>
+      <div className="wp-instance-body" style={{ borderTop: '1px solid var(--border)', padding: '18px 20px' }}>
         {/* Sub-navigation bar */}
         <div
           style={{
@@ -825,9 +825,9 @@ export function NodejsManagerPage({
             alignItems: 'center',
             justifyContent: 'space-between',
             gap: '10px',
-            marginBottom: '16px',
-            paddingBottom: '12px',
-            borderBottom: '1px solid var(--border-subtle)',
+            marginBottom: '18px',
+            paddingBottom: '14px',
+            borderBottom: '1px solid var(--border)',
           }}
         >
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
@@ -851,18 +851,17 @@ export function NodejsManagerPage({
                 <button
                   key={tab.id}
                   type="button"
-                  className={isActive ? 'btn-primary' : 'btn-secondary'}
+                  className={isActive ? 'mini' : 'secondary-light mini'}
                   style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '6px',
-                    padding: '6px 12px',
+                    height: '34px',
+                    minHeight: '34px',
+                    padding: '0 14px',
                     fontSize: '12.5px',
                   }}
                   onClick={() => setTab(tab.id)}
                 >
                   <IconComp size={14} />
-                  {tab.label}
+                  <span>{tab.label}</span>
                 </button>
               );
             })}
@@ -871,27 +870,24 @@ export function NodejsManagerPage({
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
             <button
               type="button"
-              className="btn-secondary"
-              style={{ fontSize: '12px', padding: '5px 10px' }}
+              className="secondary-light mini"
               onClick={() => openEnvModal(inst)}
             >
               <Settings size={13} />
-              Biến .env
+              <span>Biến .env</span>
             </button>
             <button
               type="button"
-              className="btn-secondary"
-              style={{ fontSize: '12px', padding: '5px 10px' }}
+              className="secondary-light mini"
               onClick={() => openLogsModal(inst, 'systemd', 120)}
             >
               <FileText size={13} />
-              Nhật ký (Logs)
+              <span>Nhật ký (Logs)</span>
             </button>
             {openWebsiteFileManager && (
               <button
                 type="button"
-                className="btn-secondary"
-                style={{ fontSize: '12px', padding: '5px 10px' }}
+                className="secondary-light mini"
                 onClick={() =>
                   openWebsiteFileManager({
                     id: inst.website_id,
@@ -901,17 +897,12 @@ export function NodejsManagerPage({
                 }
               >
                 <FolderOpen size={13} />
-                File Manager
+                <span>File Manager</span>
               </button>
             )}
             <button
               type="button"
-              className="btn-secondary"
-              style={{
-                fontSize: '12px',
-                padding: '5px 10px',
-                color: 'var(--danger, #ef4444)',
-              }}
+              className="danger mini"
               onClick={() => {
                 setRemoveOptions({
                   mode: 'detach',
@@ -923,7 +914,7 @@ export function NodejsManagerPage({
               }}
             >
               <Trash2 size={13} />
-              Gỡ bỏ
+              <span>Gỡ bỏ</span>
             </button>
           </div>
         </div>
@@ -939,19 +930,19 @@ export function NodejsManagerPage({
                 gap: '12px',
                 padding: '14px',
                 borderRadius: '10px',
-                background: 'var(--surface-muted, rgba(148,163,184,0.08))',
-                border: '1px solid var(--border-subtle)',
+                background: 'var(--surface-alt)',
+                border: '1px solid var(--border)',
               }}
             >
               <div>
                 <div className="hint" style={{ fontSize: '11.5px' }}>Trạng thái Daemon</div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', fontWeight: 600 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px', fontWeight: 700 }}>
                   <span
                     style={{
                       width: '8px',
                       height: '8px',
                       borderRadius: '50%',
-                      background: isRunning ? '#22c55e' : '#94a3b8',
+                      background: isRunning ? '#10b981' : '#94a3b8',
                     }}
                   />
                   <span>{isRunning ? 'Đang chạy (Active)' : 'Đã dừng (Stopped)'}</span>
@@ -959,20 +950,20 @@ export function NodejsManagerPage({
               </div>
               <div>
                 <div className="hint" style={{ fontSize: '11.5px' }}>Cổng Reverse Proxy</div>
-                <div style={{ marginTop: '4px', fontWeight: 600, fontFamily: 'monospace' }}>
+                <div style={{ marginTop: '4px', fontWeight: 700, fontFamily: 'var(--font-mono, monospace)' }}>
                   127.0.0.1:{inst.port}
                 </div>
               </div>
               <div>
                 <div className="hint" style={{ fontSize: '11.5px' }}>PID / Bộ nhớ hiện tại</div>
-                <div style={{ marginTop: '4px', fontWeight: 600 }}>
+                <div style={{ marginTop: '4px', fontWeight: 700 }}>
                   {inst.process?.main_pid ? `PID ${inst.process.main_pid}` : '—'} ·{' '}
                   {formatMemoryBytes(inst.process?.memory_current_bytes)} / {inst.memory_mb} MB
                 </div>
               </div>
               <div>
                 <div className="hint" style={{ fontSize: '11.5px' }}>Lệnh khởi chạy</div>
-                <div style={{ marginTop: '4px', fontWeight: 600, fontFamily: 'monospace', fontSize: '12.5px' }}>
+                <div style={{ marginTop: '4px', fontWeight: 700, fontFamily: 'var(--font-mono, monospace)', fontSize: '12.5px' }}>
                   {inst.start_command_display}
                 </div>
               </div>
@@ -982,40 +973,39 @@ export function NodejsManagerPage({
             <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px' }}>
               <button
                 type="button"
-                className="btn-primary"
                 disabled={busyMap[`proc_${inst.id}_start`] || isRunning}
                 onClick={() => handleProcessAction(inst, 'start')}
               >
                 <Play size={14} />
-                {busyMap[`proc_${inst.id}_start`] ? 'Đang khởi động...' : 'Khởi động (Start)'}
+                <span>{busyMap[`proc_${inst.id}_start`] ? 'Đang khởi động...' : 'Khởi động (Start)'}</span>
               </button>
               <button
                 type="button"
-                className="btn-secondary"
+                className="secondary-light"
                 disabled={busyMap[`proc_${inst.id}_restart`]}
                 onClick={() => handleProcessAction(inst, 'restart')}
               >
                 <RotateCcw size={14} />
-                {busyMap[`proc_${inst.id}_restart`] ? 'Đang khởi động lại...' : 'Khởi động lại (Restart)'}
+                <span>{busyMap[`proc_${inst.id}_restart`] ? 'Đang khởi động lại...' : 'Khởi động lại (Restart)'}</span>
               </button>
               <button
                 type="button"
-                className="btn-secondary"
+                className="secondary-light"
                 disabled={busyMap[`proc_${inst.id}_stop`] || !isRunning}
                 onClick={() => handleProcessAction(inst, 'stop')}
               >
                 <Square size={14} />
-                {busyMap[`proc_${inst.id}_stop`] ? 'Đang dừng...' : 'Dừng tiến trình (Stop)'}
+                <span>{busyMap[`proc_${inst.id}_stop`] ? 'Đang dừng...' : 'Dừng tiến trình (Stop)'}</span>
               </button>
               <a
                 href={inst.url}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="btn-secondary"
+                className="button secondary-light"
                 style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
               >
                 <ExternalLink size={14} />
-                Mở Website
+                <span>Mở Website</span>
               </a>
             </div>
 
@@ -1025,7 +1015,7 @@ export function NodejsManagerPage({
                 display: 'grid',
                 gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
                 gap: '12px',
-                paddingTop: '8px',
+                paddingTop: '4px',
               }}
             >
               <label style={{ display: 'grid', gap: '5px', fontSize: '12.5px' }}>
@@ -1116,14 +1106,15 @@ export function NodejsManagerPage({
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
               <button
                 type="button"
-                className="btn-primary"
                 disabled={busyMap[`proc_${inst.id}_configure`]}
                 onClick={() => handleProcessAction(inst, 'configure', pDraft)}
               >
                 <Save size={14} />
-                {busyMap[`proc_${inst.id}_configure`]
-                  ? 'Đang đồng bộ systemd & Nginx...'
-                  : 'Lưu & Đồng bộ cấu hình Runtime'}
+                <span>
+                  {busyMap[`proc_${inst.id}_configure`]
+                    ? 'Đang đồng bộ systemd & Nginx...'
+                    : 'Lưu & Đồng bộ cấu hình Runtime'}
+                </span>
               </button>
             </div>
           </div>
@@ -1146,9 +1137,10 @@ export function NodejsManagerPage({
                   <div
                     key={item.action}
                     style={{
-                      padding: '12px',
+                      padding: '12px 14px',
                       borderRadius: '10px',
-                      border: '1px solid var(--border-subtle)',
+                      background: 'var(--surface-alt)',
+                      border: '1px solid var(--border)',
                       display: 'flex',
                       flexDirection: 'column',
                       justifyContent: 'space-between',
@@ -1156,7 +1148,7 @@ export function NodejsManagerPage({
                     }}
                   >
                     <div>
-                      <div style={{ fontWeight: 600, fontFamily: 'monospace', fontSize: '13px' }}>
+                      <div style={{ fontWeight: 700, fontFamily: 'var(--font-mono, monospace)', fontSize: '13px' }}>
                         {item.title}
                       </div>
                       <div className="hint" style={{ fontSize: '11.5px', marginTop: '3px' }}>
@@ -1165,12 +1157,12 @@ export function NodejsManagerPage({
                     </div>
                     <button
                       type="button"
-                      className="btn-secondary"
+                      className="secondary-light mini"
                       disabled={isBusy}
                       onClick={() => handleNpmAction(inst, item.action)}
                     >
                       <Terminal size={13} />
-                      {isBusy ? 'Đang chạy...' : item.subtitle}
+                      <span>{isBusy ? 'Đang chạy...' : item.subtitle}</span>
                     </button>
                   </div>
                 );
@@ -1183,11 +1175,12 @@ export function NodejsManagerPage({
                 style={{
                   padding: '12px 14px',
                   borderRadius: '10px',
-                  border: '1px solid var(--border-subtle)',
+                  background: 'var(--surface-alt)',
+                  border: '1px solid var(--border)',
                 }}
               >
-                <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px' }}>
-                  Kịch bản trong package.json (`npm run ...`)
+                <div style={{ fontWeight: 700, fontSize: '13px', marginBottom: '8px' }}>
+                  Kịch bản trong package.json (<code>npm run ...</code>)
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                   {scriptKeys.map(sName => {
@@ -1196,14 +1189,13 @@ export function NodejsManagerPage({
                       <button
                         key={sName}
                         type="button"
-                        className="btn-secondary"
-                        style={{ fontSize: '12px', padding: '5px 10px' }}
+                        className="secondary-light mini"
                         disabled={busyMap[busyKey]}
                         title={scriptsMap[sName]}
                         onClick={() => handleNpmAction(inst, 'run_script', { script: sName })}
                       >
                         <Play size={12} />
-                        {busyMap[busyKey] ? `Đang chạy ${sName}...` : `npm run ${sName}`}
+                        <span>{busyMap[busyKey] ? `Đang chạy ${sName}...` : `npm run ${sName}`}</span>
                       </button>
                     );
                   })}
@@ -1231,7 +1223,6 @@ export function NodejsManagerPage({
               />
               <button
                 type="button"
-                className="btn-primary"
                 disabled={
                   !String(customPkgInputs[inst.id] || '').trim() ||
                   busyMap[`npm_${inst.id}_add_${String(customPkgInputs[inst.id] || '').trim()}`]
@@ -1244,13 +1235,13 @@ export function NodejsManagerPage({
                 }}
               >
                 <Plus size={14} />
-                Cài gói (dependencies)
+                <span>Cài gói (dependencies)</span>
               </button>
             </div>
 
             {/* Curated NPM packages */}
             <div>
-              <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px' }}>
+              <div style={{ fontWeight: 700, fontSize: '13px', marginBottom: '8px' }}>
                 Thư viện Node.js phổ biến khuyên dùng
               </div>
               <div
@@ -1268,9 +1259,10 @@ export function NodejsManagerPage({
                     <div
                       key={pkg.name}
                       style={{
-                        padding: '11px 13px',
+                        padding: '12px 14px',
                         borderRadius: '10px',
-                        border: '1px solid var(--border-subtle)',
+                        background: 'var(--surface-alt)',
+                        border: '1px solid var(--border)',
                         display: 'flex',
                         flexDirection: 'column',
                         justifyContent: 'space-between',
@@ -1280,11 +1272,11 @@ export function NodejsManagerPage({
                       <div>
                         <div style={{ display: 'flex', justifyContent: 'space-between', gap: '6px' }}>
                           <strong style={{ fontSize: '13px' }}>{pkg.title}</strong>
-                          <span className="pill" style={{ fontSize: '11px' }}>
+                          <span className="badge" style={{ fontSize: '11px' }}>
                             {pkg.category}
                           </span>
                         </div>
-                        <div style={{ fontFamily: 'monospace', fontSize: '11.5px', opacity: 0.75 }}>
+                        <div style={{ fontFamily: 'var(--font-mono, monospace)', fontSize: '11.5px', color: 'var(--text-muted)' }}>
                           {pkg.name} ({pkg.version})
                         </div>
                         <div className="hint" style={{ fontSize: '11.5px', marginTop: '4px' }}>
@@ -1295,23 +1287,23 @@ export function NodejsManagerPage({
                         {isInstalled ? (
                           <button
                             type="button"
-                            className="btn-secondary"
-                            style={{ width: '100%', fontSize: '12px' }}
+                            className="secondary-light mini"
+                            style={{ width: '100%' }}
                             disabled={busyRem}
                             onClick={() => handleNpmAction(inst, 'remove', { package: pkg.name })}
                           >
-                            {busyRem ? 'Đang gỡ...' : 'Đã cài · Gỡ gói'}
+                            <span>{busyRem ? 'Đang gỡ...' : 'Đã cài · Gỡ gói'}</span>
                           </button>
                         ) : (
                           <button
                             type="button"
-                            className="btn-secondary"
-                            style={{ width: '100%', fontSize: '12px' }}
+                            className="secondary-light mini"
+                            style={{ width: '100%' }}
                             disabled={busyAdd}
                             onClick={() => handleNpmAction(inst, 'add', { package: pkg.name })}
                           >
                             <Plus size={12} />
-                            {busyAdd ? 'Đang cài đặt...' : `Cài đặt ${pkg.name}`}
+                            <span>{busyAdd ? 'Đang cài đặt...' : `Cài đặt ${pkg.name}`}</span>
                           </button>
                         )}
                       </div>
@@ -1329,7 +1321,7 @@ export function NodejsManagerPage({
                   color: '#e2e8f0',
                   borderRadius: '10px',
                   padding: '12px 14px',
-                  fontFamily: 'monospace',
+                  fontFamily: 'var(--font-mono, monospace)',
                   fontSize: '12px',
                   maxHeight: '220px',
                   overflowY: 'auto',
@@ -1356,14 +1348,14 @@ export function NodejsManagerPage({
                 alignItems: 'center',
                 justifyContent: 'space-between',
                 gap: '12px',
-                padding: '12px 14px',
+                padding: '12px 16px',
                 borderRadius: '10px',
-                background: 'var(--surface-muted, rgba(148,163,184,0.08))',
-                border: '1px solid var(--border-subtle)',
+                background: 'var(--surface-alt)',
+                border: '1px solid var(--border)',
               }}
             >
               <div>
-                <div style={{ fontWeight: 600, fontSize: '14px' }}>
+                <div style={{ fontWeight: 700, fontSize: '14px' }}>
                   Điểm an toàn vận hành Node.js: {inst.security_score || 0}%
                 </div>
                 <div className="hint" style={{ fontSize: '12px' }}>
@@ -1372,14 +1364,15 @@ export function NodejsManagerPage({
               </div>
               <button
                 type="button"
-                className="btn-primary"
                 disabled={busyMap[`sec_${inst.id}_all`]}
                 onClick={() => handleSecurityAction(inst, { applyAll: true, enabled: true })}
               >
                 <ShieldCheck size={14} />
-                {busyMap[`sec_${inst.id}_all`]
-                  ? 'Đang tối ưu bảo mật...'
-                  : 'Tối ưu toàn bộ bảo mật (1-Click)'}
+                <span>
+                  {busyMap[`sec_${inst.id}_all`]
+                    ? 'Đang tối ưu bảo mật...'
+                    : 'Tối ưu toàn bộ bảo mật (1-Click)'}
+                </span>
               </button>
             </div>
 
@@ -1396,17 +1389,18 @@ export function NodejsManagerPage({
                       gap: '12px',
                       padding: '10px 14px',
                       borderRadius: '10px',
-                      border: '1px solid var(--border-subtle)',
+                      background: 'var(--surface-alt)',
+                      border: '1px solid var(--border)',
                     }}
                   >
                     <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
                       {chk.passed ? (
-                        <CheckCircle2 size={17} style={{ color: '#22c55e', marginTop: '2px', flexShrink: 0 }} />
+                        <CheckCircle2 size={17} style={{ color: '#10b981', marginTop: '2px', flexShrink: 0 }} />
                       ) : (
                         <AlertTriangle size={17} style={{ color: '#f59e0b', marginTop: '2px', flexShrink: 0 }} />
                       )}
                       <div>
-                        <div style={{ fontWeight: 600, fontSize: '13px' }}>{chk.title}</div>
+                        <div style={{ fontWeight: 700, fontSize: '13px' }}>{chk.title}</div>
                         <div className="hint" style={{ fontSize: '12px' }}>
                           {chk.description}
                         </div>
@@ -1418,29 +1412,26 @@ export function NodejsManagerPage({
                         navigateToPage && (
                           <button
                             type="button"
-                            className="btn-secondary"
-                            style={{ fontSize: '12px' }}
+                            className="secondary-light mini"
                             onClick={() => navigateToPage('ssl')}
                           >
-                            Cấp SSL
+                            <span>Cấp SSL</span>
                           </button>
                         )
                       ) : chk.id === 'lockfile_present' ? (
                         !chk.passed && (
                           <button
                             type="button"
-                            className="btn-secondary"
-                            style={{ fontSize: '12px' }}
+                            className="secondary-light mini"
                             onClick={() => handleNpmAction(inst, 'install')}
                           >
-                            Chạy npm install
+                            <span>Chạy npm install</span>
                           </button>
                         )
                       ) : (
                         <button
                           type="button"
-                          className={chk.passed ? 'btn-secondary' : 'btn-primary'}
-                          style={{ fontSize: '12px' }}
+                          className={chk.passed ? 'secondary-light mini' : 'mini'}
                           disabled={isBusy}
                           onClick={() =>
                             handleSecurityAction(inst, {
@@ -1449,7 +1440,7 @@ export function NodejsManagerPage({
                             })
                           }
                         >
-                          {isBusy ? 'Đang xử lý...' : chk.passed ? 'Đã bật ✓' : 'Kích hoạt'}
+                          <span>{isBusy ? 'Đang xử lý...' : chk.passed ? 'Đã bật ✓' : 'Kích hoạt'}</span>
                         </button>
                       )}
                     </div>
@@ -1500,35 +1491,36 @@ export function NodejsManagerPage({
             </div>
 
             <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: '10px' }}>
-              <div style={{ display: 'flex', gap: '16px', fontSize: '12.5px' }}>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '16px', fontSize: '12.5px' }}>
+                <label className="check-line" style={{ fontSize: '12.5px' }}>
                   <input
                     type="checkbox"
                     checked={gDraft.run_npm_install !== false}
                     onChange={e => updateGDraft({ run_npm_install: e.target.checked })}
                   />
-                  Tự động chạy `npm install`
+                  <span>Tự động chạy <code>npm install</code></span>
                 </label>
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                <label className="check-line" style={{ fontSize: '12.5px' }}>
                   <input
                     type="checkbox"
                     checked={gDraft.restart_process !== false}
                     onChange={e => updateGDraft({ restart_process: e.target.checked })}
                   />
-                  Khởi động lại tiến trình sau khi Deploy
+                  <span>Khởi động lại tiến trình sau khi Deploy</span>
                 </label>
               </div>
 
               <button
                 type="button"
-                className="btn-primary"
                 disabled={busyMap[`git_${inst.id}`]}
                 onClick={() => handleGitDeploy(inst)}
               >
                 <GitBranch size={14} />
-                {busyMap[`git_${inst.id}`]
-                  ? 'Đang Pull & Triển khai...'
-                  : 'Triển khai ngay (Git Pull + NPM + Restart)'}
+                <span>
+                  {busyMap[`git_${inst.id}`]
+                    ? 'Đang Pull & Triển khai...'
+                    : 'Triển khai ngay (Git Pull + NPM + Restart)'}
+                </span>
               </button>
             </div>
 
@@ -1537,18 +1529,18 @@ export function NodejsManagerPage({
               style={{
                 padding: '12px 14px',
                 borderRadius: '10px',
-                border: '1px solid var(--border-subtle)',
+                background: 'var(--surface-alt)',
+                border: '1px solid var(--border)',
                 display: 'grid',
                 gap: '8px',
               }}
             >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
                 <strong style={{ fontSize: '13px' }}>Webhook CI/CD (GitHub / GitLab Push)</strong>
                 <div style={{ display: 'flex', gap: '6px' }}>
                   <button
                     type="button"
-                    className="btn-secondary"
-                    style={{ fontSize: '12px', padding: '4px 10px' }}
+                    className="secondary-light mini"
                     onClick={() =>
                       copyText(
                         `${window.location.origin}${inst.webhook_path}`,
@@ -1557,27 +1549,27 @@ export function NodejsManagerPage({
                     }
                   >
                     <Copy size={12} />
-                    Sao chép Webhook URL
+                    <span>Sao chép Webhook URL</span>
                   </button>
                   <button
                     type="button"
-                    className="btn-secondary"
-                    style={{ fontSize: '12px', padding: '4px 10px' }}
+                    className="secondary-light mini"
                     disabled={busyMap[`wh_${inst.id}`]}
                     onClick={() => handleWebhookConfig(inst, { enabled: true, rotateToken: true })}
                   >
                     <RotateCcw size={12} />
-                    Đổi khóa Token
+                    <span>Đổi khóa Token</span>
                   </button>
                 </div>
               </div>
               <div
                 style={{
-                  fontFamily: 'monospace',
+                  fontFamily: 'var(--font-mono, monospace)',
                   fontSize: '12px',
                   padding: '8px 10px',
                   borderRadius: '6px',
-                  background: 'var(--surface-muted, rgba(148,163,184,0.08))',
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
                   wordBreak: 'break-all',
                 }}
               >
@@ -1592,175 +1584,321 @@ export function NodejsManagerPage({
   };
 
   return (
-    <div className="page-container" style={{ display: 'grid', gap: '18px' }}>
-      {/* Top Header & Action Bar */}
+    <div className="section nodejs-manager-page" style={{ padding: '20px 24px' }}>
+      {/* 1. Page Header & Breadcrumb (matching Laravel & WordPress Manager) */}
       <div
-        className="section"
         style={{
           display: 'flex',
-          flexWrap: 'wrap',
-          alignItems: 'center',
           justifyContent: 'space-between',
-          gap: '14px',
-          padding: '18px 20px',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: '12px',
+          marginBottom: '16px',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <div
             style={{
-              width: '42px',
-              height: '42px',
-              borderRadius: '11px',
-              background: 'rgba(34, 197, 94, 0.14)',
-              color: '#16a34a',
-              display: 'grid',
-              placeItems: 'center',
+              width: '38px',
+              height: '38px',
+              borderRadius: '10px',
+              background: 'color-mix(in srgb, var(--primary) 12%, transparent)',
+              color: 'var(--primary)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
             }}
           >
             <NodejsBrandIcon size={22} />
           </div>
           <div>
-            <h2 style={{ margin: 0, fontSize: '18px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <h2 style={{ margin: 0, fontSize: '18px', fontWeight: 700, color: 'var(--text)' }}>
               Node.js Manager
-              <span className="pill" style={{ fontSize: '11.5px' }}>
-                {instances.length} ứng dụng
-              </span>
             </h2>
-            <p className="hint" style={{ margin: '3px 0 0', fontSize: '13px' }}>
+            <p className="hint" style={{ margin: '2px 0 0', fontSize: '12.5px' }}>
               Quản lý trọn vòng đời ứng dụng Node.js (Express, Next.js, NestJS, Socket.IO), dịch vụ systemd, Reverse Proxy Nginx và gói NPM.
             </p>
           </div>
         </div>
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
           <button
             type="button"
-            className="btn-secondary"
+            className="secondary-light"
             onClick={() => setShowRuntimeModal(true)}
+            style={{ height: '36px', padding: '0 14px', fontSize: '13px' }}
           >
             <Cpu size={14} />
-            Node.js Runtimes ({installedNodeVersions.map(v => `v${v}`).join(', ') || 'v22'})
+            <span>Node.js Runtimes ({installedNodeVersions.map(v => `v${v}`).join(', ') || 'v22'})</span>
           </button>
           <button
             type="button"
-            className="btn-secondary"
-            disabled={busyMap.scan}
-            onClick={handleScan}
-          >
-            <Search size={14} />
-            {busyMap.scan ? 'Đang quét...' : 'Quét ứng dụng'}
-          </button>
-          <button
-            type="button"
-            className="btn-secondary"
+            className="secondary-light"
             disabled={initialLoading}
             onClick={() => loadInstances({ refresh: true })}
+            style={{ height: '36px', padding: '0 14px', fontSize: '13px' }}
           >
-            <RefreshCw size={14} />
-            Làm mới
-          </button>
-          <button type="button" className="btn-primary" onClick={openInstallModal}>
-            <Plus size={15} />
-            Cài đặt Node.js
+            <RefreshCw size={14} className={initialLoading ? 'spin' : ''} />
+            <span>Làm mới</span>
           </button>
         </div>
       </div>
 
-      {/* Filter & View Switcher Toolbar */}
-      {instances.length > 0 && (
+      {/* 2. Global Top Tabs + Search Bar (matching Laravel & WordPress Manager) */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-end',
+          flexWrap: 'wrap',
+          gap: '12px',
+          borderBottom: '1px solid var(--border)',
+          marginBottom: '16px',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            style={{
+              height: '40px',
+              minHeight: '40px',
+              padding: '0 18px',
+              marginBottom: '-1px',
+              borderRadius: '8px 8px 0 0',
+              border: '1px solid var(--border)',
+              borderBottom: '2px solid var(--primary)',
+              background: 'var(--surface)',
+              color: 'var(--primary)',
+              fontWeight: 600,
+              fontSize: '13.5px',
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '7px',
+              boxShadow: 'none',
+            }}
+          >
+            <span>Instances</span>
+            <span
+              className="badge"
+              style={{
+                fontSize: '11px',
+                padding: '1px 6px',
+                background: 'color-mix(in srgb, var(--primary) 12%, transparent)',
+                color: 'var(--primary)',
+              }}
+            >
+              {instances.length}
+            </span>
+          </button>
+        </div>
+
+        <div style={{ position: 'relative', width: '280px', marginBottom: '6px' }}>
+          <Search
+            size={15}
+            style={{
+              position: 'absolute',
+              left: '11px',
+              top: '50%',
+              transform: 'translateY(-50%)',
+              color: 'var(--text-muted)',
+            }}
+          />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            placeholder="Tìm kiếm tên miền, ứng dụng, cổng..."
+            style={{
+              height: '34px',
+              paddingLeft: '34px',
+              paddingRight: '10px',
+              fontSize: '13px',
+              width: '100%',
+              borderRadius: '8px',
+            }}
+          />
+        </div>
+      </div>
+
+      {/* 3. Global Action Toolbar (matching Laravel & WordPress Manager) */}
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: '10px',
+          marginBottom: '16px',
+          padding: '10px 14px',
+          background: 'var(--surface-alt)',
+          border: '1px solid var(--border)',
+          borderRadius: '10px',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            disabled={busyMap.install}
+            onClick={openInstallModal}
+            style={{
+              height: '34px',
+              minHeight: '34px',
+              padding: '0 14px',
+              fontSize: '13px',
+              fontWeight: 600,
+              background: 'var(--primary)',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '7px',
+            }}
+          >
+            <Plus size={14} />
+            <span>Install</span>
+          </button>
+
+          <button
+            type="button"
+            className="secondary-light"
+            disabled={busyMap.scan}
+            onClick={handleScan}
+            style={{ height: '34px', minHeight: '34px', padding: '0 12px', fontSize: '13px' }}
+            title="Quét tự động các ứng dụng Node.js có sẵn trên tài khoản"
+          >
+            <Search size={14} />
+            <span>{busyMap.scan ? 'Đang quét...' : 'Scan'}</span>
+          </button>
+
+          <select
+            value={statusFilter}
+            onChange={e => setStatusFilter(e.target.value)}
+            style={{ height: '34px', fontSize: '12.5px', borderRadius: '7px', width: 'auto' }}
+          >
+            <option value="all">Tất cả ứng dụng ({instances.length})</option>
+            <option value="running">Đang chạy (Running)</option>
+            <option value="stopped">Đã dừng (Stopped)</option>
+            <option value="security">Cần tối ưu bảo mật</option>
+          </select>
+        </div>
+
         <div
           style={{
-            display: 'flex',
-            flexWrap: 'wrap',
+            display: 'inline-flex',
             alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: '10px',
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: '7px',
+            padding: '2px',
+            gap: '2px',
           }}
         >
-          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px', flex: '1 1 320px' }}>
-            <div style={{ position: 'relative', flex: '1 1 240px', maxWidth: '360px' }}>
-              <input
-                type="text"
-                placeholder="Tìm kiếm tên miền, ứng dụng, framework, cổng..."
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-                style={{ width: '100%' }}
-              />
-            </div>
-            <select
-              value={statusFilter}
-              onChange={e => setStatusFilter(e.target.value)}
-              style={{ width: 'auto' }}
-            >
-              <option value="all">Tất cả trạng thái ({instances.length})</option>
-              <option value="running">Đang chạy (Running)</option>
-              <option value="stopped">Đã dừng (Stopped)</option>
-              <option value="security">Cần tối ưu bảo mật</option>
-            </select>
-          </div>
-
-          <div style={{ display: 'flex', gap: '6px' }}>
-            {[
-              { id: 'expanded', label: 'Chi tiết', icon: Layers },
-              { id: 'cards', label: 'Lưới', icon: LayoutGrid },
-              { id: 'list', label: 'Danh sách', icon: List },
-            ].map(m => {
-              const IconComp = m.icon;
-              return (
-                <button
-                  key={m.id}
-                  type="button"
-                  className={viewMode === m.id ? 'btn-primary' : 'btn-secondary'}
-                  style={{ padding: '6px 10px', fontSize: '12px' }}
-                  onClick={() => setViewMode(m.id)}
-                >
-                  <IconComp size={14} />
-                  {m.label}
-                </button>
-              );
-            })}
-          </div>
+          {[
+            { id: 'expanded', title: 'Card View', icon: Server },
+            { id: 'cards', title: 'Grid View', icon: LayoutGrid },
+            { id: 'list', title: 'List View', icon: List },
+          ].map(v => {
+            const VIcon = v.icon;
+            const active = viewMode === v.id;
+            return (
+              <button
+                key={v.id}
+                type="button"
+                title={v.title}
+                onClick={() => setViewMode(v.id)}
+                style={{
+                  height: '28px',
+                  minHeight: '28px',
+                  width: '32px',
+                  padding: 0,
+                  border: 'none',
+                  borderRadius: '5px',
+                  background: active ? 'var(--primary)' : 'transparent',
+                  color: active ? '#fff' : 'var(--text-secondary)',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  boxShadow: 'none',
+                }}
+              >
+                <VIcon size={14} />
+              </button>
+            );
+          })}
         </div>
-      )}
+      </div>
 
       {/* Main Content Area */}
       {initialLoading && instances.length === 0 ? (
-        <div className="section" style={{ padding: '42px 20px', textAlign: 'center' }}>
+        <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--text-muted)' }}>
           <RefreshCw size={24} className="spin" style={{ marginBottom: '10px', opacity: 0.7 }} />
           <div>Đang tải danh sách ứng dụng Node.js...</div>
         </div>
       ) : filteredInstances.length === 0 ? (
-        <div className="section" style={{ padding: '44px 24px', textAlign: 'center' }}>
+        <div
+          style={{
+            border: '1px solid var(--border)',
+            borderRadius: '14px',
+            background: 'var(--surface)',
+            padding: '48px 24px',
+            textAlign: 'center',
+          }}
+        >
           <div
             style={{
               width: '54px',
               height: '54px',
               borderRadius: '14px',
-              background: 'rgba(34, 197, 94, 0.12)',
-              color: '#16a34a',
-              display: 'grid',
-              placeItems: 'center',
+              background: 'color-mix(in srgb, var(--primary) 10%, transparent)',
+              color: 'var(--primary)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               margin: '0 auto 14px',
             }}
           >
             <NodejsBrandIcon size={28} />
           </div>
-          <h3 style={{ margin: '0 0 6px' }}>
+          <h3 style={{ margin: '0 0 6px', fontSize: '16px', color: 'var(--text)' }}>
             {instances.length === 0
               ? 'Chưa có ứng dụng Node.js nào được triển khai'
               : 'Không tìm thấy ứng dụng Node.js phù hợp bộ lọc'}
           </h3>
-          <p className="hint" style={{ maxWidth: '520px', margin: '0 auto 18px' }}>
+          <p
+            className="hint"
+            style={{
+              maxWidth: '520px',
+              margin: '0 auto 18px',
+              fontSize: '13px',
+              lineHeight: 1.55,
+            }}
+          >
             Khởi tạo nhanh ứng dụng Express.js, Next.js SSR, NestJS hoặc triển khai từ Git Repository với dịch vụ systemd tự động phục hồi và Nginx Reverse Proxy hỗ trợ sẵn WebSocket.
           </p>
-          <div style={{ display: 'flex', justifyContent: 'center', gap: '10px' }}>
-            <button type="button" className="btn-primary" onClick={openInstallModal}>
+          <div style={{ display: 'inline-flex', justifyContent: 'center', gap: '10px', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              onClick={openInstallModal}
+              style={{
+                height: '38px',
+                padding: '0 18px',
+                background: 'var(--primary)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '8px',
+                fontWeight: 600,
+              }}
+            >
               <Plus size={15} />
-              Khởi tạo ứng dụng Node.js đầu tiên
+              <span>Khởi tạo ứng dụng Node.js đầu tiên</span>
             </button>
-            <button type="button" className="btn-secondary" onClick={handleScan}>
-              <Search size={14} />
-              Quét thư mục Website hiện có
+            <button
+              type="button"
+              className="secondary-light"
+              onClick={handleScan}
+              style={{ height: '38px', padding: '0 16px' }}
+            >
+              <Search size={15} />
+              <span>Quét thư mục Website hiện có</span>
             </button>
           </div>
         </div>
@@ -1773,22 +1911,25 @@ export function NodejsManagerPage({
             return (
               <div
                 key={inst.id}
-                className="section"
                 style={{
-                  padding: 0,
+                  borderRadius: '16px',
+                  background: 'var(--surface)',
+                  border: '1px solid var(--border)',
+                  boxShadow: '0 2px 10px rgba(15, 23, 42, 0.04)',
                   overflow: 'hidden',
-                  border: '1px solid var(--border-subtle)',
                 }}
               >
                 {/* Instance Header Bar */}
                 <div
                   style={{
-                    padding: '15px 20px',
+                    padding: '14px 20px',
                     display: 'flex',
                     flexWrap: 'wrap',
                     alignItems: 'center',
                     justifyContent: 'space-between',
                     gap: '12px',
+                    background: 'var(--surface-alt)',
+                    borderBottom: isExpanded ? '1px solid var(--border)' : 'none',
                     cursor: 'pointer',
                   }}
                   onClick={() => {
@@ -1802,92 +1943,12 @@ export function NodejsManagerPage({
                     }
                   }}
                 >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                    <div
-                      style={{
-                        width: '38px',
-                        height: '38px',
-                        borderRadius: '10px',
-                        background: isRunning
-                          ? 'rgba(34, 197, 94, 0.14)'
-                          : 'rgba(148, 163, 184, 0.15)',
-                        color: isRunning ? '#16a34a' : '#64748b',
-                        display: 'grid',
-                        placeItems: 'center',
-                        flexShrink: 0,
-                      }}
-                    >
-                      <NodejsBrandIcon size={20} />
-                    </div>
-                    <div>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px' }}>
-                        <strong style={{ fontSize: '15px' }}>{inst.domain}</strong>
-                        <span
-                          className="pill"
-                          style={{
-                            background: isRunning
-                              ? 'rgba(34, 197, 94, 0.15)'
-                              : 'rgba(148, 163, 184, 0.18)',
-                            color: isRunning ? '#16a34a' : 'inherit',
-                            fontSize: '11.5px',
-                          }}
-                        >
-                          ● {isRunning ? 'Running' : 'Stopped'}
-                        </span>
-                        <span className="pill" style={{ fontSize: '11.5px' }}>
-                          {inst.framework || 'Node.js'}
-                        </span>
-                        <span className="pill" style={{ fontSize: '11.5px' }}>
-                          Node v{inst.node_major}
-                        </span>
-                        <span className="pill" style={{ fontSize: '11.5px', fontFamily: 'monospace' }}>
-                          :{inst.port}
-                        </span>
-                      </div>
-                      <div className="hint" style={{ fontSize: '12px', marginTop: '3px' }}>
-                        {inst.app_name} · {inst.path}
-                        {inst.db_name ? ` · DB: ${inst.db_name}` : ''}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div
-                    style={{ display: 'flex', alignItems: 'center', gap: '8px' }}
-                    onClick={e => e.stopPropagation()}
-                  >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
                     <button
                       type="button"
-                      className="btn-secondary"
-                      style={{ padding: '5px 10px', fontSize: '12px' }}
-                      disabled={busyMap[`proc_${inst.id}_restart`]}
-                      onClick={() => handleProcessAction(inst, 'restart')}
-                    >
-                      <RotateCcw size={13} />
-                      Restart
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      style={{ padding: '5px 10px', fontSize: '12px' }}
-                      onClick={() => openEnvModal(inst)}
-                    >
-                      <Settings size={13} />
-                      .env
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      style={{ padding: '5px 10px', fontSize: '12px' }}
-                      onClick={() => openLogsModal(inst, 'systemd', 120)}
-                    >
-                      <FileText size={13} />
-                      Logs
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      style={{ padding: '5px 8px' }}
-                      onClick={() => {
+                      className="secondary-light mini"
+                      onClick={e => {
+                        e.stopPropagation();
                         if (viewMode === 'expanded') {
                           setExpandedIds(prev => ({
                             ...prev,
@@ -1897,8 +1958,103 @@ export function NodejsManagerPage({
                           setSelectedId(prev => (prev === inst.id ? null : inst.id));
                         }
                       }}
+                      style={{
+                        width: '30px',
+                        minWidth: '30px',
+                        height: '30px',
+                        minHeight: '30px',
+                        padding: 0,
+                        borderRadius: '8px',
+                      }}
                     >
                       {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                    </button>
+                    <div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px' }}>
+                        <strong style={{ fontSize: '15.5px', fontWeight: 800, color: 'var(--text)' }}>
+                          {inst.domain}
+                        </strong>
+                        <span
+                          className="badge"
+                          style={{
+                            background: isRunning
+                              ? 'rgba(16, 185, 129, 0.14)'
+                              : 'rgba(148, 163, 184, 0.18)',
+                            color: isRunning ? '#059669' : 'var(--text-secondary)',
+                            fontSize: '11px',
+                          }}
+                        >
+                          ● {isRunning ? 'Running' : 'Stopped'}
+                        </span>
+                        <span className="badge" style={{ fontSize: '11px' }}>
+                          {inst.framework || 'Node.js'}
+                        </span>
+                        <span className="badge" style={{ fontSize: '11px' }}>
+                          Node v{inst.node_major}
+                        </span>
+                        <span className="badge" style={{ fontSize: '11px', fontFamily: 'var(--font-mono, monospace)' }}>
+                          127.0.0.1:{inst.port}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                        {inst.app_name} · <code>{inst.path}</code>
+                        {inst.db_name ? ` · DB: ${inst.db_name}` : ''}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <a
+                      href={inst.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="button secondary-light mini"
+                      style={{
+                        height: '32px',
+                        minHeight: '32px',
+                        padding: '0 12px',
+                        borderRadius: '8px',
+                        fontSize: '12px',
+                        fontWeight: 600,
+                        textDecoration: 'none',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '5px',
+                      }}
+                    >
+                      <ExternalLink size={13} />
+                      <span>Mở Website</span>
+                    </a>
+                    <button
+                      type="button"
+                      className="secondary-light mini"
+                      style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12px' }}
+                      disabled={busyMap[`proc_${inst.id}_restart`]}
+                      onClick={() => handleProcessAction(inst, 'restart')}
+                    >
+                      <RotateCcw size={13} />
+                      <span>Restart</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-light mini"
+                      style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12px' }}
+                      onClick={() => openEnvModal(inst)}
+                    >
+                      <Settings size={13} />
+                      <span>.env</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-light mini"
+                      style={{ height: '32px', minHeight: '32px', padding: '0 12px', fontSize: '12px' }}
+                      onClick={() => openLogsModal(inst, 'systemd', 120)}
+                    >
+                      <FileText size={13} />
+                      <span>Logs</span>
                     </button>
                   </div>
                 </div>
@@ -1911,22 +2067,59 @@ export function NodejsManagerPage({
         </div>
       )}
 
-      {/* MODAL 1: Install Node.js Application */}
+      {/* ── MODAL 1: Install Node.js Application ────────────────────────────── */}
       {showInstallModal && (
-        <div className="modal-backdrop" onClick={() => !busyMap.install && setShowInstallModal(false)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => !busyMap.install && setShowInstallModal(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1250,
+            background: 'rgba(15, 23, 42, 0.6)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+        >
           <div
-            className="modal-content"
-            style={{ maxWidth: '680px', width: '95%' }}
+            className="modal"
+            style={{
+              width: '100%',
+              maxWidth: '680px',
+              maxHeight: '90vh',
+              overflowY: 'auto',
+              borderRadius: '16px',
+              background: 'var(--bg-elevated, #ffffff)',
+              border: '1px solid var(--border-strong, var(--border))',
+              padding: '22px 24px',
+            }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
-              <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <NodejsBrandIcon size={20} />
-                Triển khai ứng dụng Node.js mới
-              </h3>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '14px',
+                marginBottom: '16px',
+                borderBottom: '1px solid var(--border)',
+              }}
+            >
+              <div>
+                <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 800, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <NodejsBrandIcon size={20} />
+                  <span>Triển khai ứng dụng Node.js mới</span>
+                </h3>
+                <small style={{ color: 'var(--text-muted)' }}>
+                  Tự động cấu hình dịch vụ systemd cô lập theo user, Reverse Proxy Nginx hỗ trợ WebSocket &amp; tệp <code>.env</code>
+                </small>
+              </div>
               <button
                 type="button"
-                className="btn-secondary"
+                className="secondary-light mini"
                 disabled={busyMap.install}
                 onClick={() => setShowInstallModal(false)}
               >
@@ -1934,9 +2127,9 @@ export function NodejsManagerPage({
               </button>
             </div>
 
-            <form onSubmit={handleInstallSubmit} style={{ display: 'grid', gap: '14px' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '12px' }}>
-                <label style={{ display: 'grid', gap: '5px', fontSize: '13px' }}>
+            <form onSubmit={handleInstallSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1.2fr', gap: '12px' }}>
+                <label>
                   <span>Website / Tên miền đích *</span>
                   <select
                     required
@@ -1969,7 +2162,7 @@ export function NodejsManagerPage({
                   </select>
                 </label>
 
-                <label style={{ display: 'grid', gap: '5px', fontSize: '13px' }}>
+                <label>
                   <span>Tên hiển thị ứng dụng</span>
                   <input
                     type="text"
@@ -1981,33 +2174,37 @@ export function NodejsManagerPage({
               </div>
 
               {/* Install source selector */}
-              <div style={{ display: 'flex', gap: '8px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
                 <button
                   type="button"
-                  className={installForm.install_source === 'template' ? 'btn-primary' : 'btn-secondary'}
+                  className={installForm.install_source === 'template' ? '' : 'secondary-light'}
                   onClick={() => setInstallForm(prev => ({ ...prev, install_source: 'template' }))}
+                  style={{ height: '38px', fontSize: '12.5px' }}
                 >
                   <Sparkles size={14} />
-                  Khởi tạo từ Mẫu Starter (1-Click)
+                  <span>Khởi tạo từ Mẫu Starter (1-Click)</span>
                 </button>
                 <button
                   type="button"
-                  className={installForm.install_source === 'git' ? 'btn-primary' : 'btn-secondary'}
+                  className={installForm.install_source === 'git' ? '' : 'secondary-light'}
                   onClick={() => setInstallForm(prev => ({ ...prev, install_source: 'git' }))}
+                  style={{ height: '38px', fontSize: '12.5px' }}
                 >
                   <GitBranch size={14} />
-                  Sao chép từ Git Repository
+                  <span>Sao chép từ Git Repository</span>
                 </button>
               </div>
 
               {installForm.install_source === 'template' ? (
                 <div style={{ display: 'grid', gap: '8px' }}>
-                  <span style={{ fontSize: '13px', fontWeight: 600 }}>Chọn kiến trúc mẫu (Starter Template)</span>
+                  <span style={{ fontSize: '12.5px', fontWeight: 700, color: 'var(--text-secondary)' }}>
+                    Chọn kiến trúc mẫu (Starter Template)
+                  </span>
                   <div
                     style={{
                       display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fit, minmax(195px, 1fr))',
-                      gap: '8px',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+                      gap: '10px',
                     }}
                   >
                     {(starterTemplates.length ? starterTemplates : [
@@ -2015,7 +2212,7 @@ export function NodejsManagerPage({
                         id: 'express-api',
                         name: 'Express.js Web & REST API',
                         badge: 'Phổ biến nhất',
-                        description: 'REST API + Health check (/api/health) + Trang trạng thái.',
+                        description: 'REST API chuẩn Production với health-check (/api/health), CORS/JSON và trang trạng thái.',
                         start_mode: 'node',
                         start_arg: 'server.js',
                       },
@@ -2023,7 +2220,23 @@ export function NodejsManagerPage({
                         id: 'nextjs-ssr',
                         name: 'Next.js SSR Ready Starter',
                         badge: 'Full-stack',
-                        description: 'Cấu trúc SSR chạy qua Nginx Reverse Proxy.',
+                        description: 'Khởi tạo dự án chuẩn kiến trúc SSR qua Nginx Reverse Proxy và hỗ trợ WebSocket.',
+                        start_mode: 'node',
+                        start_arg: 'server.js',
+                      },
+                      {
+                        id: 'nestjs-api',
+                        name: 'NestJS-Style Enterprise API',
+                        badge: 'Enterprise',
+                        description: 'Kiến trúc dịch vụ API phân tầng (Controller / Service / Health) sẵn sàng kết nối MariaDB.',
+                        start_mode: 'node',
+                        start_arg: 'server.js',
+                      },
+                      {
+                        id: 'socketio-realtime',
+                        name: 'Real-time WebSocket Server',
+                        badge: 'WebSocket',
+                        description: 'Máy chủ sự kiện thời gian thực tương thích cấu hình Upgrade/Connection của Nginx Proxy.',
                         start_mode: 'node',
                         start_arg: 'server.js',
                       },
@@ -2031,7 +2244,7 @@ export function NodejsManagerPage({
                         id: 'minimal-http',
                         name: 'Node.js Native HTTP',
                         badge: 'Siêu nhẹ',
-                        description: 'Máy chủ node:http thuần không phụ thuộc gói ngoài.',
+                        description: 'Máy chủ node:http thuần không phụ thuộc thư viện ngoài, khởi chạy tức thì dưới 30ms.',
                         start_mode: 'node',
                         start_arg: 'server.js',
                       },
@@ -2049,18 +2262,37 @@ export function NodejsManagerPage({
                             }))
                           }
                           style={{
-                            padding: '10px 12px',
+                            padding: '11px 13px',
                             borderRadius: '10px',
+                            background: active
+                              ? 'color-mix(in srgb, var(--primary) 10%, var(--surface))'
+                              : 'var(--surface-alt)',
                             border: active
-                              ? '2px solid var(--accent, #2563eb)'
-                              : '1px solid var(--border-subtle)',
+                              ? '1.5px solid var(--primary)'
+                              : '1px solid var(--border)',
                             cursor: 'pointer',
+                            transition: 'all 0.15s ease',
                           }}
                         >
-                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: '4px' }}>
-                            <strong style={{ fontSize: '12.5px' }}>{tpl.name}</strong>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
+                            <strong style={{ fontSize: '13px', color: 'var(--text)' }}>{tpl.name}</strong>
+                            {tpl.badge && (
+                              <span
+                                className="badge"
+                                style={{
+                                  fontSize: '10.5px',
+                                  flexShrink: 0,
+                                  background: active
+                                    ? 'var(--primary)'
+                                    : 'color-mix(in srgb, var(--primary) 12%, transparent)',
+                                  color: active ? '#fff' : 'var(--primary)',
+                                }}
+                              >
+                                {tpl.badge}
+                              </span>
+                            )}
                           </div>
-                          <div className="hint" style={{ fontSize: '11.5px', marginTop: '4px' }}>
+                          <div className="hint" style={{ fontSize: '11.5px', marginTop: '4px', lineHeight: 1.45 }}>
                             {tpl.description}
                           </div>
                         </div>
@@ -2070,7 +2302,7 @@ export function NodejsManagerPage({
                 </div>
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '12px' }}>
-                  <label style={{ display: 'grid', gap: '5px', fontSize: '13px' }}>
+                  <label>
                     <span>Git Repository URL *</span>
                     <input
                       type="text"
@@ -2080,7 +2312,7 @@ export function NodejsManagerPage({
                       onChange={e => setInstallForm(prev => ({ ...prev, git_repo: e.target.value }))}
                     />
                   </label>
-                  <label style={{ display: 'grid', gap: '5px', fontSize: '13px' }}>
+                  <label>
                     <span>Nhánh (Branch)</span>
                     <input
                       type="text"
@@ -2092,8 +2324,8 @@ export function NodejsManagerPage({
               )}
 
               {/* Runtime parameters */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(145px, 1fr))', gap: '10px' }}>
-                <label style={{ display: 'grid', gap: '5px', fontSize: '12.5px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: '10px' }}>
+                <label>
                   <span>Phiên bản Node.js</span>
                   <select
                     value={installForm.node_major}
@@ -2107,7 +2339,7 @@ export function NodejsManagerPage({
                   </select>
                 </label>
 
-                <label style={{ display: 'grid', gap: '5px', fontSize: '12.5px' }}>
+                <label>
                   <span>Chế độ khởi chạy</span>
                   <select
                     value={installForm.start_mode}
@@ -2127,7 +2359,7 @@ export function NodejsManagerPage({
                   </select>
                 </label>
 
-                <label style={{ display: 'grid', gap: '5px', fontSize: '12.5px' }}>
+                <label>
                   <span>Entry File / Script</span>
                   <input
                     type="text"
@@ -2136,7 +2368,7 @@ export function NodejsManagerPage({
                   />
                 </label>
 
-                <label style={{ display: 'grid', gap: '5px', fontSize: '12.5px' }}>
+                <label>
                   <span>Giới hạn RAM</span>
                   <select
                     value={installForm.memory_mb}
@@ -2158,12 +2390,14 @@ export function NodejsManagerPage({
                 style={{
                   padding: '12px 14px',
                   borderRadius: '10px',
-                  border: '1px solid var(--border-subtle)',
-                  display: 'grid',
+                  background: 'var(--surface-alt)',
+                  border: '1px solid var(--border)',
+                  display: 'flex',
+                  flexDirection: 'column',
                   gap: '10px',
                 }}
               >
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 600, fontSize: '13px' }}>
+                <label className="check-line" style={{ fontSize: '12.5px' }}>
                   <input
                     type="checkbox"
                     checked={installForm.create_database}
@@ -2171,13 +2405,14 @@ export function NodejsManagerPage({
                       setInstallForm(prev => ({ ...prev, create_database: e.target.checked }))
                     }
                   />
-                  <Database size={14} />
-                  Khởi tạo kèm Cơ sở dữ liệu MySQL / MariaDB và tự động cấu hình vào `.env`
+                  <span>
+                    Khởi tạo kèm <strong>Cơ sở dữ liệu MySQL / MariaDB</strong> và tự động cấu hình vào <code>.env</code>
+                  </span>
                 </label>
 
                 {installForm.create_database && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr', gap: '10px' }}>
-                    <label style={{ display: 'grid', gap: '4px', fontSize: '12px' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr', gap: '10px', paddingTop: '4px' }}>
+                    <label>
                       <span>Tên Database</span>
                       <input
                         type="text"
@@ -2185,7 +2420,7 @@ export function NodejsManagerPage({
                         onChange={e => setInstallForm(prev => ({ ...prev, db_name: e.target.value }))}
                       />
                     </label>
-                    <label style={{ display: 'grid', gap: '4px', fontSize: '12px' }}>
+                    <label>
                       <span>Database User</span>
                       <input
                         type="text"
@@ -2193,29 +2428,29 @@ export function NodejsManagerPage({
                         onChange={e => setInstallForm(prev => ({ ...prev, db_user: e.target.value }))}
                       />
                     </label>
-                    <div style={{ display: 'grid', gap: '4px', fontSize: '12px' }}>
+                    <label>
                       <span>Mật khẩu Database</span>
                       <PasswordField
                         value={installForm.db_password}
                         onChange={val => setInstallForm(prev => ({ ...prev, db_password: val }))}
                       />
-                    </div>
+                    </label>
                   </div>
                 )}
               </div>
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '4px' }}>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '4px' }}>
                 <button
                   type="button"
-                  className="btn-secondary"
+                  className="secondary-light"
                   disabled={busyMap.install}
                   onClick={() => setShowInstallModal(false)}
                 >
                   Hủy
                 </button>
-                <button type="submit" className="btn-primary" disabled={busyMap.install}>
+                <button type="submit" disabled={busyMap.install}>
                   <Plus size={15} />
-                  {busyMap.install ? 'Đang triển khai Node.js...' : 'Triển khai ứng dụng'}
+                  <span>{busyMap.install ? 'Đang triển khai Node.js...' : 'Triển khai ứng dụng'}</span>
                 </button>
               </div>
             </form>
@@ -2223,20 +2458,50 @@ export function NodejsManagerPage({
         </div>
       )}
 
-      {/* MODAL 2: Post-Install Credentials Summary */}
+      {/* ── MODAL 2: Post-Install Credentials Summary ──────────────────────── */}
       {installSuccessCreds && (
-        <div className="modal-backdrop" onClick={() => setInstallSuccessCreds(null)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => setInstallSuccessCreds(null)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1250,
+            background: 'rgba(15, 23, 42, 0.6)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+        >
           <div
-            className="modal-content"
-            style={{ maxWidth: '520px', width: '95%' }}
+            className="modal"
+            style={{
+              width: '100%',
+              maxWidth: '520px',
+              borderRadius: '16px',
+              background: 'var(--bg-elevated, #ffffff)',
+              border: '1px solid var(--border-strong, var(--border))',
+              padding: '22px 24px',
+            }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-              <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <CheckCircle2 size={20} style={{ color: '#22c55e' }} />
-                Ứng dụng Node.js đã sẵn sàng!
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '12px',
+                marginBottom: '14px',
+                borderBottom: '1px solid var(--border)',
+              }}
+            >
+              <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <CheckCircle2 size={20} style={{ color: '#10b981' }} />
+                <span>Ứng dụng Node.js đã sẵn sàng!</span>
               </h3>
-              <button type="button" className="btn-secondary" onClick={() => setInstallSuccessCreds(null)}>
+              <button type="button" className="secondary-light mini" onClick={() => setInstallSuccessCreds(null)}>
                 <X size={15} />
               </button>
             </div>
@@ -2260,10 +2525,11 @@ export function NodejsManagerPage({
                     marginTop: '6px',
                     padding: '10px 12px',
                     borderRadius: '8px',
-                    border: '1px solid var(--border-subtle)',
+                    background: 'var(--surface-alt)',
+                    border: '1px solid var(--border)',
                   }}
                 >
-                  <div style={{ fontWeight: 600, marginBottom: '4px' }}>Thông tin kết nối MySQL</div>
+                  <div style={{ fontWeight: 700, marginBottom: '4px' }}>Thông tin kết nối MySQL</div>
                   <div>Database: <code>{installSuccessCreds.db_name}</code></div>
                   <div>Username: <code>{installSuccessCreds.db_user}</code></div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -2274,60 +2540,98 @@ export function NodejsManagerPage({
               )}
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px' }}>
-              <button type="button" className="btn-primary" onClick={() => setInstallSuccessCreds(null)}>
-                Hoàn tất
+              <button type="button" onClick={() => setInstallSuccessCreds(null)}>
+                <span>Hoàn tất</span>
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* MODAL 3: Visual & Raw .env Editor */}
+      {/* ── MODAL 3: Visual & Raw .env Editor ──────────────────────────────── */}
       {envModalInstance && (
-        <div className="modal-backdrop" onClick={() => !busyMap.save_env && setEnvModalInstance(null)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => !busyMap.save_env && setEnvModalInstance(null)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1250,
+            background: 'rgba(15, 23, 42, 0.6)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+        >
           <div
-            className="modal-content"
-            style={{ maxWidth: '680px', width: '95%' }}
+            className="modal"
+            style={{
+              width: '100%',
+              maxWidth: '700px',
+              maxHeight: '90vh',
+              overflowY: 'auto',
+              borderRadius: '16px',
+              background: 'var(--bg-elevated, #ffffff)',
+              border: '1px solid var(--border-strong, var(--border))',
+              padding: '20px 24px',
+            }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-              <h3 style={{ margin: 0 }}>
-                Cấu hình Biến môi trường (.env) — {envModalInstance.domain}
-              </h3>
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => setEnvModalInstance(null)}
-              >
-                <X size={15} />
-              </button>
-            </div>
-
-            <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
-              <button
-                type="button"
-                className={envModalData.mode === 'structured' ? 'btn-primary' : 'btn-secondary'}
-                onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'structured' }))}
-              >
-                Chế độ Trực quan (Visual)
-              </button>
-              <button
-                type="button"
-                className={envModalData.mode === 'raw' ? 'btn-primary' : 'btn-secondary'}
-                onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'raw' }))}
-              >
-                Chế độ Văn bản gốc (Raw .env)
-              </button>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '12px',
+                marginBottom: '14px',
+                borderBottom: '1px solid var(--border)',
+              }}
+            >
+              <div>
+                <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800 }}>
+                  Cấu hình Biến môi trường (.env) — {envModalInstance.domain}
+                </h3>
+                <small style={{ color: 'var(--text-muted)' }}>
+                  Tự động áp dụng quyền bảo mật <code>0640</code> và khởi động lại worker khi lưu
+                </small>
+              </div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button
+                  type="button"
+                  className={envModalData.mode === 'structured' ? 'mini' : 'secondary-light mini'}
+                  onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'structured' }))}
+                >
+                  <span>Chế độ Trực quan (Visual)</span>
+                </button>
+                <button
+                  type="button"
+                  className={envModalData.mode === 'raw' ? 'mini' : 'secondary-light mini'}
+                  onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'raw' }))}
+                >
+                  <span>Sửa Raw .env</span>
+                </button>
+                <button
+                  type="button"
+                  className="secondary-light mini"
+                  onClick={() => setEnvModalInstance(null)}
+                >
+                  <X size={15} />
+                </button>
+              </div>
             </div>
 
             {envModalData.loading ? (
-              <div style={{ padding: '24px', textAlign: 'center' }}>Đang đọc tệp .env...</div>
+              <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                Đang đọc tệp .env...
+              </div>
             ) : (
               <form onSubmit={handleSaveEnv} style={{ display: 'grid', gap: '12px' }}>
                 {envModalData.mode === 'raw' ? (
                   <textarea
                     rows={14}
-                    style={{ fontFamily: 'monospace', fontSize: '12.5px', width: '100%' }}
+                    style={{ fontFamily: 'var(--font-mono, monospace)', fontSize: '12.5px', width: '100%' }}
                     value={envModalData.raw}
                     onChange={e => setEnvModalData(prev => ({ ...prev, raw: e.target.value }))}
                   />
@@ -2354,8 +2658,8 @@ export function NodejsManagerPage({
                       ['db_user', 'DB_USERNAME'],
                       ['db_password', 'DB_PASSWORD'],
                     ].map(([fieldKey, label]) => (
-                      <label key={fieldKey} style={{ display: 'grid', gap: '4px', fontSize: '12px' }}>
-                        <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{label}</span>
+                      <label key={fieldKey}>
+                        <span style={{ fontFamily: 'var(--font-mono, monospace)', fontWeight: 700 }}>{label}</span>
                         <input
                           type={fieldKey.includes('password') ? 'password' : 'text'}
                           value={envModalData.parsed?.[fieldKey] || ''}
@@ -2371,8 +2675,8 @@ export function NodejsManagerPage({
                   </div>
                 )}
 
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px' }}>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '12.5px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px', flexWrap: 'wrap', gap: '10px' }}>
+                  <label className="check-line" style={{ fontSize: '12.5px' }}>
                     <input
                       type="checkbox"
                       checked={envModalData.restartAfterSave}
@@ -2380,20 +2684,20 @@ export function NodejsManagerPage({
                         setEnvModalData(prev => ({ ...prev, restartAfterSave: e.target.checked }))
                       }
                     />
-                    Tự động khởi động lại tiến trình Node.js sau khi lưu
+                    <span>Tự động khởi động lại tiến trình Node.js sau khi lưu</span>
                   </label>
 
                   <div style={{ display: 'flex', gap: '8px' }}>
                     <button
                       type="button"
-                      className="btn-secondary"
+                      className="secondary-light"
                       onClick={() => setEnvModalInstance(null)}
                     >
                       Đóng
                     </button>
-                    <button type="submit" className="btn-primary" disabled={busyMap.save_env}>
+                    <button type="submit" disabled={busyMap.save_env}>
                       <Save size={14} />
-                      {busyMap.save_env ? 'Đang lưu...' : 'Lưu cấu hình .env'}
+                      <span>{busyMap.save_env ? 'Đang lưu...' : 'Lưu cấu hình .env'}</span>
                     </button>
                   </div>
                 </div>
@@ -2403,29 +2707,59 @@ export function NodejsManagerPage({
         </div>
       )}
 
-      {/* MODAL 4: Logs Viewer */}
+      {/* ── MODAL 4: Logs Viewer ───────────────────────────────────────────── */}
       {logsModalInstance && (
-        <div className="modal-backdrop" onClick={() => setLogsModalInstance(null)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => setLogsModalInstance(null)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1250,
+            background: 'rgba(15, 23, 42, 0.6)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+        >
           <div
-            className="modal-content"
-            style={{ maxWidth: '760px', width: '95%' }}
+            className="modal"
+            style={{
+              width: '100%',
+              maxWidth: '760px',
+              borderRadius: '16px',
+              background: 'var(--bg-elevated, #ffffff)',
+              border: '1px solid var(--border-strong, var(--border))',
+              padding: '20px 24px',
+            }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-              <h3 style={{ margin: 0 }}>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '12px',
+                marginBottom: '12px',
+                borderBottom: '1px solid var(--border)',
+              }}
+            >
+              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>
                 Nhật ký vận hành Node.js — {logsModalInstance.domain}
               </h3>
               <button
                 type="button"
-                className="btn-secondary"
+                className="secondary-light mini"
                 onClick={() => setLogsModalInstance(null)}
               >
                 <X size={15} />
               </button>
             </div>
 
-            <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '8px', marginBottom: '10px' }}>
-              <div style={{ display: 'flex', gap: '6px' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '8px', marginBottom: '12px' }}>
+              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                 {[
                   { id: 'systemd', label: 'Systemd Journal' },
                   { id: 'nginx_error', label: 'Nginx Error Log' },
@@ -2434,11 +2768,10 @@ export function NodejsManagerPage({
                   <button
                     key={k.id}
                     type="button"
-                    className={logsModalData.kind === k.id ? 'btn-primary' : 'btn-secondary'}
-                    style={{ fontSize: '12px', padding: '5px 10px' }}
+                    className={logsModalData.kind === k.id ? 'mini' : 'secondary-light mini'}
                     onClick={() => openLogsModal(logsModalInstance, k.id, logsModalData.lines)}
                   >
-                    {k.label}
+                    <span>{k.label}</span>
                   </button>
                 ))}
               </div>
@@ -2446,33 +2779,30 @@ export function NodejsManagerPage({
               <div style={{ display: 'flex', gap: '6px' }}>
                 <button
                   type="button"
-                  className="btn-secondary"
-                  style={{ fontSize: '12px', padding: '5px 10px' }}
+                  className="secondary-light mini"
                   onClick={() =>
                     openLogsModal(logsModalInstance, logsModalData.kind, logsModalData.lines)
                   }
                 >
                   <RefreshCw size={12} />
-                  Làm mới
+                  <span>Làm mới</span>
                 </button>
                 <button
                   type="button"
-                  className="btn-secondary"
-                  style={{ fontSize: '12px', padding: '5px 10px' }}
+                  className="secondary-light mini"
                   onClick={() => copyText(logsModalData.content, 'Đã sao chép nội dung nhật ký.')}
                 >
                   <Copy size={12} />
-                  Sao chép
+                  <span>Sao chép</span>
                 </button>
                 <button
                   type="button"
-                  className="btn-secondary"
-                  style={{ fontSize: '12px', padding: '5px 10px' }}
+                  className="danger mini"
                   disabled={busyMap.clear_logs}
                   onClick={handleClearLogs}
                 >
                   <Trash2 size={12} />
-                  Xóa Log
+                  <span>Xóa Log</span>
                 </button>
               </div>
             </div>
@@ -2483,9 +2813,9 @@ export function NodejsManagerPage({
                 color: '#e2e8f0',
                 borderRadius: '10px',
                 padding: '14px',
-                fontFamily: 'monospace',
+                fontFamily: 'var(--font-mono, monospace)',
                 fontSize: '12px',
-                maxHeight: '400px',
+                maxHeight: '420px',
                 overflowY: 'auto',
               }}
             >
@@ -2497,25 +2827,57 @@ export function NodejsManagerPage({
         </div>
       )}
 
-      {/* MODAL 5: Node.js Runtime Versions Manager */}
+      {/* ── MODAL 5: Node.js Runtime Versions Manager ──────────────────────── */}
       {showRuntimeModal && (
-        <div className="modal-backdrop" onClick={() => setShowRuntimeModal(false)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => setShowRuntimeModal(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1250,
+            background: 'rgba(15, 23, 42, 0.6)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+        >
           <div
-            className="modal-content"
-            style={{ maxWidth: '540px', width: '95%' }}
+            className="modal"
+            style={{
+              width: '100%',
+              maxWidth: '540px',
+              borderRadius: '16px',
+              background: 'var(--bg-elevated, #ffffff)',
+              border: '1px solid var(--border-strong, var(--border))',
+              padding: '20px 24px',
+            }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-              <h3 style={{ margin: 0 }}>Quản lý Phiên bản Node.js Runtime</h3>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '12px',
+                marginBottom: '12px',
+                borderBottom: '1px solid var(--border)',
+              }}
+            >
+              <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800 }}>
+                Quản lý Phiên bản Node.js Runtime
+              </h3>
               <button
                 type="button"
-                className="btn-secondary"
+                className="secondary-light mini"
                 onClick={() => setShowRuntimeModal(false)}
               >
                 <X size={15} />
               </button>
             </div>
-            <p className="hint" style={{ fontSize: '12.5px', marginBottom: '12px' }}>
+            <p className="hint" style={{ fontSize: '12.5px', marginBottom: '14px' }}>
               Các phiên bản Node.js được cài đặt độc lập tại <code>/opt/spanel/node/&lt;major&gt;</code>, cho phép mỗi website chạy một phiên bản Node.js riêng biệt.
             </p>
             <div style={{ display: 'grid', gap: '8px' }}>
@@ -2531,31 +2893,33 @@ export function NodejsManagerPage({
                       justifyContent: 'space-between',
                       padding: '10px 14px',
                       borderRadius: '10px',
-                      border: '1px solid var(--border-subtle)',
+                      background: 'var(--surface-alt)',
+                      border: '1px solid var(--border)',
                     }}
                   >
                     <div>
                       <strong>Node.js v{ver}.x</strong>{' '}
-                      <span className="pill" style={{ fontSize: '11px' }}>
+                      <span className="badge" style={{ fontSize: '11px' }}>
                         {ver === '24' ? 'Current' : 'LTS'}
                       </span>
-                      <div className="hint" style={{ fontSize: '11.5px' }}>
+                      <div className="hint" style={{ fontSize: '11.5px', fontFamily: 'var(--font-mono, monospace)' }}>
                         /opt/spanel/node/{ver}/bin/node
                       </div>
                     </div>
                     <button
                       type="button"
-                      className={isInstalled ? 'btn-secondary' : 'btn-primary'}
-                      style={{ fontSize: '12px' }}
+                      className={isInstalled ? 'secondary-light mini' : 'mini'}
                       disabled={isBusy}
                       onClick={() => handleInstallNodeMajor(ver)}
                     >
                       <Download size={13} />
-                      {isBusy
-                        ? `Đang tải v${ver}...`
-                        : isInstalled
-                        ? 'Đã cài đặt · Cập nhật lại'
-                        : `Cài đặt Node v${ver}`}
+                      <span>
+                        {isBusy
+                          ? `Đang tải v${ver}...`
+                          : isInstalled
+                          ? 'Đã cài đặt · Cập nhật lại'
+                          : `Cài đặt Node v${ver}`}
+                      </span>
                     </button>
                   </div>
                 );
@@ -2565,19 +2929,51 @@ export function NodejsManagerPage({
         </div>
       )}
 
-      {/* MODAL 6: Detach / Uninstall Confirmation */}
+      {/* ── MODAL 6: Detach / Uninstall Confirmation ───────────────────────── */}
       {removeModalInstance && (
-        <div className="modal-backdrop" onClick={() => !busyMap.remove_instance && setRemoveModalInstance(null)}>
+        <div
+          className="modal-backdrop"
+          onClick={() => !busyMap.remove_instance && setRemoveModalInstance(null)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1250,
+            background: 'rgba(15, 23, 42, 0.6)',
+            backdropFilter: 'blur(4px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '16px',
+          }}
+        >
           <div
-            className="modal-content"
-            style={{ maxWidth: '520px', width: '95%' }}
+            className="modal"
+            style={{
+              width: '100%',
+              maxWidth: '520px',
+              borderRadius: '16px',
+              background: 'var(--bg-elevated, #ffffff)',
+              border: '1px solid var(--border-strong, var(--border))',
+              padding: '20px 24px',
+            }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-              <h3 style={{ margin: 0 }}>Gỡ ứng dụng Node.js — {removeModalInstance.domain}</h3>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                paddingBottom: '12px',
+                marginBottom: '14px',
+                borderBottom: '1px solid var(--border)',
+              }}
+            >
+              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>
+                Gỡ ứng dụng Node.js — {removeModalInstance.domain}
+              </h3>
               <button
                 type="button"
-                className="btn-secondary"
+                className="secondary-light mini"
                 onClick={() => setRemoveModalInstance(null)}
               >
                 <X size={15} />
@@ -2585,35 +2981,38 @@ export function NodejsManagerPage({
             </div>
 
             <form onSubmit={handleConfirmRemoveOrDetach} style={{ display: 'grid', gap: '12px' }}>
-              <div style={{ display: 'flex', gap: '8px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                 <button
                   type="button"
-                  className={removeOptions.mode === 'detach' ? 'btn-primary' : 'btn-secondary'}
+                  className={removeOptions.mode === 'detach' ? '' : 'secondary-light'}
                   onClick={() => setRemoveOptions(prev => ({ ...prev, mode: 'detach' }))}
+                  style={{ height: '36px', fontSize: '12.5px' }}
                 >
-                  Chỉ ngắt khỏi danh sách (Giữ nguyên file)
+                  <span>Chỉ ngắt khỏi danh sách</span>
                 </button>
                 <button
                   type="button"
-                  className={removeOptions.mode === 'uninstall' ? 'btn-primary' : 'btn-secondary'}
+                  className={removeOptions.mode === 'uninstall' ? 'danger' : 'secondary-light'}
                   onClick={() => setRemoveOptions(prev => ({ ...prev, mode: 'uninstall' }))}
+                  style={{ height: '36px', fontSize: '12.5px' }}
                 >
-                  Gỡ cài đặt & Dừng Daemon
+                  <span>Gỡ cài đặt &amp; Dừng Daemon</span>
                 </button>
               </div>
 
               {removeOptions.mode === 'uninstall' && (
                 <div
                   style={{
-                    padding: '12px',
+                    padding: '12px 14px',
                     borderRadius: '10px',
-                    border: '1px solid var(--border-subtle)',
+                    background: 'var(--surface-alt)',
+                    border: '1px solid var(--border)',
                     display: 'grid',
-                    gap: '8px',
+                    gap: '10px',
                     fontSize: '13px',
                   }}
                 >
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
+                  <label className="check-line" style={{ fontSize: '12.5px' }}>
                     <input
                       type="checkbox"
                       checked={removeOptions.deleteFiles}
@@ -2621,10 +3020,10 @@ export function NodejsManagerPage({
                         setRemoveOptions(prev => ({ ...prev, deleteFiles: e.target.checked }))
                       }
                     />
-                    Xóa toàn bộ tệp mã nguồn và `node_modules` trong thư mục ứng dụng
+                    <span>Xóa toàn bộ tệp mã nguồn và <code>node_modules</code> trong thư mục ứng dụng</span>
                   </label>
                   {removeModalInstance.db_name && (
-                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
+                    <label className="check-line" style={{ fontSize: '12.5px' }}>
                       <input
                         type="checkbox"
                         checked={removeOptions.dropDatabase}
@@ -2632,7 +3031,7 @@ export function NodejsManagerPage({
                           setRemoveOptions(prev => ({ ...prev, dropDatabase: e.target.checked }))
                         }
                       />
-                      Xóa cơ sở dữ liệu MySQL đi kèm ({removeModalInstance.db_name})
+                      <span>Xóa cơ sở dữ liệu MySQL đi kèm (<code>{removeModalInstance.db_name}</code>)</span>
                     </label>
                   )}
                   {removeOptions.deleteFiles && (
@@ -2653,16 +3052,20 @@ export function NodejsManagerPage({
                 </div>
               )}
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '4px' }}>
                 <button
                   type="button"
-                  className="btn-secondary"
+                  className="secondary-light"
                   onClick={() => setRemoveModalInstance(null)}
                 >
                   Hủy
                 </button>
-                <button type="submit" className="btn-primary" disabled={busyMap.remove_instance}>
-                  {busyMap.remove_instance ? 'Đang xử lý...' : 'Xác nhận thực hiện'}
+                <button
+                  type="submit"
+                  className={removeOptions.mode === 'uninstall' ? 'danger' : ''}
+                  disabled={busyMap.remove_instance}
+                >
+                  <span>{busyMap.remove_instance ? 'Đang xử lý...' : 'Xác nhận thực hiện'}</span>
                 </button>
               </div>
             </form>

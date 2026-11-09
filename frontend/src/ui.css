@@ -3345,7 +3345,8 @@ input[type="checkbox"].sp-switch-input:disabled,
 }
 
 .modal,
-.modal-card {
+.modal-card,
+.modal-content {
   background: var(--bg-elevated, #ffffff) !important;
   color: var(--text, #0f172a);
   border-radius: 16px !important;
@@ -3479,7 +3480,8 @@ input[type="checkbox"].sp-switch-input:disabled,
 }
 
 :root[data-theme="dark"] .modal,
-:root[data-theme="dark"] .modal-card {
+:root[data-theme="dark"] .modal-card,
+:root[data-theme="dark"] .modal-content {
   background: var(--bg-elevated, #1e293b) !important;
   border-color: var(--border-strong, #475569) !important;
   box-shadow: 0 24px 48px rgba(0, 0, 0, 0.65) !important;
