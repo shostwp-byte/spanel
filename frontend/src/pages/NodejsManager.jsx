@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   RefreshCw,
   Plus,
@@ -2067,1011 +2068,1078 @@ export function NodejsManagerPage({
         </div>
       )}
 
-      {/* ── MODAL 1: Install Node.js Application ────────────────────────────── */}
-      {showInstallModal && (
-        <div
-          className="modal-backdrop"
-          onClick={() => !busyMap.install && setShowInstallModal(false)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 1250,
-            background: 'rgba(15, 23, 42, 0.6)',
-            backdropFilter: 'blur(4px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-          }}
-        >
-          <div
-            className="modal"
-            style={{
-              width: '100%',
-              maxWidth: '680px',
-              maxHeight: '90vh',
-              overflowY: 'auto',
-              borderRadius: '16px',
-              background: 'var(--bg-elevated, #ffffff)',
-              border: '1px solid var(--border-strong, var(--border))',
-              padding: '22px 24px',
-            }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                paddingBottom: '14px',
-                marginBottom: '16px',
-                borderBottom: '1px solid var(--border)',
-              }}
-            >
-              <div>
-                <h3 style={{ margin: 0, fontSize: '17px', fontWeight: 800, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <NodejsBrandIcon size={20} />
-                  <span>Triển khai ứng dụng Node.js mới</span>
-                </h3>
-                <small style={{ color: 'var(--text-muted)' }}>
-                  Tự động cấu hình dịch vụ systemd cô lập theo user, Reverse Proxy Nginx hỗ trợ WebSocket &amp; tệp <code>.env</code>
-                </small>
-              </div>
-              <button
-                type="button"
-                className="secondary-light mini"
-                disabled={busyMap.install}
-                onClick={() => setShowInstallModal(false)}
-              >
-                <X size={15} />
-              </button>
-            </div>
-
-            <form onSubmit={handleInstallSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1.2fr', gap: '12px' }}>
-                <label>
-                  <span>Website / Tên miền đích *</span>
-                  <select
-                    required
-                    value={installForm.website_id}
-                    onChange={e => {
-                      const wid = e.target.value;
-                      const found = websiteCandidates.find(w => String(w.id) === String(wid));
-                      const slug = found
-                        ? String(found.domain || 'node')
-                            .toLowerCase()
-                            .replace(/[^a-z0-9]/g, '')
-                            .slice(0, 10)
-                        : 'node';
-                      const suffix = Math.random().toString(16).slice(2, 6);
-                      setInstallForm(prev => ({
-                        ...prev,
-                        website_id: wid,
-                        app_name: found ? found.domain : prev.app_name,
-                        db_name: `nd_${slug}_${suffix}`,
-                        db_user: `u_nd_${slug}_${suffix}`.slice(0, 32),
-                      }));
-                    }}
-                  >
-                    <option value="">-- Chọn tên miền --</option>
-                    {websiteCandidates.map(w => (
-                      <option key={w.id} value={w.id}>
-                        {w.domain} {w.has_nodejs ? '(Đã có Node.js)' : ''}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label>
-                  <span>Tên hiển thị ứng dụng</span>
-                  <input
-                    type="text"
-                    value={installForm.app_name}
-                    onChange={e => setInstallForm(prev => ({ ...prev, app_name: e.target.value }))}
-                    placeholder="My Node.js App"
-                  />
-                </label>
-              </div>
-
-              {/* Install source selector */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                <button
-                  type="button"
-                  className={installForm.install_source === 'template' ? '' : 'secondary-light'}
-                  onClick={() => setInstallForm(prev => ({ ...prev, install_source: 'template' }))}
-                  style={{ height: '38px', fontSize: '12.5px' }}
+      {typeof document !== 'undefined'
+        ? createPortal(
+            <>
+              {/* ── MODAL 1: Install Node.js Application ────────────────────────────── */}
+              {showInstallModal && (
+                <div
+                  className="modal-backdrop"
+                  onClick={() => !busyMap.install && setShowInstallModal(false)}
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 9999,
+                    background: 'rgba(15, 23, 42, 0.62)',
+                    backdropFilter: 'blur(4px)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '16px',
+                    boxSizing: 'border-box',
+                  }}
                 >
-                  <Sparkles size={14} />
-                  <span>Khởi tạo từ Mẫu Starter (1-Click)</span>
-                </button>
-                <button
-                  type="button"
-                  className={installForm.install_source === 'git' ? '' : 'secondary-light'}
-                  onClick={() => setInstallForm(prev => ({ ...prev, install_source: 'git' }))}
-                  style={{ height: '38px', fontSize: '12.5px' }}
-                >
-                  <GitBranch size={14} />
-                  <span>Sao chép từ Git Repository</span>
-                </button>
-              </div>
-
-              {installForm.install_source === 'template' ? (
-                <div style={{ display: 'grid', gap: '8px' }}>
-                  <span style={{ fontSize: '12.5px', fontWeight: 700, color: 'var(--text-secondary)' }}>
-                    Chọn kiến trúc mẫu (Starter Template)
-                  </span>
                   <div
+                    className="modal"
                     style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-                      gap: '10px',
+                      width: '100%',
+                      maxWidth: '680px',
+                      maxHeight: 'calc(100vh - 32px)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      overflow: 'hidden',
+                      borderRadius: '16px',
+                      background: 'var(--bg-elevated, #ffffff)',
+                      border: '1px solid var(--border-strong, var(--border))',
+                      padding: 0,
+                      boxShadow: '0 24px 64px -12px rgba(15, 23, 42, 0.4)',
                     }}
+                    onClick={e => e.stopPropagation()}
                   >
-                    {(starterTemplates.length ? starterTemplates : [
-                      {
-                        id: 'express-api',
-                        name: 'Express.js Web & REST API',
-                        badge: 'Phổ biến nhất',
-                        description: 'REST API chuẩn Production với health-check (/api/health), CORS/JSON và trang trạng thái.',
-                        start_mode: 'node',
-                        start_arg: 'server.js',
-                      },
-                      {
-                        id: 'nextjs-ssr',
-                        name: 'Next.js SSR Ready Starter',
-                        badge: 'Full-stack',
-                        description: 'Khởi tạo dự án chuẩn kiến trúc SSR qua Nginx Reverse Proxy và hỗ trợ WebSocket.',
-                        start_mode: 'node',
-                        start_arg: 'server.js',
-                      },
-                      {
-                        id: 'nestjs-api',
-                        name: 'NestJS-Style Enterprise API',
-                        badge: 'Enterprise',
-                        description: 'Kiến trúc dịch vụ API phân tầng (Controller / Service / Health) sẵn sàng kết nối MariaDB.',
-                        start_mode: 'node',
-                        start_arg: 'server.js',
-                      },
-                      {
-                        id: 'socketio-realtime',
-                        name: 'Real-time WebSocket Server',
-                        badge: 'WebSocket',
-                        description: 'Máy chủ sự kiện thời gian thực tương thích cấu hình Upgrade/Connection của Nginx Proxy.',
-                        start_mode: 'node',
-                        start_arg: 'server.js',
-                      },
-                      {
-                        id: 'minimal-http',
-                        name: 'Node.js Native HTTP',
-                        badge: 'Siêu nhẹ',
-                        description: 'Máy chủ node:http thuần không phụ thuộc thư viện ngoài, khởi chạy tức thì dưới 30ms.',
-                        start_mode: 'node',
-                        start_arg: 'server.js',
-                      },
-                    ]).map(tpl => {
-                      const active = installForm.template === tpl.id;
-                      return (
+                    <div
+                      className="modal-header"
+                      style={{
+                        flexShrink: 0,
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        padding: '14px 20px',
+                        borderBottom: '1px solid var(--border)',
+                        background: 'var(--surface-alt)',
+                        gap: '12px',
+                      }}
+                    >
+                      <div>
+                        <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          <NodejsBrandIcon size={20} />
+                          <span>Triển khai ứng dụng Node.js mới</span>
+                        </h3>
+                        <small style={{ color: 'var(--text-muted)', display: 'block', marginTop: '2px' }}>
+                          Tự động cấu hình dịch vụ systemd cô lập theo user, Reverse Proxy Nginx hỗ trợ WebSocket &amp; tệp <code>.env</code>
+                        </small>
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary-light mini"
+                        disabled={busyMap.install}
+                        onClick={() => setShowInstallModal(false)}
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+
+                    <form
+                      onSubmit={handleInstallSubmit}
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        flex: '1 1 auto',
+                        minHeight: 0,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <div
+                        className="modal-body"
+                        style={{
+                          flex: '1 1 auto',
+                          overflowY: 'auto',
+                          padding: '16px 20px',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '12px',
+                        }}
+                      >
+                        <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1.2fr', gap: '12px' }}>
+                          <label>
+                            <span>Website / Tên miền đích *</span>
+                            <select
+                              required
+                              value={installForm.website_id}
+                              onChange={e => {
+                                const wid = e.target.value;
+                                const found = websiteCandidates.find(w => String(w.id) === String(wid));
+                                const slug = found
+                                  ? String(found.domain || 'node')
+                                      .toLowerCase()
+                                      .replace(/[^a-z0-9]/g, '')
+                                      .slice(0, 10)
+                                  : 'node';
+                                const suffix = Math.random().toString(16).slice(2, 6);
+                                setInstallForm(prev => ({
+                                  ...prev,
+                                  website_id: wid,
+                                  app_name: found ? found.domain : prev.app_name,
+                                  db_name: `nd_${slug}_${suffix}`,
+                                  db_user: `u_nd_${slug}_${suffix}`.slice(0, 32),
+                                }));
+                              }}
+                            >
+                              <option value="">-- Chọn tên miền --</option>
+                              {websiteCandidates.map(w => (
+                                <option key={w.id} value={w.id}>
+                                  {w.domain} {w.has_nodejs ? '(Đã có Node.js)' : ''}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <label>
+                            <span>Tên hiển thị ứng dụng</span>
+                            <input
+                              type="text"
+                              value={installForm.app_name}
+                              onChange={e => setInstallForm(prev => ({ ...prev, app_name: e.target.value }))}
+                              placeholder="My Node.js App"
+                            />
+                          </label>
+                        </div>
+
+                        {/* Install source selector */}
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                          <button
+                            type="button"
+                            className={installForm.install_source === 'template' ? '' : 'secondary-light'}
+                            onClick={() => setInstallForm(prev => ({ ...prev, install_source: 'template' }))}
+                            style={{ height: '36px', fontSize: '12.5px' }}
+                          >
+                            <Sparkles size={14} />
+                            <span>Khởi tạo từ Mẫu Starter (1-Click)</span>
+                          </button>
+                          <button
+                            type="button"
+                            className={installForm.install_source === 'git' ? '' : 'secondary-light'}
+                            onClick={() => setInstallForm(prev => ({ ...prev, install_source: 'git' }))}
+                            style={{ height: '36px', fontSize: '12.5px' }}
+                          >
+                            <GitBranch size={14} />
+                            <span>Sao chép từ Git Repository</span>
+                          </button>
+                        </div>
+
+                        {installForm.install_source === 'template' ? (
+                          <div style={{ display: 'grid', gap: '6px' }}>
+                            <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--text-secondary)' }}>
+                              Chọn kiến trúc mẫu (Starter Template)
+                            </span>
+                            <div
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+                                gap: '8px',
+                              }}
+                            >
+                              {(starterTemplates.length ? starterTemplates : [
+                                {
+                                  id: 'express-api',
+                                  name: 'Express.js Web & REST API',
+                                  badge: 'Phổ biến nhất',
+                                  description: 'REST API chuẩn Production với health-check (/api/health), CORS/JSON và trang trạng thái.',
+                                  start_mode: 'node',
+                                  start_arg: 'server.js',
+                                },
+                                {
+                                  id: 'nextjs-ssr',
+                                  name: 'Next.js SSR Ready Starter',
+                                  badge: 'Full-stack',
+                                  description: 'Khởi tạo dự án chuẩn kiến trúc SSR qua Nginx Reverse Proxy và hỗ trợ WebSocket.',
+                                  start_mode: 'node',
+                                  start_arg: 'server.js',
+                                },
+                                {
+                                  id: 'nestjs-api',
+                                  name: 'NestJS-Style Enterprise API',
+                                  badge: 'Enterprise',
+                                  description: 'Kiến trúc dịch vụ API phân tầng (Controller / Service / Health) sẵn sàng kết nối MariaDB.',
+                                  start_mode: 'node',
+                                  start_arg: 'server.js',
+                                },
+                                {
+                                  id: 'socketio-realtime',
+                                  name: 'Real-time WebSocket Server',
+                                  badge: 'WebSocket',
+                                  description: 'Máy chủ sự kiện thời gian thực tương thích cấu hình Upgrade/Connection của Nginx Proxy.',
+                                  start_mode: 'node',
+                                  start_arg: 'server.js',
+                                },
+                                {
+                                  id: 'minimal-http',
+                                  name: 'Node.js Native HTTP',
+                                  badge: 'Siêu nhẹ',
+                                  description: 'Máy chủ node:http thuần không phụ thuộc thư viện ngoài, khởi chạy tức thì dưới 30ms.',
+                                  start_mode: 'node',
+                                  start_arg: 'server.js',
+                                },
+                              ]).map(tpl => {
+                                const active = installForm.template === tpl.id;
+                                return (
+                                  <div
+                                    key={tpl.id}
+                                    onClick={() =>
+                                      setInstallForm(prev => ({
+                                        ...prev,
+                                        template: tpl.id,
+                                        start_mode: tpl.start_mode || 'node',
+                                        start_arg: tpl.start_arg || 'server.js',
+                                      }))
+                                    }
+                                    style={{
+                                      padding: '9px 12px',
+                                      borderRadius: '10px',
+                                      background: active
+                                        ? 'color-mix(in srgb, var(--primary) 10%, var(--surface))'
+                                        : 'var(--surface-alt)',
+                                      border: active
+                                        ? '1.5px solid var(--primary)'
+                                        : '1px solid var(--border)',
+                                      cursor: 'pointer',
+                                      transition: 'all 0.15s ease',
+                                    }}
+                                  >
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
+                                      <strong style={{ fontSize: '12.5px', color: 'var(--text)' }}>{tpl.name}</strong>
+                                      {tpl.badge && (
+                                        <span
+                                          className="badge"
+                                          style={{
+                                            fontSize: '10px',
+                                            flexShrink: 0,
+                                            background: active
+                                              ? 'var(--primary)'
+                                              : 'color-mix(in srgb, var(--primary) 12%, transparent)',
+                                            color: active ? '#fff' : 'var(--primary)',
+                                          }}
+                                        >
+                                          {tpl.badge}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="hint" style={{ fontSize: '11.2px', marginTop: '3px', lineHeight: 1.4 }}>
+                                      {tpl.description}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '12px' }}>
+                            <label>
+                              <span>Git Repository URL *</span>
+                              <input
+                                type="text"
+                                required
+                                placeholder="https://github.com/username/repo.git"
+                                value={installForm.git_repo}
+                                onChange={e => setInstallForm(prev => ({ ...prev, git_repo: e.target.value }))}
+                              />
+                            </label>
+                            <label>
+                              <span>Nhánh (Branch)</span>
+                              <input
+                                type="text"
+                                value={installForm.git_branch}
+                                onChange={e => setInstallForm(prev => ({ ...prev, git_branch: e.target.value }))}
+                              />
+                            </label>
+                          </div>
+                        )}
+
+                        {/* Runtime parameters */}
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: '10px' }}>
+                          <label>
+                            <span>Phiên bản Node.js</span>
+                            <select
+                              value={installForm.node_major}
+                              onChange={e => setInstallForm(prev => ({ ...prev, node_major: e.target.value }))}
+                            >
+                              {nodeVersions.map(v => (
+                                <option key={v} value={v}>
+                                  Node.js v{v} {v === '24' ? '(Current)' : '(LTS)'}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <label>
+                            <span>Chế độ khởi chạy</span>
+                            <select
+                              value={installForm.start_mode}
+                              onChange={e => {
+                                const m = e.target.value;
+                                setInstallForm(prev => ({
+                                  ...prev,
+                                  start_mode: m,
+                                  start_arg: m === 'npm' || m === 'yarn' ? 'start' : 'server.js',
+                                }));
+                              }}
+                            >
+                              <option value="node">node (File JS)</option>
+                              <option value="npm">npm (Script)</option>
+                              <option value="npx">npx</option>
+                              <option value="yarn">yarn</option>
+                            </select>
+                          </label>
+
+                          <label>
+                            <span>Entry File / Script</span>
+                            <input
+                              type="text"
+                              value={installForm.start_arg}
+                              onChange={e => setInstallForm(prev => ({ ...prev, start_arg: e.target.value }))}
+                            />
+                          </label>
+
+                          <label>
+                            <span>Giới hạn RAM</span>
+                            <select
+                              value={installForm.memory_mb}
+                              onChange={e =>
+                                setInstallForm(prev => ({ ...prev, memory_mb: Number(e.target.value) }))
+                              }
+                            >
+                              {MEMORY_PRESETS.map(mb => (
+                                <option key={mb} value={mb}>
+                                  {mb} MB
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        </div>
+
+                        {/* Optional MySQL Database provisioning */}
                         <div
-                          key={tpl.id}
-                          onClick={() =>
-                            setInstallForm(prev => ({
-                              ...prev,
-                              template: tpl.id,
-                              start_mode: tpl.start_mode || 'node',
-                              start_arg: tpl.start_arg || 'server.js',
-                            }))
-                          }
                           style={{
-                            padding: '11px 13px',
+                            padding: '10px 14px',
                             borderRadius: '10px',
-                            background: active
-                              ? 'color-mix(in srgb, var(--primary) 10%, var(--surface))'
-                              : 'var(--surface-alt)',
-                            border: active
-                              ? '1.5px solid var(--primary)'
-                              : '1px solid var(--border)',
-                            cursor: 'pointer',
-                            transition: 'all 0.15s ease',
+                            background: 'var(--surface-alt)',
+                            border: '1px solid var(--border)',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '10px',
                           }}
                         >
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' }}>
-                            <strong style={{ fontSize: '13px', color: 'var(--text)' }}>{tpl.name}</strong>
-                            {tpl.badge && (
-                              <span
-                                className="badge"
-                                style={{
-                                  fontSize: '10.5px',
-                                  flexShrink: 0,
-                                  background: active
-                                    ? 'var(--primary)'
-                                    : 'color-mix(in srgb, var(--primary) 12%, transparent)',
-                                  color: active ? '#fff' : 'var(--primary)',
-                                }}
-                              >
-                                {tpl.badge}
-                              </span>
-                            )}
-                          </div>
-                          <div className="hint" style={{ fontSize: '11.5px', marginTop: '4px', lineHeight: 1.45 }}>
-                            {tpl.description}
+                          <label className="check-line" style={{ fontSize: '12.5px' }}>
+                            <input
+                              type="checkbox"
+                              checked={installForm.create_database}
+                              onChange={e =>
+                                setInstallForm(prev => ({ ...prev, create_database: e.target.checked }))
+                              }
+                            />
+                            <span>
+                              Khởi tạo kèm <strong>Cơ sở dữ liệu MySQL / MariaDB</strong> và tự động cấu hình vào <code>.env</code>
+                            </span>
+                          </label>
+
+                          {installForm.create_database && (
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr', gap: '10px', paddingTop: '4px' }}>
+                              <label>
+                                <span>Tên Database</span>
+                                <input
+                                  type="text"
+                                  value={installForm.db_name}
+                                  onChange={e => setInstallForm(prev => ({ ...prev, db_name: e.target.value }))}
+                                />
+                              </label>
+                              <label>
+                                <span>Database User</span>
+                                <input
+                                  type="text"
+                                  value={installForm.db_user}
+                                  onChange={e => setInstallForm(prev => ({ ...prev, db_user: e.target.value }))}
+                                />
+                              </label>
+                              <label>
+                                <span>Mật khẩu Database</span>
+                                <PasswordField
+                                  value={installForm.db_password}
+                                  onChange={val => setInstallForm(prev => ({ ...prev, db_password: val }))}
+                                />
+                              </label>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div
+                        className="modal-footer"
+                        style={{
+                          flexShrink: 0,
+                          display: 'flex',
+                          justifyContent: 'flex-end',
+                          alignItems: 'center',
+                          gap: '10px',
+                          padding: '12px 20px',
+                          borderTop: '1px solid var(--border)',
+                          background: 'var(--surface-alt)',
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="secondary-light"
+                          disabled={busyMap.install}
+                          onClick={() => setShowInstallModal(false)}
+                        >
+                          Hủy
+                        </button>
+                        <button type="submit" disabled={busyMap.install}>
+                          <Plus size={15} />
+                          <span>{busyMap.install ? 'Đang triển khai Node.js...' : 'Triển khai ứng dụng'}</span>
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+              )}
+
+              {/* ── MODAL 2: Post-Install Credentials Summary ──────────────────────── */}
+              {installSuccessCreds && (
+                <div
+                  className="modal-backdrop"
+                  onClick={() => setInstallSuccessCreds(null)}
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 9999,
+                    background: 'rgba(15, 23, 42, 0.62)',
+                    backdropFilter: 'blur(4px)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '16px',
+                    boxSizing: 'border-box',
+                  }}
+                >
+                  <div
+                    className="modal"
+                    style={{
+                      width: '100%',
+                      maxWidth: '520px',
+                      maxHeight: 'calc(100vh - 32px)',
+                      overflowY: 'auto',
+                      borderRadius: '16px',
+                      background: 'var(--bg-elevated, #ffffff)',
+                      border: '1px solid var(--border-strong, var(--border))',
+                      padding: '22px 24px',
+                      boxShadow: '0 24px 64px -12px rgba(15, 23, 42, 0.4)',
+                    }}
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        paddingBottom: '12px',
+                        marginBottom: '14px',
+                        borderBottom: '1px solid var(--border)',
+                      }}
+                    >
+                      <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <CheckCircle2 size={20} style={{ color: '#10b981' }} />
+                        <span>Ứng dụng Node.js đã sẵn sàng!</span>
+                      </h3>
+                      <button type="button" className="secondary-light mini" onClick={() => setInstallSuccessCreds(null)}>
+                        <X size={15} />
+                      </button>
+                    </div>
+                    <div style={{ display: 'grid', gap: '8px', fontSize: '13px' }}>
+                      <div>
+                        <strong>Tên miền:</strong>{' '}
+                        <a href={installSuccessCreds.url} target="_blank" rel="noopener noreferrer">
+                          {installSuccessCreds.url}
+                        </a>
+                      </div>
+                      <div>
+                        <strong>Node.js Runtime:</strong> v{installSuccessCreds.node_major} LTS (127.0.0.1:
+                        {installSuccessCreds.port})
+                      </div>
+                      <div>
+                        <strong>Lệnh khởi chạy:</strong> <code>{installSuccessCreds.start_command}</code>
+                      </div>
+                      {installSuccessCreds.db_created && (
+                        <div
+                          style={{
+                            marginTop: '6px',
+                            padding: '10px 12px',
+                            borderRadius: '8px',
+                            background: 'var(--surface-alt)',
+                            border: '1px solid var(--border)',
+                          }}
+                        >
+                          <div style={{ fontWeight: 700, marginBottom: '4px' }}>Thông tin kết nối MySQL</div>
+                          <div>Database: <code>{installSuccessCreds.db_name}</code></div>
+                          <div>Username: <code>{installSuccessCreds.db_user}</code></div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span>Password: <code>{installSuccessCreds.db_password}</code></span>
+                            <CopyPasswordButton value={installSuccessCreds.db_password} />
                           </div>
                         </div>
-                      );
-                    })}
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px' }}>
+                      <button type="button" onClick={() => setInstallSuccessCreds(null)}>
+                        <span>Hoàn tất</span>
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '12px' }}>
-                  <label>
-                    <span>Git Repository URL *</span>
-                    <input
-                      type="text"
-                      required
-                      placeholder="https://github.com/username/repo.git"
-                      value={installForm.git_repo}
-                      onChange={e => setInstallForm(prev => ({ ...prev, git_repo: e.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    <span>Nhánh (Branch)</span>
-                    <input
-                      type="text"
-                      value={installForm.git_branch}
-                      onChange={e => setInstallForm(prev => ({ ...prev, git_branch: e.target.value }))}
-                    />
-                  </label>
                 </div>
               )}
 
-              {/* Runtime parameters */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: '10px' }}>
-                <label>
-                  <span>Phiên bản Node.js</span>
-                  <select
-                    value={installForm.node_major}
-                    onChange={e => setInstallForm(prev => ({ ...prev, node_major: e.target.value }))}
-                  >
-                    {nodeVersions.map(v => (
-                      <option key={v} value={v}>
-                        Node.js v{v} {v === '24' ? '(Current)' : '(LTS)'}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <label>
-                  <span>Chế độ khởi chạy</span>
-                  <select
-                    value={installForm.start_mode}
-                    onChange={e => {
-                      const m = e.target.value;
-                      setInstallForm(prev => ({
-                        ...prev,
-                        start_mode: m,
-                        start_arg: m === 'npm' || m === 'yarn' ? 'start' : 'server.js',
-                      }));
-                    }}
-                  >
-                    <option value="node">node (File JS)</option>
-                    <option value="npm">npm (Script)</option>
-                    <option value="npx">npx</option>
-                    <option value="yarn">yarn</option>
-                  </select>
-                </label>
-
-                <label>
-                  <span>Entry File / Script</span>
-                  <input
-                    type="text"
-                    value={installForm.start_arg}
-                    onChange={e => setInstallForm(prev => ({ ...prev, start_arg: e.target.value }))}
-                  />
-                </label>
-
-                <label>
-                  <span>Giới hạn RAM</span>
-                  <select
-                    value={installForm.memory_mb}
-                    onChange={e =>
-                      setInstallForm(prev => ({ ...prev, memory_mb: Number(e.target.value) }))
-                    }
-                  >
-                    {MEMORY_PRESETS.map(mb => (
-                      <option key={mb} value={mb}>
-                        {mb} MB
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              {/* Optional MySQL Database provisioning */}
-              <div
-                style={{
-                  padding: '12px 14px',
-                  borderRadius: '10px',
-                  background: 'var(--surface-alt)',
-                  border: '1px solid var(--border)',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: '10px',
-                }}
-              >
-                <label className="check-line" style={{ fontSize: '12.5px' }}>
-                  <input
-                    type="checkbox"
-                    checked={installForm.create_database}
-                    onChange={e =>
-                      setInstallForm(prev => ({ ...prev, create_database: e.target.checked }))
-                    }
-                  />
-                  <span>
-                    Khởi tạo kèm <strong>Cơ sở dữ liệu MySQL / MariaDB</strong> và tự động cấu hình vào <code>.env</code>
-                  </span>
-                </label>
-
-                {installForm.create_database && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr', gap: '10px', paddingTop: '4px' }}>
-                    <label>
-                      <span>Tên Database</span>
-                      <input
-                        type="text"
-                        value={installForm.db_name}
-                        onChange={e => setInstallForm(prev => ({ ...prev, db_name: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      <span>Database User</span>
-                      <input
-                        type="text"
-                        value={installForm.db_user}
-                        onChange={e => setInstallForm(prev => ({ ...prev, db_user: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      <span>Mật khẩu Database</span>
-                      <PasswordField
-                        value={installForm.db_password}
-                        onChange={val => setInstallForm(prev => ({ ...prev, db_password: val }))}
-                      />
-                    </label>
-                  </div>
-                )}
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '4px' }}>
-                <button
-                  type="button"
-                  className="secondary-light"
-                  disabled={busyMap.install}
-                  onClick={() => setShowInstallModal(false)}
-                >
-                  Hủy
-                </button>
-                <button type="submit" disabled={busyMap.install}>
-                  <Plus size={15} />
-                  <span>{busyMap.install ? 'Đang triển khai Node.js...' : 'Triển khai ứng dụng'}</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ── MODAL 2: Post-Install Credentials Summary ──────────────────────── */}
-      {installSuccessCreds && (
-        <div
-          className="modal-backdrop"
-          onClick={() => setInstallSuccessCreds(null)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 1250,
-            background: 'rgba(15, 23, 42, 0.6)',
-            backdropFilter: 'blur(4px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-          }}
-        >
-          <div
-            className="modal"
-            style={{
-              width: '100%',
-              maxWidth: '520px',
-              borderRadius: '16px',
-              background: 'var(--bg-elevated, #ffffff)',
-              border: '1px solid var(--border-strong, var(--border))',
-              padding: '22px 24px',
-            }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                paddingBottom: '12px',
-                marginBottom: '14px',
-                borderBottom: '1px solid var(--border)',
-              }}
-            >
-              <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800, display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <CheckCircle2 size={20} style={{ color: '#10b981' }} />
-                <span>Ứng dụng Node.js đã sẵn sàng!</span>
-              </h3>
-              <button type="button" className="secondary-light mini" onClick={() => setInstallSuccessCreds(null)}>
-                <X size={15} />
-              </button>
-            </div>
-            <div style={{ display: 'grid', gap: '8px', fontSize: '13px' }}>
-              <div>
-                <strong>Tên miền:</strong>{' '}
-                <a href={installSuccessCreds.url} target="_blank" rel="noopener noreferrer">
-                  {installSuccessCreds.url}
-                </a>
-              </div>
-              <div>
-                <strong>Node.js Runtime:</strong> v{installSuccessCreds.node_major} LTS (127.0.0.1:
-                {installSuccessCreds.port})
-              </div>
-              <div>
-                <strong>Lệnh khởi chạy:</strong> <code>{installSuccessCreds.start_command}</code>
-              </div>
-              {installSuccessCreds.db_created && (
+              {/* ── MODAL 3: Visual & Raw .env Editor ──────────────────────────────── */}
+              {envModalInstance && (
                 <div
+                  className="modal-backdrop"
+                  onClick={() => !busyMap.save_env && setEnvModalInstance(null)}
                   style={{
-                    marginTop: '6px',
-                    padding: '10px 12px',
-                    borderRadius: '8px',
-                    background: 'var(--surface-alt)',
-                    border: '1px solid var(--border)',
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 9999,
+                    background: 'rgba(15, 23, 42, 0.62)',
+                    backdropFilter: 'blur(4px)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '16px',
+                    boxSizing: 'border-box',
                   }}
                 >
-                  <div style={{ fontWeight: 700, marginBottom: '4px' }}>Thông tin kết nối MySQL</div>
-                  <div>Database: <code>{installSuccessCreds.db_name}</code></div>
-                  <div>Username: <code>{installSuccessCreds.db_user}</code></div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span>Password: <code>{installSuccessCreds.db_password}</code></span>
-                    <CopyPasswordButton value={installSuccessCreds.db_password} />
-                  </div>
-                </div>
-              )}
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px' }}>
-              <button type="button" onClick={() => setInstallSuccessCreds(null)}>
-                <span>Hoàn tất</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── MODAL 3: Visual & Raw .env Editor ──────────────────────────────── */}
-      {envModalInstance && (
-        <div
-          className="modal-backdrop"
-          onClick={() => !busyMap.save_env && setEnvModalInstance(null)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 1250,
-            background: 'rgba(15, 23, 42, 0.6)',
-            backdropFilter: 'blur(4px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-          }}
-        >
-          <div
-            className="modal"
-            style={{
-              width: '100%',
-              maxWidth: '700px',
-              maxHeight: '90vh',
-              overflowY: 'auto',
-              borderRadius: '16px',
-              background: 'var(--bg-elevated, #ffffff)',
-              border: '1px solid var(--border-strong, var(--border))',
-              padding: '20px 24px',
-            }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                paddingBottom: '12px',
-                marginBottom: '14px',
-                borderBottom: '1px solid var(--border)',
-              }}
-            >
-              <div>
-                <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800 }}>
-                  Cấu hình Biến môi trường (.env) — {envModalInstance.domain}
-                </h3>
-                <small style={{ color: 'var(--text-muted)' }}>
-                  Tự động áp dụng quyền bảo mật <code>0640</code> và khởi động lại worker khi lưu
-                </small>
-              </div>
-              <div style={{ display: 'flex', gap: '6px' }}>
-                <button
-                  type="button"
-                  className={envModalData.mode === 'structured' ? 'mini' : 'secondary-light mini'}
-                  onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'structured' }))}
-                >
-                  <span>Chế độ Trực quan (Visual)</span>
-                </button>
-                <button
-                  type="button"
-                  className={envModalData.mode === 'raw' ? 'mini' : 'secondary-light mini'}
-                  onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'raw' }))}
-                >
-                  <span>Sửa Raw .env</span>
-                </button>
-                <button
-                  type="button"
-                  className="secondary-light mini"
-                  onClick={() => setEnvModalInstance(null)}
-                >
-                  <X size={15} />
-                </button>
-              </div>
-            </div>
-
-            {envModalData.loading ? (
-              <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)' }}>
-                Đang đọc tệp .env...
-              </div>
-            ) : (
-              <form onSubmit={handleSaveEnv} style={{ display: 'grid', gap: '12px' }}>
-                {envModalData.mode === 'raw' ? (
-                  <textarea
-                    rows={14}
-                    style={{ fontFamily: 'var(--font-mono, monospace)', fontSize: '12.5px', width: '100%' }}
-                    value={envModalData.raw}
-                    onChange={e => setEnvModalData(prev => ({ ...prev, raw: e.target.value }))}
-                  />
-                ) : (
                   <div
+                    className="modal"
                     style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-                      gap: '10px',
+                      width: '100%',
+                      maxWidth: '700px',
+                      maxHeight: 'calc(100vh - 32px)',
+                      overflowY: 'auto',
+                      borderRadius: '16px',
+                      background: 'var(--bg-elevated, #ffffff)',
+                      border: '1px solid var(--border-strong, var(--border))',
+                      padding: '20px 24px',
+                      boxShadow: '0 24px 64px -12px rgba(15, 23, 42, 0.4)',
                     }}
+                    onClick={e => e.stopPropagation()}
                   >
-                    {[
-                      ['app_name', 'APP_NAME'],
-                      ['node_env', 'NODE_ENV'],
-                      ['port', 'PORT'],
-                      ['host', 'HOST'],
-                      ['app_url', 'APP_URL'],
-                      ['tz', 'TZ'],
-                      ['jwt_secret', 'JWT_SECRET'],
-                      ['log_level', 'LOG_LEVEL'],
-                      ['db_host', 'DB_HOST'],
-                      ['db_port', 'DB_PORT'],
-                      ['db_name', 'DB_DATABASE'],
-                      ['db_user', 'DB_USERNAME'],
-                      ['db_password', 'DB_PASSWORD'],
-                    ].map(([fieldKey, label]) => (
-                      <label key={fieldKey}>
-                        <span style={{ fontFamily: 'var(--font-mono, monospace)', fontWeight: 700 }}>{label}</span>
-                        <input
-                          type={fieldKey.includes('password') ? 'password' : 'text'}
-                          value={envModalData.parsed?.[fieldKey] || ''}
-                          onChange={e =>
-                            setEnvModalData(prev => ({
-                              ...prev,
-                              parsed: { ...(prev.parsed || {}), [fieldKey]: e.target.value },
-                            }))
-                          }
-                        />
-                      </label>
-                    ))}
-                  </div>
-                )}
-
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px', flexWrap: 'wrap', gap: '10px' }}>
-                  <label className="check-line" style={{ fontSize: '12.5px' }}>
-                    <input
-                      type="checkbox"
-                      checked={envModalData.restartAfterSave}
-                      onChange={e =>
-                        setEnvModalData(prev => ({ ...prev, restartAfterSave: e.target.checked }))
-                      }
-                    />
-                    <span>Tự động khởi động lại tiến trình Node.js sau khi lưu</span>
-                  </label>
-
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <button
-                      type="button"
-                      className="secondary-light"
-                      onClick={() => setEnvModalInstance(null)}
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        paddingBottom: '12px',
+                        marginBottom: '14px',
+                        borderBottom: '1px solid var(--border)',
+                        gap: '10px',
+                        flexWrap: 'wrap',
+                      }}
                     >
-                      Đóng
-                    </button>
-                    <button type="submit" disabled={busyMap.save_env}>
-                      <Save size={14} />
-                      <span>{busyMap.save_env ? 'Đang lưu...' : 'Lưu cấu hình .env'}</span>
-                    </button>
-                  </div>
-                </div>
-              </form>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ── MODAL 4: Logs Viewer ───────────────────────────────────────────── */}
-      {logsModalInstance && (
-        <div
-          className="modal-backdrop"
-          onClick={() => setLogsModalInstance(null)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 1250,
-            background: 'rgba(15, 23, 42, 0.6)',
-            backdropFilter: 'blur(4px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-          }}
-        >
-          <div
-            className="modal"
-            style={{
-              width: '100%',
-              maxWidth: '760px',
-              borderRadius: '16px',
-              background: 'var(--bg-elevated, #ffffff)',
-              border: '1px solid var(--border-strong, var(--border))',
-              padding: '20px 24px',
-            }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                paddingBottom: '12px',
-                marginBottom: '12px',
-                borderBottom: '1px solid var(--border)',
-              }}
-            >
-              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>
-                Nhật ký vận hành Node.js — {logsModalInstance.domain}
-              </h3>
-              <button
-                type="button"
-                className="secondary-light mini"
-                onClick={() => setLogsModalInstance(null)}
-              >
-                <X size={15} />
-              </button>
-            </div>
-
-            <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '8px', marginBottom: '12px' }}>
-              <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                {[
-                  { id: 'systemd', label: 'Systemd Journal' },
-                  { id: 'nginx_error', label: 'Nginx Error Log' },
-                  { id: 'app', label: 'NPM / App Log' },
-                ].map(k => (
-                  <button
-                    key={k.id}
-                    type="button"
-                    className={logsModalData.kind === k.id ? 'mini' : 'secondary-light mini'}
-                    onClick={() => openLogsModal(logsModalInstance, k.id, logsModalData.lines)}
-                  >
-                    <span>{k.label}</span>
-                  </button>
-                ))}
-              </div>
-
-              <div style={{ display: 'flex', gap: '6px' }}>
-                <button
-                  type="button"
-                  className="secondary-light mini"
-                  onClick={() =>
-                    openLogsModal(logsModalInstance, logsModalData.kind, logsModalData.lines)
-                  }
-                >
-                  <RefreshCw size={12} />
-                  <span>Làm mới</span>
-                </button>
-                <button
-                  type="button"
-                  className="secondary-light mini"
-                  onClick={() => copyText(logsModalData.content, 'Đã sao chép nội dung nhật ký.')}
-                >
-                  <Copy size={12} />
-                  <span>Sao chép</span>
-                </button>
-                <button
-                  type="button"
-                  className="danger mini"
-                  disabled={busyMap.clear_logs}
-                  onClick={handleClearLogs}
-                >
-                  <Trash2 size={12} />
-                  <span>Xóa Log</span>
-                </button>
-              </div>
-            </div>
-
-            <div
-              style={{
-                background: '#0f172a',
-                color: '#e2e8f0',
-                borderRadius: '10px',
-                padding: '14px',
-                fontFamily: 'var(--font-mono, monospace)',
-                fontSize: '12px',
-                maxHeight: '420px',
-                overflowY: 'auto',
-              }}
-            >
-              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                {logsModalData.loading ? 'Đang tải nhật ký...' : logsModalData.content}
-              </pre>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── MODAL 5: Node.js Runtime Versions Manager ──────────────────────── */}
-      {showRuntimeModal && (
-        <div
-          className="modal-backdrop"
-          onClick={() => setShowRuntimeModal(false)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 1250,
-            background: 'rgba(15, 23, 42, 0.6)',
-            backdropFilter: 'blur(4px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-          }}
-        >
-          <div
-            className="modal"
-            style={{
-              width: '100%',
-              maxWidth: '540px',
-              borderRadius: '16px',
-              background: 'var(--bg-elevated, #ffffff)',
-              border: '1px solid var(--border-strong, var(--border))',
-              padding: '20px 24px',
-            }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                paddingBottom: '12px',
-                marginBottom: '12px',
-                borderBottom: '1px solid var(--border)',
-              }}
-            >
-              <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800 }}>
-                Quản lý Phiên bản Node.js Runtime
-              </h3>
-              <button
-                type="button"
-                className="secondary-light mini"
-                onClick={() => setShowRuntimeModal(false)}
-              >
-                <X size={15} />
-              </button>
-            </div>
-            <p className="hint" style={{ fontSize: '12.5px', marginBottom: '14px' }}>
-              Các phiên bản Node.js được cài đặt độc lập tại <code>/opt/spanel/node/&lt;major&gt;</code>, cho phép mỗi website chạy một phiên bản Node.js riêng biệt.
-            </p>
-            <div style={{ display: 'grid', gap: '8px' }}>
-              {nodeVersions.map(ver => {
-                const isInstalled = installedNodeVersions.includes(ver);
-                const isBusy = busyMap[`node_ver_${ver}`];
-                return (
-                  <div
-                    key={ver}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      padding: '10px 14px',
-                      borderRadius: '10px',
-                      background: 'var(--surface-alt)',
-                      border: '1px solid var(--border)',
-                    }}
-                  >
-                    <div>
-                      <strong>Node.js v{ver}.x</strong>{' '}
-                      <span className="badge" style={{ fontSize: '11px' }}>
-                        {ver === '24' ? 'Current' : 'LTS'}
-                      </span>
-                      <div className="hint" style={{ fontSize: '11.5px', fontFamily: 'var(--font-mono, monospace)' }}>
-                        /opt/spanel/node/{ver}/bin/node
+                      <div>
+                        <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800 }}>
+                          Cấu hình Biến môi trường (.env) — {envModalInstance.domain}
+                        </h3>
+                        <small style={{ color: 'var(--text-muted)' }}>
+                          Tự động áp dụng quyền bảo mật <code>0640</code> và khởi động lại worker khi lưu
+                        </small>
+                      </div>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button
+                          type="button"
+                          className={envModalData.mode === 'structured' ? 'mini' : 'secondary-light mini'}
+                          onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'structured' }))}
+                        >
+                          <span>Chế độ Trực quan (Visual)</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={envModalData.mode === 'raw' ? 'mini' : 'secondary-light mini'}
+                          onClick={() => setEnvModalData(prev => ({ ...prev, mode: 'raw' }))}
+                        >
+                          <span>Sửa Raw .env</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-light mini"
+                          onClick={() => setEnvModalInstance(null)}
+                        >
+                          <X size={15} />
+                        </button>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      className={isInstalled ? 'secondary-light mini' : 'mini'}
-                      disabled={isBusy}
-                      onClick={() => handleInstallNodeMajor(ver)}
-                    >
-                      <Download size={13} />
-                      <span>
-                        {isBusy
-                          ? `Đang tải v${ver}...`
-                          : isInstalled
-                          ? 'Đã cài đặt · Cập nhật lại'
-                          : `Cài đặt Node v${ver}`}
-                      </span>
-                    </button>
+
+                    {envModalData.loading ? (
+                      <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                        Đang đọc tệp .env...
+                      </div>
+                    ) : (
+                      <form onSubmit={handleSaveEnv} style={{ display: 'grid', gap: '12px' }}>
+                        {envModalData.mode === 'raw' ? (
+                          <textarea
+                            rows={14}
+                            style={{ fontFamily: 'var(--font-mono, monospace)', fontSize: '12.5px', width: '100%' }}
+                            value={envModalData.raw}
+                            onChange={e => setEnvModalData(prev => ({ ...prev, raw: e.target.value }))}
+                          />
+                        ) : (
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                              gap: '10px',
+                            }}
+                          >
+                            {[
+                              ['app_name', 'APP_NAME'],
+                              ['node_env', 'NODE_ENV'],
+                              ['port', 'PORT'],
+                              ['host', 'HOST'],
+                              ['app_url', 'APP_URL'],
+                              ['tz', 'TZ'],
+                              ['jwt_secret', 'JWT_SECRET'],
+                              ['log_level', 'LOG_LEVEL'],
+                              ['db_host', 'DB_HOST'],
+                              ['db_port', 'DB_PORT'],
+                              ['db_name', 'DB_DATABASE'],
+                              ['db_user', 'DB_USERNAME'],
+                              ['db_password', 'DB_PASSWORD'],
+                            ].map(([fieldKey, label]) => (
+                              <label key={fieldKey}>
+                                <span style={{ fontFamily: 'var(--font-mono, monospace)', fontWeight: 700 }}>{label}</span>
+                                <input
+                                  type={fieldKey.includes('password') ? 'password' : 'text'}
+                                  value={envModalData.parsed?.[fieldKey] || ''}
+                                  onChange={e =>
+                                    setEnvModalData(prev => ({
+                                      ...prev,
+                                      parsed: { ...(prev.parsed || {}), [fieldKey]: e.target.value },
+                                    }))
+                                  }
+                                />
+                              </label>
+                            ))}
+                          </div>
+                        )}
+
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '6px', flexWrap: 'wrap', gap: '10px' }}>
+                          <label className="check-line" style={{ fontSize: '12.5px' }}>
+                            <input
+                              type="checkbox"
+                              checked={envModalData.restartAfterSave}
+                              onChange={e =>
+                                setEnvModalData(prev => ({ ...prev, restartAfterSave: e.target.checked }))
+                              }
+                            />
+                            <span>Tự động khởi động lại tiến trình Node.js sau khi lưu</span>
+                          </label>
+
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <button
+                              type="button"
+                              className="secondary-light"
+                              onClick={() => setEnvModalInstance(null)}
+                            >
+                              Đóng
+                            </button>
+                            <button type="submit" disabled={busyMap.save_env}>
+                              <Save size={14} />
+                              <span>{busyMap.save_env ? 'Đang lưu...' : 'Lưu cấu hình .env'}</span>
+                            </button>
+                          </div>
+                        </div>
+                      </form>
+                    )}
                   </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── MODAL 6: Detach / Uninstall Confirmation ───────────────────────── */}
-      {removeModalInstance && (
-        <div
-          className="modal-backdrop"
-          onClick={() => !busyMap.remove_instance && setRemoveModalInstance(null)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 1250,
-            background: 'rgba(15, 23, 42, 0.6)',
-            backdropFilter: 'blur(4px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '16px',
-          }}
-        >
-          <div
-            className="modal"
-            style={{
-              width: '100%',
-              maxWidth: '520px',
-              borderRadius: '16px',
-              background: 'var(--bg-elevated, #ffffff)',
-              border: '1px solid var(--border-strong, var(--border))',
-              padding: '20px 24px',
-            }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                paddingBottom: '12px',
-                marginBottom: '14px',
-                borderBottom: '1px solid var(--border)',
-              }}
-            >
-              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>
-                Gỡ ứng dụng Node.js — {removeModalInstance.domain}
-              </h3>
-              <button
-                type="button"
-                className="secondary-light mini"
-                onClick={() => setRemoveModalInstance(null)}
-              >
-                <X size={15} />
-              </button>
-            </div>
-
-            <form onSubmit={handleConfirmRemoveOrDetach} style={{ display: 'grid', gap: '12px' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                <button
-                  type="button"
-                  className={removeOptions.mode === 'detach' ? '' : 'secondary-light'}
-                  onClick={() => setRemoveOptions(prev => ({ ...prev, mode: 'detach' }))}
-                  style={{ height: '36px', fontSize: '12.5px' }}
-                >
-                  <span>Chỉ ngắt khỏi danh sách</span>
-                </button>
-                <button
-                  type="button"
-                  className={removeOptions.mode === 'uninstall' ? 'danger' : 'secondary-light'}
-                  onClick={() => setRemoveOptions(prev => ({ ...prev, mode: 'uninstall' }))}
-                  style={{ height: '36px', fontSize: '12.5px' }}
-                >
-                  <span>Gỡ cài đặt &amp; Dừng Daemon</span>
-                </button>
-              </div>
-
-              {removeOptions.mode === 'uninstall' && (
-                <div
-                  style={{
-                    padding: '12px 14px',
-                    borderRadius: '10px',
-                    background: 'var(--surface-alt)',
-                    border: '1px solid var(--border)',
-                    display: 'grid',
-                    gap: '10px',
-                    fontSize: '13px',
-                  }}
-                >
-                  <label className="check-line" style={{ fontSize: '12.5px' }}>
-                    <input
-                      type="checkbox"
-                      checked={removeOptions.deleteFiles}
-                      onChange={e =>
-                        setRemoveOptions(prev => ({ ...prev, deleteFiles: e.target.checked }))
-                      }
-                    />
-                    <span>Xóa toàn bộ tệp mã nguồn và <code>node_modules</code> trong thư mục ứng dụng</span>
-                  </label>
-                  {removeModalInstance.db_name && (
-                    <label className="check-line" style={{ fontSize: '12.5px' }}>
-                      <input
-                        type="checkbox"
-                        checked={removeOptions.dropDatabase}
-                        onChange={e =>
-                          setRemoveOptions(prev => ({ ...prev, dropDatabase: e.target.checked }))
-                        }
-                      />
-                      <span>Xóa cơ sở dữ liệu MySQL đi kèm (<code>{removeModalInstance.db_name}</code>)</span>
-                    </label>
-                  )}
-                  {removeOptions.deleteFiles && (
-                    <label style={{ display: 'grid', gap: '4px', marginTop: '4px' }}>
-                      <span>
-                        Nhập lại tên miền <strong>{removeModalInstance.domain}</strong> để xác nhận xóa tệp:
-                      </span>
-                      <input
-                        type="text"
-                        required
-                        value={removeOptions.confirmDomain}
-                        onChange={e =>
-                          setRemoveOptions(prev => ({ ...prev, confirmDomain: e.target.value }))
-                        }
-                      />
-                    </label>
-                  )}
                 </div>
               )}
 
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '4px' }}>
-                <button
-                  type="button"
-                  className="secondary-light"
-                  onClick={() => setRemoveModalInstance(null)}
+              {/* ── MODAL 4: Logs Viewer ───────────────────────────────────────────── */}
+              {logsModalInstance && (
+                <div
+                  className="modal-backdrop"
+                  onClick={() => setLogsModalInstance(null)}
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 9999,
+                    background: 'rgba(15, 23, 42, 0.62)',
+                    backdropFilter: 'blur(4px)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '16px',
+                    boxSizing: 'border-box',
+                  }}
                 >
-                  Hủy
-                </button>
-                <button
-                  type="submit"
-                  className={removeOptions.mode === 'uninstall' ? 'danger' : ''}
-                  disabled={busyMap.remove_instance}
+                  <div
+                    className="modal"
+                    style={{
+                      width: '100%',
+                      maxWidth: '760px',
+                      maxHeight: 'calc(100vh - 32px)',
+                      overflowY: 'auto',
+                      borderRadius: '16px',
+                      background: 'var(--bg-elevated, #ffffff)',
+                      border: '1px solid var(--border-strong, var(--border))',
+                      padding: '20px 24px',
+                      boxShadow: '0 24px 64px -12px rgba(15, 23, 42, 0.4)',
+                    }}
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        paddingBottom: '12px',
+                        marginBottom: '12px',
+                        borderBottom: '1px solid var(--border)',
+                      }}
+                    >
+                      <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>
+                        Nhật ký vận hành Node.js — {logsModalInstance.domain}
+                      </h3>
+                      <button
+                        type="button"
+                        className="secondary-light mini"
+                        onClick={() => setLogsModalInstance(null)}
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+
+                    <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: '8px', marginBottom: '12px' }}>
+                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                        {[
+                          { id: 'systemd', label: 'Systemd Journal' },
+                          { id: 'nginx_error', label: 'Nginx Error Log' },
+                          { id: 'app', label: 'NPM / App Log' },
+                        ].map(k => (
+                          <button
+                            key={k.id}
+                            type="button"
+                            className={logsModalData.kind === k.id ? 'mini' : 'secondary-light mini'}
+                            onClick={() => openLogsModal(logsModalInstance, k.id, logsModalData.lines)}
+                          >
+                            <span>{k.label}</span>
+                          </button>
+                        ))}
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <button
+                          type="button"
+                          className="secondary-light mini"
+                          onClick={() =>
+                            openLogsModal(logsModalInstance, logsModalData.kind, logsModalData.lines)
+                          }
+                        >
+                          <RefreshCw size={12} />
+                          <span>Làm mới</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-light mini"
+                          onClick={() => copyText(logsModalData.content, 'Đã sao chép nội dung nhật ký.')}
+                        >
+                          <Copy size={12} />
+                          <span>Sao chép</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="danger mini"
+                          disabled={busyMap.clear_logs}
+                          onClick={handleClearLogs}
+                        >
+                          <Trash2 size={12} />
+                          <span>Xóa Log</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        background: '#0f172a',
+                        color: '#e2e8f0',
+                        borderRadius: '10px',
+                        padding: '14px',
+                        fontFamily: 'var(--font-mono, monospace)',
+                        fontSize: '12px',
+                        maxHeight: '420px',
+                        overflowY: 'auto',
+                      }}
+                    >
+                      <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                        {logsModalData.loading ? 'Đang tải nhật ký...' : logsModalData.content}
+                      </pre>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ── MODAL 5: Node.js Runtime Versions Manager ──────────────────────── */}
+              {showRuntimeModal && (
+                <div
+                  className="modal-backdrop"
+                  onClick={() => setShowRuntimeModal(false)}
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 9999,
+                    background: 'rgba(15, 23, 42, 0.62)',
+                    backdropFilter: 'blur(4px)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '16px',
+                    boxSizing: 'border-box',
+                  }}
                 >
-                  <span>{busyMap.remove_instance ? 'Đang xử lý...' : 'Xác nhận thực hiện'}</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+                  <div
+                    className="modal"
+                    style={{
+                      width: '100%',
+                      maxWidth: '540px',
+                      maxHeight: 'calc(100vh - 32px)',
+                      overflowY: 'auto',
+                      borderRadius: '16px',
+                      background: 'var(--bg-elevated, #ffffff)',
+                      border: '1px solid var(--border-strong, var(--border))',
+                      padding: '20px 24px',
+                      boxShadow: '0 24px 64px -12px rgba(15, 23, 42, 0.4)',
+                    }}
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        paddingBottom: '12px',
+                        marginBottom: '12px',
+                        borderBottom: '1px solid var(--border)',
+                      }}
+                    >
+                      <h3 style={{ margin: 0, fontSize: '16.5px', fontWeight: 800 }}>
+                        Quản lý Phiên bản Node.js Runtime
+                      </h3>
+                      <button
+                        type="button"
+                        className="secondary-light mini"
+                        onClick={() => setShowRuntimeModal(false)}
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+                    <p className="hint" style={{ fontSize: '12.5px', marginBottom: '14px' }}>
+                      Các phiên bản Node.js được cài đặt độc lập tại <code>/opt/spanel/node/&lt;major&gt;</code>, cho phép mỗi website chạy một phiên bản Node.js riêng biệt.
+                    </p>
+                    <div style={{ display: 'grid', gap: '8px' }}>
+                      {nodeVersions.map(ver => {
+                        const isInstalled = installedNodeVersions.includes(ver);
+                        const isBusy = busyMap[`node_ver_${ver}`];
+                        return (
+                          <div
+                            key={ver}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              padding: '10px 14px',
+                              borderRadius: '10px',
+                              background: 'var(--surface-alt)',
+                              border: '1px solid var(--border)',
+                            }}
+                          >
+                            <div>
+                              <strong>Node.js v{ver}.x</strong>{' '}
+                              <span className="badge" style={{ fontSize: '11px' }}>
+                                {ver === '24' ? 'Current' : 'LTS'}
+                              </span>
+                              <div className="hint" style={{ fontSize: '11.5px', fontFamily: 'var(--font-mono, monospace)' }}>
+                                /opt/spanel/node/{ver}/bin/node
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              className={isInstalled ? 'secondary-light mini' : 'mini'}
+                              disabled={isBusy}
+                              onClick={() => handleInstallNodeMajor(ver)}
+                            >
+                              <Download size={13} />
+                              <span>
+                                {isBusy
+                                  ? `Đang tải v${ver}...`
+                                  : isInstalled
+                                  ? 'Đã cài đặt · Cập nhật lại'
+                                  : `Cài đặt Node v${ver}`}
+                              </span>
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ── MODAL 6: Detach / Uninstall Confirmation ───────────────────────── */}
+              {removeModalInstance && (
+                <div
+                  className="modal-backdrop"
+                  onClick={() => !busyMap.remove_instance && setRemoveModalInstance(null)}
+                  style={{
+                    position: 'fixed',
+                    inset: 0,
+                    zIndex: 9999,
+                    background: 'rgba(15, 23, 42, 0.62)',
+                    backdropFilter: 'blur(4px)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '16px',
+                    boxSizing: 'border-box',
+                  }}
+                >
+                  <div
+                    className="modal"
+                    style={{
+                      width: '100%',
+                      maxWidth: '520px',
+                      maxHeight: 'calc(100vh - 32px)',
+                      overflowY: 'auto',
+                      borderRadius: '16px',
+                      background: 'var(--bg-elevated, #ffffff)',
+                      border: '1px solid var(--border-strong, var(--border))',
+                      padding: '20px 24px',
+                      boxShadow: '0 24px 64px -12px rgba(15, 23, 42, 0.4)',
+                    }}
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        paddingBottom: '12px',
+                        marginBottom: '14px',
+                        borderBottom: '1px solid var(--border)',
+                      }}
+                    >
+                      <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>
+                        Gỡ ứng dụng Node.js — {removeModalInstance.domain}
+                      </h3>
+                      <button
+                        type="button"
+                        className="secondary-light mini"
+                        onClick={() => setRemoveModalInstance(null)}
+                      >
+                        <X size={15} />
+                      </button>
+                    </div>
+
+                    <form onSubmit={handleConfirmRemoveOrDetach} style={{ display: 'grid', gap: '12px' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                        <button
+                          type="button"
+                          className={removeOptions.mode === 'detach' ? '' : 'secondary-light'}
+                          onClick={() => setRemoveOptions(prev => ({ ...prev, mode: 'detach' }))}
+                          style={{ height: '36px', fontSize: '12.5px' }}
+                        >
+                          <span>Chỉ ngắt khỏi danh sách</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={removeOptions.mode === 'uninstall' ? 'danger' : 'secondary-light'}
+                          onClick={() => setRemoveOptions(prev => ({ ...prev, mode: 'uninstall' }))}
+                          style={{ height: '36px', fontSize: '12.5px' }}
+                        >
+                          <span>Gỡ cài đặt &amp; Dừng Daemon</span>
+                        </button>
+                      </div>
+
+                      {removeOptions.mode === 'uninstall' && (
+                        <div
+                          style={{
+                            padding: '12px 14px',
+                            borderRadius: '10px',
+                            background: 'var(--surface-alt)',
+                            border: '1px solid var(--border)',
+                            display: 'grid',
+                            gap: '10px',
+                            fontSize: '13px',
+                          }}
+                        >
+                          <label className="check-line" style={{ fontSize: '12.5px' }}>
+                            <input
+                              type="checkbox"
+                              checked={removeOptions.deleteFiles}
+                              onChange={e =>
+                                setRemoveOptions(prev => ({ ...prev, deleteFiles: e.target.checked }))
+                              }
+                            />
+                            <span>Xóa toàn bộ tệp mã nguồn và <code>node_modules</code> trong thư mục ứng dụng</span>
+                          </label>
+                          {removeModalInstance.db_name && (
+                            <label className="check-line" style={{ fontSize: '12.5px' }}>
+                              <input
+                                type="checkbox"
+                                checked={removeOptions.dropDatabase}
+                                onChange={e =>
+                                  setRemoveOptions(prev => ({ ...prev, dropDatabase: e.target.checked }))
+                                }
+                              />
+                              <span>Xóa cơ sở dữ liệu MySQL đi kèm (<code>{removeModalInstance.db_name}</code>)</span>
+                            </label>
+                          )}
+                          {removeOptions.deleteFiles && (
+                            <label style={{ display: 'grid', gap: '4px', marginTop: '4px' }}>
+                              <span>
+                                Nhập lại tên miền <strong>{removeModalInstance.domain}</strong> để xác nhận xóa tệp:
+                              </span>
+                              <input
+                                type="text"
+                                required
+                                value={removeOptions.confirmDomain}
+                                onChange={e =>
+                                  setRemoveOptions(prev => ({ ...prev, confirmDomain: e.target.value }))
+                                }
+                              />
+                            </label>
+                          )}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '4px' }}>
+                        <button
+                          type="button"
+                          className="secondary-light"
+                          onClick={() => setRemoveModalInstance(null)}
+                        >
+                          Hủy
+                        </button>
+                        <button
+                          type="submit"
+                          className={removeOptions.mode === 'uninstall' ? 'danger' : ''}
+                          disabled={busyMap.remove_instance}
+                        >
+                          <span>{busyMap.remove_instance ? 'Đang xử lý...' : 'Xác nhận thực hiện'}</span>
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                </div>
+              )}
+            </>,
+            document.body
+          )
+        : null}
     </div>
   );
 }
