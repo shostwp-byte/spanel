@@ -8035,6 +8035,221 @@ status_laravel_worker_unit() {
   echo "state=${state}"
 }
 
+nodejs_worker_unit_base() {
+  local user="$1" site_root="$2" root_target site_hash
+  require_linux_user "$user"
+  root_target=$(require_managed_path "$site_root" "$user")
+  site_hash=$(printf '%s' "$root_target" | sha256sum | awk '{print substr($1, 1, 12)}')
+  printf 'spanel-nodejs-%s-%s' "$user" "$site_hash"
+}
+
+resolve_or_install_node_bin_dir() {
+  local major="$1" dir=""
+  require_node_major "$major"
+  if dir="$(resolve_node_bin_dir "$major" 2>/dev/null)"; then
+    printf '%s' "$dir"
+    return 0
+  fi
+  if install_node_major "$major" >/dev/null 2>&1; then
+    if dir="$(resolve_node_bin_dir "$major" 2>/dev/null)"; then
+      printf '%s' "$dir"
+      return 0
+    fi
+  fi
+  if [[ -d /opt/spanel/node ]]; then
+    for d in $(ls -1d /opt/spanel/node/* 2>/dev/null | sort -Vr); do
+      if [[ -x "$d/bin/node" ]]; then
+        printf '%s/bin' "$d"
+        return 0
+      fi
+    done
+  fi
+  if [[ -x /usr/bin/node ]]; then
+    printf '/usr/bin'
+    return 0
+  fi
+  if [[ -x /usr/local/bin/node ]]; then
+    printf '/usr/local/bin'
+    return 0
+  fi
+  return 1
+}
+
+delete_nodejs_worker_units() {
+  local user="$1" site_root="$2" base unit_file
+  base="$(nodejs_worker_unit_base "$user" "$site_root")" || return 0
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}.service"
+  systemctl disable --now "${base}.service" >/dev/null 2>&1 || true
+  if [[ -f "$unit_file" ]]; then
+    rm -f -- "$unit_file"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+delete_nodejs_worker_units_for_user() {
+  local user="$1" unit_file unit_name removed=0
+  require_linux_user "$user"
+  shopt -s nullglob
+  for unit_file in "${SYSTEMD_UNIT_DIR}/spanel-nodejs-${user}-"*.service; do
+    [[ -f "$unit_file" ]] || continue
+    unit_name="$(basename "$unit_file")"
+    systemctl disable --now "$unit_name" >/dev/null 2>&1 || true
+    rm -f -- "$unit_file"
+    removed=1
+  done
+  shopt -u nullglob
+  if (( removed == 1 )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+sync_nodejs_worker_unit() {
+  local user="$1" site_root="$2" app_dir="$3" node_major="$4"
+  local port="$5" memory_mb="$6" start_mode="$7" start_arg="$8" node_env="$9" enabled_flag="${10}"
+  local uid root_target app_target bin_dir exec_start base unit_file tmp_file
+
+  require_linux_user "$user"
+  uid="$(id -u "$user" 2>/dev/null)" || deny "panel Linux user does not exist: $user"
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 1000 ]] || deny "refusing privileged uid for nodejs worker: $uid"
+  root_target="$(require_managed_path "$site_root" "$user")"
+  app_target="$(require_bound_managed_path "$user" "$root_target" "$app_dir")"
+  require_node_major "$node_major"
+  require_app_port "$port"
+  require_app_memory "$memory_mb"
+  is_in "$start_mode" node npm npx yarn || deny "invalid nodejs start mode: $start_mode"
+  [[ "$start_arg" =~ ^[A-Za-z0-9._:@/-]{1,120}$ ]] || deny "invalid nodejs start argument: $start_arg"
+  case "$start_arg" in
+    -*|*..*) deny "unsafe nodejs start argument: $start_arg" ;;
+  esac
+  is_in "$node_env" production development staging test || deny "invalid NODE_ENV: $node_env"
+  [[ "$enabled_flag" == "0" || "$enabled_flag" == "1" ]] || deny "invalid enabled flag: $enabled_flag"
+
+  base="$(nodejs_worker_unit_base "$user" "$root_target")"
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}.service"
+
+  if [[ "$enabled_flag" == "0" ]]; then
+    systemctl disable --now "${base}.service" >/dev/null 2>&1 || true
+    echo "status=stopped"
+    echo "unit=${base}.service"
+    echo "port=${port}"
+    return 0
+  fi
+
+  bin_dir="$(resolve_or_install_node_bin_dir "$node_major")" \
+    || deny "Node ${node_major} is not installed; run node-install ${node_major} first"
+
+  case "$start_mode" in
+    node) exec_start="${bin_dir}/node ${start_arg}" ;;
+    npm)  exec_start="${bin_dir}/npm run --silent ${start_arg}" ;;
+    npx)  exec_start="${bin_dir}/npx --yes ${start_arg}" ;;
+    yarn)
+      if [[ -x "${bin_dir}/yarn" ]]; then
+        exec_start="${bin_dir}/yarn ${start_arg}"
+      elif [[ -x /usr/local/bin/yarn ]]; then
+        exec_start="/usr/local/bin/yarn ${start_arg}"
+      elif [[ -x /usr/bin/yarn ]]; then
+        exec_start="/usr/bin/yarn ${start_arg}"
+      else
+        deny "yarn is not installed; use npm instead"
+      fi
+      ;;
+  esac
+
+  install -d -o "$user" -g "$user" -m 0700 "${HOME_ROOT}/${user}/.npm"
+  install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
+  tmp_file="${unit_file}.spanel-tmp-$$"
+
+  cat >"$tmp_file" <<UNIT
+[Unit]
+Description=SPanel Node.js Application Daemon for ${user} (${root_target})
+After=network-online.target mariadb.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${user}
+Group=${user}
+Slice=user-${uid}.slice
+WorkingDirectory=${app_target}
+UMask=0027
+EnvironmentFile=-${app_target}/.env
+Environment=HOST=127.0.0.1
+Environment=PORT=${port}
+Environment=NODE_ENV=${node_env}
+Environment=HOME=${HOME_ROOT}/${user}
+Environment=npm_config_cache=${HOME_ROOT}/${user}/.npm
+Environment=PATH=${bin_dir}:/usr/local/bin:/usr/bin:/bin
+ExecStart=${exec_start}
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+MemoryAccounting=yes
+MemoryMax=${memory_mb}M
+TasksMax=256
+LimitNOFILE=8192
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${app_target} ${HOME_ROOT}/${user}/.npm
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${base}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  chown root:root "$tmp_file"
+  chmod 0644 "$tmp_file"
+  mv -f -- "$tmp_file" "$unit_file"
+
+  systemctl daemon-reload
+  systemctl enable "${base}.service" >/dev/null 2>&1 || true
+  systemctl restart "${base}.service"
+
+  echo "status=running"
+  echo "unit=${base}.service"
+  echo "port=${port}"
+}
+
+status_nodejs_worker_unit() {
+  local user="$1" site_root="$2" base unit_file
+  local unit_present=0 enabled=0 state="inactive" pid=0 mem_bytes=0
+  base="$(nodejs_worker_unit_base "$user" "$site_root")"
+  unit_file="${SYSTEMD_UNIT_DIR}/${base}.service"
+  if [[ -f "$unit_file" ]]; then
+    unit_present=1
+    if systemctl is-enabled --quiet "${base}.service" 2>/dev/null; then
+      enabled=1
+    fi
+    if systemctl is-active --quiet "${base}.service" 2>/dev/null; then
+      state="active"
+      enabled=1
+    elif systemctl is-failed --quiet "${base}.service" 2>/dev/null; then
+      state="failed"
+    elif (( enabled == 1 )); then
+      state="starting"
+    fi
+    pid="$(systemctl show -p MainPID --value "${base}.service" 2>/dev/null || echo 0)"
+    mem_bytes="$(systemctl show -p MemoryCurrent --value "${base}.service" 2>/dev/null || echo 0)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
+    [[ "$mem_bytes" =~ ^[0-9]+$ ]] || mem_bytes=0
+  fi
+  echo "unit_present=${unit_present}"
+  echo "enabled=${enabled}"
+  echo "state=${state}"
+  echo "pid=${pid}"
+  echo "memory_bytes=${mem_bytes}"
+  echo "unit=${base}.service"
+}
+
 ipv6_available() {
   # A global address, not the loopback and not a link-local one: those cannot
   # carry traffic from outside, so listening on them would prove nothing.
@@ -9233,6 +9448,7 @@ delete_panel_user_runtime() {
     systemctl daemon-reload >/dev/null 2>&1 || true
   done
   delete_laravel_worker_units_for_user "$user"
+  delete_nodejs_worker_units_for_user "$user"
   crontab -r -u "$user" 2>/dev/null || true
   rm -f "/etc/cron.d/spanel-user-${user}" 2>/dev/null || true
   local old_uid
@@ -12671,6 +12887,7 @@ EOF
     require_linux_user "$user"
     target=$(require_managed_path "$path" "$user")
     delete_laravel_worker_units "$user" "$target"
+    delete_nodejs_worker_units "$user" "$target"
     delete_site_php_pools "$user" "$target"
     exec rm -rf "$target"
     ;;
@@ -12910,12 +13127,18 @@ EOF
     [[ $# -ge 3 ]] || deny "usage: terminal-exec <site-user> <cwd> [--timeout=<sec>] [--php-version=<version>] <command> [args...]"
     user="$1"; cwd_arg="$2"; shift 2
     php_version=""
+    node_version=""
     terminal_timeout=""
     while [[ $# -gt 0 ]]; do
       case "${1:-}" in
         --php-version=*)
           php_version="${1#--php-version=}"
           require_php_version "$php_version"
+          shift
+          ;;
+        --node-version=*)
+          node_version="${1#--node-version=}"
+          require_node_major "$node_version"
           shift
           ;;
         --timeout=*)
@@ -12938,11 +13161,24 @@ EOF
     [[ -d "$target" ]] || deny "working directory does not exist: $target"
     cd "$target" || deny "failed to change to working directory: $target"
     umask 022
+    terminal_path="/usr/local/bin:/usr/bin:/bin"
+    if [[ -n "$node_version" ]]; then
+      if node_bin_dir="$(resolve_or_install_node_bin_dir "$node_version" 2>/dev/null)"; then
+        terminal_path="${node_bin_dir}:${terminal_path}"
+      fi
+    elif [[ ! -x /usr/bin/node && -d /opt/spanel/node ]]; then
+      for d in $(ls -1d /opt/spanel/node/* 2>/dev/null | sort -Vr); do
+        if [[ -x "$d/bin/node" ]]; then
+          terminal_path="$d/bin:${terminal_path}"
+          break
+        fi
+      done
+    fi
     terminal_env=(
       "HOME=$HOME_ROOT/$user"
       "COMPOSER_HOME=$HOME_ROOT/$user/.composer"
       "npm_config_cache=$HOME_ROOT/$user/.npm"
-      "PATH=/usr/local/bin:/usr/bin:/bin"
+      "PATH=$terminal_path"
     )
     php_bin="php"
     if [[ -n "$php_version" ]]; then
@@ -13352,6 +13588,30 @@ EOF
   laravel-worker-delete)
     [[ $# -eq 2 ]] || deny "usage: laravel-worker-delete <site-user> <site-root>"
     delete_laravel_worker_units "$1" "$2"
+    echo "status=deleted"
+    ;;
+
+  nodejs-worker-sync)
+    [[ $# -eq 10 ]] || deny "usage: nodejs-worker-sync <site-user> <site-root> <app-dir> <node-major> <port> <memory-mb> <start-mode> <start-arg> <node-env> <0|1>"
+    sync_nodejs_worker_unit "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"
+    ;;
+
+  nodejs-worker-status)
+    [[ $# -eq 2 ]] || deny "usage: nodejs-worker-status <site-user> <site-root>"
+    status_nodejs_worker_unit "$1" "$2"
+    ;;
+
+  nodejs-worker-logs)
+    [[ $# -eq 2 || $# -eq 3 ]] || deny "usage: nodejs-worker-logs <site-user> <site-root> [lines]"
+    user="$1"; root_arg="$2"; log_lines="${3:-200}"
+    [[ "$log_lines" =~ ^[0-9]{1,4}$ ]] || deny "invalid line count: $log_lines"
+    unit_base="$(nodejs_worker_unit_base "$user" "$root_arg")"
+    exec journalctl -u "${unit_base}.service" -n "$log_lines" --no-pager --output short-iso
+    ;;
+
+  nodejs-worker-delete)
+    [[ $# -eq 2 ]] || deny "usage: nodejs-worker-delete <site-user> <site-root>"
+    delete_nodejs_worker_units "$1" "$2"
     echo "status=deleted"
     ;;
 

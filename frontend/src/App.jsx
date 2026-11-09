@@ -127,6 +127,7 @@ const Migration = lazyNamed(() => import('./pages/Migration.jsx'), 'Migration');
 const Packages = lazyNamed(() => import('./pages/Packages.jsx'), 'Packages');
 const IpManager = lazyNamed(() => import('./pages/IpManager.jsx'), 'IpManager');
 const WordPressManagerPage = lazyNamed(() => import('./pages/WordPressManager.jsx'), 'WordPressManagerPage');
+const NodejsManagerPage = lazyNamed(() => import('./pages/NodejsManager.jsx'), 'NodejsManagerPage');
 const LaravelManagerPage = lazyNamed(() => import('./pages/LaravelManager.jsx'), 'LaravelManagerPage');
 const ResellerSettingsPage = lazyNamed(() => import('./pages/ResellerSettings.jsx'), 'ResellerSettingsPage');
 const UsersPage = lazyNamed(() => import('./pages/Users.jsx'), 'UsersPage');
@@ -549,6 +550,14 @@ function LaravelIcon({ size = 14 }) {
     <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false" className="lucide">
       <rect x="3.5" y="3.5" width="17" height="17" rx="4.5" fill="none" stroke="currentColor" strokeWidth="2" />
       <text x="12" y="16" textAnchor="middle" fontSize="11" fontWeight="800" fontFamily="Georgia, serif" fill="currentColor">L</text>
+    </svg>
+  );
+}
+function NodejsIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false" className="lucide">
+      <polygon points="12,2.5 20.2,7.25 20.2,16.75 12,21.5 3.8,16.75 3.8,7.25" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+      <text x="12" y="16" textAnchor="middle" fontSize="10.5" fontWeight="800" fontFamily="Georgia, serif" fill="currentColor">N</text>
     </svg>
   );
 }
@@ -3415,7 +3424,7 @@ function AppContent() {
     if (!addons.loaded || isAdmin) return;
     const isMailPage = ['mail', 'mail_forwarders', 'mail_auto', 'mail_spam'].includes(page);
     const isMalwarePage = page === 'malware' || page === 'malware-scan';
-    const isAppsPage = ['applications', 'docker_manager', 'nodejs_manager'].includes(page);
+    const isAppsPage = ['applications', 'docker_manager'].includes(page);
     if (
       (page === 'dns' && !dnsAddonInstalled) ||
       (isMailPage && !mailAddonInstalled) ||
@@ -3551,8 +3560,8 @@ function AppContent() {
       { key: 'application', title: 'Application', items: [
         ...(appsFeatureEnabled ? [
           ['docker_manager', 'Docker', Boxes],
-          ['nodejs_manager', 'Node.js', Cpu],
         ] : []),
+        ['nodejs_manager', 'Node.js', NodejsIcon],
         ['laravel_manager', 'Laravel', LaravelIcon],
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
       ]},
@@ -4800,8 +4809,9 @@ function AppContent() {
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
     if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
+    if (page === 'nodejs_manager') return <NodejsManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
     if (page === 'laravel_manager') return <LaravelManagerPage request={request} websites={roleScopedWebsites} phpVersions={phpVersions} openWebsiteFileManager={openWebsiteFileManager} openWebsiteTerminal={openWebsiteTerminal} navigateToPage={navigateToPage} />;
-    if (page === 'docker_manager' || page === 'nodejs_manager' || page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
+    if (page === 'docker_manager' || page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;
     if (page === 'databases') return <DatabasesPage request={request} API={API} navigateToPage={navigateToPage} refreshAll={refreshAll} />;
     if (page === 'sftp') return <SftpPage request={request} currentUser={currentUser} appVersion={appVersion} />;

@@ -185,7 +185,13 @@ def reserved_ports(db: Session, exclude_app_id: int | None = None) -> set[int]:
     query = select(SiteApp.port)
     if exclude_app_id is not None:
         query = query.where(SiteApp.id != exclude_app_id)
-    return {row for row in db.scalars(query) if row}
+    ports = {row for row in db.scalars(query) if row}
+    try:
+        from app.api import nodejs_manager
+        ports |= nodejs_manager.reserved_nodejs_ports()
+    except Exception:
+        pass
+    return ports
 
 
 def allocate_port(db: Session, preferred: int | None = None, exclude_app_id: int | None = None) -> int:
@@ -231,7 +237,13 @@ def ensure_app_quota(db: Session, user: User, is_admin: bool = False) -> None:
 
 def app_port_for_website(website: Website) -> Optional[int]:
     app = getattr(website, "app", None)
-    return app.port if app else None
+    if app and getattr(app, "port", None):
+        return app.port
+    try:
+        from app.api import nodejs_manager
+        return nodejs_manager.get_nodejs_port_for_website(getattr(website, "id", None))
+    except Exception:
+        return None
 
 
 # --- container and environment validation -----------------------------------

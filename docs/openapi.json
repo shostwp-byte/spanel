@@ -767,7 +767,7 @@
   "info": {
     "description": "Billing-system API for creating and managing hosting accounts. Authenticate with `Authorization: Bearer <token>`; write calls accept an `Idempotency-Key` header. See docs/API_AND_WHMCS.md.",
     "title": "SPanel Provisioning API",
-    "version": "1.0.8"
+    "version": "1.0.9"
   },
   "openapi": "3.1.0",
   "paths": {
