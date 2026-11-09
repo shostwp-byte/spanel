@@ -189,7 +189,7 @@ def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
     assert not any(p.startswith("/api/app-installer") for p in registered_paths)
     assert (ROOT / "backend" / "app" / "api" / "app_installer.py").is_file()
 
-    # Application menu group (Docker/Node.js gated by appsFeatureEnabled, Laravel & WordPress Manager always shown),
+    # Application menu group (Docker gated by appsFeatureEnabled; Node.js, Laravel & WordPress Manager always shown),
     # App Installer removed, activeUser/activeRole ordering, and ChunkErrorBoundary chunk vs runtime error distinction
     app_src = APP_JSX.read_text(encoding="utf-8")
     user_pages_block = app_src.split("const USER_ALLOWED_PAGES = new Set([", 1)[1].split("]);", 1)[0]
@@ -201,9 +201,9 @@ def test_panel_cors_gzip_app_installer_and_login_role_ordering(monkeypatch):
     app_group_block = app_src.split("{ key: 'application', title: 'Application', items: [", 1)[1].split("]},", 1)[0]
     assert "...(appsFeatureEnabled ? [" in app_group_block
     assert "['docker_manager', 'Docker', Boxes]" in app_group_block
-    assert "['nodejs_manager', 'Node.js', Cpu]" in app_group_block
+    assert "['nodejs_manager', 'Node.js', NodejsIcon]" in app_group_block
     assert "['laravel_manager', 'Laravel', LaravelIcon]" in app_src
-    assert "const isAppsPage = ['applications', 'docker_manager', 'nodejs_manager'].includes(page);" in app_src
+    assert "const isAppsPage = ['applications', 'docker_manager'].includes(page);" in app_src
     assert "if (isAuthenticated && currentUser)" in app_src
     assert "if (activeUser && activeRole && !headers['X-Access-Role'])" in app_src
     assert "isChunkError: isChunkLoadError(error)" in app_src
