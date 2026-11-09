@@ -564,6 +564,37 @@ def _write_app_file(
     wordpress_live.write_wp_file_text(
         linux_user, site_root, app_dir, rel_path, content, mode=mode
     )
+    if settings.command_dry_run and os.name != "nt":
+        target = app_dir / rel_path
+        if target.exists() and not target.is_symlink():
+            try:
+                os.chmod(target, 0o640 if mode == "0640" else 0o644)
+            except OSError:
+                pass
+
+
+def _apply_strict_nodejs_permissions(
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+) -> None:
+    if settings.command_dry_run:
+        if os.name != "nt":
+            for rel_f in (".env", ".env.bak"):
+                fp = app_dir / rel_f
+                if fp.exists() and not fp.is_symlink():
+                    try:
+                        os.chmod(fp, 0o640)
+                    except OSError:
+                        pass
+        return
+    for rel_f in (".env", ".env.bak"):
+        if _app_path_exists(app_dir, rel_f, linux_user, site_root):
+            shell.privileged(
+                "site-chmod",
+                helper_args=[linux_user, str(site_root), str(app_dir / rel_f), "0640"],
+                check=False,
+            )
 
 
 def _app_path_exists(
@@ -2434,6 +2465,7 @@ def update_nodejs_security(
         elif cid == "env_permissions":
             if env_raw:
                 _write_app_file(linux_user, site_root, app_dir, ".env", env_raw, "0640")
+            _apply_strict_nodejs_permissions(linux_user, site_root, app_dir)
         elif cid == "loopback_binding":
             env_updates["HOST"] = "127.0.0.1"
             env_updates["PORT"] = str(port)
