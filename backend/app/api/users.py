@@ -12,7 +12,7 @@ from app.core.permissions import Role, ensure_role, normalize_role
 from app.core.rate_limit import enforce_rate_limit
 from app.core.security import hash_password, verify_password
 from app.core.step_up import require_sensitive_action_step_up
-from app.models.entities import AuditLog, BackupSchedule, DatabaseAccount, McpToken, User, UserPackage, Website, MessageTemplate
+from app.models.entities import AuditLog, BackupSchedule, DatabaseAccount, McpToken, NodejsInstance, User, UserPackage, Website, MessageTemplate
 from app.schemas import schemas
 from app.schemas.schemas import (
     AuditLogOut,
@@ -258,6 +258,7 @@ def _delete_owned_website(db: Session, website: Website) -> None:
     wordpress.delete_wordpress(website.root_path)
     if db_item:
         db.delete(db_item)
+    db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).delete(synchronize_session=False)
     db.delete(website)
 
 

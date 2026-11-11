@@ -18,16 +18,16 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.config import settings
-from app.core.database import SessionLocal, engine, get_db
+from app.core.database import SessionLocal, get_db
 from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.rate_limit import enforce_rate_limit
 from app.core.secrets import decrypt, encrypt
-from app.models.entities import DatabaseAccount, SiteApp, User, Website
+from app.models.entities import DatabaseAccount, NodejsInstance, SiteApp, User, Website
 from app.services import addons, mariadb, nginx, site_apps, site_users, teardown, wordpress_live
 from app.services.shell import shell
 
@@ -53,7 +53,6 @@ router = APIRouter(
 )
 logger = logging.getLogger("spanel.nodejs_manager")
 
-_NODEJS_STATE_LOCK = threading.RLock()
 _NODEJS_INSPECT_CACHE_LOCK = threading.RLock()
 _NODEJS_INSPECT_CACHE: Dict[int, Tuple[Tuple[Any, ...], float, Dict[str, Any]]] = {}
 _NODEJS_INSPECT_CACHE_TTL = 45.0
@@ -67,7 +66,7 @@ NPM_SCRIPT_RE = re.compile(r"^[a-zA-Z0-9:_-]{1,64}$")
 START_ARG_RE = re.compile(r"^[A-Za-z0-9._/-]{1,120}$")
 NODE_MAJOR_RE = re.compile(r"^(18|20|22|24)$")
 GIT_URL_RE = re.compile(r"^(?:https://|git@)[a-zA-Z0-9._:/-]+$")
-GIT_BRANCH_RE = re.compile(r"^[a-zA-Z0-9._/-]{1,80}$")
+GIT_BRANCH_RE = re.compile(r"^(?!-)[a-zA-Z0-9._/-]{1,80}$")
 
 SUPPORTED_NODE_MAJORS: List[str] = ["22", "20", "18", "24"]
 ALLOWED_START_MODES = {"npm", "node", "npx", "yarn"}
@@ -259,153 +258,207 @@ SECURITY_CHECK_DEFINITIONS: List[Dict[str, Any]] = [
 ]
 
 
-# ── State Persistence & Fast In-Memory Cache ─────────────────────────────────
+# ── State Persistence (NodejsInstance SQLAlchemy Model) & Fast Cache ─────────
 
-def _toolkit_state_path() -> Path:
-    candidates = [
-        Path("/var/lib/spanel/nodejs_toolkit_state.json"),
-        Path(__file__).resolve().parents[2] / "data" / "nodejs_toolkit_state.json",
-    ]
-    for p in candidates:
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            if os.access(p.parent, os.W_OK):
-                return p
-        except Exception:
-            continue
-    return Path(__file__).resolve().parents[2] / "nodejs_toolkit_state.json"
-
-
-def _is_in_memory_engine() -> bool:
+def _row_to_instance_dict(row: NodejsInstance) -> Dict[str, Any]:
     try:
-        return str(getattr(engine, "url", "")).endswith(":memory:")
+        npm_logs = json.loads(row.last_npm_logs or "[]")
+        if not isinstance(npm_logs, list):
+            npm_logs = []
     except Exception:
-        return False
+        npm_logs = []
+    return {
+        "installed": True,
+        "website_id": int(row.website_id),
+        "owner_id": int(row.owner_id),
+        "subpath": row.subpath or "",
+        "app_name": row.app_name or "Node.js Application",
+        "template": row.template or "express-api",
+        "framework": row.framework or "Node.js",
+        "node_major": row.node_major or "22",
+        "start_mode": row.start_mode or "node",
+        "start_arg": row.start_arg or "server.js",
+        "port": int(row.port) if row.port is not None else None,
+        "memory_mb": int(row.memory_mb or 512),
+        "node_env": row.node_env or "production",
+        "process_enabled": bool(row.process_enabled),
+        "systemd_sandbox": bool(row.systemd_sandbox),
+        "db_account_id": int(row.db_account_id) if row.db_account_id is not None else None,
+        "git_repo": row.git_repo or "",
+        "git_branch": row.git_branch or "main",
+        "git_build_script": row.git_build_script or "",
+        "last_deploy_at": row.last_deploy_at or "",
+        "last_deploy_status": row.last_deploy_status or "",
+        "webhook_enabled": bool(row.webhook_enabled),
+        "webhook_token": row.webhook_token or "",
+        "last_npm_logs": npm_logs,
+        "installed_at": row.installed_at or "",
+        "updated_at": row.updated_at or "",
+        "detached": bool(row.detached),
+    }
 
 
-def _ensure_toolkit_state_table() -> None:
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "CREATE TABLE IF NOT EXISTS nodejs_toolkit_state ("
-                "id INTEGER PRIMARY KEY CHECK (id = 1), "
-                "payload TEXT NOT NULL, "
-                "updated_at TEXT"
-                ")"
-            )
-        )
-
-
-def _load_toolkit_state() -> Dict[str, Any]:
-    with _NODEJS_STATE_LOCK:
+def _apply_dict_to_row(row: NodejsInstance, inst: Dict[str, Any]) -> None:
+    detached = bool(inst.get("detached", False))
+    row.detached = detached
+    row.subpath = str(inst.get("subpath") or "")[:120]
+    row.app_name = str(inst.get("app_name") or "Node.js Application")[:120]
+    row.template = str(inst.get("template") or "express-api")[:40]
+    row.framework = str(inst.get("framework") or "Node.js")[:64]
+    row.node_major = str(inst.get("node_major") or "22")[:8]
+    row.start_mode = str(inst.get("start_mode") or "node")[:16]
+    row.start_arg = str(inst.get("start_arg") or "server.js")[:120]
+    raw_port = inst.get("port")
+    if detached or raw_port is None:
+        row.port = None
+    else:
         try:
-            _ensure_toolkit_state_table()
-            with engine.connect() as conn:
-                row = conn.execute(
-                    text("SELECT payload FROM nodejs_toolkit_state WHERE id = 1")
-                ).fetchone()
-                if row and row[0]:
-                    data = json.loads(row[0])
-                    if isinstance(data, dict):
-                        data.setdefault("instances", {})
-                        return data
-        except Exception as exc:
-            logger.debug("load_nodejs_toolkit_state db warning: %s", exc)
-
-        if _is_in_memory_engine():
-            return {"instances": {}}
-
-        path = _toolkit_state_path()
+            row.port = int(raw_port)
+        except (TypeError, ValueError):
+            row.port = None
+    try:
+        row.memory_mb = int(inst.get("memory_mb") or 512)
+    except (TypeError, ValueError):
+        row.memory_mb = 512
+    row.node_env = str(inst.get("node_env") or "production")[:24]
+    row.process_enabled = bool(inst.get("process_enabled", True))
+    row.systemd_sandbox = bool(inst.get("systemd_sandbox", True))
+    raw_db_acc = inst.get("db_account_id")
+    if raw_db_acc is not None and not isinstance(raw_db_acc, bool):
         try:
-            if path.exists() and not path.is_symlink():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    data.setdefault("instances", {})
-                    return data
-        except Exception as exc:
-            logger.warning("Failed to load Node.js toolkit state file: %s", exc)
+            row.db_account_id = int(raw_db_acc)
+        except (TypeError, ValueError):
+            row.db_account_id = None
+    else:
+        row.db_account_id = None
+    row.git_repo = str(inst.get("git_repo") or "")[:255]
+    row.git_branch = str(inst.get("git_branch") or "main")[:80]
+    row.git_build_script = str(inst.get("git_build_script") or "")[:64]
+    row.last_deploy_at = str(inst.get("last_deploy_at") or "")[:64]
+    row.last_deploy_status = str(inst.get("last_deploy_status") or "")[:32]
+    row.webhook_enabled = bool(inst.get("webhook_enabled", False))
+    row.webhook_token = str(inst.get("webhook_token") or "")
+    try:
+        row.last_npm_logs = json.dumps(inst.get("last_npm_logs") or [], ensure_ascii=False)
+    except Exception:
+        row.last_npm_logs = "[]"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row.installed_at = str(inst.get("installed_at") or row.installed_at or now_iso)[:64]
+    row.updated_at = str(inst.get("updated_at") or now_iso)[:64]
+
+
+def _load_toolkit_state(db: Optional[Session] = None) -> Dict[str, Any]:
+    def _query(session: Session) -> Dict[str, Any]:
+        rows = session.query(NodejsInstance).all()
+        return {
+            "instances": {
+                str(r.website_id): _row_to_instance_dict(r)
+                for r in rows
+            }
+        }
+
+    try:
+        if db is not None:
+            return _query(db)
+        with SessionLocal() as session:
+            return _query(session)
+    except Exception as exc:
+        logger.debug("load_nodejs_toolkit_state warning: %s", exc)
         return {"instances": {}}
 
 
-def _save_toolkit_state(state: Dict[str, Any]) -> None:
-    payload = json.dumps(state, ensure_ascii=False, indent=2)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with _NODEJS_STATE_LOCK:
-        try:
-            _ensure_toolkit_state_table()
-            with engine.begin() as conn:
-                existing = conn.execute(
-                    text("SELECT 1 FROM nodejs_toolkit_state WHERE id = 1")
-                ).fetchone()
-                if existing:
-                    conn.execute(
-                        text(
-                            "UPDATE nodejs_toolkit_state SET payload = :payload, updated_at = :updated_at WHERE id = 1"
-                        ),
-                        {"payload": payload, "updated_at": now_iso},
-                    )
-                else:
-                    conn.execute(
-                        text(
-                            "INSERT INTO nodejs_toolkit_state (id, payload, updated_at) VALUES (1, :payload, :updated_at)"
-                        ),
-                        {"payload": payload, "updated_at": now_iso},
-                    )
-        except Exception as exc:
-            logger.warning("Failed to save Node.js toolkit state to DB: %s", exc)
-
-        if _is_in_memory_engine():
-            return
-
-        path = _toolkit_state_path()
-        try:
-            if path.is_symlink():
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=".nodejs_toolkit_state.", dir=str(path.parent), text=True
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(payload)
-                os.chmod(tmp_name, 0o600)
-                os.replace(tmp_name, path)
-            finally:
-                if os.path.exists(tmp_name):
-                    try:
-                        os.remove(tmp_name)
-                    except OSError:
-                        pass
-        except Exception as exc:
-            logger.debug("save_nodejs_toolkit_state file mirror warning: %s", exc)
-
-
 def _update_instance_state(
-    inst_key: str, updater: Callable[[Dict[str, Any]], None]
+    inst_key: str | int,
+    updater: Callable[[Dict[str, Any]], None],
+    *,
+    db: Optional[Session] = None,
+    allow_port_retry: bool = True,
 ) -> Dict[str, Any]:
-    with _NODEJS_STATE_LOCK:
-        state = _load_toolkit_state()
-        inst = state.setdefault("instances", {}).setdefault(
-            str(inst_key), {"installed": True}
-        )
-        updater(inst)
-        inst["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _save_toolkit_state(state)
+    website_id = int(inst_key)
+
+    def _run_on_session(session: Session) -> Dict[str, Any]:
+        excluded_ports: set[int] = set()
+        for attempt in range(8):
+            row = (
+                session.query(NodejsInstance)
+                .filter(NodejsInstance.website_id == website_id)
+                .first()
+            )
+            if row is not None:
+                inst = _row_to_instance_dict(row)
+            else:
+                site = session.query(Website).filter(Website.id == website_id).first()
+                owner_id = int(site.owner_id) if site is not None else 0
+                row = NodejsInstance(website_id=website_id, owner_id=owner_id)
+                inst = {
+                    "installed": True,
+                    "website_id": website_id,
+                    "owner_id": owner_id,
+                }
+            updater(inst)
+            if excluded_ports and not inst.get("detached"):
+                inst["port"] = _allocate_nodejs_port(
+                    session,
+                    exclude_website_id=website_id,
+                    excluded_ports=excluded_ports,
+                )
+            inst["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _apply_dict_to_row(row, inst)
+            session.add(row)
+            try:
+                session.commit()
+                break
+            except IntegrityError as exc:
+                session.rollback()
+                collided_port = inst.get("port")
+                if allow_port_retry and collided_port is not None:
+                    excluded_ports.add(int(collided_port))
+                    continue
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Cổng nội bộ {collided_port} đang được sử dụng bởi ứng dụng khác. Vui lòng chọn cổng khác trong dải {site_apps.PORT_RANGE_START}–{site_apps.PORT_RANGE_END}.",
+                ) from exc
+        return _load_toolkit_state(session)
+
+    if db is not None:
+        state = _run_on_session(db)
+    else:
+        with SessionLocal() as session:
+            state = _run_on_session(session)
+
     try:
-        invalidate_nodejs_inspect_cache(int(inst_key))
+        invalidate_nodejs_inspect_cache(website_id)
     except (TypeError, ValueError):
         invalidate_nodejs_inspect_cache()
     return state
 
 
-def _pop_instance_state(inst_key: str) -> Dict[str, Any]:
-    with _NODEJS_STATE_LOCK:
-        state = _load_toolkit_state()
-        if isinstance(state.get("instances"), dict):
-            state["instances"].pop(str(inst_key), None)
-        _save_toolkit_state(state)
+def _pop_instance_state(
+    inst_key: str | int,
+    *,
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    website_id = int(inst_key)
+
+    def _run_on_session(session: Session) -> Dict[str, Any]:
+        row = (
+            session.query(NodejsInstance)
+            .filter(NodejsInstance.website_id == website_id)
+            .first()
+        )
+        if row is not None:
+            session.delete(row)
+            session.commit()
+        return _load_toolkit_state(session)
+
+    if db is not None:
+        state = _run_on_session(db)
+    else:
+        with SessionLocal() as session:
+            state = _run_on_session(session)
+
     try:
-        invalidate_nodejs_inspect_cache(int(inst_key))
+        invalidate_nodejs_inspect_cache(website_id)
     except (TypeError, ValueError):
         invalidate_nodejs_inspect_cache()
     return state
@@ -419,39 +472,63 @@ def invalidate_nodejs_inspect_cache(website_id: Optional[int] = None) -> None:
             _NODEJS_INSPECT_CACHE.pop(int(website_id), None)
 
 
-def get_nodejs_port_for_website(website_id: Optional[int]) -> Optional[int]:
+def get_nodejs_port_for_website(
+    website_id: Optional[int], db: Optional[Session] = None
+) -> Optional[int]:
     """Return the allocated loopback port for a Website managed by Node.js Manager, if any."""
     if not website_id:
         return None
-    try:
-        state = _load_toolkit_state()
-        inst = (state.get("instances") or {}).get(str(website_id)) or {}
-        if inst.get("detached"):
+
+    def _lookup(session: Session) -> Optional[int]:
+        row = (
+            session.query(NodejsInstance.port, NodejsInstance.detached)
+            .filter(NodejsInstance.website_id == int(website_id))
+            .first()
+        )
+        if not row or bool(row[1]) or row[0] is None:
             return None
-        port = int(inst.get("port") or 0)
+        port = int(row[0])
         if site_apps.PORT_RANGE_START <= port <= site_apps.PORT_RANGE_END:
             return port
+        return None
+
+    try:
+        if db is not None:
+            return _lookup(db)
+        with SessionLocal() as session:
+            return _lookup(session)
     except Exception:
-        pass
-    return None
+        return None
 
 
-def reserved_nodejs_ports(exclude_website_id: Optional[int] = None) -> set[int]:
+def reserved_nodejs_ports(
+    exclude_website_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> set[int]:
     """Return all loopback ports currently reserved in Node.js Manager state."""
     ports: set[int] = set()
-    try:
-        state = _load_toolkit_state()
-        for site_id_str, inst in (state.get("instances") or {}).items():
-            if exclude_website_id is not None and str(site_id_str) == str(exclude_website_id):
-                continue
-            if not isinstance(inst, dict) or inst.get("detached"):
-                continue
+
+    def _collect(session: Session) -> None:
+        q = session.query(NodejsInstance.website_id, NodejsInstance.port).filter(
+            NodejsInstance.detached.is_(False),
+            NodejsInstance.port.isnot(None),
+        )
+        if exclude_website_id is not None:
+            q = q.filter(NodejsInstance.website_id != int(exclude_website_id))
+        for _, raw_p in q.all():
             try:
-                p = int(inst.get("port") or 0)
+                p = int(raw_p)
                 if site_apps.PORT_RANGE_START <= p <= site_apps.PORT_RANGE_END:
                     ports.add(p)
             except (TypeError, ValueError):
                 continue
+
+    try:
+        if db is not None:
+            _collect(db)
+        else:
+            with SessionLocal() as session:
+                _collect(session)
     except Exception:
         pass
     return ports
@@ -460,20 +537,14 @@ def reserved_nodejs_ports(exclude_website_id: Optional[int] = None) -> set[int]:
 def count_nodejs_instances_for_owner(db: Session, owner_id: int) -> int:
     """Count active (non-detached) Node.js Manager instances belonging to ``owner_id``."""
     try:
-        state = _load_toolkit_state()
-        instances_map = state.get("instances") or {}
-        if not instances_map:
-            return 0
-        site_ids = [
-            row[0]
-            for row in db.query(Website.id).filter(Website.owner_id == owner_id).all()
-        ]
-        count = 0
-        for sid in site_ids:
-            inst = instances_map.get(str(sid))
-            if isinstance(inst, dict) and not inst.get("detached"):
-                count += 1
-        return count
+        return int(
+            db.query(NodejsInstance.website_id)
+            .filter(
+                NodejsInstance.owner_id == int(owner_id),
+                NodejsInstance.detached.is_(False),
+            )
+            .count()
+        )
     except Exception:
         return 0
 
@@ -482,11 +553,13 @@ def _allocate_nodejs_port(
     db: Session,
     preferred: Optional[int] = None,
     exclude_website_id: Optional[int] = None,
+    excluded_ports: Optional[set[int]] = None,
 ) -> int:
     taken = (
         site_apps.reserved_ports(db)
         | site_apps.listening_ports()
-        | reserved_nodejs_ports(exclude_website_id=exclude_website_id)
+        | reserved_nodejs_ports(exclude_website_id=exclude_website_id, db=db)
+        | (excluded_ports or set())
     )
     if preferred is not None:
         try:
@@ -511,7 +584,9 @@ def _allocate_nodejs_port(
 # ── Access Control & Path Resolution ─────────────────────────────────────────
 
 def _require_end_user_nodejs_access(
-    current_user: User, request: Optional[Request] = None
+    current_user: User,
+    request: Optional[Request] = None,
+    db: Optional[Session] = None,
 ) -> None:
     role = normalize_role(getattr(current_user, "role", None))
     access_role = (
@@ -531,7 +606,12 @@ def _require_end_user_nodejs_access(
             detail="The Application addon is not installed. Install it from the Addons page first.",
         )
     if not is_admin_role(getattr(current_user, "role", None)):
-        if site_apps.app_limit_for(current_user) == 0:
+        user_for_quota = current_user
+        if db is not None and getattr(current_user, "id", None) is not None:
+            db_user = db.query(User).filter(User.id == current_user.id).first()
+            if db_user is not None:
+                user_for_quota = db_user
+        if site_apps.app_limit_for(user_for_quota) == 0:
             raise HTTPException(
                 status_code=403,
                 detail="Application hosting is not enabled for this package",
@@ -539,7 +619,7 @@ def _require_end_user_nodejs_access(
 
 
 def _get_accessible_website(website_id: int, db: Session, current_user: User) -> Website:
-    _require_end_user_nodejs_access(current_user)
+    _require_end_user_nodejs_access(current_user, db=db)
     site = db.query(Website).filter(Website.id == website_id).first()
     if not site:
         raise HTTPException(status_code=404, detail="Website not found")
@@ -733,6 +813,24 @@ def _validate_start_config(
             detail="Tham số khởi chạy (Entry File / Script) chỉ cho phép chữ cái, chữ số, dấu chấm, gạch ngang, gạch dưới và dấu gạch chéo.",
         )
     return mode, arg
+
+
+def _validate_git_branch(raw_branch: Optional[str]) -> str:
+    branch = (raw_branch or "main").strip()
+    if (
+        not branch
+        or branch.startswith("-")
+        or ".." in branch
+        or "//" in branch
+        or branch.startswith("/")
+        or branch.endswith("/")
+        or branch.endswith(".lock")
+        or not GIT_BRANCH_RE.fullmatch(branch)
+    ):
+        raise HTTPException(
+            status_code=400, detail="Tên nhánh Git (branch) không hợp lệ."
+        )
+    return branch
 
 
 def _short_cmd_err(output: str, fallback: str = "Lệnh thực thi trả về mã lỗi khác 0.") -> str:
@@ -1844,6 +1942,7 @@ def _inspect_nodejs_instance(
                 lambda inst, _id=legacy_db.id: inst.update(
                     {"db_account_id": _id, "db_name": None, "db_user": None}
                 ),
+                db=db,
             )
 
     if linked_db is not None:
@@ -1998,7 +2097,7 @@ def list_nodejs_instances(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_end_user_nodejs_access(current_user)
+    _require_end_user_nodejs_access(current_user, db=db)
     if refresh:
         invalidate_nodejs_inspect_cache()
 
@@ -2008,7 +2107,7 @@ def list_nodejs_instances(
         .order_by(Website.domain.asc())
         .all()
     )
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     instances: List[Dict[str, Any]] = []
     available_websites: List[Dict[str, Any]] = []
 
@@ -2047,7 +2146,7 @@ def scan_nodejs_instances(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    _require_end_user_nodejs_access(current_user)
+    _require_end_user_nodejs_access(current_user, db=db)
     invalidate_nodejs_inspect_cache()
 
     sites = (
@@ -2056,7 +2155,7 @@ def scan_nodejs_instances(
         .order_by(Website.domain.asc())
         .all()
     )
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     discovered = 0
 
     for site in sites:
@@ -2094,7 +2193,7 @@ def scan_nodejs_instances(
                     inst.setdefault("framework", pkg_meta.get("framework") or "Node.js")
                     inst.setdefault("installed_at", datetime.now(timezone.utc).isoformat())
 
-                state = _update_instance_state(inst_key, _register)
+                state = _update_instance_state(inst_key, _register, db=db)
 
     data = list_nodejs_instances(refresh=True, db=db, current_user=current_user)
     return {
@@ -2158,22 +2257,20 @@ def install_nodejs_instance(
 
     install_source = (payload.install_source or "template").strip().lower()
     git_repo = (payload.git_repo or "").strip()
-    git_branch = (payload.git_branch or "main").strip()
+    git_branch = _validate_git_branch(payload.git_branch)
     if install_source == "git":
         if not git_repo or not GIT_URL_RE.fullmatch(git_repo):
             raise HTTPException(
                 status_code=400,
                 detail="Địa chỉ Git Repository không hợp lệ (chỉ hỗ trợ https:// hoặc git@).",
             )
-        if not GIT_BRANCH_RE.fullmatch(git_branch):
-            raise HTTPException(status_code=400, detail="Tên nhánh Git (branch) không hợp lệ.")
 
     site_owner = db.query(User).filter(User.id == site.owner_id).first()
     if site_owner is None or not hasattr(site_owner, "role"):
         site_owner = current_user
     is_admin_owner = is_admin_role(getattr(site_owner, "role", None))
 
-    existing_inst = ((_load_toolkit_state().get("instances") or {}).get(str(site.id))) or {}
+    existing_inst = ((_load_toolkit_state(db).get("instances") or {}).get(str(site.id))) or {}
     already_counted = bool(existing_inst.get("installed")) and not bool(existing_inst.get("detached"))
     if not already_counted:
         try:
@@ -2305,7 +2402,7 @@ def install_nodejs_instance(
         db.add(site)
         db.commit()
         try:
-            _pop_instance_state(inst_key)
+            _pop_instance_state(inst_key, db=db)
         except Exception:
             pass
 
@@ -2318,13 +2415,13 @@ def install_nodejs_instance(
             rc, out = _run_as_site_user(
                 linux_user,
                 app_dir,
-                ["git", "clone", "--depth", "1", "--branch", git_branch, git_repo, "."],
+                ["git", "clone", "--depth", "1", "--branch", git_branch, "--", git_repo, "."],
                 node_major=clean_major,
                 timeout=300,
             )
             npm_logs.append(
                 {
-                    "cmd": f"git clone -b {git_branch} {git_repo} .",
+                    "cmd": f"git clone -b {git_branch} -- {git_repo} .",
                     "output": (out or "OK")[-2000:],
                     "status": "ok" if rc == 0 else "error",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2418,7 +2515,17 @@ def install_nodejs_instance(
                 }
             )
 
-        state = _update_instance_state(inst_key, _save_new)
+        state = _update_instance_state(
+            inst_key,
+            _save_new,
+            db=db,
+            allow_port_retry=(payload.port is None),
+        )
+        saved_after = (state.get("instances") or {}).get(inst_key) or {}
+        if saved_after.get("port") and int(saved_after["port"]) != port:
+            port = int(saved_after["port"])
+            updated_env = _update_env_text(env_content, {"PORT": str(port)})
+            _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
 
         # Start systemd worker & sync Nginx vhost
         _sync_nodejs_worker_unit(
@@ -2467,7 +2574,7 @@ def manage_nodejs_process(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     inst_key = str(site.id)
     saved = dict((state.get("instances") or {}).get(inst_key) or {})
     if not saved:
@@ -2535,6 +2642,7 @@ def manage_nodejs_process(
         _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
 
     def _mutate(inst: Dict[str, Any]) -> None:
+        inst.pop("detached", None)
         inst["node_major"] = node_major
         inst["start_mode"] = start_mode
         inst["start_arg"] = start_arg
@@ -2543,7 +2651,18 @@ def manage_nodejs_process(
         inst["node_env"] = node_env
         inst["process_enabled"] = enabled
 
-    state = _update_instance_state(inst_key, _mutate)
+    state = _update_instance_state(
+        inst_key,
+        _mutate,
+        db=db,
+        allow_port_retry=(payload.port is None),
+    )
+    saved_after = (state.get("instances") or {}).get(inst_key) or {}
+    if saved_after.get("port") and int(saved_after["port"]) != port:
+        port = int(saved_after["port"])
+        if env_raw:
+            updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
+            _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
 
     _sync_nodejs_worker_unit(
         linux_user,
@@ -2585,7 +2704,7 @@ def run_npm_action(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     inst_key = str(site.id)
     saved = dict((state.get("instances") or {}).get(inst_key) or {})
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
@@ -2669,7 +2788,7 @@ def run_npm_action(
     def _record_log(inst: Dict[str, Any]) -> None:
         _append_npm_log(inst, cmd_display, out, ok=(rc == 0))
 
-    state = _update_instance_state(inst_key, _record_log)
+    state = _update_instance_state(inst_key, _record_log, db=db)
     if rc != 0:
         raise HTTPException(
             status_code=500,
@@ -2692,7 +2811,7 @@ def get_nodejs_env(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     saved = (state.get("instances") or {}).get(str(site.id)) or {}
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
@@ -2713,7 +2832,7 @@ def update_nodejs_env(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     inst_key = str(site.id)
     saved = dict((state.get("instances") or {}).get(inst_key) or {})
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
@@ -2740,7 +2859,7 @@ def update_nodejs_env(
         inst["app_name"] = parsed.get("app_name") or site.domain
         inst["node_env"] = parsed.get("node_env") or "production"
 
-    state = _update_instance_state(inst_key, _sync_env_meta)
+    state = _update_instance_state(inst_key, _sync_env_meta, db=db)
 
     if payload.restart_after_save and saved.get("process_enabled", True):
         _sync_nodejs_worker_unit(
@@ -2774,7 +2893,7 @@ def update_nodejs_security(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     inst_key = str(site.id)
     saved = dict((state.get("instances") or {}).get(inst_key) or {})
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
@@ -2828,7 +2947,7 @@ def update_nodejs_security(
         if "systemd_sandbox" in targets:
             inst["systemd_sandbox"] = bool(payload.enabled)
 
-    state = _update_instance_state(inst_key, _mutate_sec)
+    state = _update_instance_state(inst_key, _mutate_sec, db=db)
 
     if vhost_dirty:
         db.add(site)
@@ -2867,33 +2986,45 @@ def _execute_git_deploy_pipeline(
     build_script: Optional[str] = None,
     restart_process: bool = True,
 ) -> Dict[str, Any]:
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     inst_key = str(site.id)
     saved = dict((state.get("instances") or {}).get(inst_key) or {})
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
     node_major = str(saved.get("node_major") or "22")
 
     repo = (git_repo if git_repo is not None else saved.get("git_repo") or "").strip()
-    branch = (git_branch or saved.get("git_branch") or "main").strip()
+    branch = _validate_git_branch(git_branch or saved.get("git_branch") or "main")
     b_script = (build_script if build_script is not None else saved.get("git_build_script") or "").strip()
 
     if repo and not GIT_URL_RE.fullmatch(repo):
         raise HTTPException(status_code=400, detail="Địa chỉ Git Repository không hợp lệ.")
-    if not GIT_BRANCH_RE.fullmatch(branch):
-        raise HTTPException(status_code=400, detail="Tên nhánh Git không hợp lệ.")
     if b_script and not NPM_SCRIPT_RE.fullmatch(b_script):
         raise HTTPException(status_code=400, detail="Tên script build không hợp lệ.")
 
     steps_output: List[str] = []
     if _app_path_exists(app_dir, ".git", linux_user, site_root):
-        rc, out = _run_as_site_user(
-            linux_user, app_dir, ["git", "pull", "origin", branch], node_major=node_major, timeout=180
+        rc, out_fetch = _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["git", "fetch", "--depth", "1", "origin", "--", branch],
+            node_major=node_major,
+            timeout=180,
         )
+        out = out_fetch
+        if rc == 0:
+            rc, out_reset = _run_as_site_user(
+                linux_user,
+                app_dir,
+                ["git", "reset", "--hard", "FETCH_HEAD"],
+                node_major=node_major,
+                timeout=60,
+            )
+            out = f"{out_fetch}\n{out_reset}".strip()
     elif repo:
         rc, out = _run_as_site_user(
             linux_user,
             app_dir,
-            ["git", "clone", "--depth", "1", "--branch", branch, repo, "."],
+            ["git", "clone", "--depth", "1", "--branch", branch, "--", repo, "."],
             node_major=node_major,
             timeout=300,
         )
@@ -2903,7 +3034,7 @@ def _execute_git_deploy_pipeline(
             detail="Chưa cấu hình địa chỉ Git Repository cho ứng dụng này.",
         )
 
-    steps_output.append(f"$ git pull/clone ({branch})\n{out}")
+    steps_output.append(f"$ git fetch/clone ({branch})\n{out}")
     if rc != 0:
         raise HTTPException(
             status_code=500,
@@ -2967,7 +3098,7 @@ def _execute_git_deploy_pipeline(
         inst["last_deploy_status"] = "ok"
         _append_npm_log(inst, f"git deploy ({branch})", combined_out, ok=True)
 
-    state = _update_instance_state(inst_key, _record_deploy)
+    state = _update_instance_state(inst_key, _record_deploy, db=db)
     instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
     return {
         "instance": instance_info,
@@ -3008,7 +3139,7 @@ def configure_nodejs_webhook(
 ):
     site = _get_accessible_website(website_id, db, current_user)
     inst_key = str(site.id)
-    state_before = _load_toolkit_state()
+    state_before = _load_toolkit_state(db)
     saved_before = (state_before.get("instances") or {}).get(inst_key) or {}
     existing_raw_token = _decrypt_webhook_token(saved_before)
 
@@ -3025,7 +3156,7 @@ def configure_nodejs_webhook(
         elif not payload.enabled and payload.rotate_token:
             inst["webhook_token"] = ""
 
-    state = _update_instance_state(inst_key, _mutate_wh)
+    state = _update_instance_state(inst_key, _mutate_wh, db=db)
     instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
     resp: Dict[str, Any] = {
         "instance": instance_info,
@@ -3078,7 +3209,7 @@ async def public_nodejs_webhook_deploy(
     site = db.query(Website).filter(Website.id == website_id).first()
     if not site:
         raise HTTPException(status_code=403, detail="Invalid or disabled webhook")
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     saved = (state.get("instances") or {}).get(str(site.id)) or {}
     if not saved or saved.get("detached") or not bool(saved.get("webhook_enabled", False)):
         raise HTTPException(status_code=403, detail="Webhook is disabled for this Node.js application")
@@ -3155,7 +3286,7 @@ def get_nodejs_logs(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     saved = (state.get("instances") or {}).get(str(site.id)) or {}
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
@@ -3207,7 +3338,7 @@ def clear_nodejs_logs(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     inst_key = str(site.id)
     saved = (state.get("instances") or {}).get(inst_key) or {}
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
@@ -3219,7 +3350,7 @@ def clear_nodejs_logs(
     def _clear_npm_history(inst: Dict[str, Any]) -> None:
         inst["last_npm_logs"] = []
 
-    _update_instance_state(inst_key, _clear_npm_history)
+    _update_instance_state(inst_key, _clear_npm_history, db=db)
     return {"message": "Đã dọn sạch bộ đệm nhật ký ứng dụng Node.js."}
 
 
@@ -3235,7 +3366,7 @@ def detach_nodejs_instance(
     def _mark_detached(inst: Dict[str, Any]) -> None:
         inst["detached"] = True
 
-    _update_instance_state(inst_key, _mark_detached)
+    _update_instance_state(inst_key, _mark_detached, db=db)
     return {
         "website_id": site.id,
         "message": f"Đã gỡ {site.domain} khỏi danh sách quản lý Node.js Manager (mã nguồn và tiến trình được giữ nguyên).",
@@ -3250,7 +3381,7 @@ def remove_nodejs_instance(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    state = _load_toolkit_state()
+    state = _load_toolkit_state(db)
     inst_key = str(site.id)
     saved = dict((state.get("instances") or {}).get(inst_key) or {})
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
@@ -3296,7 +3427,7 @@ def remove_nodejs_instance(
     db.commit()
     _restore_website_standard_vhost(site, linux_user, site_root)
 
-    _pop_instance_state(inst_key)
+    _pop_instance_state(inst_key, db=db)
     return {
         "website_id": site.id,
         "message": f"Đã gỡ cài đặt ứng dụng Node.js khỏi {site.domain}.",

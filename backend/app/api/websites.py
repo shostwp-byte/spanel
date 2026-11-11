@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.secrets import encrypt
-from app.models.entities import AuditLog, CloudflareCredential, DatabaseAccount, SiteApp, User, Website, WebsiteAlias
+from app.models.entities import AuditLog, CloudflareCredential, DatabaseAccount, NodejsInstance, SiteApp, User, Website, WebsiteAlias
 from app.schemas.schemas import (
     CloudflareZoneOut,
     SharedSslRequest,
@@ -1361,6 +1361,7 @@ def delete_website(website_id: int, request: Request, delete_files: bool = True,
     if delete_database and db_item:
         db_backends.backend_for(db_item).drop_database(db_item.db_name, db_item.db_user)
     db.query(WebsiteAlias).filter(WebsiteAlias.website_id == website.id).delete(synchronize_session=False)
+    db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).delete(synchronize_session=False)
     nginx.delete_wordpress_vhost(website.domain)
     # The vhost is gone, so nothing reads the certificate or the rule file any
     # more: retire both before the row disappears and we no longer know which
