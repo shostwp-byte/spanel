@@ -2313,6 +2313,11 @@ def install_laravel_instance(
             created_new_db_acc = db_acc
 
     db.commit()
+    if db_acc is not None:
+        try:
+            db.refresh(db_acc)
+        except Exception:
+            pass
 
     def _rollback_failed_install(*, purge_files: bool = False) -> None:
         if purge_files:
@@ -2614,6 +2619,7 @@ def install_laravel_instance(
         "app_key_set": True,
         "laravel_version": payload.laravel_version or "11.x",
         "composer_version": "2.8",
+        "db_account_id": db_acc.id if db_acc is not None else None,
         "db_name": db_info["db_name"],
         "db_user": db_info["db_user"],
         "git_repo": payload.git_repo.strip() if payload.install_source == "git" else "",
@@ -3214,10 +3220,6 @@ def update_laravel_env(
         inst["app_name"] = parsed["app_name"]
         inst["app_env"] = parsed["app_env"]
         inst["app_debug"] = parsed["app_debug"]
-        if parsed.get("db_name"):
-            inst["db_name"] = parsed["db_name"]
-        if parsed.get("db_user"):
-            inst["db_user"] = parsed["db_user"]
         _append_artisan_log(
             inst,
             f"{Path(php_cli).name} artisan config:clear",
@@ -3586,10 +3588,15 @@ def remove_laravel_instance(
     saved = (state_snapshot.get("instances") or {}).get(inst_key) or {}
     linux_user, site_root, app_dir = _resolve_laravel_paths(site, db, saved.get("subpath") or "")
 
-    # Read .env before purging app_dir so exact DB name is known if drop_database=True
-    env_text = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
-    env_info = _parse_env_details(env_text)
-    target_db_name = (saved.get("db_name") or env_info.get("db_name") or "").strip()
+    # Resolve database strictly from saved state (never from user-editable .env)
+    target_db_name = (saved.get("db_name") or "").strip()
+    raw_db_acc_id = saved.get("db_account_id")
+    db_acc_id: Optional[int] = None
+    if raw_db_acc_id is not None and not isinstance(raw_db_acc_id, bool):
+        try:
+            db_acc_id = int(raw_db_acc_id)
+        except (TypeError, ValueError):
+            db_acc_id = None
 
     _delete_laravel_worker_unit(linux_user, site_root)
     _remove_scheduler_cron(site, linux_user, site_root)
@@ -3599,25 +3606,37 @@ def remove_laravel_instance(
     _purge_app_dir_contents(linux_user, site_root, app_dir)
 
     dropped_db = False
-    if (
-        drop_database
-        and target_db_name
-        and target_db_name.lower() not in mariadb.RESERVED_DATABASES
-    ):
-        db_acc = (
-            db.query(DatabaseAccount)
-            .filter(
-                DatabaseAccount.db_name == target_db_name,
-                DatabaseAccount.owner_id == site.owner_id,
+    if drop_database:
+        db_acc: Optional[DatabaseAccount] = None
+        if db_acc_id is not None and db_acc_id > 0:
+            db_acc = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.id == db_acc_id,
+                    DatabaseAccount.owner_id == site.owner_id,
+                    DatabaseAccount.website_id == site.id,
+                )
+                .first()
             )
-            .first()
-        )
-        if db_acc is not None and getattr(db_acc, "db_name", None) == target_db_name:
+        elif target_db_name and target_db_name.lower() not in mariadb.RESERVED_DATABASES:
+            db_acc = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.db_name == target_db_name,
+                    DatabaseAccount.owner_id == site.owner_id,
+                    DatabaseAccount.website_id == site.id,
+                )
+                .first()
+            )
+        if (
+            db_acc is not None
+            and (getattr(db_acc, "db_name", None) or "").lower() not in mariadb.RESERVED_DATABASES
+        ):
             try:
                 teardown.drop_database_record(db, db_acc)
                 dropped_db = True
             except Exception as exc:
-                logger.warning("Drop Laravel database warning (%s): %s", target_db_name, exc)
+                logger.warning("Drop Laravel database warning (%s): %s", getattr(db_acc, "db_name", ""), exc)
 
     site.nginx_custom = _strip_laravel_nginx_security(getattr(site, "nginx_custom", "") or "")
     site.document_root = "public_html"

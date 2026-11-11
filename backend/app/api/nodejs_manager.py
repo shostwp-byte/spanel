@@ -1690,9 +1690,53 @@ def _inspect_nodejs_instance(
     scheme = "https" if getattr(site, "ssl_enabled", False) else "http"
     site_url = f"{scheme}://{site.domain}" + (f"/{subpath.strip('/')}" if subpath else "")
 
-    db_name = env_info.get("db_name") or saved.get("db_name") or ""
-    db_user = env_info.get("db_user") or saved.get("db_user") or ""
-    db_host = env_info.get("db_host") or saved.get("db_host") or "localhost"
+    db_acc_id = saved.get("db_account_id")
+    linked_db: Optional[DatabaseAccount] = None
+    if db_acc_id is not None:
+        try:
+            linked_db = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.id == int(db_acc_id),
+                    DatabaseAccount.owner_id == site.owner_id,
+                )
+                .first()
+            )
+        except (TypeError, ValueError):
+            linked_db = None
+    elif saved.get("db_name"):
+        legacy_db = (
+            db.query(DatabaseAccount)
+            .filter(
+                DatabaseAccount.db_name == str(saved.get("db_name")).strip(),
+                DatabaseAccount.owner_id == site.owner_id,
+                DatabaseAccount.website_id == site.id,
+            )
+            .first()
+        )
+        if legacy_db is not None:
+            linked_db = legacy_db
+            saved["db_account_id"] = legacy_db.id
+            _update_instance_state(
+                inst_key,
+                lambda inst, _id=legacy_db.id: inst.update(
+                    {"db_account_id": _id, "db_name": None, "db_user": None}
+                ),
+            )
+
+    if linked_db is not None:
+        db_name = linked_db.db_name
+        db_user = linked_db.db_user
+        remote_host = getattr(linked_db, "db_host", None)
+        db_host = (
+            str(remote_host.host).strip()
+            if remote_host is not None and getattr(remote_host, "host", None)
+            else "localhost"
+        )
+    else:
+        db_name = ""
+        db_user = ""
+        db_host = "localhost"
 
     webhook_tok = _webhook_token_for(site, saved)
     webhook_path = f"/api/nodejs-manager/webhook/{site.id}/{webhook_tok}"
@@ -2515,10 +2559,6 @@ def update_nodejs_env(
     def _sync_env_meta(inst: Dict[str, Any]) -> None:
         inst["app_name"] = parsed.get("app_name") or site.domain
         inst["node_env"] = parsed.get("node_env") or "production"
-        if parsed.get("db_name"):
-            inst["db_name"] = parsed["db_name"]
-        if parsed.get("db_user"):
-            inst["db_user"] = parsed["db_user"]
 
     state = _update_instance_state(inst_key, _sync_env_meta)
 
@@ -2932,27 +2972,31 @@ def remove_nodejs_instance(
     # Stop and delete systemd worker unit
     _delete_nodejs_worker_unit(linux_user, site_root)
 
-    # Optionally drop MySQL database
+    # Optionally drop MySQL database (strictly via owned & bound DatabaseAccount record)
     if payload.drop_database:
-        db_name = (saved.get("db_name") or "").strip()
-        db_user = (saved.get("db_user") or "").strip()
-        if db_name:
+        raw_db_acc_id = saved.get("db_account_id")
+        db_acc_id: Optional[int] = None
+        if raw_db_acc_id is not None and not isinstance(raw_db_acc_id, bool):
+            try:
+                db_acc_id = int(raw_db_acc_id)
+            except (TypeError, ValueError):
+                db_acc_id = None
+        if db_acc_id is not None and db_acc_id > 0:
             try:
                 acc = (
                     db.query(DatabaseAccount)
                     .filter(
-                        DatabaseAccount.db_name == db_name,
+                        DatabaseAccount.id == db_acc_id,
                         DatabaseAccount.owner_id == site.owner_id,
+                        DatabaseAccount.website_id == site.id,
                     )
                     .first()
                 )
-                if acc:
+                if acc is not None:
                     teardown.drop_database_record(db, acc)
                     db.commit()
-                elif db_user:
-                    mariadb.drop_database(db_name, db_user)
             except Exception as exc:
-                logger.warning("Drop Node.js database warning for %s: %s", db_name, exc)
+                logger.warning("Drop Node.js database warning for db_account_id=%s: %s", db_acc_id, exc)
 
     # Optionally delete files in app_dir
     if payload.delete_files:
