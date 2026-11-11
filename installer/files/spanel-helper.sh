@@ -8043,6 +8043,36 @@ nodejs_worker_unit_base() {
   printf 'spanel-nodejs-%s-%s' "$user" "$site_hash"
 }
 
+nodejs_env_file() {
+  local base="$1"
+  printf '%s/nodejs/%s.env' "${SPANEL_DATA_DIR:-/var/lib/spanel}" "$base"
+}
+
+copy_site_env_as_user() {
+  local user="$1" app_target="$2" dest="$3" data_dir tmp_dest raw line trimmed
+  data_dir="${SPANEL_DATA_DIR:-/var/lib/spanel}/nodejs"
+  install -d -o root -g root -m 0700 "$data_dir"
+  tmp_dest="${dest}.spanel-tmp-$$"
+  install -m 0600 -o root -g root /dev/null "$tmp_dest"
+  raw="$(runuser -u "$user" -- head -c 65536 -- "${app_target}/.env" 2>/dev/null || true)"
+  if [[ -n "$raw" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      trimmed="${line#"${line%%[![:space:]]*}"}"
+      [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+      if [[ "$trimmed" == export[[:space:]]* ]]; then
+        trimmed="${trimmed#export}"
+        trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+      fi
+      [[ "$trimmed" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+      printf '%s\n' "$trimmed" >>"$tmp_dest"
+    done <<<"$raw"
+  fi
+  chown root:root "$tmp_dest"
+  chmod 0600 "$tmp_dest"
+  mv -f -- "$tmp_dest" "$dest"
+}
+
 resolve_or_install_node_bin_dir() {
   local major="$1" dir=""
   require_node_major "$major"
@@ -8076,10 +8106,12 @@ resolve_or_install_node_bin_dir() {
 }
 
 delete_nodejs_worker_units() {
-  local user="$1" site_root="$2" base unit_file
+  local user="$1" site_root="$2" base unit_file env_file
   base="$(nodejs_worker_unit_base "$user" "$site_root")" || return 0
   unit_file="${SYSTEMD_UNIT_DIR}/${base}.service"
+  env_file="$(nodejs_env_file "$base")"
   systemctl disable --now "${base}.service" >/dev/null 2>&1 || true
+  rm -f -- "$env_file"
   if [[ -f "$unit_file" ]]; then
     rm -f -- "$unit_file"
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -8087,14 +8119,15 @@ delete_nodejs_worker_units() {
 }
 
 delete_nodejs_worker_units_for_user() {
-  local user="$1" unit_file unit_name removed=0
+  local user="$1" unit_file unit_name base_name removed=0
   require_linux_user "$user"
   shopt -s nullglob
   for unit_file in "${SYSTEMD_UNIT_DIR}/spanel-nodejs-${user}-"*.service; do
     [[ -f "$unit_file" ]] || continue
     unit_name="$(basename "$unit_file")"
+    base_name="${unit_name%.service}"
     systemctl disable --now "$unit_name" >/dev/null 2>&1 || true
-    rm -f -- "$unit_file"
+    rm -f -- "$unit_file" "$(nodejs_env_file "$base_name")"
     removed=1
   done
   shopt -u nullglob
@@ -8106,7 +8139,7 @@ delete_nodejs_worker_units_for_user() {
 sync_nodejs_worker_unit() {
   local user="$1" site_root="$2" app_dir="$3" node_major="$4"
   local port="$5" memory_mb="$6" start_mode="$7" start_arg="$8" node_env="$9" enabled_flag="${10}"
-  local uid root_target app_target bin_dir exec_start base unit_file tmp_file
+  local uid root_target app_target bin_dir exec_start base unit_file env_file tmp_file
 
   require_linux_user "$user"
   uid="$(id -u "$user" 2>/dev/null)" || deny "panel Linux user does not exist: $user"
@@ -8126,6 +8159,7 @@ sync_nodejs_worker_unit() {
 
   base="$(nodejs_worker_unit_base "$user" "$root_target")"
   unit_file="${SYSTEMD_UNIT_DIR}/${base}.service"
+  env_file="$(nodejs_env_file "$base")"
 
   if [[ "$enabled_flag" == "0" ]]; then
     systemctl disable --now "${base}.service" >/dev/null 2>&1 || true
@@ -8157,6 +8191,7 @@ sync_nodejs_worker_unit() {
 
   install -d -o "$user" -g "$user" -m 0700 "${HOME_ROOT}/${user}/.npm"
   install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
+  copy_site_env_as_user "$user" "$app_target" "$env_file"
   tmp_file="${unit_file}.spanel-tmp-$$"
 
   cat >"$tmp_file" <<UNIT
@@ -8172,7 +8207,7 @@ Group=${user}
 Slice=user-${uid}.slice
 WorkingDirectory=${app_target}
 UMask=0027
-EnvironmentFile=-${app_target}/.env
+EnvironmentFile=-${env_file}
 Environment=HOST=127.0.0.1
 Environment=PORT=${port}
 Environment=NODE_ENV=${node_env}
