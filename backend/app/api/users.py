@@ -759,6 +759,8 @@ def delete_user(user_id: int, request: Request, db: Session = Depends(get_db), c
         # Worth recording separately: these are resources the website loop never
         # touched, so before this sweep existed they simply stayed behind.
         detail = f"{detail} +db:{len(purged['databases'])} +app:{len(purged['applications'])}"
+    for domain in deleted_domains:
+        log_action(db, current_user.id, "delete_website", domain, request=request)
     log_action(db, current_user.id, "delete_user", username, detail, request=request)
     return {
         "ok": True,

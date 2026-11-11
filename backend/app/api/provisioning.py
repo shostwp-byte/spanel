@@ -640,6 +640,8 @@ def _terminate(
         if account.reseller_id is None and subject.reseller_id is not None:
             account.reseller_id = subject.reseller_id
     deleted_domains = terminate_account(db, account, backup=backup)
+    for domain in deleted_domains:
+        log_action(db, None, "delete_website", domain, request=request)
     log_action(db, None, "provisioning_terminate", external_id, detail=",".join(deleted_domains), request=request)
     body = {"ok": True, "status": "terminated", "deleted_websites": deleted_domains}
     if backup:
