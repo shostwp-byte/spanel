@@ -8049,7 +8049,7 @@ nodejs_env_file() {
 }
 
 copy_site_env_as_user() {
-  local user="$1" app_target="$2" dest="$3" data_dir tmp_dest raw line trimmed
+  local user="$1" app_target="$2" dest="$3" data_dir tmp_dest raw line trimmed key_name
   data_dir="${SPANEL_DATA_DIR:-/var/lib/spanel}/nodejs"
   install -d -o root -g root -m 0700 "$data_dir"
   tmp_dest="${dest}.spanel-tmp-$$"
@@ -8065,6 +8065,10 @@ copy_site_env_as_user() {
         trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
       fi
       [[ "$trimmed" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+      key_name="${trimmed%%=*}"
+      case "$key_name" in
+        PORT|HOST|NODE_ENV|PATH|HOME|npm_config_cache) continue ;;
+      esac
       printf '%s\n' "$trimmed" >>"$tmp_dest"
     done <<<"$raw"
   fi

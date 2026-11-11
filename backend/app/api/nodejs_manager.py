@@ -423,7 +423,14 @@ def _update_instance_state(
                 break
             except IntegrityError as exc:
                 session.rollback()
+                orig_msg = str(getattr(exc, "orig", None) or exc).lower()
+                is_port_collision = "port" in orig_msg and "website_id" not in orig_msg
                 collided_port = inst.get("port")
+                if not is_port_collision:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Ứng dụng Node.js trên website này đang được cập nhật bởi tiến trình khác. Vui lòng thử lại.",
+                    ) from exc
                 if allow_port_retry and collided_port is not None:
                     excluded_ports.add(int(collided_port))
                     continue
@@ -431,6 +438,11 @@ def _update_instance_state(
                     status_code=409,
                     detail=f"Cổng nội bộ {collided_port} đang được sử dụng bởi ứng dụng khác. Vui lòng chọn cổng khác trong dải {site_apps.PORT_RANGE_START}–{site_apps.PORT_RANGE_END}.",
                 ) from exc
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Không thể cấp phát cổng nội bộ sau 8 lần thử (xung đột cổng liên tiếp). Vui lòng thử lại.",
+            )
         return _load_toolkit_state(session)
 
     if db is not None:
@@ -1790,7 +1802,12 @@ def _deploy_lock_path(website_id: int) -> Path:
     return _deploy_locks_dir() / f"nodejs-deploy-{int(website_id)}.lock"
 
 
-def _acquire_deploy_lock(website_id: int, stale_seconds: int = 900) -> Path:
+_DEPLOY_LOCK_TTL_SECONDS = 1800
+
+
+def _acquire_deploy_lock(
+    website_id: int, stale_seconds: int = _DEPLOY_LOCK_TTL_SECONDS
+) -> Path:
     lock_path = _deploy_lock_path(website_id)
     for attempt in range(2):
         try:
@@ -2397,6 +2414,10 @@ def install_nodejs_instance(
     inst_key = str(site.id)
 
     def _rollback_failed_install(*, purge_files: bool = False) -> None:
+        try:
+            _delete_nodejs_worker_unit(linux_user, site_root)
+        except Exception as unit_exc:
+            logger.warning("Failed to delete Node.js worker unit during rollback: %s", unit_exc)
         if purge_files:
             try:
                 _purge_app_dir_contents(linux_user, site_root, app_dir)
@@ -3014,6 +3035,19 @@ def _execute_git_deploy_pipeline(
 
     steps_output: List[str] = []
     if _app_path_exists(app_dir, ".git", linux_user, site_root):
+        if repo:
+            rc_url, out_url = _run_as_site_user(
+                linux_user,
+                app_dir,
+                ["git", "remote", "set-url", "origin", "--", repo],
+                node_major=node_major,
+                timeout=30,
+            )
+            if rc_url != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Không thể cập nhật Git remote origin: {_short_cmd_err(out_url)}",
+                )
         rc, out_fetch = _run_as_site_user(
             linux_user,
             app_dir,
@@ -3220,6 +3254,15 @@ async def public_nodejs_webhook_deploy(
     site = db.query(Website).filter(Website.id == website_id).first()
     if not site:
         raise HTTPException(status_code=403, detail="Invalid or disabled webhook")
+    if not addons.is_installed("applications"):
+        raise HTTPException(status_code=403, detail="Application hosting addon is not installed")
+    site_owner = db.query(User).filter(User.id == site.owner_id).first()
+    if site_owner is not None and not is_admin_role(getattr(site_owner, "role", None)):
+        if site_apps.app_limit_for(site_owner) == 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Application hosting is not enabled for this package",
+            )
     state = _load_toolkit_state(db)
     saved = (state.get("instances") or {}).get(str(site.id)) or {}
     if not saved or saved.get("detached") or not bool(saved.get("webhook_enabled", False)):

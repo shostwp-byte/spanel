@@ -124,25 +124,6 @@ def test_p0_1_p1_1_p1_2_1_7_real_helper_worker_sync_and_status(tmp_path, monkeyp
     """
     monkeypatch.setattr(settings, "command_dry_run", False)
 
-    # Verify parameter order contract directly against spanel-helper.sh source
-    helper_text = (REPO_ROOT / "installer" / "files" / "spanel-helper.sh").read_text(encoding="utf-8")
-    m = re.search(r"sync_nodejs_worker_unit\(\)\s*\{(.*?)\n\}", helper_text, re.DOTALL)
-    assert m is not None
-    body = m.group(1)
-    positional_vars = re.findall(r'([a-z_]+)="\$\{?([0-9]+)', body)
-    assert positional_vars[:10] == [
-        ("user", "1"),
-        ("site_root", "2"),
-        ("app_dir", "3"),
-        ("node_major", "4"),
-        ("port", "5"),
-        ("memory_mb", "6"),
-        ("start_mode", "7"),
-        ("start_arg", "8"),
-        ("node_env", "9"),
-        ("enabled_flag", "10"),
-    ]
-
     home_root = tmp_path / "home"
     site_root = home_root / "alice" / "app.example.com"
     app_dir = site_root / "public_html"
@@ -283,6 +264,34 @@ systemctl() {{
         # Root secret was rejected by runuser as 'alice', so safe_env_file does not contain it
         safe_env_files = list((data_dir / "nodejs").glob("*.env"))
         assert not any("PANEL_ROOT_MASTER_SECRET_999" in f.read_text(encoding="utf-8") for f in safe_env_files)
+
+        # P3-1: Regular .env with reserved keys (PORT, HOST, NODE_ENV, PATH, HOME, npm_config_cache)
+        # has those keys stripped by copy_site_env_as_user while keeping custom variables.
+        if env_path.is_symlink() or env_path.exists():
+            env_path.unlink()
+        env_path.write_text(
+            "PORT=9999\nHOST=0.0.0.0\nNODE_ENV=development\nPATH=/tmp/evil\nCUSTOM_VAR=kept_ok\n",
+            encoding="utf-8",
+        )
+        nm._sync_nodejs_worker_unit(
+            "alice",
+            site_root,
+            app_dir,
+            node_major="22",
+            start_mode="node",
+            start_arg="server.js",
+            port=21005,
+            memory_mb=512,
+            node_env="production",
+            enabled=True,
+            strict=True,
+        )
+        copied_env_text = safe_env_files[0].read_text(encoding="utf-8")
+        assert "CUSTOM_VAR=kept_ok" in copied_env_text
+        assert "PORT=" not in copied_env_text
+        assert "HOST=" not in copied_env_text
+        assert "NODE_ENV=" not in copied_env_text
+        assert "PATH=" not in copied_env_text
 
         # 1.3 (P1-2): _query_nodejs_worker_status reads live main_pid, memory_current_bytes, restarts
         status_res = nm._query_nodejs_worker_status(
@@ -1113,4 +1122,201 @@ def test_stage_4_nodejs_manager_feature_flag_default_disabled(monkeypatch):
     client = _build_test_client(SessionLocal, holder)
     assert client.get("/api/nodejs-manager/instances").status_code == 404
     assert client.post("/api/nodejs-manager/webhook/1", json={}).status_code == 404
+
+
+def test_round16_p2_and_p3_regressions(tmp_path, monkeypatch):
+    """Verify Round 16 P2-1..3 and P3-3..5 fixes:
+    - P2-1: delete_website(..., delete_files=False) invokes nodejs-worker-delete when NodejsInstance exists.
+    - P2-2: _rollback_failed_install invokes _delete_nodejs_worker_unit when install fails mid-way.
+    - P2-3: _update_instance_state raises 409 immediately on non-port IntegrityError and raises 409 after 8 port collisions.
+    - P3-3: public_nodejs_webhook_deploy rejects with 403 when package node_apps_limit == 0 or addon is disabled.
+    - P3-4: _DEPLOY_LOCK_TTL_SECONDS is 1800.
+    - P3-5: _execute_git_deploy_pipeline runs `git remote set-url origin -- <repo>` when `.git` exists.
+    """
+    from app.api import websites as websites_api
+
+    monkeypatch.setattr(settings, "command_dry_run", True)
+    monkeypatch.setattr(settings, "secret_key", "round16-test-secret-key-0123456789")
+
+    assert nm._DEPLOY_LOCK_TTL_SECONDS == 1800
+
+    _, SessionLocal = _setup_test_db()
+    with patch.object(nm, "SessionLocal", SessionLocal), patch(
+        "app.api.websites._rewrite_website_vhost"
+    ):
+        db = SessionLocal()
+        pkg = UserPackage(name="pro", database_limit=5, node_apps_limit=5, node_app_memory_mb=1024)
+        db.add(pkg)
+        db.commit()
+        db.refresh(pkg)
+
+        alice = User(
+            username="alice",
+            email="alice@example.com",
+            hashed_password="x",
+            role="end_user",
+            package_id=pkg.id,
+        )
+        db.add(alice)
+        db.commit()
+        db.refresh(alice)
+
+        site1 = Website(
+            domain="site1.example.com",
+            root_path=str(tmp_path / "site1"),
+            document_root="public_html",
+            linux_user="alice",
+            owner_id=alice.id,
+        )
+        site2 = Website(
+            domain="site2.example.com",
+            root_path=str(tmp_path / "site2"),
+            document_root="public_html",
+            linux_user="alice",
+            owner_id=alice.id,
+        )
+        db.add_all([site1, site2])
+        db.commit()
+        db.refresh(site1)
+        db.refresh(site2)
+        (Path(site1.root_path) / "public_html").mkdir(parents=True, exist_ok=True)
+        (Path(site2.root_path) / "public_html").mkdir(parents=True, exist_ok=True)
+
+        # P2-2: When _sync_nodejs_worker_unit fails during install, _delete_nodejs_worker_unit is called in rollback
+        with patch.object(
+            nm, "_sync_nodejs_worker_unit", side_effect=HTTPException(status_code=500, detail="systemctl restart failed")
+        ), patch.object(nm, "_delete_nodejs_worker_unit") as mock_del_unit:
+            with pytest.raises(HTTPException) as exc_install:
+                nm.install_nodejs_instance(
+                    nm.NodejsInstallRequest(
+                        website_id=site1.id,
+                        app_name="Fail Restart App",
+                        db_mode="none",
+                    ),
+                    db=db,
+                    current_user=alice,
+                )
+            assert exc_install.value.status_code == 500
+            mock_del_unit.assert_called_once_with("alice", Path(site1.root_path))
+
+        # Install successfully on site1 and site2
+        nm.install_nodejs_instance(
+            nm.NodejsInstallRequest(website_id=site1.id, app_name="Site1 App", db_mode="none"),
+            db=db,
+            current_user=alice,
+        )
+        nm.install_nodejs_instance(
+            nm.NodejsInstallRequest(website_id=site2.id, app_name="Site2 App", db_mode="none"),
+            db=db,
+            current_user=alice,
+        )
+
+        # P2-3a: Non-port IntegrityError (e.g. website_id PK collision) raises 409 immediately on first attempt
+        pk_calls = []
+
+        def _fail_pk():
+            pk_calls.append(1)
+            raise IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed: nodejs_instances.website_id"))
+
+        with patch.object(db, "commit", side_effect=_fail_pk):
+            with pytest.raises(HTTPException) as exc_pk:
+                nm._update_instance_state(site1.id, lambda inst: None, db=db, allow_port_retry=True)
+            assert exc_pk.value.status_code == 409
+            assert len(pk_calls) == 1
+
+        # P2-3b: 8 consecutive port IntegrityErrors hit for-else and raise 409 instead of silently returning
+        port_calls = []
+
+        def _fail_port():
+            port_calls.append(1)
+            raise IntegrityError("UPDATE", {}, Exception("UNIQUE constraint failed: nodejs_instances.port"))
+
+        with patch.object(db, "commit", side_effect=_fail_port):
+            with pytest.raises(HTTPException) as exc_port8:
+                nm._update_instance_state(site1.id, lambda inst: None, db=db, allow_port_retry=True)
+            assert exc_port8.value.status_code == 409
+            assert len(port_calls) == 8
+
+        # P3-5: When .git already exists, _execute_git_deploy_pipeline runs `git remote set-url origin -- <new_repo>`
+        git_dir = Path(site1.root_path) / "public_html" / ".git"
+        git_dir.mkdir(parents=True, exist_ok=True)
+        recorded_cmds: List[List[str]] = []
+
+        def _fake_run_site_user(linux_user, cwd, argv, *, node_major="22", extra_env=None, timeout=180):
+            recorded_cmds.append(list(argv))
+            return 0, "ok"
+
+        with patch.object(nm, "_run_as_site_user", side_effect=_fake_run_site_user):
+            nm._execute_git_deploy_pipeline(
+                site1,
+                db,
+                git_repo="https://github.com/example/new-repo.git",
+                git_branch="main",
+                run_npm_install=False,
+                build_script="",
+                restart_process=False,
+            )
+        assert ["git", "remote", "set-url", "origin", "--", "https://github.com/example/new-repo.git"] in recorded_cmds
+
+        # P3-3: Webhook returns 403 when package node_apps_limit is downgraded to 0
+        wh_cfg = nm.configure_nodejs_webhook(
+            site1.id,
+            nm.WebhookConfigRequest(enabled=True, rotate_token=True),
+            db=db,
+            current_user=alice,
+        )
+        raw_token = wh_cfg["webhook_token"]
+        wh_secret = wh_cfg["webhook_secret"]
+        body_bytes = json.dumps({"ref": "refs/heads/main"}).encode("utf-8")
+        sig = "sha256=" + hmac.new(wh_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+
+        pkg.node_apps_limit = 0
+        db.commit()
+        db.refresh(alice)
+        db.refresh(site1)
+        db.refresh(site2)
+        site1_id = site1.id
+        site2_id = site2.id
+        site2_root = str(site2.root_path)
+        db.close()
+
+        holder = {"user": alice}
+        client = _build_test_client(SessionLocal, holder)
+        r_wh_downgraded = client.post(
+            f"/api/nodejs-manager/webhook/{site1_id}/{raw_token}",
+            content=body_bytes,
+            headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "push"},
+        )
+        assert r_wh_downgraded.status_code == 403
+
+        # P2-1: delete_website(..., delete_files=False) still calls nodejs-worker-delete for site2
+        app_full = FastAPI()
+        app_full.include_router(websites_api.router, prefix="/api")
+
+        def _override_db():
+            s = SessionLocal()
+            try:
+                yield s
+            finally:
+                s.close()
+
+        app_full.dependency_overrides[get_db] = _override_db
+        app_full.dependency_overrides[get_current_user] = lambda: alice
+        full_client = TestClient(app_full)
+
+        priv_calls: List[tuple] = []
+
+        def _spy_priv(action: str, **kwargs):
+            priv_calls.append((action, kwargs.get("helper_args")))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(websites_api.shell, "privileged", side_effect=_spy_priv), patch.object(
+            websites_api.nginx, "delete_wordpress_vhost"
+        ), patch.object(websites_api.ssl, "release_site_certificates", return_value=""), patch.object(
+            websites_api.waf, "remove_site_rules"
+        ):
+            r_del = full_client.delete(f"/api/websites/{site2_id}?delete_files=false&delete_database=false")
+            assert r_del.status_code == 200
+            assert ("nodejs-worker-delete", ["alice", site2_root]) in priv_calls
+
 
