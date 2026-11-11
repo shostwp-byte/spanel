@@ -26,6 +26,7 @@
   - [1. Phân quyền 3 Cấp độ & Chuyển đổi Vai trò Tức thì](#1-phân-quyền-3-cấp-độ--chuyển-đổi-vai-trò-tức-thì-rbac--access-role-switch)
   - [2. Quản trị Tên miền, Subdomain, Chuyển hướng & SSL/TLS](#2-quản-trị-tên-miền-subdomain-chuyển-hướng--ssltls)
   - [3. Bộ ba Quản trị Ứng dụng Chuyên sâu: Node.js Manager, Laravel Manager & WordPress Manager](#3-bộ-ba-quản-trị-ứng-dụng-chuyên-sâu-nodejs-manager-laravel-manager--wordpress-manager)
+    - [Hướng dẫn Kích hoạt & Cấu hình Node.js Manager](#hướng-dẫn-kích-hoạt--cấu-hình-nodejs-manager)
   - [4. Ngăn xếp Web Đa phiên bản PHP, CustomBuild & Ứng dụng Hiện đại](#4-ngăn-xếp-web-đa-phiên-bản-php-custombuild--ứng-dụng-hiện-đại)
   - [5. Cơ sở dữ liệu MariaDB, Remote MySQL, MySQL Governor & phpMyAdmin SSO](#5-cơ-sở-dữ-liệu-mariadb-remote-mysql-mysql-governor--phpmyadmin-sso)
   - [6. Cô lập Tài nguyên Cgroups v2, Kernel Quota & Giám sát Thời gian thực](#6-cô-lập-tài-nguyên-cgroups-v2-kernel-quota--giám-sát-thời-gian-thực)
@@ -70,7 +71,7 @@ flowchart TB
 ```
 
 - **Nguyên tắc Đặc quyền Tối thiểu (Privilege Separation):** Dịch vụ `spanel-api.service` bị khóa cứng bởi systemd sandbox (`RestrictAddressFamilies`, `RestrictNamespaces=mnt`) và hoàn toàn không có quyền `root`.
-- **Kiểm duyệt Tham số & Chống Rò rỉ `.env` qua Symlink:** Mọi lệnh gọi sang `spanel-helper` đều được kiểm tra định danh tên miền, đường dẫn thực (`realpath`), mở tệp với `O_NOFOLLOW` chống leo thang đặc quyền qua symlink/hardlink. Các tiến trình worker (`systemd`) chỉ nạp tệp môi trường tại `/var/lib/spanel/nodejs/<base>.env` (`0600 root:root`) đã được đọc và lọc dưới đúng quyền Linux user của khách (`copy_site_env_as_user`).
+- **Kiểm duyệt Tham số & Chống Rò rỉ `.env` qua Symlink:** Mọi lệnh gọi sang `spanel-helper` đều được kiểm tra định danh tên miền, đường dẫn thực (`realpath`), mở tệp với `O_NOFOLLOW` chống leo thang đặc quyền qua symlink/hardlink. Các tiến trình worker (`systemd`) chỉ nạp tệp môi trường tại `/etc/spanel/nodejs-env/<unit>.env` (`0600 root:root`) đã được đọc và lọc bỏ khóa nhạy cảm (`PORT`, `HOST`, `NODE_ENV`, `PATH`, `HOME`, `npm_config_cache`) dưới đúng quyền Linux user của khách (`copy_site_env_as_user`).
 - **Chốt chặn Bảo mật CI/CD Tự động:** Pipeline GitHub Actions tự động kiểm tra ranh giới gọi hàm MariaDB (`create_database_credentials`, `drop_database`), quét AST toàn bộ endpoint API để chặn route thiếu xác thực, chặn chỉ thị `EnvironmentFile=` trỏ vào thư mục người dùng và chạy kiểm thử tích hợp `systemd` + `spanel-helper.sh` thực tế trên Ubuntu 24.04.
 - **Xác thực Đa nhân tố & Chống Giả mạo:** Hỗ trợ **2FA TOTP** (Google Authenticator), khóa bảo mật sinh trắc học **WebAuthn Passkeys**, phiên đăng nhập `HttpOnly + SameSite` tự động gia hạn kèm **CSRF Token** và nhật ký kiểm toán (**Audit Log**) toàn diện.
 
@@ -117,15 +118,39 @@ flowchart TB
 
 #### 🟢 Node.js Manager (`/nodejs-manager` — Cờ cấu hình `NODEJS_MANAGER_ENABLED`)
 - **Khởi tạo 1-Click từ Starter Template & Git Repository:**
-  - Hỗ trợ 5 kiến trúc mẫu sẵn sàng Production (**Express.js REST API**, **Next.js SSR**, **NestJS Enterprise API**, **Real-time WebSocket**, **Node.js Native HTTP**) hoặc sao chép trực tiếp từ Git Repository (kiểm duyệt nhánh Git nghiêm ngặt, cập nhật nguyên tử qua `git fetch --depth 1 origin -- <branch>` + `git reset --hard FETCH_HEAD`).
-  - Hỗ trợ đa phiên bản runtime Node.js (`v18`, `v20`, `v22`, `v24` do Admin quản lý cài đặt tập trung) và tự động cấp phát/gắn cơ sở dữ liệu MariaDB theo đúng quyền sở hữu (`db_mode: none | new | existing`) kèm cơ chế tự động hoàn tác (`_rollback_failed_install`) nếu quá trình triển khai gặp lỗi.
+  - Hỗ trợ 5 kiến trúc mẫu sẵn sàng Production (**Express.js REST API**, **Next.js SSR**, **NestJS Enterprise API**, **Real-time WebSocket**, **Node.js Native HTTP**) hoặc sao chép trực tiếp từ Git Repository (kiểm duyệt nhánh Git nghiêm ngặt, cập nhật nguyên tử qua `git remote set-url` + `git fetch --depth 1 origin -- <branch>` + `git reset --hard FETCH_HEAD`).
+  - Hỗ trợ đa phiên bản runtime Node.js (`v18`, `v20`, `v22`, `v24` do Admin quản lý cài đặt tập trung) và tự động cấp phát/gắn cơ sở dữ liệu MariaDB theo đúng quyền sở hữu (`db_mode: none | auto | existing`) kèm cơ chế tự động hoàn tác (`_rollback_failed_install`) nếu quá trình triển khai gặp lỗi.
 - **Cô lập Tiến trình `systemd` & Bảo mật Biến Môi trường (`.env`):**
   - Mỗi ứng dụng vận hành trên một unit `systemd` riêng dưới định danh Linux user của chủ sở hữu, áp dụng chặt chẽ hạn mức số lượng ứng dụng (`node_apps_limit`) và trần bộ nhớ RAM (`node_app_memory_mb` / `MemoryMax`) của gói dịch vụ.
-  - Tệp `.env` được sao chép và lọc dưới quyền Linux user của khách sang `/var/lib/spanel/nodejs/<base>.env` (`0600 root:root`) trước khi `systemd` nạp `EnvironmentFile`, ngăn chặn tuyệt đối tấn công đọc tệp hệ thống qua symlink.
+  - Tệp `.env` được sao chép và lọc dưới quyền Linux user của khách sang `/etc/spanel/nodejs-env/<unit>.env` (`0600 root:root`) trước khi `systemd` nạp `EnvironmentFile`, ngăn chặn tuyệt đối tấn công đọc tệp hệ thống qua symlink cũng như ghi đè các biến điều khiển runtime.
   - Cấp phát cổng nội bộ có ràng buộc `UNIQUE` cấp cơ sở dữ liệu (`nodejs_instances.port`), tự động cấu hình Nginx Reverse Proxy hỗ trợ sẵn WebSocket (`Upgrade` / `Connection`) và theo dõi trực tiếp `MainPID`, `MemoryCurrent`, `NRestarts` từ `systemd`.
 - **Triển khai Tự động qua Git Webhook & Gia cố Bảo mật 7 Điểm:**
   - Webhook mặc định tắt, sử dụng token ngẫu nhiên mã hóa kèm secret ký xác thực `HMAC-SHA256` (`X-Hub-Signature-256` / `X-Gitlab-Token`), chạy nền bất đồng bộ (`202 Accepted`) với khóa chống xung đột theo từng website (`409 Conflict`).
   - Tích hợp trình quản lý gói `npm` (`install`, `ci`, `run build`, `prune`, `audit`) và 7 chốt kiểm tra bảo mật tự động (chặn lộ `.env`/`.git` trên Nginx, kiểm tra quyền tệp `0640`, khóa thực thi script trong `uploads`, đồng bộ `NODE_ENV=production`).
+
+##### Hướng dẫn Kích hoạt & Cấu hình Node.js Manager
+
+Để đảm bảo máy chủ vận hành tinh gọn khi chưa có nhu cầu chạy ứng dụng Node.js, **Node.js Manager** mặc định ở trạng thái tắt (`NODEJS_MANAGER_ENABLED=false`). Quản trị viên thực hiện 4 bước sau để bật đầy đủ tính năng cho máy chủ và khách hàng:
+
+1. **Bước 1 — Bật cờ `NODEJS_MANAGER_ENABLED=true` trên máy chủ:**
+   Đăng nhập SSH với quyền `root` và chạy lệnh sau để kích hoạt module trong `/opt/spanel/backend/.env` rồi khởi động lại `spanel-api`:
+   ```bash
+   grep -q '^NODEJS_MANAGER_ENABLED=' /opt/spanel/backend/.env \
+     && sudo sed -i 's/^NODEJS_MANAGER_ENABLED=.*/NODEJS_MANAGER_ENABLED=true/' /opt/spanel/backend/.env \
+     || echo 'NODEJS_MANAGER_ENABLED=true' | sudo tee -a /opt/spanel/backend/.env
+   sudo systemctl restart spanel-api
+   ```
+2. **Bước 2 — Bật tiện ích mở rộng `Application` trong Addon Manager (`/addons`):**
+   - Đăng nhập SPanel với quyền **Admin** → truy cập menu **Extra Features → Addon Manager (`/addons`)**.
+   - Tại mục **Application (Node/Python/Docker)**, nhấn **Install / Enable** để mở khóa nhóm tính năng ứng dụng trên toàn máy chủ.
+3. **Bước 3 — Cấp hạn mức Node.js trong Gói Dịch vụ (`Manage User Packages` — `/packages`):**
+   - Truy cập **Account Manager → Manage User Packages (`/packages`)**, chọn tạo mới hoặc chỉnh sửa gói dịch vụ của khách hàng:
+     - **Node.js Apps Limit (`node_apps_limit`):** Đặt số lượng ứng dụng Node.js tối đa được phép tạo lớn hơn `0` (ví dụ: `3` hoặc `5`). *(Lưu ý: Nếu gói có hạn mức bằng `0`, tài khoản End User sẽ không thấy menu Node.js và không thể kích hoạt Webhook).*
+     - **Node.js App Memory Ceiling (`node_app_memory_mb`):** Đặt trần bộ nhớ RAM tối đa cho mỗi tiến trình Node.js (ví dụ: `512 MB` hoặc `1024 MB`).
+4. **Bước 4 — Cài đặt Node.js Runtime (`v18` / `v20` / `v22` / `v24`) & Khởi tạo Ứng dụng (`/nodejs-manager`):**
+   - Trên thanh công cụ góc trên bên phải của **Admin**, chuyển góc nhìn sang **User** (hoặc dùng **Login as** vào tài khoản khách hàng) → mở menu **Application → Node.js (`/nodejs-manager`)**.
+   - **Cài đặt Runtime (chỉ Admin):** Nhấn nút **Node.js Runtimes** trên thanh công cụ để cài đặt 1-Click các phiên bản Node.js LTS (`v22`, `v20`, `v18`, `v24`) vào hệ thống.
+   - **Triển khai Ứng dụng (End User):** Nhấn **+ Cài đặt Node.js**, chọn tên miền đích, kiến trúc mẫu (**Starter Template** hoặc **Git Repository**), phiên bản Node.js, giới hạn RAM và chế độ cơ sở dữ liệu để khởi chạy ứng dụng.
 
 #### 🔴 Laravel Manager (`/laravel-manager` — Composer, Artisan, Queue Worker & Bảo mật)
 - **Triển khai & Nhận diện Tự động:**
