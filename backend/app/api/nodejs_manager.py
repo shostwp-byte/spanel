@@ -796,6 +796,33 @@ def _parse_kv_output(raw: str) -> Dict[str, str]:
     return parsed
 
 
+def _worker_sync_helper_args(
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    *,
+    node_major: str,
+    port: int,
+    memory_mb: int,
+    start_mode: str,
+    start_arg: str,
+    node_env: str,
+    enabled: bool,
+) -> List[str]:
+    return [
+        linux_user,
+        str(site_root),
+        str(app_dir),
+        str(node_major),
+        str(port),
+        str(memory_mb),
+        str(start_mode),
+        str(start_arg),
+        str(node_env),
+        "1" if enabled else "0",
+    ]
+
+
 def _sync_nodejs_worker_unit(
     linux_user: str,
     site_root: Path,
@@ -834,18 +861,18 @@ def _sync_nodejs_worker_unit(
 
     res = shell.privileged(
         "nodejs-worker-sync",
-        helper_args=[
+        helper_args=_worker_sync_helper_args(
             linux_user,
-            str(site_root),
-            str(app_dir),
-            clean_major,
-            clean_mode,
-            clean_arg,
-            str(clean_port),
-            str(clean_mem),
-            clean_env,
-            "1" if enabled else "0",
-        ],
+            site_root,
+            app_dir,
+            node_major=clean_major,
+            port=clean_port,
+            memory_mb=clean_mem,
+            start_mode=clean_mode,
+            start_arg=clean_arg,
+            node_env=clean_env,
+            enabled=enabled,
+        ),
         check=False,
         timeout=120,
     )
@@ -2123,7 +2150,7 @@ def install_nodejs_instance(
         memory_mb=int(payload.memory_mb or 512),
         node_env=payload.node_env or "production",
         enabled=True,
-        strict=False,
+        strict=True,
     )
     _sync_nodejs_nginx_vhost(site, linux_user, site_root, port, strict=False)
 
