@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from jinja2 import Environment, FileSystemLoader
@@ -399,56 +399,67 @@ _VHOST_DOCROOT_RE = re.compile(r"^\s*root\s+([^;\s]+);", re.MULTILINE)
 _VHOST_PHP_VER_RE = re.compile(r"php(\d+\.\d+)-fpm")
 
 
-def _domain_matches_user(domain: str, user: User) -> bool:
-    clean_domain = (domain or "").strip().lower()
-    uname = (getattr(user, "username", "") or "").strip().lower()
-    uemail = (getattr(user, "email", "") or "").strip().lower()
-    if not clean_domain or not uname:
-        return False
-    try:
-        if not settings.command_dry_run and (Path("/home") / uname / clean_domain).is_dir():
-            return True
-    except OSError:
-        pass
-    return False
-    if uemail.endswith("@" + clean_domain):
+def _was_vhost_deleted(db: Session, stem: str, vhost_user: str = "") -> bool:
+    last_create = (
+        db.query(AuditLog.id)
+        .filter(AuditLog.target == stem, AuditLog.action == "create_website")
+        .order_by(AuditLog.id.desc())
+        .first()
+    )
+    created_id = last_create[0] if last_create else 0
+
+    last_target_audit = (
+        db.query(AuditLog)
+        .filter(AuditLog.target == stem)
+        .order_by(AuditLog.id.desc())
+        .first()
+    )
+    if (
+        last_target_audit
+        and last_target_audit.id > created_id
+        and last_target_audit.action in {"delete_website", "delete_user", "provisioning_terminate"}
+    ):
         return True
-    compact_domain = re.sub(r"[^a-z0-9]", "", clean_domain)
-    first_label = re.sub(r"[^a-z0-9]", "", clean_domain.split(".")[0])
-    compact_user = re.sub(r"[^a-z0-9]", "", uname)
-    if len(compact_user) >= 3:
-        if compact_domain.startswith(compact_user):
+
+    if vhost_user:
+        last_user_delete = (
+            db.query(AuditLog)
+            .filter(AuditLog.target == vhost_user, AuditLog.action == "delete_user")
+            .order_by(AuditLog.id.desc())
+            .first()
+        )
+        if last_user_delete and last_user_delete.id > created_id:
             return True
-        if len(first_label) >= 3 and compact_user.startswith(first_label):
+
+    for row in (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.action.in_(("delete_user", "provisioning_terminate")),
+            AuditLog.id > created_id,
+        )
+        .order_by(AuditLog.id.desc())
+        .all()
+    ):
+        domains_part = (row.detail or "").split(" +", 1)[0]
+        deleted_set = {d.strip().lower() for d in domains_part.split(",") if d.strip()}
+        if stem in deleted_set:
             return True
-        if first_label == compact_user:
-            return True
+
     return False
 
 
 def reconcile_websites_from_disk(db: Session) -> None:
-    """Self-heal missing Website rows from managed Nginx vhosts on disk and
-    reconcile domain ownership when a domain's owner_id is dangling or was
-    inadvertently created under admin instead of its matching customer account.
+    """Restore missing Website rows from managed Nginx vhosts on disk without
+    ever reassigning ownership or moving files across accounts.
     """
-    if settings.command_dry_run or not getattr(db, "_explicit_reconcile_allowed", False):
+    if settings.command_dry_run:
         return
-    try:
-        from app.models.entities import DnsZone
-    except Exception:
-        DnsZone = None
 
     try:
         all_users = db.query(User).order_by(User.id.asc()).all()
         if not all_users:
             return
-        users_by_id = {u.id: u for u in all_users}
         users_by_name = {(u.username or "").strip().lower(): u for u in all_users if u.username}
-        end_users = [
-            u for u in all_users
-            if not is_admin_role(u.role) and normalize_role(u.role) != Role.reseller
-        ]
-        primary_admin = next((u for u in all_users if is_admin_role(u.role)), all_users[0])
 
         known_websites = db.query(Website).all()
         known_domains = {(w.domain or "").strip().lower() for w in known_websites if w.domain}
@@ -466,13 +477,7 @@ def reconcile_websites_from_disk(db: Session) -> None:
                     or not site_users.DOMAIN_RE.match(stem)
                 ):
                     continue
-                last_audit = (
-                    db.query(AuditLog)
-                    .filter(AuditLog.target == stem)
-                    .order_by(AuditLog.id.desc())
-                    .first()
-                )
-                if last_audit and last_audit.action in {"delete_website", "delete_user", "provisioning_terminate"}:
+                if _was_vhost_deleted(db, stem):
                     try:
                         nginx.delete_wordpress_vhost(stem)
                     except Exception:
@@ -497,9 +502,9 @@ def reconcile_websites_from_disk(db: Session) -> None:
                     if candidate in {"/var/www/spanel-acme", "/usr/share/phpmyadmin"}:
                         continue
                     if not root_path:
-                        p_cand = Path(candidate)
+                        p_cand = PurePosixPath(candidate)
                         if p_cand.name == "public_html":
-                            root_path = str(p_cand.parent)
+                            root_path = p_cand.parent.as_posix()
                         else:
                             root_path = candidate
                     elif candidate.startswith(root_path.rstrip("/") + "/"):
@@ -522,42 +527,27 @@ def reconcile_websites_from_disk(db: Session) -> None:
                 else:
                     app_type = "static"
 
-                parts = Path(root_path).parts
+                parts = PurePosixPath(root_path).parts
                 vhost_user = parts[2].lower() if len(parts) > 2 else ""
+                if _was_vhost_deleted(db, stem, vhost_user):
+                    try:
+                        nginx.delete_wordpress_vhost(stem)
+                    except Exception:
+                        pass
+                    continue
 
-                owner = None
-                if vhost_user and vhost_user in users_by_name and not is_admin_role(users_by_name[vhost_user].role):
-                    owner = users_by_name[vhost_user]
-                if owner is None and DnsZone is not None:
-                    z = db.query(DnsZone).filter(DnsZone.name == stem).first()
-                    if z and z.owner_id and z.owner_id in users_by_id and not is_admin_role(users_by_id[z.owner_id].role):
-                        owner = users_by_id[z.owner_id]
+                owner = users_by_name.get(vhost_user)
                 if owner is None:
-                    for u in end_users:
-                        if _domain_matches_user(stem, u):
-                            owner = u
-                            break
-                if owner is None:
-                    owner = users_by_name.get(vhost_user) or primary_admin
+                    continue
 
                 target_linux_user = site_users.linux_user_for_panel_username(owner.username)
-                target_root_path = site_users.site_root_for_panel_user(owner.username, stem)
-                runtime_php = php_version if app_type in {"wordpress", "php"} else None
-                try:
-                    if root_path != target_root_path:
-                        site_users.move_site_runtime(root_path, target_root_path, target_linux_user, runtime_php)
-                        root_path = target_root_path
-                    else:
-                        site_users.ensure_site_runtime(stem, root_path, runtime_php, target_linux_user)
-                except Exception:
-                    pass
-
                 ssl_live = Path("/etc/letsencrypt/live") / stem
                 has_le = False
                 try:
                     has_le = (ssl_live / "fullchain.pem").is_file() and (ssl_live / "privkey.pem").is_file()
                 except OSError:
-                    has_le = "listen 443 ssl" in text
+                    has_le = False
+                has_ssl = bool(has_le or "listen 443 ssl" in text)
 
                 recovered = Website(
                     domain=stem,
@@ -568,8 +558,8 @@ def reconcile_websites_from_disk(db: Session) -> None:
                     php_version=php_version,
                     app_type=app_type,
                     nginx_rewrite_mode="front_controller" if app_type == "wordpress" else "none",
-                    ssl_enabled=bool(has_le or "listen 443 ssl" in text),
-                    ssl_mode="letsencrypt" if (has_le or "listen 443 ssl" in text) else "none",
+                    ssl_enabled=has_ssl,
+                    ssl_mode="letsencrypt" if has_le else ("manual" if has_ssl else "none"),
                     status="active",
                 )
                 db.add(recovered)
@@ -579,65 +569,8 @@ def reconcile_websites_from_disk(db: Session) -> None:
                 known_websites.append(recovered)
                 try:
                     _ensure_default_waf_file(recovered.domain)
-                    _rewrite_website_vhost(recovered)
                 except Exception:
                     pass
-
-        # 2. Reconcile websites whose owner_id is dangling or set to admin when a matching end_user exists
-        site_counts: dict[int, int] = {u.id: 0 for u in all_users}
-        for w in known_websites:
-            if w.owner_id in site_counts:
-                site_counts[w.owner_id] += 1
-
-        for w in known_websites:
-            current_owner = users_by_id.get(w.owner_id)
-            if current_owner is not None:
-                continue
-            matched_user = None
-            w_linux = (w.linux_user or "").strip().lower()
-            if w_linux and w_linux in users_by_name and not is_admin_role(users_by_name[w_linux].role):
-                matched_user = users_by_name[w_linux]
-            if matched_user is None and DnsZone is not None:
-                z = db.query(DnsZone).filter(DnsZone.name == w.domain).first()
-                if z and z.owner_id and z.owner_id in users_by_id and not is_admin_role(users_by_id[z.owner_id].role):
-                    matched_user = users_by_id[z.owner_id]
-            if matched_user is None:
-                for u in end_users:
-                    eff_limit = effective_website_limit(u)
-                    if quota.is_quota_reached(site_counts.get(u.id, 0), eff_limit):
-                        continue
-                    if _domain_matches_user(w.domain, u):
-                        matched_user = u
-                        break
-            if matched_user is None:
-                continue
-
-            new_linux_user = site_users.linux_user_for_panel_username(matched_user.username)
-            new_root_path = site_users.site_root_for_panel_user(matched_user.username, w.domain)
-            runtime_php = w.php_version if (w.app_type or "wordpress") in {"wordpress", "php"} else None
-            try:
-                if w.root_path != new_root_path or w.linux_user != new_linux_user:
-                    site_users.move_site_runtime(w.root_path, new_root_path, new_linux_user, runtime_php)
-                    w.root_path = new_root_path
-                    w.linux_user = new_linux_user
-                    _ensure_default_waf_file(w.domain)
-                    _rewrite_website_vhost(w, root_path=new_root_path, linux_user=new_linux_user)
-            except Exception:
-                w.root_path = new_root_path
-                w.linux_user = new_linux_user
-
-            if w.owner_id in site_counts and site_counts[w.owner_id] > 0:
-                site_counts[w.owner_id] -= 1
-            w.owner_id = matched_user.id
-            site_counts[matched_user.id] = site_counts.get(matched_user.id, 0) + 1
-            for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == w.id).all():
-                if db_acc.owner_id != matched_user.id:
-                    db_acc.owner_id = matched_user.id
-            if DnsZone is not None:
-                z = db.query(DnsZone).filter(DnsZone.name == w.domain).first()
-                if z and z.owner_id != matched_user.id:
-                    z.owner_id = matched_user.id
-            db.commit()
     except Exception:
         db.rollback()
 
@@ -646,7 +579,6 @@ def reconcile_websites_from_disk(db: Session) -> None:
 def create_website(payload: WebsiteCreate, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Create a website. If install_wordpress is False, only creates the domain
     folder + Nginx vhost (no DB, no WordPress files)."""
-    reconcile_websites_from_disk(db)
     requested_owner_id = payload.owner_id
     access_role = (request.headers.get("x-access-role") or "").strip().lower() if (request is not None and getattr(request, "headers", None)) else ""
     if (is_admin_role(current_user.role) or normalize_role(current_user.role) == Role.reseller) and requested_owner_id is None:
@@ -931,7 +863,6 @@ def list_websites(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    reconcile_websites_from_disk(db)
     search = (q or "").strip().lower()
     access_role = (request.headers.get("x-access-role") or "").strip().lower() if (request is not None and getattr(request, "headers", None)) else ""
     if scope == "own" or access_role in {"user", "end_user"}:
@@ -1044,7 +975,6 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
     if not _is_authorized_for_website(db, website, current_user):
         ensure_role(current_user.role, Role.admin)
     if payload.domain is not None and payload.domain != website.domain:
-        reconcile_websites_from_disk(db)
         if _hostname_conflicts(db, payload.domain):
             raise HTTPException(status_code=409, detail="Domain already exists")
         old_domain = website.domain
