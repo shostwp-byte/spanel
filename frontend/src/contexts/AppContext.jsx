@@ -114,8 +114,12 @@ export function formatFileTime(seconds, withSeconds = false) {
 export function storageLimitBytes(user) {
   if (!user) return null;
   if (user.storage_limit_bytes === null) return null;
-  if (user.storage_limit_bytes !== undefined) return user.storage_limit_bytes;
-  return Number(user.storage_limit_mb || 0) * 1024 * 1024;
+  if (user.storage_limit_bytes !== undefined) {
+    const b = Number(user.storage_limit_bytes);
+    return b > 0 ? b : null;
+  }
+  const mb = Number(user.storage_limit_mb || 0);
+  return mb > 0 ? mb * 1024 * 1024 : null;
 }
 
 export function storageUsageText(user) {

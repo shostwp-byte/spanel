@@ -34,7 +34,7 @@ function normalizeDomainFinal(raw) {
 
 function formatPackageSummary(pkg) {
   if (!pkg) return '';
-  const storageText = Number(pkg.storage_limit_mb) < 0
+  const storageText = Number(pkg.storage_limit_mb) <= 0
     ? t('Unlimited disk')
     : Number(pkg.storage_limit_mb) >= 1024
       ? `${(Number(pkg.storage_limit_mb) / 1024).toFixed(Number(pkg.storage_limit_mb) % 1024 === 0 ? 0 : 1)} GB`

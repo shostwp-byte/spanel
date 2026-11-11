@@ -840,3 +840,176 @@ def test_alembic_unify_package_quota_limits_migration():
                 eng.dispose()
         finally:
             settings.database_url = prev_url
+
+
+def test_unlimited_storage_quota_allows_end_user_add_domain(tmp_path):
+    """End users with storage_limit_mb <= 0 (0 or -1 = Unlimited) must not fail
+    with 'Storage quota exceeded: 1 MB used/projected, limit 0 MB' when adding a domain."""
+    from app.api import websites as websites_api
+    from app.models.entities import User, UserPackage
+    from app.schemas.schemas import WebsiteCreate
+    from app.services import site_users, storage_quota
+
+    engine, db = _make_sqlite_session()
+    prev_home = site_users.HOME_ROOT
+    site_users.HOME_ROOT = tmp_path
+    try:
+        for idx, limit_mb in enumerate((0, -1)):
+            pkg = UserPackage(
+                name=f"UnlimStorage_{idx}",
+                website_limit=5,
+                subdomain_limit=10,
+                storage_limit_mb=limit_mb,
+            )
+            db.add(pkg)
+            db.flush()
+            user = User(
+                username=f"enduser{idx}",
+                email=f"enduser{idx}@example.test",
+                hashed_password="x",
+                role="end_user",
+                package_id=pkg.id,
+                website_limit=5,
+                storage_limit_mb=limit_mb,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            assert storage_quota.user_storage_limit_bytes(user) is None
+            storage_quota.enforce_user_storage_quota(
+                db, user, incoming_bytes=storage_quota.STATIC_SITE_ESTIMATE_BYTES
+            )
+
+            fake_req = MagicMock()
+            fake_req.headers = {}
+            fake_req.client = SimpleNamespace(host="127.0.0.1")
+
+            with (
+                patch.object(websites_api, "reconcile_websites_from_disk"),
+                patch.object(websites_api, "_ensure_default_waf_file"),
+                patch.object(websites_api, "_write_placeholder_page"),
+                patch.object(websites_api, "_sync_http_flood_zones"),
+                patch("app.services.mail.webmail_host_taken", return_value=False),
+                patch("app.services.site_users.ensure_site_runtime", side_effect=lambda _d, _r, _p, u: u),
+                patch("app.services.site_users.fix_site_path", return_value=_ok_proc()),
+                patch("app.services.nginx.write_vhost", return_value="/etc/nginx/conf.d/test.conf"),
+                patch("app.services.waf.sync_website_rules", return_value=_ok_proc()),
+                patch("app.services.dns.zone_for_new_website"),
+                patch.object(websites_api, "log_action"),
+            ):
+                site = websites_api.create_website(
+                    WebsiteCreate(domain=f"unlim-{idx}.test", install_wordpress=False, app_type="php"),
+                    fake_req,
+                    db,
+                    user,
+                )
+                assert site.domain == f"unlim-{idx}.test"
+    finally:
+        site_users.HOME_ROOT = prev_home
+        db.close()
+        engine.dispose()
+
+
+def test_rename_domain_moves_runtime_rewrites_vhost_and_renames_subdomains(tmp_path):
+    """Renaming a domain via PATCH /api/websites/{id} moves root_path to the new
+    managed domain directory, passes nginx.render_vhost root_path validation,
+    renames child subdomains, and rolls back cleanly on failure."""
+    from app.api import websites as websites_api
+    from app.core.config import settings
+    from app.models.entities import User, Website
+    from app.schemas.schemas import WebsiteUpdate
+    from app.services import site_users
+
+    engine, db = _make_sqlite_session()
+    prev_home = site_users.HOME_ROOT
+    prev_dry = settings.command_dry_run
+    site_users.HOME_ROOT = tmp_path
+    settings.command_dry_run = True
+    try:
+        user = User(
+            username="renamer",
+            email="renamer@example.test",
+            hashed_password="x",
+            role="end_user",
+            website_limit=5,
+            storage_limit_mb=-1,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        old_root = site_users.site_root_for_panel_user("renamer", "old-site.test")
+        sub_old_root = site_users.site_root_for_panel_user("renamer", "blog.old-site.test")
+        (Path(old_root) / "public_html").mkdir(parents=True, exist_ok=True)
+        (Path(sub_old_root) / "public_html").mkdir(parents=True, exist_ok=True)
+
+        site = Website(
+            domain="old-site.test",
+            owner_id=user.id,
+            root_path=old_root,
+            document_root="public_html",
+            linux_user="renamer",
+            php_version="8.4",
+            app_type="php",
+            ssl_enabled=True,
+            ssl_mode="letsencrypt",
+        )
+        sub_site = Website(
+            domain="blog.old-site.test",
+            owner_id=user.id,
+            root_path=sub_old_root,
+            document_root="public_html",
+            linux_user="renamer",
+            php_version="8.4",
+            app_type="php",
+        )
+        db.add_all([site, sub_site])
+        db.commit()
+        db.refresh(site)
+        db.refresh(sub_site)
+
+        move_calls = []
+        deleted_vhosts = []
+
+        def fake_move(old_p, new_p, linux_u, php_v):
+            move_calls.append((old_p, new_p, linux_u, php_v))
+            (Path(new_p) / "public_html").mkdir(parents=True, exist_ok=True)
+            return new_p
+
+        with (
+            patch.object(websites_api, "_ensure_default_waf_file"),
+            patch("app.services.mail.webmail_host_taken", return_value=False),
+            patch("app.services.site_users.move_site_runtime", side_effect=fake_move),
+            patch("app.services.waf.sync_website_rules", return_value=_ok_proc()),
+            patch("app.services.waf.remove_site_rules", return_value=_ok_proc()),
+            patch("app.services.nginx.delete_wordpress_vhost", side_effect=deleted_vhosts.append),
+            patch("app.services.ssl.release_site_certificates"),
+            patch("app.services.dns.zone_for_new_website"),
+            patch.object(websites_api, "log_action"),
+        ):
+            updated = websites_api.update_website(
+                site.id,
+                WebsiteUpdate(domain="new-site.test"),
+                db,
+                user,
+            )
+
+        expected_new_root = site_users.site_root_for_panel_user("renamer", "new-site.test")
+        expected_sub_new_root = site_users.site_root_for_panel_user("renamer", "blog.new-site.test")
+        assert updated.domain == "new-site.test"
+        assert updated.root_path == expected_new_root
+        assert updated.ssl_enabled is False
+        assert move_calls[0] == (old_root, expected_new_root, "renamer", "8.4")
+        assert "old-site.test" in deleted_vhosts
+
+        db.refresh(sub_site)
+        assert sub_site.domain == "blog.new-site.test"
+        assert sub_site.root_path == expected_sub_new_root
+        assert "blog.old-site.test" in deleted_vhosts
+    finally:
+        site_users.HOME_ROOT = prev_home
+        settings.command_dry_run = prev_dry
+        db.close()
+        engine.dispose()
+

@@ -169,7 +169,7 @@ export function MaintenancePage({ request, isAdmin, websites: propWebsites, user
       if (loadUsers) await loadUsers();
       if (refreshAll) await refreshAll();
       const summaryLines = (users || []).map(
-        u => `${u.username} (${u.role}): ${formatBytesShort(u.storage_used_bytes || 0)} / ${u.storage_limit_mb ? u.storage_limit_mb + ' MB' : 'Unlimited'}`
+        u => `${u.username} (${u.role}): ${formatBytesShort(u.storage_used_bytes || 0)} / ${Number(u.storage_limit_mb) > 0 ? u.storage_limit_mb + ' MB' : 'Unlimited'}`
       );
       appendLog(
         `Recalculate Storage Quotas (${users.length} account(s))`,

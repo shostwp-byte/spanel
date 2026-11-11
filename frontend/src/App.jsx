@@ -1252,7 +1252,7 @@ function AppContent() {
       flag('bad', t('Quota'), t('{n} of your MySQL database(s) are write-locked due to quota.', { n: tenants.own_locked_databases_count }), 'databases', t('Databases'), Database);
     }
     if (currentUser) {
-      const limitBytes = Number(currentUser.storage_limit_bytes ?? (Number(currentUser.storage_limit_mb || 0) * 1024 * 1024));
+      const limitBytes = Number(currentUser.storage_limit_bytes ?? (Number(currentUser.storage_limit_mb) > 0 ? Number(currentUser.storage_limit_mb) * 1024 * 1024 : 0));
       const usedBytes = Number(currentUser.storage_used_bytes || 0);
       if (limitBytes > 0 && usedBytes > 0) {
         const storagePct = (usedBytes / limitBytes) * 100;
@@ -3875,8 +3875,12 @@ function AppContent() {
   function storageLimitBytes(user) {
     if (!user) return null;
     if (user.storage_limit_bytes === null) return null;
-    if (user.storage_limit_bytes !== undefined) return user.storage_limit_bytes;
-    return Number(user.storage_limit_mb || 0) * 1024 * 1024;
+    if (user.storage_limit_bytes !== undefined) {
+      const b = Number(user.storage_limit_bytes);
+      return b > 0 ? b : null;
+    }
+    const mb = Number(user.storage_limit_mb || 0);
+    return mb > 0 ? mb * 1024 * 1024 : null;
   }
 
   function storageUsageText(user) {

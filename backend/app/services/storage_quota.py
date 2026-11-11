@@ -41,10 +41,29 @@ class StorageQuotaExceeded(ValueError):
     pass
 
 
-def user_storage_limit_bytes(user: User) -> int | None:
-    if is_admin_role(user.role):
+def effective_storage_limit_mb(user: User | None) -> int:
+    """Resolve effective storage limit in MB for a user (-1 = unlimited, >0 = quota in MB).
+
+    In SPanel packages and resource limits, both ``0`` and ``-1`` (any value ``<= 0``)
+    represent Unlimited disk storage (matching ``Packages.jsx`` ``zeroIsUnlimited: true``,
+    ``resource_monitor.py``, ``resources.py``, and Linux kernel ``setquota 0 0``).
+    """
+    if user is None or is_admin_role(getattr(user, "role", None)):
+        return -1
+    raw = getattr(user, "storage_limit_mb", None)
+    if raw is None and getattr(user, "package", None) is not None:
+        raw = getattr(user.package, "storage_limit_mb", None)
+    if raw is None:
+        return -1
+    val = int(raw)
+    return val if val > 0 else -1
+
+
+def user_storage_limit_bytes(user: User | None) -> int | None:
+    limit_mb = effective_storage_limit_mb(user)
+    if limit_mb <= 0:
         return None
-    return max(0, int(user.storage_limit_mb or 0)) * BYTES_PER_MB
+    return limit_mb * BYTES_PER_MB
 
 
 def path_usage_bytes(path: str | Path) -> int:

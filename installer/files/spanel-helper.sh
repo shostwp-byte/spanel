@@ -12961,6 +12961,8 @@ EOF
     ensure_panel_user_home "$user"
     if [[ "$old_target" != "$new_target" ]]; then
       [[ ! -e "$new_target" && ! -L "$new_target" ]] || deny "target path already exists: $new_target"
+      delete_laravel_worker_units "$old_user" "$old_target"
+      delete_nodejs_worker_units "$old_user" "$old_target"
       delete_site_php_pools "$old_user" "$old_target"
       mkdir -p "$(dirname "$new_target")"
       if [[ -e "$old_target" ]]; then
@@ -12969,7 +12971,7 @@ EOF
         mkdir -p "$new_target"
       fi
     fi
-    if [[ -d "$new_target/public" && ! -e "$new_target/public_html" ]]; then
+    if [[ -d "$new_target/public" && ! -e "$new_target/public_html" && ! -f "$new_target/artisan" ]]; then
       mv "$new_target/public" "$new_target/public_html"
     fi
     mkdir -p "$new_target/public_html"

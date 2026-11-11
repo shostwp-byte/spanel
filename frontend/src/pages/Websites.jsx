@@ -798,8 +798,19 @@ export function WebsitesPage({
 
   async function handleRenameDomain() {
     const targetId = renameTargetId || (defaultSite ? String(defaultSite.id) : '');
-    const cleanNew = String(renameNewDomain || '').trim().toLowerCase();
+    const cleanNew = String(renameNewDomain || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^https?:\/\//, '')
+      .replace(/\/.*$/, '')
+      .replace(/:\d+$/, '')
+      .replace(/^\.+|\.+$/g, '');
     if (!targetId || !cleanNew) {
+      setError(t('Please enter a new domain name.'));
+      return;
+    }
+    const targetSite = rootDomains.find(d => String(d.id) === String(targetId));
+    if (targetSite && String(targetSite.domain || '').toLowerCase() === cleanNew) {
       setError(t('Please enter a new domain name.'));
       return;
     }
@@ -811,7 +822,13 @@ export function WebsitesPage({
     if (data) {
       setRenameModalOpen(false);
       setRenameNewDomain('');
-      setNotice(t('Renamed domain to {domain}.', { domain: cleanNew }));
+      if (nginxCustomEditing && String(nginxCustomEditing.id) === String(targetId)) {
+        setNginxCustomEditing(prev => prev ? ({ ...prev, domain: data.domain || cleanNew, site: data }) : prev);
+      }
+      if (fileAppId && String(fileAppId) === String(targetId) && setFileListPath) {
+        setFileListPath('public_html');
+      }
+      setNotice(t('Renamed domain to {domain}.', { domain: data.domain || cleanNew }));
       await loadWebsiteList(websiteSearch, false);
       if (refreshAll) await refreshAll();
     }

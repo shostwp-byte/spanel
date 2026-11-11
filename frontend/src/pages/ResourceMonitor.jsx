@@ -751,7 +751,7 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
             return (
               <div style={{ padding: '12px 14px', background: 'var(--surface-alt)', borderRadius: '8px', border: '1px solid var(--border)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px', fontSize: '12px', flexWrap: 'wrap', gap: '8px' }}>
-                  <strong>{t('Storage Composition Breakdown')} ({fmtBytes(b.storage_used_bytes)} / {selectedUser.storage_limit_mb ? `${selectedUser.storage_limit_mb} MB` : t('Unlimited')})</strong>
+                  <strong>{t('Storage Composition Breakdown')} ({fmtBytes(b.storage_used_bytes)} / {Number(selectedUser.storage_limit_mb) > 0 ? `${selectedUser.storage_limit_mb} MB` : t('Unlimited')})</strong>
                   <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
                     <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#3b82f6', marginRight: 5 }} />Web: <strong>{fmtBytes(b.web_used_bytes)}</strong></span>
                     <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: '#f59e0b', marginRight: 5 }} />MySQL: <strong>{fmtBytes(b.mysql_used_bytes)}</strong></span>

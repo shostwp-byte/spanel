@@ -136,11 +136,11 @@ def _enforce_reseller_quotas(
 
     if not overselling:
         if total_storage_mb > 0:
-            allocated_storage = sum(int(u.storage_limit_mb or 0) for u in other_users)
+            allocated_storage = sum(max(0, int(u.storage_limit_mb or 0)) for u in other_users)
             if target_storage_mb <= 0 or allocated_storage + target_storage_mb > total_storage_mb:
                 raise HTTPException(status_code=403, detail="Reseller storage quota exceeded")
         if total_website_limit > 0:
-            allocated_websites = sum(int(u.website_limit or 0) for u in other_users)
+            allocated_websites = sum(max(0, int(u.website_limit or 0)) for u in other_users)
             if target_website_limit <= 0 or allocated_websites + target_website_limit > total_website_limit:
                 raise HTTPException(status_code=403, detail="Reseller website quota exceeded")
         if total_database_limit > 0:
@@ -304,8 +304,6 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
 
         if quota_service.is_quota_reached(0, effective_website_limit):
             raise HTTPException(status_code=403, detail="Website limit reached")
-        if effective_storage_mb == 0:
-            raise HTTPException(status_code=403, detail="Storage limit reached")
     effective_terminal = (
         bool(payload.terminal_enabled)
         if payload.terminal_enabled is not None

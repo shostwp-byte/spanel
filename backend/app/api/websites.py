@@ -108,6 +108,44 @@ def _write_placeholder_page(domain: str, root_path: str, linux_user: str | None,
     )
 
 
+def _refresh_placeholder_page_if_unchanged(
+    old_domain: str,
+    new_domain: str,
+    root_path: str,
+    linux_user: str | None,
+    php_version: str,
+) -> None:
+    if settings.command_dry_run:
+        return
+    try:
+        placeholder = site_users.document_root(root_path) / "index.html"
+        if not placeholder.is_file():
+            return
+        env = Environment(loader=FileSystemLoader(_PLACEHOLDER_TEMPLATE_DIR), autoescape=True)
+        tmpl = env.get_template("placeholder.html.j2")
+        old_rendered = tmpl.render(domain=old_domain)
+        current_text = placeholder.read_text(encoding="utf-8", errors="ignore")
+        if current_text.strip() != old_rendered.strip():
+            return
+        placeholder_site = Website(
+            domain=new_domain,
+            owner_id=0,
+            root_path=root_path,
+            document_root="public_html",
+            linux_user=linux_user,
+            php_version=php_version,
+            app_type="php",
+        )
+        file_manager.write_text_file(
+            placeholder_site,
+            "public_html/index.html",
+            tmpl.render(domain=new_domain),
+            allow_executable=True,
+        )
+    except Exception:
+        pass
+
+
 def _website_http_flood_config(website: Website) -> dict:
     return nginx.http_flood_config_for_website(website)
 
@@ -418,7 +456,7 @@ def _was_vhost_deleted(db: Session, stem: str, vhost_user: str = "") -> bool:
     if (
         last_target_audit
         and last_target_audit.id > created_id
-        and last_target_audit.action in {"delete_website", "delete_user", "provisioning_terminate"}
+        and last_target_audit.action in {"delete_website", "delete_user", "provisioning_terminate", "rename_website"}
     ):
         return True
 
@@ -968,6 +1006,142 @@ def delete_website_alias(
     return {"ok": True}
 
 
+def _rename_single_website(
+    db: Session,
+    website: Website,
+    new_domain: str,
+    owner: User | None,
+    current_user_id: int | None = None,
+) -> None:
+    old_domain = website.domain
+    old_root_path = website.root_path
+    old_linux_user = website.linux_user
+    if owner is not None:
+        new_linux_user = website.linux_user or site_users.linux_user_for_panel_username(owner.username)
+        new_root_path = site_users.site_root_for_panel_user(owner.username, new_domain)
+    elif website.linux_user:
+        new_linux_user = site_users.validate_linux_user(website.linux_user)
+        new_root_path = site_users.site_root_for_panel_user(new_linux_user, new_domain)
+    else:
+        new_linux_user = None
+        new_root_path = str(site_users.legacy_site_root_for_domain(new_domain))
+
+    old_ssl_enabled = website.ssl_enabled
+    old_ssl_mode = getattr(website, "ssl_mode", "letsencrypt")
+    old_ssl_source_domain = getattr(website, "ssl_source_domain", None)
+    old_ssl_cert_path = website.ssl_cert_path
+    old_ssl_key_path = website.ssl_key_path
+    old_ssl_ca_path = website.ssl_ca_path
+    old_alias_ssl = [(alias_row, bool(alias_row.ssl_enabled)) for alias_row in (getattr(website, "aliases", []) or [])]
+    runtime_php = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
+    moved_runtime = False
+
+    try:
+        if new_linux_user and old_root_path != new_root_path:
+            site_users.move_site_runtime(old_root_path, new_root_path, new_linux_user, runtime_php)
+            moved_runtime = True
+        elif not new_linux_user and old_root_path != new_root_path and not settings.command_dry_run:
+            old_p = Path(old_root_path)
+            new_p = Path(new_root_path)
+            if old_p.exists() and not new_p.exists():
+                new_p.parent.mkdir(parents=True, exist_ok=True)
+                old_p.rename(new_p)
+                moved_runtime = True
+
+        website.domain = new_domain
+        website.root_path = new_root_path
+        if new_linux_user:
+            website.linux_user = new_linux_user
+        website.ssl_enabled = False
+        website.ssl_mode = "letsencrypt"
+        website.ssl_source_domain = None
+        website.ssl_cert_path = None
+        website.ssl_key_path = None
+        website.ssl_ca_path = None
+        for alias_row, _ in old_alias_ssl:
+            alias_row.ssl_enabled = False
+
+        _ensure_default_waf_file(website.domain)
+        waf_res = waf.sync_website_rules(website)
+        if waf_res.returncode != 0:
+            raise RuntimeError(_command_error(waf_res))
+        if website.http_flood_enabled:
+            _sync_http_flood_zones(db)
+        _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
+        nginx.delete_wordpress_vhost(old_domain)
+        waf.remove_site_rules(old_domain)
+        if website.http_flood_enabled:
+            _sync_http_flood_zones(db)
+
+        _refresh_placeholder_page_if_unchanged(
+            old_domain,
+            new_domain,
+            new_root_path,
+            new_linux_user,
+            website.php_version or "8.4",
+        )
+
+        if new_linux_user:
+            from app.models.entities import SftpAccount
+            from app.services import sftp_accounts
+
+            for sftp_acc in db.query(SftpAccount).filter(SftpAccount.website_id == website.id).all():
+                try:
+                    sftp_acc.chroot_path = sftp_accounts.ensure_account(
+                        new_linux_user, sftp_acc.linux_user, new_root_path
+                    )
+                except Exception:
+                    pass
+
+        from app.models.entities import NodejsInstance
+
+        node_inst = db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).first()
+        if node_inst is not None:
+            try:
+                from app.api.nodejs_manager import _sync_systemd_unit
+
+                _sync_systemd_unit(website, node_inst)
+            except Exception:
+                pass
+
+        try:
+            ssl.release_site_certificates(db, old_domain, exclude_website_id=website.id)
+        except Exception:
+            pass
+        try:
+            dns.zone_for_new_website(db, website)
+        except Exception:
+            pass
+        if current_user_id is not None:
+            log_action(db, current_user_id, "rename_website", old_domain, new_domain)
+    except Exception as exc:
+        website.domain = old_domain
+        website.root_path = old_root_path
+        website.linux_user = old_linux_user
+        website.ssl_enabled = old_ssl_enabled
+        website.ssl_mode = old_ssl_mode
+        website.ssl_source_domain = old_ssl_source_domain
+        website.ssl_cert_path = old_ssl_cert_path
+        website.ssl_key_path = old_ssl_key_path
+        website.ssl_ca_path = old_ssl_ca_path
+        for alias_row, prev_flag in old_alias_ssl:
+            alias_row.ssl_enabled = prev_flag
+        if moved_runtime:
+            try:
+                if new_linux_user:
+                    site_users.move_site_runtime(
+                        new_root_path, old_root_path, old_linux_user or new_linux_user, runtime_php
+                    )
+                elif not settings.command_dry_run and Path(new_root_path).exists() and not Path(old_root_path).exists():
+                    Path(new_root_path).rename(old_root_path)
+                _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
+            except Exception:
+                pass
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(status_code=400, detail=f"Cannot rename domain: {exc}") from exc
+
+
 @router.patch("/{website_id}", response_model=WebsiteOut)
 def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = db.query(Website).filter(Website.id == website_id).first()
@@ -978,15 +1152,28 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
     if payload.domain is not None and payload.domain != website.domain:
         if _hostname_conflicts(db, payload.domain):
             raise HTTPException(status_code=409, detail="Domain already exists")
+        from app.services import mail as mail_service
+
+        if mail_service.webmail_host_taken(db, payload.domain):
+            raise HTTPException(status_code=409, detail="That name is the webmail address of a mail domain here.")
         old_domain = website.domain
-        website.domain = payload.domain
-        try:
-            _ensure_default_waf_file(website.domain)
-            _rewrite_website_vhost(website)
-            nginx.delete_wordpress_vhost(old_domain)
-        except Exception as exc:
-            website.domain = old_domain
-            raise HTTPException(status_code=400, detail=f"Cannot rename domain: {exc}") from exc
+        owner = db.query(User).filter(User.id == website.owner_id).first() if website.owner_id else None
+        child_sites = [
+            s
+            for s in db.query(Website).filter(Website.owner_id == website.owner_id, Website.id != website.id).all()
+            if (s.domain or "").strip().lower().endswith("." + old_domain.lower())
+        ]
+        _rename_single_website(db, website, payload.domain, owner, current_user.id)
+        for child in child_sites:
+            prefix = child.domain[: -(len(old_domain) + 1)]
+            new_child_domain = f"{prefix}.{payload.domain}".lower()
+            if site_users.DOMAIN_RE.match(new_child_domain) and not _hostname_conflicts(db, new_child_domain):
+                try:
+                    _rename_single_website(db, child, new_child_domain, owner, current_user.id)
+                except Exception:
+                    pass
+        if website.owner_id:
+            storage_quota.forget_user_storage(website.owner_id)
     if payload.php_version is not None:
         try:
             runtime_php_version = payload.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
