@@ -1393,4 +1393,58 @@ def test_nextjs_fallback_install_and_auto_build(tmp_path, monkeypatch):
         assert logs[1]["status"] == "ok"
 
 
+def test_nginx_error_log_endpoint_returns_string_content(tmp_path, monkeypatch):
+    """Verify GET /instances/{website_id}/logs?kind=nginx_error unwraps nginx.read_site_log dict
+    and returns a string `content` (preventing React Error #31)."""
+    monkeypatch.setattr(settings, "command_dry_run", True)
+    _, SessionLocal = _setup_test_db()
+    with patch.object(nm, "SessionLocal", SessionLocal), patch(
+        "app.api.websites._rewrite_website_vhost"
+    ):
+        db = SessionLocal()
+        pkg = UserPackage(name="log-pkg", node_apps_limit=5, node_app_memory_mb=1024)
+        db.add(pkg)
+        db.commit()
+        db.refresh(pkg)
+        alice = User(username="alice", email="alice@example.com", hashed_password="x", role="end_user", package_id=pkg.id)
+        db.add(alice)
+        db.commit()
+        db.refresh(alice)
+        site = Website(
+            domain="digipower.cloud",
+            root_path=str(tmp_path / "digipower.cloud"),
+            document_root="public_html",
+            linux_user="alice",
+            owner_id=alice.id,
+        )
+        db.add(site)
+        db.commit()
+        db.refresh(site)
+        (Path(site.root_path) / "public_html").mkdir(parents=True, exist_ok=True)
+        site_id = site.id
+        db.close()
+
+        holder = {"user": alice}
+        client = _build_test_client(SessionLocal, holder)
+        r_inst = client.post("/api/nodejs-manager/install", json={"website_id": site_id, "app_name": "DigiPower"})
+        assert r_inst.status_code == 200
+
+        fake_log_dict = {
+            "domain": "digipower.cloud",
+            "kind": "error",
+            "path": "/var/log/nginx/digipower.cloud.error.log",
+            "lines": 120,
+            "content": "2026/11/11 14:30:00 [error] 1234#1234: *1 connect() failed (111: Connection refused)",
+            "exists": True,
+        }
+        with patch.object(nm.nginx, "read_site_log", return_value=fake_log_dict):
+            r_log = client.get(f"/api/nodejs-manager/instances/{site_id}/logs?kind=nginx_error&lines=120")
+            assert r_log.status_code == 200
+            body = r_log.json()
+            assert body["kind"] == "nginx_error"
+            assert isinstance(body["content"], str)
+            assert "connect() failed (111: Connection refused)" in body["content"]
+
+
+
 

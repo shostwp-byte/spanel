@@ -3530,7 +3530,11 @@ def get_nodejs_logs(
             content = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
     elif clean_kind == "nginx_error":
         try:
-            content = nginx.read_site_log(site.domain, "error", lines=lines)
+            log_res = nginx.read_site_log(site.domain, "error", lines=lines)
+            if isinstance(log_res, dict):
+                content = str(log_res.get("content") or "").strip()
+            else:
+                content = str(log_res or "").strip()
         except Exception as exc:
             content = f"Không thể đọc nhật ký Nginx Error Log: {exc}"
     else:
@@ -3545,6 +3549,11 @@ def get_nodejs_logs(
                 for item in (saved.get("last_npm_logs") or [])
             )
 
+    if isinstance(content, dict):
+        content = str(content.get("content") or "").strip()
+    elif not isinstance(content, str):
+        content = str(content or "").strip()
+
     return {
         "kind": clean_kind,
         "lines": lines,
@@ -3555,6 +3564,7 @@ def get_nodejs_logs(
 @router.delete("/instances/{website_id}/logs")
 def clear_nodejs_logs(
     website_id: int,
+    kind: str = Query(default="all", max_length=24),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -3563,6 +3573,13 @@ def clear_nodejs_logs(
     inst_key = str(site.id)
     saved = (state.get("instances") or {}).get(inst_key) or {}
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
+
+    clean_kind = (kind if isinstance(kind, str) else "all").strip().lower()
+    if clean_kind in {"all", "nginx_error"} and not settings.command_dry_run:
+        try:
+            nginx.clear_site_log(site.domain, "error")
+        except Exception:
+            pass
 
     for rel_log in ("logs/app.log", "logs/error.log"):
         if _app_path_exists(app_dir, rel_log, linux_user, site_root):

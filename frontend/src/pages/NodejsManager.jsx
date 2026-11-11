@@ -698,10 +698,19 @@ export function NodejsManagerPage({
       const res = await request(
         `/nodejs-manager/instances/${inst.id}/logs?kind=${encodeURIComponent(kind)}&lines=${lines}`
       );
+      const rawContent = res?.content;
+      const safeContent =
+        typeof rawContent === 'string'
+          ? rawContent
+          : typeof rawContent?.content === 'string'
+          ? rawContent.content
+          : rawContent != null
+          ? JSON.stringify(rawContent, null, 2)
+          : '';
       setLogsModalData({
         kind,
         lines,
-        content: res?.content || '',
+        content: safeContent || 'Chưa có dữ liệu nhật ký phát sinh.',
         loading: false,
       });
     } catch (err) {
@@ -718,9 +727,12 @@ export function NodejsManagerPage({
     if (!logsModalInstance) return;
     markBusy('clear_logs', true);
     try {
-      const res = await request(`/nodejs-manager/instances/${logsModalInstance.id}/logs`, {
-        method: 'DELETE',
-      });
+      const res = await request(
+        `/nodejs-manager/instances/${logsModalInstance.id}/logs?kind=${encodeURIComponent(logsModalData.kind || 'all')}`,
+        {
+          method: 'DELETE',
+        }
+      );
       setNotice(res?.message || 'Đã xóa bộ đệm nhật ký ứng dụng.');
       await openLogsModal(logsModalInstance, logsModalData.kind, logsModalData.lines);
     } catch (err) {
@@ -2954,7 +2966,11 @@ export function NodejsManagerPage({
                       }}
                     >
                       <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                        {logsModalData.loading ? 'Đang tải nhật ký...' : logsModalData.content}
+                        {logsModalData.loading
+                          ? 'Đang tải nhật ký...'
+                          : typeof logsModalData.content === 'string'
+                          ? logsModalData.content
+                          : String(logsModalData.content?.content ?? '')}
                       </pre>
                     </div>
                   </div>
