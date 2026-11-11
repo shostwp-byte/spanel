@@ -324,6 +324,7 @@ def create_phpmyadmin_sso(database_id: int, request: Request, db: Session = Depe
                 item.db_user,
                 db_password,
                 allow_existing_user=True,
+                allow_existing_database=True,
             )
         except Exception as exc:
             logger.debug("Could not refresh local MariaDB credentials before phpMyAdmin SSO: %s", exc)

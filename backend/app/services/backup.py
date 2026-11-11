@@ -1597,7 +1597,7 @@ def restore_user_backup(
                         database_notes.append(f"{db_name}: {note}")
                     backend = db_backends.backend_for_host(target_host)
                     backend.create_database_credentials(
-                        db_name, db_user, db_password, allow_existing_user=True
+                        db_name, db_user, db_password, allow_existing_user=True, allow_existing_database=True
                     )
                     sql_member = db_info.get("sql_member") or f"databases/{domain}.sql"
                     sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
@@ -1669,7 +1669,7 @@ def restore_user_backup(
                     database_notes.append(f"{db_name}: {note}")
                 backend = db_backends.backend_for_host(target_host)
                 backend.create_database_credentials(
-                    db_name, db_user, db_password, allow_existing_user=True
+                    db_name, db_user, db_password, allow_existing_user=True, allow_existing_database=True
                 )
                 sql_member = extra_db.get("sql_member")
                 if sql_member:

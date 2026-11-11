@@ -194,6 +194,7 @@ def create_database(seed: str, prefix: str = "wp", db_name: str | None = None, i
 def create_database_credentials(
     db_name: str, db_user: str, db_password: str, *, password_hash: str | None = None,
     allow_existing_user: bool = False,
+    allow_existing_database: bool = False,
     allow_existing_db: bool | None = None,
 ) -> Dict[str, str]:
     """Create a database and the account that owns it.
@@ -208,17 +209,16 @@ def create_database_credentials(
     of MariaDB.
 
     Creating now refuses an account or database that already exists.
-    `allow_existing_user` / `allow_existing_db` are for the restore paths - a
+    `allow_existing_user` / `allow_existing_database` are for the restore paths - a
     backup or a DirectAdmin import legitimately recreates the database/account
     that archive already owned - and even those cannot touch a reserved name.
     """
     db_name = _reject_reserved_database(db_name)
     db_user = _validate_identifier(db_user)
     _reject_reserved_user(db_user)
-    if allow_existing_db is None:
-        allow_existing_db = allow_existing_user
+    allow_db = bool(allow_existing_database if allow_existing_db is None else allow_existing_db)
 
-    if not allow_existing_db and database_exists(db_name):
+    if not allow_db and database_exists(db_name):
         raise ValueError(
             f"MariaDB database '{db_name}' already exists. Choose another database name."
         )

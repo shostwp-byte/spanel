@@ -48,7 +48,15 @@ class LocalBackend:
         return mariadb.database_exists(db_name)
 
     def create_database_credentials(
-        self, db_name, db_user, db_password, *, password_hash=None, allow_existing_user=False, allow_existing_db=None
+        self,
+        db_name,
+        db_user,
+        db_password,
+        *,
+        password_hash=None,
+        allow_existing_user=False,
+        allow_existing_database=False,
+        allow_existing_db=None,
     ):
         return mariadb.create_database_credentials(
             db_name,
@@ -56,6 +64,7 @@ class LocalBackend:
             db_password,
             password_hash=password_hash,
             allow_existing_user=allow_existing_user,
+            allow_existing_database=allow_existing_database,
             allow_existing_db=allow_existing_db,
         )
 
