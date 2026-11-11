@@ -46,7 +46,7 @@ Thứ tự trong PR A là bắt buộc: **P0-1 phải vào trước P1-1**. P1-1
   - Ghi vào file tạm root 0600 trong `${SPANEL_DATA_DIR}/nodejs/` (thư mục root 0700), rồi `mv`.
   - Không có `.env` hoặc đọc lỗi thì ghi file rỗng, không `deny`.
 - Trong unit (8175): `EnvironmentFile=-${app_target}/.env` → `EnvironmentFile=-$(nodejs_env_file "$base")`.
-- Các dòng `Environment=PORT/HOST/NODE_ENV` giữ **sau** `EnvironmentFile=` để panel luôn thắng nếu `.env` cũng đặt `PORT`.
+- ~~Các dòng `Environment=PORT/HOST/NODE_ENV` giữ **sau** `EnvironmentFile=` để panel luôn thắng nếu `.env` cũng đặt `PORT`.~~ **Đính chính (lần 16):** câu này sai. Theo `systemd.exec(5)`, giá trị từ `EnvironmentFile=` đè `Environment=` bất kể thứ tự. Muốn panel luôn thắng thì `copy_site_env_as_user` phải bỏ các khoá `PORT`, `HOST`, `NODE_ENV`, `PATH`, `HOME`, `npm_config_cache` khi sao.
 - `delete_nodejs_worker_units` (8078) và `delete_nodejs_worker_units_for_user` (8089): xoá cả file env tương ứng.
 
 Python không đổi gì: các đường đã gọi `nodejs-worker-sync` sau khi lưu `.env` (2421), deploy (2619), restart (2219) sẽ tự sao lại file.
