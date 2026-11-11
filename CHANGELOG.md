@@ -4,6 +4,23 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
+## [v1.0.9] — 2026-11-11
+
+Bản phát hành `v1.0.9` tập trung vào độ ổn định của Kernel Disk Quota sau khi khởi động lại máy chủ, hiệu năng bộ nhớ đệm của WordPress Manager, đồng bộ chủ sở hữu website khi đối chiếu đĩa (`fix-round7-p1`), và quy tắc bảo vệ ranh giới cơ sở dữ liệu / systemd trên CI:
+
+> **Lưu ý phát hành:** Tính năng **Node.js Manager** đang trong quá trình hoàn thiện và thẩm định bảo mật độc lập nên được tách riêng sang nhánh phát triển `feat/nodejs-manager` (mặc định tắt sau cờ cấu hình), không đưa vào bản phát hành `v1.0.9` trên `main`. Tag `v1.0.9` được tạo lại sau khi hợp nhất PR vào `main`.
+
+### 🔒 Bảo mật & Kiểm soát Ranh giới Tự động
+- **Chỉ khôi phục bản ghi bị mất trong `_reconcile_websites_from_disk` (`fix-round7-p1`):** Luồng đối chiếu đĩa chỉ thêm lại các website bị mất dòng trong SQLite, tuyệt đối không ghi đè `owner_id`, `linux_user`, `root_path` của các website đã có chủ sở hữu; đồng bộ chủ sở hữu chỉ thực hiện qua hành động quản trị tường minh (`move-owner`).
+- **Chặn tạo trùng hoặc chiếm quyền cơ sở dữ liệu trong `mariadb.create_database_credentials`:** Mặc định từ chối cơ sở dữ liệu đã tồn tại trên MariaDB (`database_exists`) trừ luồng khôi phục sao lưu (`allow_existing_user=True` / `allow_existing_db=True`).
+- **Quy tắc CI tự động (`Security boundary guard`):** Chặn mọi lệnh gọi trực tiếp `mariadb.drop_database` / `create_database_credentials` trong `backend/app/api/` ngoài `databases.py` và chặn `EnvironmentFile=` trong `installer/` trỏ vào thư mục khách (`/home`, `app_target`, `site_root`).
+
+### 📦 Kernel Disk Quota & Hiệu năng WordPress Manager
+- **Tự động kích hoạt lại Kernel Quota sau khi reboot (`8fb6b75` + Mục 4):** Tự động chạy `quotaon` / `quotacheck` qua `systemd-run -p PrivateDevices=no` khi khởi động nếu phân vùng đã gắn tùy chọn quota nhưng trạng thái kernel quota đang tắt; giới hạn việc tự động cài gói `linux-modules-extra-$(uname -r)` tối đa **1 lần trên mỗi phiên bản kernel** (`quota-kmod-attempted-<uname -r>`).
+- **Bộ nhớ đệm WordPress Manager (`496bcfd`):** Lưu đệm danh sách WordPress instance theo tài khoản khi chuyển trang trong phiên làm việc và bỏ các lượt quét `wp-cli` lặp lại không cần thiết, giúp mở lại WordPress Manager tức thì trên tài khoản có nhiều website.
+
+---
+
 ## [v1.0.8] — 2026-10-31
 
 Bản phát hành hợp nhất các nâng cấp kiến trúc sau `v1.0.7` cùng toàn bộ bản vá bảo mật, hạn mức gói dịch vụ, Webmail, Quota, Nginx và Application Manager qua các đợt thẩm định độc lập Lần 11 → Lần 14:
