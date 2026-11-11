@@ -8256,7 +8256,7 @@ UNIT
 
 status_nodejs_worker_unit() {
   local user="$1" site_root="$2" base unit_file
-  local unit_present=0 enabled=0 state="inactive" pid=0 mem_bytes=0
+  local unit_present=0 enabled=0 state="inactive" pid=0 mem_bytes=0 restarts=0
   base="$(nodejs_worker_unit_base "$user" "$site_root")"
   unit_file="${SYSTEMD_UNIT_DIR}/${base}.service"
   if [[ -f "$unit_file" ]]; then
@@ -8274,14 +8274,19 @@ status_nodejs_worker_unit() {
     fi
     pid="$(systemctl show -p MainPID --value "${base}.service" 2>/dev/null || echo 0)"
     mem_bytes="$(systemctl show -p MemoryCurrent --value "${base}.service" 2>/dev/null || echo 0)"
+    restarts="$(systemctl show -p NRestarts --value "${base}.service" 2>/dev/null || echo 0)"
     [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
     [[ "$mem_bytes" =~ ^[0-9]+$ ]] || mem_bytes=0
+    [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
   fi
   echo "unit_present=${unit_present}"
   echo "enabled=${enabled}"
   echo "state=${state}"
   echo "pid=${pid}"
+  echo "main_pid=${pid}"
   echo "memory_bytes=${mem_bytes}"
+  echo "memory_current_bytes=${mem_bytes}"
+  echo "restarts=${restarts}"
   echo "unit=${base}.service"
 }
 

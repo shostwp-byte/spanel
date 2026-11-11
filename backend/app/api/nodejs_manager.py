@@ -947,11 +947,12 @@ def _query_nodejs_worker_status(
                 "main_pid": int(kv.get("main_pid") or 0),
                 "memory_current_bytes": int(kv.get("memory_current_bytes") or 0),
                 "restarts": int(kv.get("restarts") or 0),
-                "port": int(kv.get("port") or 0) or default_port,
-                "node_major": kv.get("node_major") or default_major,
-                "start_mode": kv.get("start_mode") or default_mode,
-                "start_arg": kv.get("start_arg") or default_arg,
-                "memory_mb": int(kv.get("memory_mb") or 0) or default_mem,
+                # Configuration values come from panel state, not systemd output
+                "port": default_port,
+                "node_major": default_major,
+                "start_mode": default_mode,
+                "start_arg": default_arg,
+                "memory_mb": default_mem,
             }
     except Exception as exc:
         logger.debug("nodejs-worker-status warning: %s", exc)
