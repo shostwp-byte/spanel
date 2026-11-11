@@ -122,6 +122,16 @@ def user_exists(db_user: str) -> bool:
     return "1" in (result.stdout or "")
 
 
+def database_exists(db_name: str) -> bool:
+    """Whether this MariaDB schema already exists on the local server."""
+    safe = _reject_reserved_database(db_name)
+    result = _run_sql(
+        f"SELECT 1 FROM information_schema.schemata WHERE schema_name = {_quote_sql_string(safe)} LIMIT 1;\n",
+        check=False,
+    )
+    return "1" in (result.stdout or "")
+
+
 def _quote_sql_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
@@ -184,6 +194,7 @@ def create_database(seed: str, prefix: str = "wp", db_name: str | None = None, i
 def create_database_credentials(
     db_name: str, db_user: str, db_password: str, *, password_hash: str | None = None,
     allow_existing_user: bool = False,
+    allow_existing_db: bool | None = None,
 ) -> Dict[str, str]:
     """Create a database and the account that owns it.
 
@@ -196,23 +207,30 @@ def create_database_credentials(
     the ALTER also drops the socket clause and locks the system's own root out
     of MariaDB.
 
-    Creating now refuses an account that already exists. `allow_existing_user`
-    is for the restore paths - a backup or a DirectAdmin import legitimately
-    recreates the account that archive already owned - and even those cannot
-    touch a reserved account.
+    Creating now refuses an account or database that already exists.
+    `allow_existing_user` / `allow_existing_db` are for the restore paths - a
+    backup or a DirectAdmin import legitimately recreates the database/account
+    that archive already owned - and even those cannot touch a reserved name.
     """
     db_name = _reject_reserved_database(db_name)
     db_user = _validate_identifier(db_user)
     _reject_reserved_user(db_user)
+    if allow_existing_db is None:
+        allow_existing_db = allow_existing_user
 
+    if not allow_existing_db and database_exists(db_name):
+        raise ValueError(
+            f"MariaDB database '{db_name}' already exists. Choose another database name."
+        )
     if not allow_existing_user and user_exists(db_user):
         raise ValueError(
             f"MariaDB account '{db_user}' already exists. Choose another database user name."
         )
 
     auth = _auth_clause(db_password, password_hash)
+    create_db_clause = "CREATE DATABASE IF NOT EXISTS" if allow_existing_db else "CREATE DATABASE"
     statements = [
-        f"CREATE DATABASE IF NOT EXISTS {_quote_identifier(db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
+        f"{create_db_clause} {_quote_identifier(db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
         f"CREATE USER IF NOT EXISTS {_quote_sql_string(db_user)}@'localhost' {auth};",
     ]
     if allow_existing_user:

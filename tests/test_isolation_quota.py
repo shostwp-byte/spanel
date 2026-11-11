@@ -510,3 +510,46 @@ def test_post_reboot_auto_enable_completes_once_and_does_not_loop_on_error(tmp_p
     ):
         manual_ok = disk_quota.enable(manual=True)
     assert manual_ok["mode"] == "kernel" and manual_ok["last_error"] == ""
+
+
+@needs_bash
+def test_enable_attempts_linux_modules_extra_at_most_once_per_kernel(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    env = {
+        "QUOTA_FORCE_MODULE_CHECK": "1",
+        "FAKE_MODINFO_RC": "1",
+        "FAKE_UNAME": "6.8.0-77-custom",
+    }
+    run_bash(tmp_path, _script(tmp_path, "quota_enable"), env=env)
+    run_bash(tmp_path, _script(tmp_path, "quota_enable"), env=env)
+    calls = _calls(tmp_path)
+    assert calls.count("apt-get -o DPkg::Lock::Timeout=120 install -y linux-modules-extra-6.8.0-77-custom") == 1
+    # A new kernel version gets its own single attempt.
+    run_bash(tmp_path, _script(tmp_path, "quota_enable"), env={**env, "FAKE_UNAME": "6.8.0-78-custom"})
+    calls = _calls(tmp_path)
+    assert calls.count("apt-get -o DPkg::Lock::Timeout=120 install -y linux-modules-extra-6.8.0-78-custom") == 1
+
+
+def test_create_database_credentials_refuses_existing_database_unless_restore():
+    from app.services import mariadb
+
+    executed: list[str] = []
+
+    def fake_run_sql(sql: str, *, check: bool = True):
+        executed.append(sql)
+        if "information_schema.schemata" in sql and "'wp_alice_db'" in sql:
+            return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(mariadb, "_run_sql", side_effect=fake_run_sql):
+        with pytest.raises(ValueError, match="MariaDB database 'wp_alice_db' already exists"):
+            mariadb.create_database_credentials("wp_alice_db", "u_bob_new", "StrongPass123!")
+        assert not any("GRANT ALL PRIVILEGES" in s for s in executed)
+
+        # Restore path explicitly sets allow_existing_user=True (which implies allow_existing_db=True).
+        res = mariadb.create_database_credentials(
+            "wp_alice_db", "u_alice_restore", "StrongPass123!", allow_existing_user=True
+        )
+        assert res["db_name"] == "wp_alice_db"
+        assert any("GRANT ALL PRIVILEGES ON `wp_alice_db`.*" in s for s in executed)
+

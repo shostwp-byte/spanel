@@ -10470,7 +10470,9 @@ quota_enable() {
     "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y quota >/dev/null || deny "apt-get could not install the quota tools"
   fi
   if [[ "$fstype" == ext4 ]]; then
-    local mod_dir
+    local mod_dir krel kmod_stamp
+    krel="$(uname -r 2>/dev/null || echo unknown)"
+    kmod_stamp="${QUOTA_ROOT_PREFIX}${SPANEL_DATA_DIR:-/var/lib/spanel}/quota-kmod-attempted-${krel}"
     mod_dir="$(dirname "$QUOTA_MODULES_CONF")"
     mkdir -p "$mod_dir" 2>/dev/null || true
     if [[ -d "$mod_dir" && -w "$mod_dir" ]]; then
@@ -10479,12 +10481,18 @@ quota_enable() {
     fi
     # Pre-install linux-modules-extra before reboot when quota_v2 is missing on
     # a stripped cloud/virtual kernel, so quotaon succeeds right after reboot.
+    # Guarded by a per-kernel stamp so boot-time reconcile attempts apt-get at
+    # most once per kernel version.
     if [[ "${QUOTA_FORCE_MODULE_CHECK:-0}" == "1" || "$(type -t setquota)" == "file" ]]; then
-      if command -v modinfo >/dev/null 2>&1 && [[ "${QUOTA_FORCE_MODULE_CHECK:-0}" == "1" || -d "/lib/modules/$(uname -r)" ]]; then
+      if command -v modinfo >/dev/null 2>&1 && [[ "${QUOTA_FORCE_MODULE_CHECK:-0}" == "1" || -d "/lib/modules/${krel}" ]]; then
         if ! "${host_run[@]}" modinfo quota_v2 >/dev/null 2>&1 && [[ ! -d /sys/module/quota_v2 ]]; then
-          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
-          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
-          "${host_run[@]}" depmod -a >/dev/null 2>&1 || true
+          if [[ ! -f "$kmod_stamp" || "${QUOTA_FORCE_MODULE_INSTALL:-0}" == "1" ]]; then
+            mkdir -p "$(dirname "$kmod_stamp")" 2>/dev/null || true
+            : >"$kmod_stamp" 2>/dev/null || true
+            "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
+            "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y "linux-modules-extra-${krel}" >/dev/null 2>&1 || true
+            "${host_run[@]}" depmod -a >/dev/null 2>&1 || true
+          fi
           "${host_run[@]}" modprobe quota_v1 >/dev/null 2>&1 || true
           "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
         fi
@@ -10561,9 +10569,13 @@ quota_enable() {
         "${host_run[@]}" modprobe quota_v1 >/dev/null 2>&1 || true
         "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
         if ! q_err="$("${host_run[@]}" quotaon -u "$mp" 2>&1)"; then
-          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
-          "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true
-          "${host_run[@]}" depmod -a >/dev/null 2>&1 || true
+          if [[ ! -f "$kmod_stamp" || "${QUOTA_FORCE_MODULE_INSTALL:-0}" == "1" ]]; then
+            mkdir -p "$(dirname "$kmod_stamp")" 2>/dev/null || true
+            : >"$kmod_stamp" 2>/dev/null || true
+            "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 update -qq >/dev/null 2>&1 || true
+            "${host_run[@]}" apt-get -o DPkg::Lock::Timeout=120 install -y "linux-modules-extra-${krel}" >/dev/null 2>&1 || true
+            "${host_run[@]}" depmod -a >/dev/null 2>&1 || true
+          fi
           "${host_run[@]}" modprobe quota_v1 >/dev/null 2>&1 || true
           "${host_run[@]}" modprobe quota_v2 >/dev/null 2>&1 || true
           if ! q_err="$("${host_run[@]}" quotaon -u "$mp" 2>&1)"; then

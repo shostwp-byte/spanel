@@ -1544,15 +1544,6 @@ def install_wp_instance(
                 "db_user": mariadb.safe_db_identifier(fallback_name, "u"),
                 "db_password": mariadb.random_password(20),
             }
-            try:
-                mariadb.create_database_credentials(
-                    db_info["db_name"],
-                    db_info["db_user"],
-                    db_info["db_password"],
-                    allow_existing_user=False,
-                )
-            except Exception:
-                pass
 
         existing_acc = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_info["db_name"]).first()
         if existing_acc and existing_acc.owner_id == site.owner_id:

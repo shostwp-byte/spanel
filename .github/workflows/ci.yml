@@ -27,6 +27,15 @@ jobs:
           pip install -r backend/requirements.txt -r backend/requirements-dev.txt
       - name: Compile all modules
         run: python -m compileall -q backend/app
+      - name: Security boundary guard (MariaDB API calls)
+        run: |
+          bad=$(git grep -n "mariadb\.drop_database\|create_database_credentials" -- backend/app/api \
+            | grep -v "^backend/app/api/databases\.py:" || true)
+          if [ -n "$bad" ]; then
+            echo "Direct mariadb.drop_database / create_database_credentials calls outside databases.py:" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
       - name: Migrations apply to an empty database
         working-directory: backend
         env:
@@ -54,6 +63,14 @@ jobs:
             if bash -n "$f"; then echo "ok   $f"; else echo "FAIL $f"; status=1; fi
           done
           exit $status
+      - name: Security boundary guard (systemd EnvironmentFile)
+        run: |
+          bad=$(git grep -n 'EnvironmentFile=.*\(/home\|app_target\|site_root\)' -- installer || true)
+          if [ -n "$bad" ]; then
+            echo "Unsafe systemd EnvironmentFile pointing into tenant directory:" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
 
   whmcs-module:
     name: WHMCS module (PHP ${{ matrix.php }})

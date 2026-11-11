@@ -37,9 +37,19 @@ from __future__ import annotations
 import logging
 
 from app.models.entities import DatabaseAccount, SftpAccount, SiteApp, WebauthnCredential
-from app.services import db_backends, sftp_accounts, site_apps
+from app.services import db_backends, mariadb, sftp_accounts, site_apps
 
 logger = logging.getLogger("spanel.teardown")
+
+
+def rollback_uncommitted_database(db_info: dict[str, str] | None) -> None:
+    """Drop a freshly created local MariaDB database and user during creation rollback."""
+    if not db_info:
+        return
+    db_name = db_info.get("db_name")
+    db_user = db_info.get("db_user")
+    if db_name and db_user:
+        mariadb.drop_database(db_name, db_user)
 
 
 def drop_database_record(db, db_item: DatabaseAccount) -> None:
