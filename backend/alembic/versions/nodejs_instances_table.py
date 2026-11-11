@@ -110,6 +110,12 @@ def upgrade() -> None:
                 sa.ForeignKey("database_accounts.id", ondelete="SET NULL"),
                 nullable=True,
             ),
+            sa.Column(
+                "db_created_by_manager",
+                sa.Boolean(),
+                nullable=False,
+                server_default=sa.false(),
+            ),
             sa.Column("git_repo", sa.String(length=255), nullable=False, server_default=""),
             sa.Column("git_branch", sa.String(length=80), nullable=False, server_default="main"),
             sa.Column("git_build_script", sa.String(length=64), nullable=False, server_default=""),
@@ -230,13 +236,13 @@ def upgrade() -> None:
                 "INSERT INTO nodejs_instances ("
                 "website_id, owner_id, subpath, app_name, template, framework, "
                 "node_major, start_mode, start_arg, port, memory_mb, node_env, "
-                "process_enabled, systemd_sandbox, db_account_id, git_repo, git_branch, "
+                "process_enabled, systemd_sandbox, db_account_id, db_created_by_manager, git_repo, git_branch, "
                 "git_build_script, last_deploy_at, last_deploy_status, webhook_enabled, "
                 "webhook_token, last_npm_logs, installed_at, updated_at, detached"
                 ") VALUES ("
                 ":website_id, :owner_id, :subpath, :app_name, :template, :framework, "
                 ":node_major, :start_mode, :start_arg, :port, :memory_mb, :node_env, "
-                ":process_enabled, :systemd_sandbox, :db_account_id, :git_repo, :git_branch, "
+                ":process_enabled, :systemd_sandbox, :db_account_id, :db_created_by_manager, :git_repo, :git_branch, "
                 ":git_build_script, :last_deploy_at, :last_deploy_status, :webhook_enabled, "
                 ":webhook_token, :last_npm_logs, :installed_at, :updated_at, :detached"
                 ")"
@@ -257,6 +263,7 @@ def upgrade() -> None:
                 "process_enabled": bool(inst.get("process_enabled", True)),
                 "systemd_sandbox": bool(inst.get("systemd_sandbox", True)),
                 "db_account_id": db_acc_id,
+                "db_created_by_manager": bool(inst.get("db_created_by_manager", False)),
                 "git_repo": str(inst.get("git_repo") or "")[:255],
                 "git_branch": str(inst.get("git_branch") or "main")[:80],
                 "git_build_script": str(inst.get("git_build_script") or "")[:64],

@@ -2275,8 +2275,8 @@ def install_laravel_instance(
             "db_host": str(remote_host.host).strip() if has_remote_host else "localhost",
             "db_port": int(remote_host.port or 3306) if has_remote_host else 3306,
         }
-        prev_existing_db_website_id = existing_check.website_id
-        existing_check.website_id = site.id
+        # P1-A: Never overwrite website_id on an existing database so deleting/removing this
+        # website never drops a database belonging to another website.
         db_acc = existing_check
     else:
         seed = f"{site.domain}_{secrets.token_hex(2)}"
@@ -2330,8 +2330,6 @@ def install_laravel_instance(
                 teardown.drop_database_record(db, created_new_db_acc)
             except Exception as db_exc:
                 logger.warning("Failed to rollback auto-created Laravel DB: %s", db_exc)
-        elif existing_check is not None:
-            existing_check.website_id = prev_existing_db_website_id
         site.app_type = orig_app_type
         site.php_version = orig_php_version
         site.linux_user = orig_linux_user
@@ -2620,6 +2618,7 @@ def install_laravel_instance(
         "laravel_version": payload.laravel_version or "11.x",
         "composer_version": "2.8",
         "db_account_id": db_acc.id if db_acc is not None else None,
+        "db_created_by_manager": bool(payload.db_mode != "existing" and db_acc is not None),
         "db_name": db_info["db_name"],
         "db_user": db_info["db_user"],
         "git_repo": payload.git_repo.strip() if payload.install_source == "git" else "",
@@ -3606,7 +3605,7 @@ def remove_laravel_instance(
     _purge_app_dir_contents(linux_user, site_root, app_dir)
 
     dropped_db = False
-    if drop_database:
+    if drop_database and bool(saved.get("db_created_by_manager", False)):
         db_acc: Optional[DatabaseAccount] = None
         if db_acc_id is not None and db_acc_id > 0:
             db_acc = (

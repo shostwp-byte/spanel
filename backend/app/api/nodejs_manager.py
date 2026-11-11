@@ -295,6 +295,7 @@ def _row_to_instance_dict(row: NodejsInstance) -> Dict[str, Any]:
         "process_enabled": bool(row.process_enabled),
         "systemd_sandbox": bool(row.systemd_sandbox),
         "db_account_id": int(row.db_account_id) if row.db_account_id is not None else None,
+        "db_created_by_manager": bool(getattr(row, "db_created_by_manager", False)),
         "git_repo": row.git_repo or "",
         "git_branch": row.git_branch or "main",
         "git_build_script": row.git_build_script or "",
@@ -342,6 +343,7 @@ def _apply_dict_to_row(row: NodejsInstance, inst: Dict[str, Any]) -> None:
             row.db_account_id = None
     else:
         row.db_account_id = None
+    row.db_created_by_manager = bool(inst.get("db_created_by_manager", False))
     row.git_repo = str(inst.get("git_repo") or "")[:255]
     row.git_branch = str(inst.get("git_branch") or "main")[:80]
     row.git_build_script = str(inst.get("git_build_script") or "")[:64]
@@ -2360,10 +2362,9 @@ def install_nodejs_instance(
         db_user = existing_check.db_user
         db_password = stored_db_pass
         db_host = str(remote_host.host).strip() if has_remote_host else "localhost"
-        prev_existing_db_website_id = existing_check.website_id
-        existing_check.website_id = site.id
+        # P1-A: Never overwrite website_id on an existing database so deleting/removing this
+        # website never drops a database belonging to another website.
         db_acc = existing_check
-        db.commit()
     elif db_mode == "new":
         seed = f"{site.domain}_{secrets.token_hex(2)}"
         try:
@@ -2406,8 +2407,6 @@ def install_nodejs_instance(
                 teardown.drop_database_record(db, created_new_db_acc)
             except Exception as db_exc:
                 logger.warning("Failed to rollback auto-created Node.js DB: %s", db_exc)
-        elif existing_check is not None:
-            existing_check.website_id = prev_existing_db_website_id
         site.app_type = orig_app_type
         site.nginx_custom = orig_nginx_custom
         db.add(site)
@@ -2517,6 +2516,7 @@ def install_nodejs_instance(
                     "process_enabled": True,
                     "systemd_sandbox": True,
                     "db_account_id": db_acc.id if db_acc is not None else None,
+                    "db_created_by_manager": bool(db_mode == "new" and db_acc is not None),
                     "git_repo": git_repo if install_source == "git" else "",
                     "git_branch": git_branch,
                     "webhook_enabled": False,
@@ -3400,8 +3400,8 @@ def remove_nodejs_instance(
     # Stop and delete systemd worker unit
     _delete_nodejs_worker_unit(linux_user, site_root)
 
-    # Optionally drop MySQL database (strictly via owned & bound DatabaseAccount record)
-    if payload.drop_database:
+    # Optionally drop MySQL database (strictly only when created by Node.js Manager for this site)
+    if payload.drop_database and bool(saved.get("db_created_by_manager", False)):
         raw_db_acc_id = saved.get("db_account_id")
         db_acc_id: Optional[int] = None
         if raw_db_acc_id is not None and not isinstance(raw_db_acc_id, bool):

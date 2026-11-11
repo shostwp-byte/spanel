@@ -491,13 +491,14 @@ def test_p0_2_db_mode_ownership_extra_forbid_quota_and_rollback(tmp_path, monkey
 
 
 def test_p0_3_env_edit_and_remove_cannot_drop_other_tenant_or_unrelated_database(tmp_path, monkeypatch):
-    """1.5 (P0-3):
-    - nodejs_manager.py never calls mariadb.drop_database directly.
+    """1.5 (P0-3) & Round 16 P1-A:
     - Poisoning .env with another user's DB or another website's DB of the same user never drops that DB on remove.
+    - P1-A: Installing with db_mode='existing' (wp_a bound to site 1) onto site 2:
+      (a) DELETE /api/websites/2 does not DROP wp_a;
+      (b) remove_nodejs_instance with drop_database=True does not DROP wp_a;
+      (c) after remove, wp_a.website_id == site1.id.
     """
     monkeypatch.setattr(settings, "command_dry_run", True)
-    nm_source = (REPO_ROOT / "backend" / "app" / "api" / "nodejs_manager.py").read_text(encoding="utf-8")
-    assert "mariadb.drop_database" not in nm_source
 
     _, SessionLocal = _setup_test_db()
     with patch.object(nm, "SessionLocal", SessionLocal), patch(
@@ -542,23 +543,27 @@ def test_p0_3_env_edit_and_remove_cannot_drop_other_tenant_or_unrelated_database
         db.refresh(bob_site)
         db.refresh(bob_other_site)
         (Path(bob_site.root_path) / "public_html").mkdir(parents=True, exist_ok=True)
+        (Path(bob_other_site.root_path) / "public_html").mkdir(parents=True, exist_ok=True)
 
         alice_db = DatabaseAccount(
             owner_id=alice.id,
             website_id=alice_site.id,
             db_name="wp_alice_prod",
             db_user="u_alice_prod",
-            db_password="enc",
+            db_password=nm.encrypt("AlicePass123!"),
         )
         bob_other_db = DatabaseAccount(
             owner_id=bob.id,
             website_id=bob_other_site.id,
             db_name="wp_bob_other",
             db_user="u_bob_other",
-            db_password="enc",
+            db_password=nm.encrypt("BobPass123!"),
         )
         db.add_all([alice_db, bob_other_db])
         db.commit()
+        db.refresh(bob_other_db)
+        bob_other_db_id = bob_other_db.id
+        bob_other_site_id = bob_other_site.id
         db.close()
 
         holder = {"user": bob}
@@ -599,9 +604,67 @@ def test_p0_3_env_edit_and_remove_cannot_drop_other_tenant_or_unrelated_database
             assert res_rm.status_code == 200, res_rm.text
             mock_drop.assert_not_called()
 
+        # P1-A: Bob installs Node.js on bob_site (site 2) reusing bob_other_db (bound to bob_other_site / site 1)
+        res_existing = client.post(
+            "/api/nodejs-manager/install",
+            json={
+                "website_id": bob_site.id,
+                "app_name": "Bob Reuse DB",
+                "db_mode": "existing",
+                "existing_database_id": bob_other_db_id,
+            },
+        )
+        assert res_existing.status_code == 200, res_existing.text
+        with SessionLocal() as check_db1:
+            reused = check_db1.query(DatabaseAccount).filter_by(id=bob_other_db_id).first()
+            assert reused is not None
+            assert reused.website_id == bob_other_site_id
+
+        # (b) & (c): Removing Node.js with drop_database=True does NOT drop bob_other_db and keeps website_id
+        with patch("app.services.teardown.drop_database_record") as mock_drop_existing:
+            res_rm_existing = client.post(
+                f"/api/nodejs-manager/instances/{bob_site.id}/remove",
+                json={"delete_files": True, "drop_database": True},
+            )
+            assert res_rm_existing.status_code == 200, res_rm_existing.text
+            mock_drop_existing.assert_not_called()
+
+        with SessionLocal() as check_db2:
+            reused_after_rm = check_db2.query(DatabaseAccount).filter_by(id=bob_other_db_id).first()
+            assert reused_after_rm is not None
+            assert reused_after_rm.website_id == bob_other_site_id
+
+        # (a): Re-install with existing DB, then DELETE /api/websites/{bob_site.id} -> must NOT drop bob_other_db
+        res_existing2 = client.post(
+            "/api/nodejs-manager/install",
+            json={
+                "website_id": bob_site.id,
+                "app_name": "Bob Reuse DB 2",
+                "db_mode": "existing",
+                "existing_database_id": bob_other_db_id,
+            },
+        )
+        assert res_existing2.status_code == 200, res_existing2.text
+
+        from app.api import websites as websites_api
+
+        with SessionLocal() as del_session, patch("app.services.db_backends.LocalBackend.drop_database") as mock_backend_drop:
+            dummy_req = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"), headers={})
+            websites_api.delete_website(
+                bob_site.id,
+                request=dummy_req,
+                delete_files=True,
+                delete_database=True,
+                db=del_session,
+                current_user=bob,
+            )
+            mock_backend_drop.assert_not_called()
+
         with SessionLocal() as check_db:
             assert check_db.query(DatabaseAccount).filter_by(db_name="wp_alice_prod").first() is not None
-            assert check_db.query(DatabaseAccount).filter_by(db_name="wp_bob_other").first() is not None
+            still_there = check_db.query(DatabaseAccount).filter_by(id=bob_other_db_id).first()
+            assert still_there is not None
+            assert still_there.website_id == bob_other_site_id
 
 
 def test_1_6_package_node_apps_limit_and_memory_ceiling(tmp_path, monkeypatch):

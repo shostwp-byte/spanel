@@ -170,12 +170,7 @@ jobs:
           }).listen(port, '127.0.0.1');
           JS
 
-          # 1.1: Create root-owned 0600 secret and symlink site .env -> /root/secret.env
-          echo "ROOT_ONLY_SECRET=top_secret_panel_master_key" | sudo tee /root/secret.env >/dev/null
-          sudo chmod 0600 /root/secret.env
-          sudo -u spaneltest ln -sf /root/secret.env "${APP_DIR}/.env"
-
-          # 1.2: Build helper args from Python _worker_sync_helper_args and run real helper
+          # 1.2: Build helper args from Python _worker_sync_helper_args
           mapfile -t SYNC_ARGS < <(python - <<'PY'
           from pathlib import Path
           from app.api.nodejs_manager import _worker_sync_helper_args
@@ -195,6 +190,10 @@ jobs:
               print(a)
           PY
           )
+
+          # Positive control (P1-B): regular .env owned by spaneltest must be loaded into worker environ
+          echo "APP_MARKER=ok" | sudo -u spaneltest tee "${APP_DIR}/.env" >/dev/null
+          sudo -u spaneltest chmod 0640 "${APP_DIR}/.env"
           sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-sync "${SYNC_ARGS[@]}"
 
           # Wait for HTTP 200 on 127.0.0.1:21055
@@ -207,6 +206,27 @@ jobs:
             sleep 0.5
           done
           test "$ok" -eq 1
+
+          STATUS_POS="$(sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-status spaneltest "$SITE_ROOT")"
+          PID_POS="$(STATUS_OUT="$STATUS_POS" python - <<'PY'
+          import os
+          from app.api.nodejs_manager import _parse_kv_output
+          kv = _parse_kv_output(os.environ["STATUS_OUT"])
+          assert kv.get("state") == "active", kv
+          pid = int(kv.get("main_pid") or 0)
+          assert pid > 0, kv
+          print(pid)
+          PY
+          )"
+          ENVIRON_POS="$(sudo cat "/proc/${PID_POS}/environ" | tr '\0' '\n')"
+          grep -q '^PORT=21055$' <<<"$ENVIRON_POS"
+          grep -q '^APP_MARKER=ok$' <<<"$ENVIRON_POS"
+
+          # Negative control (1.1 / P0-1 & P1-B): symlink site .env -> /root/secret.env (0600 root:root)
+          echo "ROOT_ONLY_SECRET=top_secret_panel_master_key" | sudo tee /root/secret.env >/dev/null
+          sudo chmod 0600 /root/secret.env
+          sudo -u spaneltest ln -sf /root/secret.env "${APP_DIR}/.env"
+          sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-sync "${SYNC_ARGS[@]}"
 
           # 1.3: Verify nodejs-worker-status output parsed via _parse_kv_output
           STATUS_OUT="$(sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-status spaneltest "$SITE_ROOT")"
@@ -221,11 +241,11 @@ jobs:
           PY
           )"
 
-          # 1.1: Verify root secret from symlinked .env is NOT in /proc/<pid>/environ
-          if sudo tr '\0' '\n' < "/proc/${MAIN_PID}/environ" | grep -q "ROOT_ONLY_SECRET"; then
-            echo "SECURITY FAILURE: ROOT_ONLY_SECRET leaked into worker /proc/${MAIN_PID}/environ!" >&2
-            exit 1
-          fi
+          # 1.1: Verify /proc/<pid>/environ is readable via sudo cat and ROOT_ONLY_SECRET is NOT present
+          ENVIRON="$(sudo cat "/proc/${MAIN_PID}/environ" | tr '\0' '\n')"
+          grep -q '^PORT=21055$' <<<"$ENVIRON"
+          ! grep -q 'ROOT_ONLY_SECRET' <<<"$ENVIRON"
+          ! grep -q '^APP_MARKER=ok$' <<<"$ENVIRON"
 
           # 6: Verify nodejs-worker-delete removes both unit file and env file
           sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-delete spaneltest "$SITE_ROOT"

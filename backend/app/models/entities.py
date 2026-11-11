@@ -1072,6 +1072,7 @@ class NodejsInstance(Base):
     db_account_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("database_accounts.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    db_created_by_manager: Mapped[bool] = mapped_column(Boolean, default=False)
     git_repo: Mapped[str] = mapped_column(String(255), default="")
     git_branch: Mapped[str] = mapped_column(String(80), default="main")
     git_build_script: Mapped[str] = mapped_column(String(64), default="")
