@@ -3560,8 +3560,8 @@ function AppContent() {
       { key: 'application', title: 'Application', items: [
         ...(appsFeatureEnabled ? [
           ['docker_manager', 'Docker', Boxes],
+          ['nodejs_manager', 'Node.js', NodejsIcon],
         ] : []),
-        ['nodejs_manager', 'Node.js', NodejsIcon],
         ['laravel_manager', 'Laravel', LaravelIcon],
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
       ]},
@@ -4809,7 +4809,7 @@ function AppContent() {
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
     if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
-    if (page === 'nodejs_manager') return <NodejsManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
+    if (page === 'nodejs_manager') return appsFeatureEnabled ? <NodejsManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} /> : renderAddonMissing('application');
     if (page === 'laravel_manager') return <LaravelManagerPage request={request} websites={roleScopedWebsites} phpVersions={phpVersions} openWebsiteFileManager={openWebsiteFileManager} openWebsiteTerminal={openWebsiteTerminal} navigateToPage={navigateToPage} />;
     if (page === 'docker_manager' || page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;

@@ -26,7 +26,7 @@ from app.core.database import engine, get_db
 from app.core.permissions import Role, is_admin_role, normalize_role
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, SiteApp, User, Website
-from app.services import mariadb, nginx, site_apps, site_users, teardown, wordpress_live
+from app.services import addons, mariadb, nginx, site_apps, site_users, teardown, wordpress_live
 from app.services.shell import shell
 
 _NODEJS_ACCESS_ROLE_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -455,6 +455,27 @@ def reserved_nodejs_ports(exclude_website_id: Optional[int] = None) -> set[int]:
     return ports
 
 
+def count_nodejs_instances_for_owner(db: Session, owner_id: int) -> int:
+    """Count active (non-detached) Node.js Manager instances belonging to ``owner_id``."""
+    try:
+        state = _load_toolkit_state()
+        instances_map = state.get("instances") or {}
+        if not instances_map:
+            return 0
+        site_ids = [
+            row[0]
+            for row in db.query(Website.id).filter(Website.owner_id == owner_id).all()
+        ]
+        count = 0
+        for sid in site_ids:
+            inst = instances_map.get(str(sid))
+            if isinstance(inst, dict) and not inst.get("detached"):
+                count += 1
+        return count
+    except Exception:
+        return 0
+
+
 def _allocate_nodejs_port(
     db: Session,
     preferred: Optional[int] = None,
@@ -501,6 +522,17 @@ def _require_end_user_nodejs_access(
             raise HTTPException(
                 status_code=403,
                 detail="Node.js Manager is only available in User Access Role. Please switch Access Role to User or use 'Login as' on an End User account.",
+            )
+    if not addons.is_installed(addons.APPLICATION):
+        raise HTTPException(
+            status_code=403,
+            detail="The Application addon is not installed. Install it from the Addons page first.",
+        )
+    if not is_admin_role(getattr(current_user, "role", None)):
+        if site_apps.app_limit_for(current_user) == 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Application hosting is not enabled for this package",
             )
 
 
@@ -1805,7 +1837,7 @@ class NodejsInstallRequest(BaseModel):
     start_mode: str = Field(default="node", max_length=16)
     start_arg: str = Field(default="server.js", max_length=120)
     port: Optional[int] = Field(default=None)
-    memory_mb: int = Field(default=512, ge=64, le=16384)
+    memory_mb: Optional[int] = Field(default=512)
     node_env: str = Field(default="production", max_length=24)
     db_mode: Literal["none", "new", "existing"] = "none"
     existing_database_id: Optional[int] = Field(default=None)
@@ -1825,7 +1857,7 @@ class ProcessControlRequest(BaseModel):
     start_mode: Optional[str] = Field(default=None, max_length=16)
     start_arg: Optional[str] = Field(default=None, max_length=120)
     port: Optional[int] = Field(default=None)
-    memory_mb: Optional[int] = Field(default=None, ge=64, le=16384)
+    memory_mb: Optional[int] = Field(default=None)
     node_env: Optional[str] = Field(default=None, max_length=24)
 
 
@@ -1945,6 +1977,14 @@ def scan_nodejs_instances(
         if _is_nodejs_project_dir(app_dir, linux_user, site_root):
             discovered += 1
             if not saved.get("installed") or saved.get("detached"):
+                try:
+                    site_apps.ensure_app_quota(
+                        db,
+                        current_user,
+                        is_admin=is_admin_role(getattr(current_user, "role", None)),
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
                 port = _allocate_nodejs_port(db, exclude_website_id=site.id)
                 pkg_meta = _detect_package_json_metadata(
                     app_dir, linux_user=linux_user, site_root=site_root, saved=saved
@@ -2037,12 +2077,32 @@ def install_nodejs_instance(
         if not GIT_BRANCH_RE.fullmatch(git_branch):
             raise HTTPException(status_code=400, detail="Tên nhánh Git (branch) không hợp lệ.")
 
-    _ensure_install_target_dir_clean(site, linux_user, site_root, app_dir)
-    port = _allocate_nodejs_port(db, preferred=payload.port, exclude_website_id=site.id)
-
     site_owner = db.query(User).filter(User.id == site.owner_id).first()
     if site_owner is None or not hasattr(site_owner, "role"):
         site_owner = current_user
+    is_admin_owner = is_admin_role(getattr(site_owner, "role", None))
+
+    existing_inst = ((_load_toolkit_state().get("instances") or {}).get(str(site.id))) or {}
+    already_counted = bool(existing_inst.get("installed")) and not bool(existing_inst.get("detached"))
+    if not already_counted:
+        try:
+            site_apps.ensure_app_quota(db, site_owner, is_admin=is_admin_owner)
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+    elif not is_admin_owner and site_apps.app_limit_for(site_owner) == 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Application hosting is not enabled for this package",
+        )
+
+    mem_ceiling = None if is_admin_owner else site_apps.memory_ceiling_for(site_owner)
+    try:
+        validated_memory_mb = site_apps.validate_memory_mb(payload.memory_mb, mem_ceiling)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _ensure_install_target_dir_clean(site, linux_user, site_root, app_dir)
+    port = _allocate_nodejs_port(db, preferred=payload.port, exclude_website_id=site.id)
 
     db_mode = (payload.db_mode or "none").strip().lower()
     existing_check: Optional[DatabaseAccount] = None
@@ -2253,7 +2313,7 @@ def install_nodejs_instance(
                     "start_mode": clean_mode,
                     "start_arg": clean_arg,
                     "port": port,
-                    "memory_mb": int(payload.memory_mb or 512),
+                    "memory_mb": validated_memory_mb,
                     "node_env": payload.node_env or "production",
                     "process_enabled": True,
                     "systemd_sandbox": True,
@@ -2276,7 +2336,7 @@ def install_nodejs_instance(
             start_mode=clean_mode,
             start_arg=clean_arg,
             port=port,
-            memory_mb=int(payload.memory_mb or 512),
+            memory_mb=validated_memory_mb,
             node_env=payload.node_env or "production",
             enabled=True,
             strict=True,
@@ -2330,7 +2390,34 @@ def manage_nodejs_process(
         payload.start_mode or saved.get("start_mode") or "node",
         payload.start_arg or saved.get("start_arg") or "server.js",
     )
-    memory_mb = int(payload.memory_mb or saved.get("memory_mb") or 512)
+    site_owner = db.query(User).filter(User.id == site.owner_id).first()
+    if site_owner is None or not hasattr(site_owner, "role"):
+        site_owner = current_user
+    is_admin_owner = is_admin_role(getattr(site_owner, "role", None))
+    if saved.get("detached") and action != "stop":
+        try:
+            site_apps.ensure_app_quota(db, site_owner, is_admin=is_admin_owner)
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+    elif not is_admin_owner and action != "stop":
+        limit = site_apps.app_limit_for(site_owner)
+        if limit == 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Application hosting is not enabled for this package",
+            )
+        if limit > 0 and site_apps.count_apps_for_owner(db, site_owner.id) > limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This package allows at most {limit} application(s)",
+            )
+
+    mem_ceiling = None if is_admin_owner else site_apps.memory_ceiling_for(site_owner)
+    raw_mem = payload.memory_mb if payload.memory_mb is not None else (saved.get("memory_mb") or 512)
+    try:
+        memory_mb = site_apps.validate_memory_mb(raw_mem, mem_ceiling)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     node_env = (payload.node_env or saved.get("node_env") or "production").strip().lower()
 
     old_port = int(saved.get("port") or 0)

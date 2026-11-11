@@ -222,7 +222,13 @@ def memory_ceiling_for(user: User) -> int:
 
 
 def count_apps_for_owner(db: Session, owner_id: int) -> int:
-    return db.query(SiteApp).filter(SiteApp.owner_id == owner_id).count()
+    total = db.query(SiteApp).filter(SiteApp.owner_id == owner_id).count()
+    try:
+        from app.api import nodejs_manager
+        total += nodejs_manager.count_nodejs_instances_for_owner(db, owner_id)
+    except Exception:
+        pass
+    return total
 
 
 def ensure_app_quota(db: Session, user: User, is_admin: bool = False) -> None:
