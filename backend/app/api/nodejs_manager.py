@@ -942,6 +942,137 @@ def _append_npm_log(
     saved["last_npm_logs"] = logs[-12:]
 
 
+def _run_npm_install_with_fallback(
+    linux_user: str,
+    app_dir: Path,
+    *,
+    node_major: str = "22",
+    timeout: int = 300,
+) -> Tuple[int, str, str]:
+    """Run `npm install --include=dev --no-audit --no-fund` as `linux_user`, falling back
+    automatically to `--legacy-peer-deps` when peer dependency conflicts (ERESOLVE) occur."""
+    primary_args = ["npm", "install", "--include=dev", "--no-audit", "--no-fund"]
+    rc, out = _run_as_site_user(
+        linux_user,
+        app_dir,
+        primary_args,
+        node_major=node_major,
+        timeout=timeout,
+    )
+    if rc == 0:
+        return rc, out, " ".join(primary_args)
+
+    fallback_args = [
+        "npm",
+        "install",
+        "--include=dev",
+        "--legacy-peer-deps",
+        "--no-audit",
+        "--no-fund",
+    ]
+    rc_fb, out_fb = _run_as_site_user(
+        linux_user,
+        app_dir,
+        fallback_args,
+        node_major=node_major,
+        timeout=timeout,
+    )
+    combined = f"{out}\n\n[Fallback --legacy-peer-deps]\n{out_fb}".strip()
+    return rc_fb, combined, " ".join(fallback_args)
+
+
+def _ensure_nodejs_app_ready(
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    *,
+    node_major: str = "22",
+    npm_logs: Optional[List[Dict[str, Any]]] = None,
+    force_install: bool = False,
+    run_build_if_needed: bool = True,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    """Ensure `node_modules` / `node_modules/.bin` are installed and Next.js production
+    build (`.next/BUILD_ID`) exists before starting the systemd worker."""
+    pkg_meta = _detect_package_json_metadata(
+        app_dir, linux_user=linux_user, site_root=site_root
+    )
+    has_deps = len(pkg_meta.get("packages") or []) > 0
+    framework = pkg_meta.get("framework") or "Node.js"
+    scripts = pkg_meta.get("scripts") or {}
+
+    need_install = force_install
+    if not need_install and has_deps and not settings.command_dry_run:
+        if not _app_path_exists(app_dir, "node_modules", linux_user, site_root):
+            need_install = True
+        elif not _app_path_exists(app_dir, "node_modules/.bin", linux_user, site_root):
+            need_install = True
+        elif framework == "Next.js" and not _app_path_exists(
+            app_dir, "node_modules/.bin/next", linux_user, site_root
+        ):
+            need_install = True
+
+    if need_install and has_deps:
+        rc, out, cmd_str = _run_npm_install_with_fallback(
+            linux_user,
+            app_dir,
+            node_major=node_major,
+            timeout=300,
+        )
+        if npm_logs is not None:
+            npm_logs.append(
+                {
+                    "cmd": cmd_str,
+                    "output": (out or "OK")[-2000:],
+                    "status": "ok" if rc == 0 else "error",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        if rc != 0 and strict:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Cài đặt gói phụ thuộc (`{cmd_str}`) thất bại: {_short_cmd_err(out)}",
+            )
+
+    start_script_body = str(scripts.get("start") or "")
+    is_nextjs_prod = framework == "Next.js" or "next start" in start_script_body
+    if (
+        run_build_if_needed
+        and "build" in scripts
+        and is_nextjs_prod
+        and (
+            force_install
+            or (
+                not settings.command_dry_run
+                and not _app_path_exists(app_dir, ".next/BUILD_ID", linux_user, site_root)
+            )
+        )
+    ):
+        rc_b, out_b = _run_as_site_user(
+            linux_user,
+            app_dir,
+            ["npm", "run", "build"],
+            node_major=node_major,
+            timeout=300,
+        )
+        if npm_logs is not None:
+            npm_logs.append(
+                {
+                    "cmd": "npm run build",
+                    "output": (out_b or "OK")[-2000:],
+                    "status": "ok" if rc_b == 0 else "error",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        if rc_b != 0 and strict:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Biên dịch ứng dụng (`npm run build`) thất bại: {_short_cmd_err(out_b)}",
+            )
+
+    return pkg_meta
+
+
 # ── Systemd Worker & Nginx Reverse Proxy Sync ────────────────────────────────
 
 def _parse_kv_output(raw: str) -> Dict[str, str]:
@@ -1031,7 +1162,7 @@ def _sync_nodejs_worker_unit(
             enabled=enabled,
         ),
         check=False,
-        timeout=120,
+        timeout=600,
     )
     out = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
     if int(getattr(res, "returncode", 1) or 0) != 0:
@@ -2485,23 +2616,27 @@ def install_nodejs_instance(
         )
         _write_app_file(linux_user, site_root, app_dir, ".env", env_content, "0640")
 
-        # Install npm dependencies if requested and package.json has dependencies
+        # Install npm dependencies & build production bundle if requested
         pkg_meta = _detect_package_json_metadata(app_dir, linux_user=linux_user, site_root=site_root)
-        if payload.run_npm_install and len(pkg_meta.get("packages") or []) > 0:
-            rc, out = _run_as_site_user(
+        if (
+            install_source == "git"
+            and clean_mode == "node"
+            and clean_arg == "server.js"
+            and not _app_path_exists(app_dir, "server.js", linux_user, site_root)
+            and "start" in (pkg_meta.get("scripts") or {})
+        ):
+            clean_mode, clean_arg = "npm", "start"
+
+        if payload.run_npm_install:
+            pkg_meta = _ensure_nodejs_app_ready(
                 linux_user,
+                site_root,
                 app_dir,
-                ["npm", "install", "--no-audit", "--no-fund"],
                 node_major=clean_major,
-                timeout=300,
-            )
-            npm_logs.append(
-                {
-                    "cmd": "npm install --no-audit --no-fund",
-                    "output": (out or "OK")[-2000:],
-                    "status": "ok" if rc == 0 else "error",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
+                npm_logs=npm_logs,
+                force_install=True,
+                run_build_if_needed=(clean_arg != "dev"),
+                strict=(install_source == "git"),
             )
 
         # Apply Nginx security block & switch Website to reverse-proxy application mode
@@ -2673,6 +2808,19 @@ def manage_nodejs_process(
         updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
         _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
 
+    auto_logs: List[Dict[str, Any]] = []
+    if enabled and not settings.command_dry_run:
+        _ensure_nodejs_app_ready(
+            linux_user,
+            site_root,
+            app_dir,
+            node_major=node_major,
+            npm_logs=auto_logs,
+            force_install=False,
+            run_build_if_needed=(start_arg != "dev"),
+            strict=False,
+        )
+
     def _mutate(inst: Dict[str, Any]) -> None:
         inst.pop("detached", None)
         inst["node_major"] = node_major
@@ -2682,6 +2830,13 @@ def manage_nodejs_process(
         inst["memory_mb"] = memory_mb
         inst["node_env"] = node_env
         inst["process_enabled"] = enabled
+        for entry in auto_logs:
+            _append_npm_log(
+                inst,
+                entry["cmd"],
+                entry["output"],
+                ok=(entry["status"] == "ok"),
+            )
 
     state = _update_instance_state(
         inst_key,
@@ -2812,10 +2967,15 @@ def run_npm_action(
     else:
         raise HTTPException(status_code=400, detail=f"Thao tác NPM '{action}' không được hỗ trợ.")
 
-    rc, out = _run_as_site_user(
-        linux_user, app_dir, cmd_args, node_major=node_major, timeout=300
-    )
-    cmd_display = " ".join(cmd_args)
+    if action == "install":
+        rc, out, cmd_display = _run_npm_install_with_fallback(
+            linux_user, app_dir, node_major=node_major, timeout=300
+        )
+    else:
+        rc, out = _run_as_site_user(
+            linux_user, app_dir, cmd_args, node_major=node_major, timeout=300
+        )
+        cmd_display = " ".join(cmd_args)
 
     def _record_log(inst: Dict[str, Any]) -> None:
         _append_npm_log(inst, cmd_display, out, ok=(rc == 0))
@@ -3087,19 +3247,26 @@ def _execute_git_deploy_pipeline(
         )
 
     if run_npm_install:
-        rc_npm, out_npm = _run_as_site_user(
+        rc_npm, out_npm, cmd_npm = _run_npm_install_with_fallback(
             linux_user,
             app_dir,
-            ["npm", "install", "--no-audit", "--no-fund"],
             node_major=node_major,
             timeout=300,
         )
-        steps_output.append(f"$ npm install\n{out_npm}")
+        steps_output.append(f"$ {cmd_npm}\n{out_npm}")
         if rc_npm != 0:
             raise HTTPException(
                 status_code=500,
-                detail=f"Git deploy thất bại ở bước `npm install`: {_short_cmd_err(out_npm)}",
+                detail=f"Git deploy thất bại ở bước `{cmd_npm}`: {_short_cmd_err(out_npm)}",
             )
+        if not b_script:
+            pkg_meta = _detect_package_json_metadata(
+                app_dir, linux_user=linux_user, site_root=site_root
+            )
+            scripts = pkg_meta.get("scripts") or {}
+            start_body = str(scripts.get("start") or "")
+            if (pkg_meta.get("framework") == "Next.js" or "next start" in start_body) and "build" in scripts:
+                b_script = "build"
 
     if b_script:
         rc_b, out_b = _run_as_site_user(

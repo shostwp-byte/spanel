@@ -156,7 +156,7 @@ def test_p0_1_p1_1_p1_2_1_7_real_helper_worker_sync_and_status(tmp_path, monkeyp
         "nodejs_worker_unit_base",
         "nodejs_env_file",
         "copy_site_env_as_user",
-        "resolve_or_install_node_bin_dir",
+        "prepare_nodejs_app_as_user",
         "sync_nodejs_worker_unit",
         "status_nodejs_worker_unit",
         "delete_nodejs_worker_units",
@@ -258,6 +258,9 @@ systemctl() {{
         unit_files = list(unit_dir.glob("spanel-nodejs-alice-*.service"))
         assert len(unit_files) == 1
         unit_text = unit_files[0].read_text(encoding="utf-8")
+        assert "StartLimitIntervalSec=60" in unit_text
+        assert "StartLimitBurst=5" in unit_text
+        assert f"Environment=PATH={app_dir}/node_modules/.bin:{node22_bin.as_posix()}:" in unit_text
         # 1.1 (P0-1): EnvironmentFile points to SPANEL_DATA_DIR/nodejs, never customer home
         assert f"EnvironmentFile=-{data_dir.as_posix()}/nodejs/" in unit_text
         assert home_root.as_posix() not in unit_text.split("EnvironmentFile=")[1].splitlines()[0]
@@ -1318,5 +1321,76 @@ def test_round16_p2_and_p3_regressions(tmp_path, monkeypatch):
             r_del = full_client.delete(f"/api/websites/{site2_id}?delete_files=false&delete_database=false")
             assert r_del.status_code == 200
             assert ("nodejs-worker-delete", ["alice", site2_root]) in priv_calls
+
+
+def test_nextjs_fallback_install_and_auto_build(tmp_path, monkeypatch):
+    """Verify:
+    - _run_npm_install_with_fallback retries with --legacy-peer-deps when standard npm install fails (ERESOLVE).
+    - _ensure_nodejs_app_ready automatically installs missing node_modules/.bin/next and runs `npm run build`
+      when `.next/BUILD_ID` is missing on a Next.js project.
+    """
+    monkeypatch.setattr(settings, "command_dry_run", False)
+
+    site_root = tmp_path / "v3shost" / "digipower.cloud"
+    app_dir = site_root / "public_html"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "name": "digipower-web",
+                "version": "1.0.0",
+                "scripts": {"dev": "next dev", "build": "next build", "start": "next start"},
+                "dependencies": {"next": "14.2.5", "react": "18.3.1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    recorded: List[List[str]] = []
+
+    def _fake_run(linux_user: str, cwd: Path, cmd_args: List[str], *, node_major: Optional[str] = None, timeout: int = 180):
+        recorded.append(list(cmd_args))
+        if cmd_args == ["npm", "install", "--include=dev", "--no-audit", "--no-fund"]:
+            return 1, "npm ERR! code ERESOLVE\nnpm ERR! ERESOLVE unable to resolve dependency tree"
+        if cmd_args == ["npm", "install", "--include=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"]:
+            bin_dir = cwd / "node_modules" / ".bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            (bin_dir / "next").write_text("#!/bin/sh\necho next\n", encoding="utf-8")
+            return 0, "added 312 packages with --legacy-peer-deps"
+        if cmd_args == ["npm", "run", "build"]:
+            next_dir = cwd / ".next"
+            next_dir.mkdir(parents=True, exist_ok=True)
+            (next_dir / "BUILD_ID").write_text("prod-build-123\n", encoding="utf-8")
+            return 0, "Compiled successfully"
+        return 0, "OK"
+
+    logs: List[Dict[str, str]] = []
+    with patch.object(nm, "_run_as_site_user", side_effect=_fake_run), patch.object(
+        nm, "_read_app_file", side_effect=lambda d, rel, **kw: (d / rel).read_text(encoding="utf-8") if (d / rel).is_file() else ""
+    ), patch.object(
+        nm, "_app_path_exists", side_effect=lambda d, rel, *a, **kw: (d / rel).exists()
+    ):
+        meta = nm._ensure_nodejs_app_ready(
+            "v3shost",
+            site_root,
+            app_dir,
+            node_major="22",
+            npm_logs=logs,
+            force_install=False,
+            run_build_if_needed=True,
+            strict=True,
+        )
+        assert meta["framework"] == "Next.js"
+        assert ["npm", "install", "--include=dev", "--no-audit", "--no-fund"] in recorded
+        assert ["npm", "install", "--include=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"] in recorded
+        assert ["npm", "run", "build"] in recorded
+        assert (app_dir / "node_modules" / ".bin" / "next").is_file()
+        assert (app_dir / ".next" / "BUILD_ID").is_file()
+        assert len(logs) == 2
+        assert logs[0]["status"] == "ok"
+        assert "--legacy-peer-deps" in logs[0]["cmd"]
+        assert logs[1]["cmd"] == "npm run build"
+        assert logs[1]["status"] == "ok"
+
 
 

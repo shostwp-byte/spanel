@@ -912,6 +912,62 @@ PY_WARN_ROLES
   ) || true
 }
 
+migrate_repair_nodejs_worker_units() {
+  local db_path="$APP_DIR/backend/spanel.db"
+  [[ -f "$db_path" ]] || return 0
+  local py_bin="$APP_DIR/backend/.venv/bin/python"
+  [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
+
+  (cd "$APP_DIR/backend" && sudo -u spanel env \
+    HOME="$APP_DIR" \
+    PYTHONPATH="$APP_DIR/backend" \
+    SPANEL_USE_HELPER=true \
+    "$py_bin" - <<'PY_REPAIR_NODEJS'
+import sys
+
+try:
+    from app.api import nodejs_manager as nm
+    from app.core.database import SessionLocal
+    from app.models.entities import NodejsInstance, Website
+
+    with SessionLocal() as db:
+        rows = db.query(NodejsInstance).all()
+        for row in rows:
+            data = row.data if isinstance(row.data, dict) else {}
+            if not data.get("installed") or data.get("detached") or not data.get("process_enabled", True):
+                continue
+            site = db.query(Website).filter(Website.id == row.website_id).first()
+            if site is None:
+                continue
+            try:
+                linux_user, site_root, app_dir = nm._resolve_nodejs_paths(
+                    site, db, data.get("subpath") or ""
+                )
+                nm._sync_nodejs_worker_unit(
+                    linux_user,
+                    site_root,
+                    app_dir,
+                    node_major=str(data.get("node_major") or "22"),
+                    start_mode=str(data.get("start_mode") or "npm"),
+                    start_arg=str(data.get("start_arg") or "start"),
+                    port=int(data.get("port") or 21000),
+                    memory_mb=int(data.get("memory_mb") or 512),
+                    node_env=str(data.get("node_env") or "production"),
+                    enabled=True,
+                    strict=False,
+                )
+                print(f"Resynced Node.js worker unit for {site.domain}")
+            except Exception as inner_exc:
+                print(
+                    f"WARNING: Node.js worker unit repair skipped for site_id={row.website_id}: {inner_exc}",
+                    file=sys.stderr,
+                )
+except Exception as exc:
+    print(f"WARNING: Node.js worker unit migration skipped: {exc}", file=sys.stderr)
+PY_REPAIR_NODEJS
+  ) || true
+}
+
 ensure_terminal_tools() {
   local missing=()
   command -v composer >/dev/null 2>&1 || missing+=(composer)
@@ -2329,6 +2385,7 @@ migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
 warn_legacy_privileged_owned_resources
+migrate_repair_nodejs_worker_units
 # The empty database earlier updates left behind when the cron migration ran
 # from frontend/ (see migrate_site_cron_php_binary).
 if [[ -f "$APP_DIR/frontend/spanel.db" && ! -L "$APP_DIR/frontend/spanel.db" ]]; then
