@@ -10,7 +10,7 @@
 [![Security](https://img.shields.io/badge/Security-Privilege%20Separated%20%2B%20Cgroups%20v2-10b981?style=flat-square)](docs/ADMIN_AND_CLI_GUIDE.md)
 [![License](https://img.shields.io/badge/License-GNU%20AGPLv3-blue?style=flat-square)](LICENSE)
 
-**SPanel** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, hiệu năng cao, được thiết kế chuyên biệt cho **Ubuntu 24.04 LTS**. Hệ thống kết hợp kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)** chuẩn DirectAdmin với cơ chế cô lập đặc quyền `spanel-helper`, giới hạn tài nguyên phần cứng **Linux Cgroups v2 & MySQL Governor**, trình quản trị chuyên sâu **WordPress Manager**, hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh**, chế độ **Sáng / Tối (Light / Dark Mode)** và tương thích hoàn hảo trên thiết bị di động (**Mobile-First Responsive**).
+**SPanel** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, hiệu năng cao, được thiết kế chuyên biệt cho **Ubuntu 24.04 LTS**. Hệ thống kết hợp kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)** chuẩn DirectAdmin với cơ chế cô lập đặc quyền `spanel-helper`, giới hạn tài nguyên phần cứng **Linux Cgroups v2, Kernel Disk/Inode Quota & MySQL Governor**, bộ ba trình quản trị ứng dụng chuyên sâu (**Node.js Manager**, **Laravel Manager**, **WordPress Manager**), hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh**, chế độ **Sáng / Tối (Light / Dark Mode)** và tương thích hoàn hảo trên thiết bị di động (**Mobile-First Responsive**).
 
 [Cài đặt Nhanh](#-cài-đặt-nhanh-quick-start) • [Tính năng Chi tiết](#-danh-mục-tính-năng-toàn-diện) • [Kiến trúc Bảo mật](#-kiến-trúc-hệ-thống--bảo-mật-đa-lớp) • [Tài liệu Kỹ thuật (`docs/`)](#-tài-liệu-kỹ-thuật-docs) • [Báo lỗi & Đóng góp](https://github.com/shostwp-byte/spanel/issues)
 
@@ -25,10 +25,10 @@
 - [Danh mục Tính năng Toàn diện](#-danh-mục-tính-năng-toàn-diện)
   - [1. Phân quyền 3 Cấp độ & Chuyển đổi Vai trò Tức thì](#1-phân-quyền-3-cấp-độ--chuyển-đổi-vai-trò-tức-thì-rbac--access-role-switch)
   - [2. Quản trị Tên miền, Subdomain, Chuyển hướng & SSL/TLS](#2-quản-trị-tên-miền-subdomain-chuyển-hướng--ssltls)
-  - [3. WordPress Manager Chuyên sâu (WP-CLI & Bảo mật 1-Click)](#3-wordpress-manager-chuyên-sâu-wp-cli--bảo-mật-1-click)
+  - [3. Bộ ba Quản trị Ứng dụng Chuyên sâu: Node.js Manager, Laravel Manager & WordPress Manager](#3-bộ-ba-quản-trị-ứng-dụng-chuyên-sâu-nodejs-manager-laravel-manager--wordpress-manager)
   - [4. Ngăn xếp Web Đa phiên bản PHP, CustomBuild & Ứng dụng Hiện đại](#4-ngăn-xếp-web-đa-phiên-bản-php-custombuild--ứng-dụng-hiện-đại)
   - [5. Cơ sở dữ liệu MariaDB, Remote MySQL, MySQL Governor & phpMyAdmin SSO](#5-cơ-sở-dữ-liệu-mariadb-remote-mysql-mysql-governor--phpmyadmin-sso)
-  - [6. Cô lập Tài nguyên Cgroups v2 & Giám sát Thời gian thực](#6-cô-lập-tài-nguyên-cgroups-v2--giám-sát-thời-gian-thực)
+  - [6. Cô lập Tài nguyên Cgroups v2, Kernel Quota & Giám sát Thời gian thực](#6-cô-lập-tài-nguyên-cgroups-v2-kernel-quota--giám-sát-thời-gian-thực)
   - [7. Trung tâm Sao lưu, Khôi phục Chi tiết (Granular Restore) & Di chuyển Panel](#7-trung-tâm-sao-lưu-khôi-phục-chi-tiết-granular-restore--di-chuyển-panel)
   - [8. Tường lửa Chủ động, WAF ModSecurity, Fail2ban & Quét Mã độc](#8-tường-lửa-chủ-động-waf-modsecurity-fail2ban--quét-mã-độc)
   - [9. Hệ thống Thông báo Đa kênh (`System Notifications`)](#9-hệ-thống-thông-báo-đa-kênh-system-notifications)
@@ -48,9 +48,9 @@
 | Tiêu chí | Giải pháp truyền thống | SPanel (`v1.0.9`) |
 | :--- | :--- | :--- |
 | **Đặc quyền tiến trình Web Panel** | Thường chạy trực tiếp dưới `root` hoặc wrapper rộng | Tiến trình `spanel-api` chạy dưới user không đặc quyền `spanel`, mọi tác vụ hệ thống đi qua cổng kiểm duyệt `/usr/local/sbin/spanel-helper` |
-| **Cô lập Người dùng & Website** | Dùng chung pool PHP hoặc quyền thư mục lỏng lẻo | Mỗi khách hàng có **Linux user riêng**, mỗi website chạy **PHP-FPM Unix socket riêng**, Web Terminal cô lập mount namespace (`unshare --mount`) |
-| **Kiểm soát Tài nguyên (Noisy Neighbor)** | Cần mua thêm CloudLinux / LVE trả phí | Tích hợp sẵn **Linux Cgroups v2** (`CPU`, `RAM`, `Disk I/O`, `IOPS`, `Tasks`) và **MySQL Governor** miễn phí ngay trong nhân Ubuntu 24.04 |
-| **Quản trị WordPress** | Phải cài plugin quản lý rời hoặc thao tác tay | Tích hợp **WordPress Manager** toàn diện: 1-Click SSO, Clone, Snapshot, khoá thực thi PHP trong `uploads`, tắt XML-RPC, Redis Object Cache |
+| **Cô lập Người dùng & Website** | Dùng chung pool PHP hoặc quyền thư mục lỏng lẻo | Mỗi khách hàng có **Linux user riêng**, mỗi tài khoản/website chạy **PHP-FPM master/socket riêng**, Web Terminal cô lập mount namespace (`unshare --mount`) |
+| **Kiểm soát Tài nguyên (Noisy Neighbor)** | Cần mua thêm CloudLinux / LVE trả phí | Tích hợp sẵn **Linux Cgroups v2** (`CPU`, `RAM`, `Disk I/O`, `IOPS`, `Tasks`), **Kernel Disk/Inode Quota** và **MySQL Governor** miễn phí ngay trong nhân Ubuntu 24.04 |
+| **Quản trị Ứng dụng (Node.js / Laravel / WP)** | Phải cài plugin rời hoặc cấu hình thủ công | Tích hợp bộ ba **Node.js Manager**, **Laravel Manager** và **WordPress Manager**: 1-Click Install, Queue/Worker `systemd`, Artisan/WP-CLI/NPM, Git Webhook & gia cố bảo mật 7 điểm |
 | **Tốc độ Tải Giao diện** | Nặng nề, tải nguyên khối nhiều MB | Kiến trúc **React 19 + Vite Code-Splitting (`React.lazy`) + GZip + Immutable Cache**, gói tải khởi động chỉ **~115 KB** |
 
 ---
@@ -62,15 +62,16 @@ flowchart TB
     Browser["Trình duyệt Quản trị / WHMCS / MCP Client"] -->|HTTPS :2222 / GZip + Immutable Assets| API["spanel-api (FastAPI / Uvicorn - User: spanel)"]
     API -->|SQLite WAL| DB[("spanel.db")]
     API -->|Sudoers Whitelist| Helper["/usr/local/sbin/spanel-helper (Root Gatekeeper)"]
-    Helper --> WebStack["Nginx + Multi-PHP-FPM (5.6 - 8.5) + ModSecurity WAF"]
+    Helper --> WebStack["Nginx + Multi-PHP-FPM (5.6 - 8.5) + Node.js / Laravel Workers + ModSecurity WAF"]
     Helper --> DataStack["MariaDB Local / Remote MySQL + MySQL Governor"]
     Helper --> MailDNS["PowerDNS + Exim4 + Dovecot + Rspamd"]
-    Helper --> Isolation["Linux Cgroups v2 + Mount Namespace Jail (unshare)"]
+    Helper --> Isolation["Linux Cgroups v2 + Kernel Quota + Mount Namespace Jail (unshare)"]
     Helper --> SecStack["iptables/ipset + Fail2ban + LMD/ClamAV"]
 ```
 
 - **Nguyên tắc Đặc quyền Tối thiểu (Privilege Separation):** Dịch vụ `spanel-api.service` bị khóa cứng bởi systemd sandbox (`RestrictAddressFamilies`, `RestrictNamespaces=mnt`) và hoàn toàn không có quyền `root`.
-- **Kiểm duyệt Tham số Nghiêm ngặt:** Mọi lệnh gọi sang `spanel-helper` đều được kiểm tra định danh tên miền, đường dẫn thực (`realpath`), chống leo thang đặc quyền qua symlink/hardlink và chống tiêm lệnh (Command Injection).
+- **Kiểm duyệt Tham số & Chống Rò rỉ `.env` qua Symlink:** Mọi lệnh gọi sang `spanel-helper` đều được kiểm tra định danh tên miền, đường dẫn thực (`realpath`), mở tệp với `O_NOFOLLOW` chống leo thang đặc quyền qua symlink/hardlink. Các tiến trình worker (`systemd`) chỉ nạp tệp môi trường tại `/var/lib/spanel/nodejs/<base>.env` (`0600 root:root`) đã được đọc và lọc dưới đúng quyền Linux user của khách (`copy_site_env_as_user`).
+- **Chốt chặn Bảo mật CI/CD Tự động:** Pipeline GitHub Actions tự động kiểm tra ranh giới gọi hàm MariaDB (`create_database_credentials`, `drop_database`), quét AST toàn bộ endpoint API để chặn route thiếu xác thực, chặn chỉ thị `EnvironmentFile=` trỏ vào thư mục người dùng và chạy kiểm thử tích hợp `systemd` + `spanel-helper.sh` thực tế trên Ubuntu 24.04.
 - **Xác thực Đa nhân tố & Chống Giả mạo:** Hỗ trợ **2FA TOTP** (Google Authenticator), khóa bảo mật sinh trắc học **WebAuthn Passkeys**, phiên đăng nhập `HttpOnly + SameSite` tự động gia hạn kèm **CSRF Token** và nhật ký kiểm toán (**Audit Log**) toàn diện.
 
 ---
@@ -112,26 +113,39 @@ flowchart TB
 
 ---
 
-### 3. WordPress Manager Chuyên sâu (WP-CLI & Bảo mật 1-Click)
+### 3. Bộ ba Quản trị Ứng dụng Chuyên sâu: Node.js Manager, Laravel Manager & WordPress Manager
 
-- **Tự động Nhận diện & Cài đặt 1-Click:**
-  - Tự động phát hiện mọi cài đặt WordPress trên tên miền chính, Subdomain và cả thư mục con (ví dụ `/blog`, `/shop`).
+#### 🟢 Node.js Manager (`/nodejs-manager` — Cờ cấu hình `NODEJS_MANAGER_ENABLED`)
+- **Khởi tạo 1-Click từ Starter Template & Git Repository:**
+  - Hỗ trợ 5 kiến trúc mẫu sẵn sàng Production (**Express.js REST API**, **Next.js SSR**, **NestJS Enterprise API**, **Real-time WebSocket**, **Node.js Native HTTP**) hoặc sao chép trực tiếp từ Git Repository (kiểm duyệt nhánh Git nghiêm ngặt, cập nhật nguyên tử qua `git fetch --depth 1 origin -- <branch>` + `git reset --hard FETCH_HEAD`).
+  - Hỗ trợ đa phiên bản runtime Node.js (`v18`, `v20`, `v22`, `v24` do Admin quản lý cài đặt tập trung) và tự động cấp phát/gắn cơ sở dữ liệu MariaDB theo đúng quyền sở hữu (`db_mode: none | new | existing`) kèm cơ chế tự động hoàn tác (`_rollback_failed_install`) nếu quá trình triển khai gặp lỗi.
+- **Cô lập Tiến trình `systemd` & Bảo mật Biến Môi trường (`.env`):**
+  - Mỗi ứng dụng vận hành trên một unit `systemd` riêng dưới định danh Linux user của chủ sở hữu, áp dụng chặt chẽ hạn mức số lượng ứng dụng (`node_apps_limit`) và trần bộ nhớ RAM (`node_app_memory_mb` / `MemoryMax`) của gói dịch vụ.
+  - Tệp `.env` được sao chép và lọc dưới quyền Linux user của khách sang `/var/lib/spanel/nodejs/<base>.env` (`0600 root:root`) trước khi `systemd` nạp `EnvironmentFile`, ngăn chặn tuyệt đối tấn công đọc tệp hệ thống qua symlink.
+  - Cấp phát cổng nội bộ có ràng buộc `UNIQUE` cấp cơ sở dữ liệu (`nodejs_instances.port`), tự động cấu hình Nginx Reverse Proxy hỗ trợ sẵn WebSocket (`Upgrade` / `Connection`) và theo dõi trực tiếp `MainPID`, `MemoryCurrent`, `NRestarts` từ `systemd`.
+- **Triển khai Tự động qua Git Webhook & Gia cố Bảo mật 7 Điểm:**
+  - Webhook mặc định tắt, sử dụng token ngẫu nhiên mã hóa kèm secret ký xác thực `HMAC-SHA256` (`X-Hub-Signature-256` / `X-Gitlab-Token`), chạy nền bất đồng bộ (`202 Accepted`) với khóa chống xung đột theo từng website (`409 Conflict`).
+  - Tích hợp trình quản lý gói `npm` (`install`, `ci`, `run build`, `prune`, `audit`) và 7 chốt kiểm tra bảo mật tự động (chặn lộ `.env`/`.git` trên Nginx, kiểm tra quyền tệp `0640`, khóa thực thi script trong `uploads`, đồng bộ `NODE_ENV=production`).
+
+#### 🔴 Laravel Manager (`/laravel-manager` — Composer, Artisan, Queue Worker & Bảo mật)
+- **Triển khai & Nhận diện Tự động:**
+  - Khởi tạo dự án Laravel mới (Composer / Git Repository) hoặc quét nhận diện ứng dụng Laravel hiện có; tự động cấu hình `Document Root` chuẩn `/public` và luật rewrite Nginx chuyên biệt cho Laravel.
+- **Quản trị `.env`, Artisan CLI & Composer An toàn:**
+  - Trình biên tập `.env` trực quan bảo toàn chú thích, tự động tạo bản sao lưu `.env.bak` (`chmod 0640`) và xóa bộ đệm cấu hình (`config:clear`).
+  - Thực thi các lệnh **Artisan** (`migrate`, `cache:clear`, `route:cache`, `view:cache`, `storage:link`, `down`/`up` kèm mã bí mật bypass) và **Composer** (`install`, `update`, `dump-autoload`) theo danh sách trắng (whitelist) dưới đúng quyền Linux user của website.
+- **Tiến trình Queue Worker (`systemd`), Task Scheduler & Kiểm tra Bảo mật 7 Điểm:**
+  - Quản lý vòng đời tiến trình hàng đợi `php artisan queue:work` qua `systemd` và tự động lập lịch Cron `* * * * * php artisan schedule:run`.
+  - Kiểm tra và vá tự động 7 hạng mục bảo mật Laravel (`APP_DEBUG=false`, `APP_KEY`, quyền thư mục `storage`/`bootstrap/cache`, chặn truy cập `.env`/`.git` và khóa thực thi PHP trong `storage`).
+
+#### 🔵 WordPress Manager Chuyên sâu (`/wordpress-manager` — WP-CLI & Bảo mật 1-Click)
+- **Tự động Nhận diện, Bộ đệm Trạng thái Tức thì (`SWR Cache`) & Cài đặt 1-Click:**
+  - Tự động phát hiện mọi cài đặt WordPress trên tên miền chính, Subdomain và thư mục con (ví dụ `/blog`, `/shop`), lưu đệm trạng thái thông minh trong SQLite giúp mở giao diện tức thì kèm nút làm mới chủ động (`Refresh All`).
   - Cài đặt WordPress mới chỉ với 1 cú nhấp chuột, tự động khởi tạo Database MariaDB, cấu hình `wp-config.php` và tài khoản quản trị.
-- **Đăng nhập 1-Click WP-Admin (`SSO`):**
-  - Truy cập thẳng vào bảng điều khiển `wp-admin` với quyền quản trị viên mà không cần nhập mật khẩu.
-- **Quản lý Vòng đời WordPress Trực tiếp:**
-  - Cập nhật phiên bản WordPress Core; cài đặt, bật/tắt, cập nhật và gỡ bỏ **Plugins** & **Themes**.
-  - Quản lý danh sách người dùng WordPress, thêm quản trị viên hoặc đặt lại mật khẩu trực tiếp từ SPanel.
-- **Cấu hình & Gia cố Bảo mật WordPress 1-Click (`Security Hardening`):**
-  - **Maintenance Mode:** Bật/tắt chế độ bảo trì tức thì.
-  - **WP_DEBUG & DISALLOW_FILE_EDIT:** Bật/tắt chế độ gỡ lỗi và khóa trình sửa file PHP trong `wp-admin`.
-  - **Disable XML-RPC:** Chặn hoàn toàn giao thức `xmlrpc.php` để ngăn tấn công Brute-Force khuếch đại và DDoS Pingback.
-  - **Hide WP Version:** Ẩn thông tin phiên bản WordPress khỏi mã nguồn HTML và RSS feeds.
-  - **Block PHP Execution in Uploads:** Ngăn chặn tuyệt đối việc thực thi mã độc `.php`, `.phtml`, `.phar` trong thư mục `wp-content/uploads` ở cả tầng Nginx vhost (hỗ trợ cả cài đặt ở thư mục gốc lẫn thư mục con) và `.htaccess`, đồng thời giữ nguyên chế độ `app_type` của website.
-  - **Redis Object Cache & System Cron:** Kích hoạt bộ nhớ đệm đối tượng Redis (kèm nút `Flush Cache`) và chuyển đổi `DISABLE_WP_CRON` sang tiến trình Cron hệ thống.
-- **Snapshot Nhanh & Nhân bản Website (`Clone WordPress`):**
-  - Tạo bản chụp nhanh (**On-Demand Snapshot**) bao gồm mã nguồn và cơ sở dữ liệu nén `.sql.gz`, hỗ trợ tải về hoặc khôi phục 1-click.
-  - **Clone WordPress:** Nhân bản toàn bộ website WordPress sang tên miền hoặc subdomain đích, tự động thay thế URL (`search-replace`), kiểm tra nghiêm ngặt chống tấn công symlink/hardlink/UID spoofing và tự động thu hồi database mồ côi nếu quá trình sao chép gặp sự cố.
+- **Đăng nhập 1-Click WP-Admin (`SSO`) & Quản lý Vòng đời:**
+  - Truy cập thẳng vào `wp-admin` không cần mật khẩu; cập nhật WordPress Core, quản lý **Plugins**, **Themes** và danh sách người dùng WordPress trực tiếp từ SPanel.
+- **Gia cố Bảo mật WordPress 1-Click (`Security Hardening`), Snapshot & Clone:**
+  - Bật/tắt **Maintenance Mode**, **WP_DEBUG**, **DISALLOW_FILE_EDIT**, **Disable XML-RPC**, **Hide WP Version**, **Block PHP Execution in Uploads** (ở cả Nginx vhost lẫn `.htaccess`), **Redis Object Cache** và **System Cron**.
+  - Tạo bản chụp nhanh (**On-Demand Snapshot**) và **Clone WordPress** sang tên miền/subdomain đích kèm `search-replace` URL tự động và bảo vệ chống tấn công symlink/hardlink.
 
 ---
 
@@ -166,7 +180,7 @@ flowchart TB
 
 ---
 
-### 6. Cô lập Tài nguyên Cgroups v2 & Giám sát Thời gian thực
+### 6. Cô lập Tài nguyên Cgroups v2, Kernel Quota & Giám sát Thời gian thực
 
 - **Giới hạn Tài nguyên Phần cứng theo Gói & Người dùng (`Linux Cgroups v2`):**
   - Định nghĩa trực tiếp trong từng gói dịch vụ (`User Packages`) hoặc từng tài khoản:
@@ -174,6 +188,8 @@ flowchart TB
     - **RAM (`memory_high_mb` & `memory_max_mb`):** Ngưỡng tiết lưu bộ nhớ mềm và giới hạn bộ nhớ cứng chống tràn RAM.
     - **Disk I/O & IOPS (`io_read_mbps`, `io_write_mbps`, `iops_read_max`, `iops_write_max`):** Giới hạn băng thông đọc/ghi ổ đĩa và số tác vụ I/O mỗi giây.
     - **Số lượng Tiến trình (`tasks_max`):** Ngăn chặn hiệu quả tấn công Fork Bomb từ một tài khoản khách hàng.
+- **Hạn mức Ổ đĩa & Inode Tầng Nhân (`Kernel Disk & Inode Quota`):**
+  - Tự động cấu hình `usrjquota=aquota.user,grpjquota=aquota.group,jqfmt=vfsv1`, cài đặt gói `linux-modules-extra` tương ứng nhân đang chạy (`quota_v2`) và tự động hoàn tất kích hoạt hạn mức Block + Inode (`setquota`) ngay sau khi khởi động lại máy chủ.
 - **Resource Monitor (`/resources`) & Process Monitor (`/processes`):**
   - Theo dõi mức tiêu thụ CPU, RAM, Disk I/O, Băng thông mạng và Inodes theo thời gian thực cho toàn máy chủ cũng như từng tài khoản người dùng.
   - Tự động cảnh báo các tài khoản đang bị tấn công (`Under Attack`) hoặc sắp chạm trần dung lượng ổ đĩa (`Over Quota`).
@@ -299,9 +315,9 @@ spanel/
 ├── backend/                  # Máy chủ API FastAPI (Python 3.12), SQLAlchemy, Alembic & System Services
 │   ├── alembic/              # Quản lý phiên bản lược đồ cơ sở dữ liệu (Database Migrations)
 │   ├── app/
-│   │   ├── api/              # Các bộ định tuyến REST API & WebSocket (Websites, WP Manager, Backups, v.v.)
+│   │   ├── api/              # Các bộ định tuyến REST API & WebSocket (Websites, Node.js/Laravel/WP Manager, Backups, v.v.)
 │   │   ├── core/             # Cấu hình hệ thống, phân quyền RBAC, mã hóa секрет & kết nối SQLite WAL
-│   │   ├── models/           # Mô hình thực thể ORM (User, Website, DatabaseAccount, BackupSchedule, v.v.)
+│   │   ├── models/           # Mô hình thực thể ORM (User, Website, NodejsInstance, DatabaseAccount, BackupSchedule, v.v.)
 │   │   ├── schemas/          # Lược đồ kiểm duyệt dữ liệu Pydantic v2
 │   │   ├── services/         # Tầng điều phối dịch vụ hệ thống (Nginx, PHP, MariaDB, Cgroups, WAF, DNS, Mail)
 │   │   └── templates/        # Mẫu cấu hình Jinja2 cho Nginx vhost, trang mặc định & Webmail
@@ -310,7 +326,7 @@ spanel/
 │   │   ├── components/       # Thành phần giao diện dùng chung (Terminal, AIAssistant, WebsiteSelect, v.v.)
 │   │   ├── contexts/         # Quản lý trạng thái ứng dụng (AppContext)
 │   │   ├── locales/          # Từ điển đa ngôn ngữ Tiếng Việt (vi.js) & Tiếng Anh
-│   │   └── pages/            # 46 phân trang chức năng tải động (React.lazy) cho Admin, Reseller & End User
+│   │   └── pages/            # 47 phân trang chức năng tải động (React.lazy) cho Admin, Reseller & End User
 ├── installer/                # Bộ kịch bản cài đặt, cập nhật & cổng bảo mật đặc quyền
 │   ├── files/
 │   │   ├── spanel-helper.sh  # Cổng kiểm duyệt đặc quyền Root (/usr/local/sbin/spanel-helper)
