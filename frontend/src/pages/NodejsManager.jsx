@@ -193,6 +193,7 @@ export function NodejsManagerPage({
 
   // Modals state
   const [showInstallModal, setShowInstallModal] = useState(false);
+  const [availableDatabases, setAvailableDatabases] = useState([]);
   const [installSuccessCreds, setInstallSuccessCreds] = useState(null);
   const [envModalInstance, setEnvModalInstance] = useState(null);
   const [envModalData, setEnvModalData] = useState({
@@ -231,10 +232,8 @@ export function NodejsManagerPage({
     port: '',
     memory_mb: 512,
     node_env: 'production',
-    create_database: false,
-    db_name: '',
-    db_user: '',
-    db_password: '',
+    db_mode: 'none',
+    existing_database_id: '',
     git_repo: '',
     git_branch: 'main',
     run_npm_install: true,
@@ -398,16 +397,9 @@ export function NodejsManagerPage({
     }));
   }, [availableWebsites, websites, instances]);
 
-  const openInstallModal = useCallback(() => {
+  const openInstallModal = useCallback(async () => {
     const firstSite =
       websiteCandidates.find(w => !w.has_nodejs) || websiteCandidates[0] || null;
-    const slug = firstSite
-      ? String(firstSite.domain || 'node')
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, '')
-          .slice(0, 10)
-      : 'node';
-    const suffix = Math.random().toString(16).slice(2, 6);
     setInstallForm({
       website_id: firstSite ? String(firstSite.id) : '',
       subpath: '',
@@ -420,16 +412,25 @@ export function NodejsManagerPage({
       port: '',
       memory_mb: 512,
       node_env: 'production',
-      create_database: false,
-      db_name: `nd_${slug}_${suffix}`,
-      db_user: `u_nd_${slug}_${suffix}`.slice(0, 32),
-      db_password: generateStrongPassword(16),
+      db_mode: 'none',
+      existing_database_id: '',
       git_repo: '',
       git_branch: 'main',
       run_npm_install: true,
       harden_security: true,
     });
     setShowInstallModal(true);
+    try {
+      const req = requestRef.current;
+      if (req) {
+        const dbs = await req('/databases');
+        if (Array.isArray(dbs)) {
+          setAvailableDatabases(dbs);
+        }
+      }
+    } catch {
+      // Non-fatal if user has no databases or cannot list
+    }
   }, [websiteCandidates, installedNodeVersions]);
 
   const handleScan = async () => {
@@ -469,10 +470,11 @@ export function NodejsManagerPage({
         port: installForm.port ? Number(installForm.port) : null,
         memory_mb: Number(installForm.memory_mb || 512),
         node_env: installForm.node_env,
-        create_database: Boolean(installForm.create_database),
-        db_name: installForm.create_database ? installForm.db_name.trim() : null,
-        db_user: installForm.create_database ? installForm.db_user.trim() : null,
-        db_password: installForm.create_database ? installForm.db_password : null,
+        db_mode: installForm.db_mode || 'none',
+        existing_database_id:
+          installForm.db_mode === 'existing' && installForm.existing_database_id
+            ? Number(installForm.existing_database_id)
+            : null,
         git_repo: installForm.install_source === 'git' ? installForm.git_repo.trim() : null,
         git_branch: installForm.git_branch.trim() || 'main',
         run_npm_install: Boolean(installForm.run_npm_install),
@@ -2428,46 +2430,47 @@ export function NodejsManagerPage({
                             gap: '10px',
                           }}
                         >
-                          <label className="check-line" style={{ fontSize: '12.5px' }}>
-                            <input
-                              type="checkbox"
-                              checked={installForm.create_database}
-                              onChange={e =>
-                                setInstallForm(prev => ({ ...prev, create_database: e.target.checked }))
-                              }
-                            />
-                            <span>
-                              Khởi tạo kèm <strong>Cơ sở dữ liệu MySQL / MariaDB</strong> và tự động cấu hình vào <code>.env</code>
-                            </span>
-                          </label>
+                          <div style={{ display: 'grid', gridTemplateColumns: installForm.db_mode === 'existing' ? '1fr 1fr' : '1fr', gap: '10px' }}>
+                            <label>
+                              <span>Cơ sở dữ liệu MySQL / MariaDB (Tự động cấu hình vào <code>.env</code>)</span>
+                              <select
+                                value={installForm.db_mode}
+                                onChange={e =>
+                                  setInstallForm(prev => ({
+                                    ...prev,
+                                    db_mode: e.target.value,
+                                    existing_database_id:
+                                      e.target.value === 'existing'
+                                        ? prev.existing_database_id || String(availableDatabases[0]?.id || '')
+                                        : '',
+                                  }))
+                                }
+                              >
+                                <option value="none">Không sử dụng Database</option>
+                                <option value="new">Tạo mới tự động (MySQL/MariaDB)</option>
+                                <option value="existing">Dùng Database có sẵn</option>
+                              </select>
+                            </label>
 
-                          {installForm.create_database && (
-                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr', gap: '10px', paddingTop: '4px' }}>
+                            {installForm.db_mode === 'existing' && (
                               <label>
-                                <span>Tên Database</span>
-                                <input
-                                  type="text"
-                                  value={installForm.db_name}
-                                  onChange={e => setInstallForm(prev => ({ ...prev, db_name: e.target.value }))}
-                                />
+                                <span>Chọn Database có sẵn</span>
+                                <select
+                                  value={installForm.existing_database_id}
+                                  onChange={e =>
+                                    setInstallForm(prev => ({ ...prev, existing_database_id: e.target.value }))
+                                  }
+                                >
+                                  <option value="">-- Chọn Database --</option>
+                                  {availableDatabases.map(dbItem => (
+                                    <option key={dbItem.id} value={String(dbItem.id)}>
+                                      {dbItem.db_name} ({dbItem.db_user})
+                                    </option>
+                                  ))}
+                                </select>
                               </label>
-                              <label>
-                                <span>Database User</span>
-                                <input
-                                  type="text"
-                                  value={installForm.db_user}
-                                  onChange={e => setInstallForm(prev => ({ ...prev, db_user: e.target.value }))}
-                                />
-                              </label>
-                              <label>
-                                <span>Mật khẩu Database</span>
-                                <PasswordField
-                                  value={installForm.db_password}
-                                  onChange={val => setInstallForm(prev => ({ ...prev, db_password: val }))}
-                                />
-                              </label>
-                            </div>
-                          )}
+                            )}
+                          </div>
                         </div>
                       </div>
 

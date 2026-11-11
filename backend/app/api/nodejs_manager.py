@@ -13,10 +13,10 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -1750,6 +1750,8 @@ def _inspect_nodejs_instance(
 # ── Request Schemas ──────────────────────────────────────────────────────────
 
 class NodejsInstallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     website_id: int
     subpath: str = Field(default="", max_length=120)
     app_name: str = Field(default="Node.js Application", max_length=120)
@@ -1761,10 +1763,8 @@ class NodejsInstallRequest(BaseModel):
     port: Optional[int] = Field(default=None)
     memory_mb: int = Field(default=512, ge=64, le=16384)
     node_env: str = Field(default="production", max_length=24)
-    create_database: bool = False
-    db_name: Optional[str] = Field(default=None, max_length=64)
-    db_user: Optional[str] = Field(default=None, max_length=64)
-    db_password: Optional[str] = Field(default=None, max_length=128)
+    db_mode: Literal["none", "new", "existing"] = "none"
+    existing_database_id: Optional[int] = Field(default=None)
     git_repo: Optional[str] = Field(default=None, max_length=255)
     git_branch: str = Field(default="main", max_length=80)
     run_npm_install: bool = True
@@ -1974,57 +1974,17 @@ def install_nodejs_instance(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.api.databases import enforce_user_database_limit
+
     site = _get_accessible_website(payload.website_id, db, current_user)
     clean_major = _validate_node_major(payload.node_major)
     clean_mode, clean_arg = _validate_start_config(payload.start_mode, payload.start_arg)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, payload.subpath)
 
-    _ensure_install_target_dir_clean(site, linux_user, site_root, app_dir)
-    _purge_app_dir_contents(linux_user, site_root, app_dir)
-
-    port = _allocate_nodejs_port(db, preferred=payload.port, exclude_website_id=site.id)
-    scheme = "https" if getattr(site, "ssl_enabled", False) else "http"
-    app_url = f"{scheme}://{site.domain}" + (
-        f"/{payload.subpath.strip('/')}" if payload.subpath.strip("/") else ""
-    )
-
-    # Optional MySQL Database provisioning
-    db_name = ""
-    db_user = ""
-    db_password = ""
-    created_db_record: Optional[DatabaseAccount] = None
-
-    if payload.create_database:
-        slug = re.sub(r"[^a-z0-9]", "", site.domain.lower())[:10] or "node"
-        rand_suffix = secrets.token_hex(2)
-        db_name = (payload.db_name or f"nd_{slug}_{rand_suffix}").strip()[:32]
-        db_user = (payload.db_user or f"u_{db_name}"[:32]).strip()[:32]
-        db_password = payload.db_password or secrets.token_urlsafe(14)
-
-        try:
-            mariadb.create_database_credentials(db_name, db_user, db_password)
-            created_db_record = DatabaseAccount(
-                db_name=db_name,
-                db_user=db_user,
-                db_password=encrypt(db_password),
-                owner_id=site.owner_id,
-                website_id=site.id,
-            )
-            db.add(created_db_record)
-            db.commit()
-        except Exception as exc:
-            db.rollback()
-            raise HTTPException(
-                status_code=500,
-                detail=f"Không thể khởi tạo cơ sở dữ liệu MySQL cho ứng dụng Node.js: {exc}",
-            ) from exc
-
     install_source = (payload.install_source or "template").strip().lower()
-    npm_logs: List[Dict[str, Any]] = []
-
+    git_repo = (payload.git_repo or "").strip()
+    git_branch = (payload.git_branch or "main").strip()
     if install_source == "git":
-        git_repo = (payload.git_repo or "").strip()
-        git_branch = (payload.git_branch or "main").strip()
         if not git_repo or not GIT_URL_RE.fullmatch(git_repo):
             raise HTTPException(
                 status_code=400,
@@ -2033,127 +1993,254 @@ def install_nodejs_instance(
         if not GIT_BRANCH_RE.fullmatch(git_branch):
             raise HTTPException(status_code=400, detail="Tên nhánh Git (branch) không hợp lệ.")
 
-        rc, out = _run_as_site_user(
-            linux_user,
-            app_dir,
-            ["git", "clone", "--depth", "1", "--branch", git_branch, git_repo, "."],
-            node_major=clean_major,
-            timeout=300,
+    _ensure_install_target_dir_clean(site, linux_user, site_root, app_dir)
+    port = _allocate_nodejs_port(db, preferred=payload.port, exclude_website_id=site.id)
+
+    site_owner = db.query(User).filter(User.id == site.owner_id).first()
+    if site_owner is None or not hasattr(site_owner, "role"):
+        site_owner = current_user
+
+    db_mode = (payload.db_mode or "none").strip().lower()
+    existing_check: Optional[DatabaseAccount] = None
+    if db_mode == "existing":
+        if payload.existing_database_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Vui lòng chọn cơ sở dữ liệu có sẵn để gắn vào ứng dụng.",
+            )
+        existing_check = (
+            db.query(DatabaseAccount)
+            .filter(DatabaseAccount.id == payload.existing_database_id)
+            .first()
         )
-        npm_logs.append(
-            {
-                "cmd": f"git clone -b {git_branch} {git_repo} .",
-                "output": (out or "OK")[-2000:],
-                "status": "ok" if rc == 0 else "error",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        if rc != 0:
+        if existing_check is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Database not found. Please create the database first.",
+            )
+        if existing_check.owner_id != site.owner_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot bind a database owned by another user.",
+            )
+    elif db_mode == "new":
+        enforce_user_database_limit(db, site_owner)
+
+    scheme = "https" if getattr(site, "ssl_enabled", False) else "http"
+    app_url = f"{scheme}://{site.domain}" + (
+        f"/{payload.subpath.strip('/')}" if payload.subpath.strip("/") else ""
+    )
+
+    orig_app_type = getattr(site, "app_type", "php")
+    orig_nginx_custom = getattr(site, "nginx_custom", "") or ""
+
+    # Provision or bind MySQL Database
+    db_name = ""
+    db_user = ""
+    db_password = ""
+    db_host = "localhost"
+    db_acc: Optional[DatabaseAccount] = None
+    created_new_db_acc: Optional[DatabaseAccount] = None
+    prev_existing_db_website_id: Optional[int] = None
+
+    if db_mode == "existing" and existing_check is not None:
+        try:
+            stored_db_pass = decrypt(existing_check.db_password)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Stored database password cannot be decrypted; please reset database password first.",
+            ) from exc
+        remote_host = getattr(existing_check, "db_host", None)
+        has_remote_host = remote_host is not None and bool(getattr(remote_host, "host", None))
+        db_name = existing_check.db_name
+        db_user = existing_check.db_user
+        db_password = stored_db_pass
+        db_host = str(remote_host.host).strip() if has_remote_host else "localhost"
+        prev_existing_db_website_id = existing_check.website_id
+        existing_check.website_id = site.id
+        db_acc = existing_check
+        db.commit()
+    elif db_mode == "new":
+        seed = f"{site.domain}_{secrets.token_hex(2)}"
+        try:
+            db_info = dict(mariadb.create_database(seed, prefix="nd"))
+            db_name = db_info["db_name"]
+            db_user = db_info["db_user"]
+            db_password = db_info["db_password"]
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            db.rollback()
             raise HTTPException(
                 status_code=500,
-                detail=f"Không thể sao chép mã nguồn từ Git Repository: {_short_cmd_err(out)}",
-            )
-    else:
-        pkg_str, srv_str = _render_starter_files(
-            payload.template,
-            app_name=payload.app_name or site.domain,
-            domain=site.domain,
-            port=port,
-        )
-        _write_app_file(linux_user, site_root, app_dir, "package.json", pkg_str, "0644")
-        _write_app_file(linux_user, site_root, app_dir, "server.js", srv_str, "0644")
+                detail=f"Không thể khởi tạo cơ sở dữ liệu MySQL cho ứng dụng Node.js: {exc}",
+            ) from exc
 
-    # Write .env with strict 0640 permissions
-    env_content = _render_nodejs_default_env(
-        app_name=payload.app_name or site.domain,
-        app_url=app_url,
-        port=port,
-        node_env=payload.node_env or "production",
-        db_name=db_name,
-        db_user=db_user,
-        db_password=db_password,
-    )
-    _write_app_file(linux_user, site_root, app_dir, ".env", env_content, "0640")
-
-    # Install npm dependencies if requested and package.json has dependencies
-    pkg_meta = _detect_package_json_metadata(app_dir, linux_user=linux_user, site_root=site_root)
-    if payload.run_npm_install and len(pkg_meta.get("packages") or []) > 0:
-        rc, out = _run_as_site_user(
-            linux_user,
-            app_dir,
-            ["npm", "install", "--no-audit", "--no-fund"],
-            node_major=clean_major,
-            timeout=300,
+        db_acc = DatabaseAccount(
+            owner_id=site.owner_id,
+            website_id=site.id,
+            db_name=db_name,
+            db_user=db_user,
+            db_password=encrypt(db_password),
         )
-        npm_logs.append(
-            {
-                "cmd": "npm install --no-audit --no-fund",
-                "output": (out or "OK")[-2000:],
-                "status": "ok" if rc == 0 else "error",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        db.add(db_acc)
+        created_new_db_acc = db_acc
+        db.commit()
+        db.refresh(db_acc)
 
-    # Apply Nginx security block & switch Website to reverse-proxy application mode
-    if payload.harden_security:
-        site.nginx_custom = _update_nodejs_nginx_security(
-            getattr(site, "nginx_custom", "") or "",
-            sensitive_files=True,
-        )
-    site.app_type = "application"
-    db.add(site)
-    db.commit()
-
-    # Persist state BEFORE rewriting Nginx vhost so app_port_for_website can resolve it
-    now_iso = datetime.now(timezone.utc).isoformat()
     inst_key = str(site.id)
 
-    def _save_new(inst: Dict[str, Any]) -> None:
-        inst.clear()
-        inst.update(
-            {
-                "installed": True,
-                "website_id": site.id,
-                "domain": site.domain,
-                "subpath": payload.subpath.strip("/"),
-                "app_name": payload.app_name or site.domain,
-                "template": payload.template if install_source != "git" else "git-repo",
-                "framework": pkg_meta.get("framework") or "Node.js",
-                "node_major": clean_major,
-                "start_mode": clean_mode,
-                "start_arg": clean_arg,
-                "port": port,
-                "memory_mb": int(payload.memory_mb or 512),
-                "node_env": payload.node_env or "production",
-                "process_enabled": True,
-                "systemd_sandbox": True,
-                "db_name": db_name,
-                "db_user": db_user,
-                "db_host": "localhost",
-                "git_repo": (payload.git_repo or "").strip() if install_source == "git" else "",
-                "git_branch": (payload.git_branch or "main").strip(),
-                "last_npm_logs": npm_logs[-12:],
-                "installed_at": now_iso,
-            }
+    def _rollback_failed_install(*, purge_files: bool = False) -> None:
+        if purge_files:
+            try:
+                _purge_app_dir_contents(linux_user, site_root, app_dir)
+            except Exception as purge_exc:
+                logger.warning("Failed to purge partial Node.js install dir: %s", purge_exc)
+        if created_new_db_acc is not None:
+            try:
+                teardown.drop_database_record(db, created_new_db_acc)
+            except Exception as db_exc:
+                logger.warning("Failed to rollback auto-created Node.js DB: %s", db_exc)
+        elif existing_check is not None:
+            existing_check.website_id = prev_existing_db_website_id
+        site.app_type = orig_app_type
+        site.nginx_custom = orig_nginx_custom
+        db.add(site)
+        db.commit()
+        try:
+            _pop_instance_state(inst_key)
+        except Exception:
+            pass
+
+    # Clean target dir only AFTER all quota/DB/port checks succeeded
+    _purge_app_dir_contents(linux_user, site_root, app_dir)
+
+    npm_logs: List[Dict[str, Any]] = []
+    try:
+        if install_source == "git":
+            rc, out = _run_as_site_user(
+                linux_user,
+                app_dir,
+                ["git", "clone", "--depth", "1", "--branch", git_branch, git_repo, "."],
+                node_major=clean_major,
+                timeout=300,
+            )
+            npm_logs.append(
+                {
+                    "cmd": f"git clone -b {git_branch} {git_repo} .",
+                    "output": (out or "OK")[-2000:],
+                    "status": "ok" if rc == 0 else "error",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            if rc != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Không thể sao chép mã nguồn từ Git Repository: {_short_cmd_err(out)}",
+                )
+        else:
+            pkg_str, srv_str = _render_starter_files(
+                payload.template,
+                app_name=payload.app_name or site.domain,
+                domain=site.domain,
+                port=port,
+            )
+            _write_app_file(linux_user, site_root, app_dir, "package.json", pkg_str, "0644")
+            _write_app_file(linux_user, site_root, app_dir, "server.js", srv_str, "0644")
+
+        # Write .env with strict 0640 permissions
+        env_content = _render_nodejs_default_env(
+            app_name=payload.app_name or site.domain,
+            app_url=app_url,
+            port=port,
+            node_env=payload.node_env or "production",
+            db_name=db_name,
+            db_user=db_user,
+            db_password=db_password,
         )
+        _write_app_file(linux_user, site_root, app_dir, ".env", env_content, "0640")
 
-    state = _update_instance_state(inst_key, _save_new)
+        # Install npm dependencies if requested and package.json has dependencies
+        pkg_meta = _detect_package_json_metadata(app_dir, linux_user=linux_user, site_root=site_root)
+        if payload.run_npm_install and len(pkg_meta.get("packages") or []) > 0:
+            rc, out = _run_as_site_user(
+                linux_user,
+                app_dir,
+                ["npm", "install", "--no-audit", "--no-fund"],
+                node_major=clean_major,
+                timeout=300,
+            )
+            npm_logs.append(
+                {
+                    "cmd": "npm install --no-audit --no-fund",
+                    "output": (out or "OK")[-2000:],
+                    "status": "ok" if rc == 0 else "error",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
-    # Start systemd worker & sync Nginx vhost
-    _sync_nodejs_worker_unit(
-        linux_user,
-        site_root,
-        app_dir,
-        node_major=clean_major,
-        start_mode=clean_mode,
-        start_arg=clean_arg,
-        port=port,
-        memory_mb=int(payload.memory_mb or 512),
-        node_env=payload.node_env or "production",
-        enabled=True,
-        strict=True,
-    )
-    _sync_nodejs_nginx_vhost(site, linux_user, site_root, port, strict=False)
+        # Apply Nginx security block & switch Website to reverse-proxy application mode
+        if payload.harden_security:
+            site.nginx_custom = _update_nodejs_nginx_security(
+                orig_nginx_custom,
+                sensitive_files=True,
+            )
+        site.app_type = "application"
+        db.add(site)
+        db.commit()
+
+        # Persist state BEFORE rewriting Nginx vhost so app_port_for_website can resolve it
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        def _save_new(inst: Dict[str, Any]) -> None:
+            inst.clear()
+            inst.update(
+                {
+                    "installed": True,
+                    "website_id": site.id,
+                    "domain": site.domain,
+                    "subpath": payload.subpath.strip("/"),
+                    "app_name": payload.app_name or site.domain,
+                    "template": payload.template if install_source != "git" else "git-repo",
+                    "framework": pkg_meta.get("framework") or "Node.js",
+                    "node_major": clean_major,
+                    "start_mode": clean_mode,
+                    "start_arg": clean_arg,
+                    "port": port,
+                    "memory_mb": int(payload.memory_mb or 512),
+                    "node_env": payload.node_env or "production",
+                    "process_enabled": True,
+                    "systemd_sandbox": True,
+                    "db_account_id": db_acc.id if db_acc is not None else None,
+                    "git_repo": git_repo if install_source == "git" else "",
+                    "git_branch": git_branch,
+                    "last_npm_logs": npm_logs[-12:],
+                    "installed_at": now_iso,
+                }
+            )
+
+        state = _update_instance_state(inst_key, _save_new)
+
+        # Start systemd worker & sync Nginx vhost
+        _sync_nodejs_worker_unit(
+            linux_user,
+            site_root,
+            app_dir,
+            node_major=clean_major,
+            start_mode=clean_mode,
+            start_arg=clean_arg,
+            port=port,
+            memory_mb=int(payload.memory_mb or 512),
+            node_env=payload.node_env or "production",
+            enabled=True,
+            strict=True,
+        )
+        _sync_nodejs_nginx_vhost(site, linux_user, site_root, port, strict=False)
+    except Exception:
+        _rollback_failed_install(purge_files=True)
+        raise
 
     instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
     return {
@@ -2164,11 +2251,12 @@ def install_nodejs_instance(
             "node_major": clean_major,
             "port": port,
             "start_command": f"{clean_mode} {clean_arg}",
-            "db_created": bool(payload.create_database and db_name),
+            "db_created": bool(db_mode == "new" and db_name),
+            "db_bound": bool(db_acc is not None),
             "db_name": db_name,
             "db_user": db_user,
-            "db_password": db_password,
-            "db_host": "localhost",
+            "db_password": db_password if db_mode == "new" else "",
+            "db_host": db_host,
         },
         "message": f"Đã triển khai ứng dụng Node.js (v{clean_major}) trên {site.domain} (Cổng nội bộ {port}).",
     }
