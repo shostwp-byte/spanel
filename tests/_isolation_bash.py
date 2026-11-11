@@ -14,7 +14,21 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HELPER = REPO_ROOT / "installer" / "files" / "spanel-helper.sh"
-BASH = shutil.which("bash")
+def _find_working_bash() -> str | None:
+    for name in ("bash", "sh"):
+        cand = shutil.which(name)
+        if not cand or "\\windows\\system32\\bash.exe" in cand.lower():
+            continue
+        try:
+            proc = subprocess.run([cand, "-c", "echo ok"], capture_output=True, text=True, timeout=5)
+            if proc.returncode == 0 and "ok" in (proc.stdout or ""):
+                return cand
+        except Exception:
+            continue
+    return None
+
+
+BASH = _find_working_bash()
 
 
 def helper_text() -> str:

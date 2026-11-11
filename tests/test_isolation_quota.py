@@ -39,9 +39,43 @@ findmnt() {
   esac
 }
 setquota() { record "setquota $*"; }
-quotacheck() { record "quotacheck $*"; }
-quotaon() { if [[ "$1" == -pu ]]; then echo "user quota on $2 (/dev/vda1) is ${FAKE_QUOTA_ON:-off}"; else record "quotaon $*"; fi; }
+quotacheck() {
+  record "quotacheck $*"
+  if [[ "$1" == -cum && "${FAKE_QUOTACHECK_CUM_RC:-0}" != "0" ]]; then
+    return "${FAKE_QUOTACHECK_CUM_RC}"
+  fi
+  if [[ "$1" == -cfum && "${FAKE_QUOTACHECK_CFUM_RC:-0}" != "0" ]]; then
+    echo "quotacheck: superblock quota active" >&2
+    return "${FAKE_QUOTACHECK_CFUM_RC}"
+  fi
+}
+quotaoff() { record "quotaoff $*"; }
+quotaon() {
+  if [[ "$1" == -pu ]]; then
+    if [[ -f "$ROOT/quota_switched_on" ]]; then
+      echo "user quota on $2 (/dev/vda1) is on"
+    else
+      echo "user quota on $2 (/dev/vda1) is ${FAKE_QUOTA_ON:-off}"
+    fi
+  else
+    record "quotaon $*"
+    local count_file="$ROOT/quotaon_u_attempts"
+    local attempt=0
+    [[ -f "$count_file" ]] && attempt="$(cat "$count_file")"
+    attempt=$(( attempt + 1 ))
+    echo "$attempt" >"$count_file"
+    if (( attempt <= ${FAKE_QUOTAON_FAILS_BEFORE_OK:-0} )); then
+      echo "${FAKE_QUOTAON_ERR:-quotaon: Quota format not supported in kernel.}" >&2
+      return 1
+    fi
+    touch "$ROOT/quota_switched_on"
+  fi
+}
 apt-get() { record "apt-get $*"; }
+modinfo() { record "modinfo $*"; return "${FAKE_MODINFO_RC:-0}"; }
+modprobe() { record "modprobe $*"; }
+depmod() { record "depmod $*"; }
+uname() { echo "${FAKE_UNAME:-6.8.0-100-generic}"; }
 systemctl() { record "systemctl $*"; }
 mount() {
   case "$*" in
@@ -67,6 +101,9 @@ def _script(root: Path, body: str) -> str:
         f"ROOT='{root.as_posix()}'",
         'QUOTA_HOME="/home"',
         'FSTAB_FILE="$ROOT/fstab"',
+        'QUOTA_MODULES_CONF="$ROOT/modules-load.d/spanel-quota.conf"',
+        'QUOTA_LOCK_FILE="$ROOT/quota.lock"',
+        'QUOTA_ROOT_PREFIX="$ROOT"',
         'touch "$ROOT/calls.log"',
         helper_functions(*QUOTA_FUNCTIONS),
         STUBS,
@@ -235,12 +272,98 @@ def test_enable_refuses_separate_home_disk_without_fstab_entry(tmp_path):
 @needs_bash
 def test_enable_switches_quota_on_once_the_options_are_mounted(tmp_path):
     (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
-    run_bash(tmp_path, _script(tmp_path, "quota_enable"),
-             env={"FAKE_OPTS": "rw,relatime,usrjquota=aquota.user,jqfmt=vfsv1"})
+    out = run_bash(tmp_path, _script(tmp_path, "quota_enable"),
+                   env={"FAKE_OPTS": "rw,relatime,usrjquota=aquota.user,jqfmt=vfsv1"})
+    status = _kv(out.stdout)
+    assert status["state"] == "active" and status["mode"] == "kernel"
     calls = _calls(tmp_path)
     assert "quotacheck -cum /" in calls
     assert "quotaon -u /" in calls
     assert not any(c.startswith(("mount", "reboot")) for c in calls)
+
+
+@needs_bash
+def test_enable_preinstalls_linux_modules_extra_and_writes_modules_load_conf(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    out = run_bash(
+        tmp_path,
+        _script(tmp_path, "quota_enable"),
+        env={
+            "QUOTA_FORCE_MODULE_CHECK": "1",
+            "FAKE_MODINFO_RC": "1",
+            "FAKE_UNAME": "6.8.0-51-generic",
+        },
+    )
+    status = _kv(out.stdout)
+    assert status["state"] == "remount-required"
+    mod_conf = tmp_path / "modules-load.d" / "spanel-quota.conf"
+    assert mod_conf.read_text(encoding="utf-8").splitlines() == ["quota_v1", "quota_v2"]
+    calls = _calls(tmp_path)
+    assert "modinfo quota_v2" in calls
+    assert "apt-get -o DPkg::Lock::Timeout=120 install -y linux-modules-extra-6.8.0-51-generic" in calls
+    assert "depmod -a" in calls
+    assert "modprobe quota_v1" in calls
+    assert "modprobe quota_v2" in calls
+
+
+@needs_bash
+def test_enable_recovers_missing_quota_module_and_live_quotacheck_after_reboot(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    out = run_bash(
+        tmp_path,
+        _script(tmp_path, "quota_enable"),
+        env={
+            "FAKE_OPTS": "rw,relatime,usrjquota=aquota.user,jqfmt=vfsv1",
+            "FAKE_SRC": "/dev/mapper/ubuntu--vg-ubuntu--lv",
+            "FAKE_QUOTACHECK_CUM_RC": "1",
+            "FAKE_QUOTAON_FAILS_BEFORE_OK": "2",
+            "FAKE_UNAME": "6.8.0-100-generic",
+        },
+    )
+    status = _kv(out.stdout)
+    assert status["state"] == "active" and status["mode"] == "kernel"
+    calls = _calls(tmp_path)
+    assert "quotacheck -cum /" in calls
+    assert "quotaoff -u /" in calls
+    assert "quotacheck -cfum /" in calls
+    assert "apt-get -o DPkg::Lock::Timeout=120 install -y linux-modules-extra-6.8.0-100-generic" in calls
+    assert calls.count("quotaon -u /") == 3
+
+
+@needs_bash
+def test_enable_rebuilds_corrupt_aquota_file_or_surfaces_quotaon_error(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    (tmp_path / "aquota.user").write_bytes(b"corrupt-header")
+    out = run_bash(
+        tmp_path,
+        _script(tmp_path, "quota_enable"),
+        env={
+            "FAKE_OPTS": "rw,relatime,usrjquota=aquota.user,jqfmt=vfsv1",
+            "FAKE_QUOTAON_FAILS_BEFORE_OK": "3",
+        },
+    )
+    status = _kv(out.stdout)
+    assert status["state"] == "active" and status["mode"] == "kernel"
+    calls = _calls(tmp_path)
+    assert "quotacheck -cum /" not in calls
+    assert "quotacheck -cfum /" in calls
+    assert calls.count("quotaon -u /") == 4
+
+    fail_dir = tmp_path / "unrecoverable"
+    fail_dir.mkdir()
+    (fail_dir / "fstab").write_text(FSTAB, encoding="utf-8")
+    failed = run_bash(
+        fail_dir,
+        _script(fail_dir, "quota_enable"),
+        check=False,
+        env={
+            "FAKE_OPTS": "rw,relatime,usrjquota=aquota.user,jqfmt=vfsv1",
+            "FAKE_QUOTAON_FAILS_BEFORE_OK": "99",
+            "FAKE_QUOTAON_ERR": "quotaon: Quota format not supported in kernel.",
+        },
+    )
+    assert failed.returncode != 0
+    assert "quotaon failed on /: quotaon: Quota format not supported in kernel." in failed.stderr
 
 
 @needs_bash
@@ -316,3 +439,117 @@ def test_limits_apply_passes_the_inode_limit_to_the_helper():
     args = privileged.call_args.kwargs["helper_args"]
     assert command == "user-limits-apply"
     assert args[0] == "alice" and args[-2:] == ["5120", "250000"] and len(args) == 11
+
+
+def test_post_reboot_auto_enable_completes_once_and_does_not_loop_on_error(tmp_path):
+    from contextlib import contextmanager
+    from app.services import disk_quota, resource_monitor
+
+    users = [SimpleNamespace(id=1, role="admin"), SimpleNamespace(id=2, role="end_user")]
+    marker = tmp_path / "applied_marker"
+
+    @contextmanager
+    def fake_db_factory():
+        yield SimpleNamespace(query=lambda model: SimpleNamespace(all=lambda: users))
+
+    with disk_quota._state_lock:
+        disk_quota._auto_enable_attempted_for.clear()
+        disk_quota._last_auto_enable_error.clear()
+        disk_quota._reconciling = False
+
+    needs_qon = (
+        "mode=app\nstate=needs-quotaon\nmount=/\nfstype=ext4\n"
+        "device=/dev/mapper/ubuntu--vg-ubuntu--lv\ntools=yes\n"
+        "mounted_options=yes\nfstab_options=yes\nquota_on=no\n"
+    )
+    active_out = (
+        "mode=kernel\nstate=active\nmount=/\nfstype=ext4\n"
+        "device=/dev/mapper/ubuntu--vg-ubuntu--lv\ntools=yes\n"
+        "mounted_options=yes\nfstab_options=yes\nquota_on=yes\n"
+    )
+
+    responses = [
+        SimpleNamespace(returncode=0, stdout=needs_qon, stderr=""),
+        SimpleNamespace(returncode=0, stdout=active_out, stderr=""),
+        SimpleNamespace(returncode=0, stdout=active_out, stderr=""),
+    ]
+    with (
+        patch.object(disk_quota, "APPLIED_MARKER", marker),
+        patch.object(disk_quota.shell, "privileged", side_effect=responses) as priv,
+        patch.object(resource_monitor, "apply_user_cgroup_limits_async") as apply_async,
+    ):
+        final = disk_quota.reconcile_on_startup(db_factory=fake_db_factory)
+
+    assert final["mode"] == "kernel" and final["state"] == "active"
+    assert [c.args[0] for c in priv.call_args_list] == ["quota-status", "quota-enable", "quota-status"]
+    assert [c.args[0] for c in apply_async.call_args_list] == [2]
+
+    # Failure case: auto-enable records last_error and refuses to re-trigger in a loop
+    # until the administrator clicks Enable manually (manual=True).
+    with disk_quota._state_lock:
+        disk_quota._auto_enable_attempted_for.clear()
+        disk_quota._last_auto_enable_error.clear()
+
+    fail_responses = [
+        SimpleNamespace(returncode=0, stdout=needs_qon, stderr=""),
+        SimpleNamespace(returncode=1, stdout="", stderr="deny: quotaon failed on /: Quota format not supported"),
+        SimpleNamespace(returncode=0, stdout=needs_qon, stderr=""),
+    ]
+    with patch.object(disk_quota.shell, "privileged", side_effect=fail_responses):
+        after_fail = disk_quota.reconcile_on_startup(db_factory=fake_db_factory)
+
+    assert after_fail["state"] == "needs-quotaon"
+    assert "Quota format not supported" in after_fail["last_error"]
+    assert disk_quota.maybe_trigger_auto_enable(after_fail, db_factory=fake_db_factory, async_run=False) is False
+
+    # Manual enable resets the one-shot guard and clears stale error once active.
+    with patch.object(
+        disk_quota.shell,
+        "privileged",
+        return_value=SimpleNamespace(returncode=0, stdout=active_out, stderr=""),
+    ):
+        manual_ok = disk_quota.enable(manual=True)
+    assert manual_ok["mode"] == "kernel" and manual_ok["last_error"] == ""
+
+
+@needs_bash
+def test_enable_attempts_linux_modules_extra_at_most_once_per_kernel(tmp_path):
+    (tmp_path / "fstab").write_text(FSTAB, encoding="utf-8")
+    env = {
+        "QUOTA_FORCE_MODULE_CHECK": "1",
+        "FAKE_MODINFO_RC": "1",
+        "FAKE_UNAME": "6.8.0-77-custom",
+    }
+    run_bash(tmp_path, _script(tmp_path, "quota_enable"), env=env)
+    run_bash(tmp_path, _script(tmp_path, "quota_enable"), env=env)
+    calls = _calls(tmp_path)
+    assert calls.count("apt-get -o DPkg::Lock::Timeout=120 install -y linux-modules-extra-6.8.0-77-custom") == 1
+    # A new kernel version gets its own single attempt.
+    run_bash(tmp_path, _script(tmp_path, "quota_enable"), env={**env, "FAKE_UNAME": "6.8.0-78-custom"})
+    calls = _calls(tmp_path)
+    assert calls.count("apt-get -o DPkg::Lock::Timeout=120 install -y linux-modules-extra-6.8.0-78-custom") == 1
+
+
+def test_create_database_credentials_refuses_existing_database_unless_restore():
+    from app.services import mariadb
+
+    executed: list[str] = []
+
+    def fake_run_sql(sql: str, *, check: bool = True):
+        executed.append(sql)
+        if "information_schema.schemata" in sql and "'wp_alice_db'" in sql:
+            return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(mariadb, "_run_sql", side_effect=fake_run_sql):
+        with pytest.raises(ValueError, match="MariaDB database 'wp_alice_db' already exists"):
+            mariadb.create_database_credentials("wp_alice_db", "u_bob_new", "StrongPass123!")
+        assert not any("GRANT ALL PRIVILEGES" in s for s in executed)
+
+        # Restore path explicitly sets allow_existing_user=True (which implies allow_existing_db=True).
+        res = mariadb.create_database_credentials(
+            "wp_alice_db", "u_alice_restore", "StrongPass123!", allow_existing_user=True
+        )
+        assert res["db_name"] == "wp_alice_db"
+        assert any("GRANT ALL PRIVILEGES ON `wp_alice_db`.*" in s for s in executed)
+

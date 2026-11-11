@@ -15,7 +15,7 @@ from app.api import backup_ops, wordpress_manager, laravel_manager
 from app.core.config import settings
 from app.core.database import run_migrations
 from app.core.version import APP_VERSION
-from app.services import panel_settings as panel_brand_settings, auto_updater, resource_monitor, cluster_worker, webhooks as webhooks_service
+from app.services import panel_settings as panel_brand_settings, auto_updater, disk_quota, resource_monitor, cluster_worker, webhooks as webhooks_service
 
 run_migrations()
 auto_updater.start_auto_update_daemon()
@@ -94,6 +94,7 @@ def _sync_dns_zones() -> None:
 
 
 _sync_dns_zones()
+disk_quota.start_boot_reconciler()
 
 # Secure default umask: files get 644 (-rw-r--r--), dirs get 755 (rwxr-xr-x)
 os.umask(0o022)

@@ -72,20 +72,52 @@ const MAINTENANCE_PRESET_OPTIONS = [
   },
 ];
 
+const WP_TOOLKIT_CACHE_SOFT_TTL_MS = 180 * 1000;
+const _wpToolkitSessionCache = new Map();
+
+function buildWebsitesSignature(websites) {
+  if (!Array.isArray(websites) || websites.length === 0) return '';
+  return websites
+    .map(w => `${w.id}:${w.domain || ''}:${w.app_type || ''}:${w.php_version || ''}:${w.ssl_enabled ? 1 : 0}`)
+    .sort()
+    .join('|');
+}
+
+export function invalidateWordPressToolkitCache(userId = null) {
+  if (userId !== null && userId !== undefined) {
+    _wpToolkitSessionCache.delete(String(userId));
+  } else {
+    _wpToolkitSessionCache.clear();
+  }
+}
+
 export function WordPressManagerPage({ request, websites = [], openWebsiteFileManager, navigateToPage }) {
   const { loading, setError, setNotice, phpVersions, loadPhpVersions, currentUser, packages } = useAppContext();
   const installedPhpList = phpVersions?.installed?.length ? phpVersions.installed : ['8.4', '8.3', '8.2', '8.1'];
 
+  const cacheUserKey = String(currentUser?.id || currentUser?.username || 'default');
+  const websitesSig = useMemo(() => buildWebsitesSignature(websites), [websites]);
+  const initialCached = useMemo(() => {
+    const entry = _wpToolkitSessionCache.get(cacheUserKey);
+    if (!entry) return null;
+    if (websitesSig && entry.websitesSig && entry.websitesSig !== websitesSig) {
+      return null;
+    }
+    return entry;
+  }, [cacheUserKey, websitesSig]);
+
   // Global tabs: 'instances' | 'plugins' | 'themes' | 'sets'
-  const [globalTab, setGlobalTab] = useState('instances');
+  const [globalTab, setGlobalTab] = useState(() => initialCached?.globalTab || 'instances');
   // View mode for instances: 'expanded' | 'grid' | 'list'
-  const [viewMode, setViewMode] = useState('expanded');
+  const [viewMode, setViewMode] = useState(() => initialCached?.viewMode || 'expanded');
   const [searchQuery, setSearchQuery] = useState('');
 
-  const [instances, setInstances] = useState([]);
-  const [packageSets, setPackageSets] = useState([]);
-  const [allWebsites, setAllWebsites] = useState(websites || []);
-  const [quotaInfo, setQuotaInfo] = useState(null);
+  const [instances, setInstances] = useState(() => initialCached?.instances || []);
+  const [packageSets, setPackageSets] = useState(() => initialCached?.packageSets || []);
+  const [allWebsites, setAllWebsites] = useState(() =>
+    initialCached?.allWebsites?.length ? initialCached.allWebsites : websites || []
+  );
+  const [quotaInfo, setQuotaInfo] = useState(() => initialCached?.quotaInfo || null);
   const [busyAction, setBusyAction] = useState('');
 
   // Selection & expansion states
@@ -93,8 +125,8 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   const [collapsedMap, setCollapsedMap] = useState({});
   // Active sub-tab per instance ID: 'overview' | 'plugins' | 'themes' | 'security' | 'database'
   const [instanceTabMap, setInstanceTabMap] = useState({});
-  const [instancePluginsMap, setInstancePluginsMap] = useState({});
-  const [instanceThemesMap, setInstanceThemesMap] = useState({});
+  const [instancePluginsMap, setInstancePluginsMap] = useState(() => initialCached?.instancePluginsMap || {});
+  const [instanceThemesMap, setInstanceThemesMap] = useState(() => initialCached?.instanceThemesMap || {});
   const [securityCheckedMap, setSecurityCheckedMap] = useState({});
 
   // Modals state
@@ -188,9 +220,41 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
   const [applySetModal, setApplySetModal] = useState(null); // { pkg, websiteIds: [] }
 
   useEffect(() => {
-    if (loadPhpVersions) loadPhpVersions({ silent: true });
-    loadToolkitData(false);
-  }, []);
+    if (loadPhpVersions && !phpVersions?.installed?.length) {
+      loadPhpVersions({ silent: true });
+    }
+    const existing = _wpToolkitSessionCache.get(cacheUserKey);
+    const sigMatches = !websitesSig || !existing?.websitesSig || existing.websitesSig === websitesSig;
+    if (existing && sigMatches) {
+      setInstances(existing.instances || []);
+      setPackageSets(existing.packageSets || []);
+      if (existing.allWebsites?.length) setAllWebsites(existing.allWebsites);
+      setQuotaInfo(existing.quotaInfo || null);
+      setInstancePluginsMap(existing.instancePluginsMap || {});
+      setInstanceThemesMap(existing.instanceThemesMap || {});
+      if (Date.now() - (existing.fetchedAt || 0) > WP_TOOLKIT_CACHE_SOFT_TTL_MS) {
+        loadToolkitData(true, false);
+      }
+      return;
+    }
+    loadToolkitData(false, false);
+  }, [cacheUserKey, websitesSig]);
+
+  useEffect(() => {
+    const existing = _wpToolkitSessionCache.get(cacheUserKey);
+    if (!existing) return;
+    _wpToolkitSessionCache.set(cacheUserKey, {
+      ...existing,
+      instances,
+      packageSets,
+      allWebsites,
+      quotaInfo,
+      instancePluginsMap,
+      instanceThemesMap,
+      globalTab,
+      viewMode,
+    });
+  }, [cacheUserKey, instances, packageSets, allWebsites, quotaInfo, instancePluginsMap, instanceThemesMap, globalTab, viewMode]);
 
   function generateStrongPassword(len = 16) {
     const chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#%^&*_-+=';
@@ -201,10 +265,13 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
     return out;
   }
 
-  async function loadToolkitData(silent = true) {
+  async function loadToolkitData(silent = true, forceRefresh = false) {
     if (!silent) setBusyAction('loading');
     try {
-      const data = await request('/wordpress-manager/instances', silent ? { silent: true } : {});
+      const endpoint = forceRefresh
+        ? '/wordpress-manager/instances?refresh=1'
+        : '/wordpress-manager/instances';
+      const data = await request(endpoint, silent ? { silent: true } : {});
       if (data) {
         const list = Array.isArray(data.instances) ? data.instances : [];
         setInstances(list);
@@ -216,11 +283,26 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
         }
         setInstancePluginsMap(nextPlugins);
         setInstanceThemesMap(nextThemes);
+        const nextSets = Array.isArray(data.sets) ? data.sets : packageSets;
         if (Array.isArray(data.sets)) setPackageSets(data.sets);
+        const nextQuota = data.quota || quotaInfo;
         if (data.quota) setQuotaInfo(data.quota);
+        const nextWebsites = Array.isArray(data.websites) ? data.websites : allWebsites;
         if (Array.isArray(data.websites)) {
           setAllWebsites(data.websites);
         }
+        _wpToolkitSessionCache.set(cacheUserKey, {
+          fetchedAt: Date.now(),
+          websitesSig: buildWebsitesSignature(nextWebsites) || websitesSig,
+          instances: list,
+          packageSets: nextSets,
+          allWebsites: nextWebsites,
+          quotaInfo: nextQuota,
+          instancePluginsMap: nextPlugins,
+          instanceThemesMap: nextThemes,
+          globalTab,
+          viewMode,
+        });
       }
     } finally {
       if (!silent) setBusyAction('');
@@ -1140,7 +1222,7 @@ export function WordPressManagerPage({ request, websites = [], openWebsiteFileMa
             type="button"
             className="secondary-light"
             disabled={!!busyAction}
-            onClick={() => loadToolkitData(false)}
+            onClick={() => loadToolkitData(false, true)}
             style={{ height: '36px', padding: '0 14px', fontSize: '13px' }}
           >
             <RefreshCw size={14} className={busyAction === 'loading' ? 'spin' : ''} /> Làm mới

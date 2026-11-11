@@ -659,11 +659,11 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
                 root_path=root_path,
             )
         except HTTPException:
-            mariadb.drop_database(db_info["db_name"], db_info["db_user"])
+            teardown.rollback_uncommitted_database(db_info)
             _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise
         except Exception as exc:
-            mariadb.drop_database(db_info["db_name"], db_info["db_user"])
+            teardown.rollback_uncommitted_database(db_info)
             _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
@@ -678,11 +678,11 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
                 rewrite_mode="front_controller",
             )
         except HTTPException:
-            mariadb.drop_database(db_info["db_name"], db_info["db_user"])
+            teardown.rollback_uncommitted_database(db_info)
             _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise
         except Exception as exc:
-            mariadb.drop_database(db_info["db_name"], db_info["db_user"])
+            teardown.rollback_uncommitted_database(db_info)
             _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app_type_value = "wordpress"
@@ -828,7 +828,7 @@ def install_wordpress_on_website(
             rewrite_mode="front_controller",
         )
     except (RuntimeError, ValueError, OSError) as exc:
-        mariadb.drop_database(db_info["db_name"], db_info["db_user"])
+        teardown.rollback_uncommitted_database(db_info)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     website.root_path = root_path
