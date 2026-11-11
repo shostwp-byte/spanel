@@ -451,14 +451,26 @@ class RemoteMySQLBackend:
     def create_database_credentials(
         self, db_name: str, db_user: str, db_password: str, *, password_hash: str | None = None,
         allow_existing_user: bool = False,
+        allow_existing_database: bool = False,
+        allow_existing_db: bool | None = None,
     ) -> dict[str, str]:
         db_name = mariadb._validate_identifier(db_name)
         db_user = self._checked_user(db_user)
+        allow_db = bool(allow_existing_database if allow_existing_db is None else allow_existing_db)
         if password_hash:
             # Only a DirectAdmin import carries a hash, and imports go local.
             raise ValueError("A password hash can only be restored onto the local MariaDB.")
         clients = client_hosts_for(self.host)
         with admin_cursor(self.host) as cur:
+            if not allow_db:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s LIMIT 1",
+                    (db_name,),
+                )
+                if cur.fetchone():
+                    raise ValueError(
+                        f"Database '{db_name}' already exists on {self.label}. Choose another database name."
+                    )
             if not allow_existing_user and self._account_hosts(cur, db_user):
                 raise ValueError(
                     f"Account '{db_user}' already exists on {self.label}. Choose another database user name."

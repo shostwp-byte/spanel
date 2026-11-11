@@ -27,7 +27,16 @@ def recorded(monkeypatch, tmp_path):
         return run
 
     def create(where):
-        def run(self, db_name, db_user, db_password, *, password_hash=None, allow_existing_user=False):
+        def run(
+            self,
+            db_name,
+            db_user,
+            db_password,
+            *,
+            password_hash=None,
+            allow_existing_user=False,
+            allow_existing_database=False,
+        ):
             calls.append(("create", where(self), db_name))
             return {"db_name": db_name, "db_user": db_user, "db_password": db_password}
         return run

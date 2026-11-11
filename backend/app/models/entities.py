@@ -1047,3 +1047,42 @@ class MailAutoresponder(Base):
     def address(self) -> str:
         return f'{self.local_part}@{self.domain}'
 
+
+class NodejsInstance(Base):
+    __tablename__ = "nodejs_instances"
+
+    website_id: Mapped[int] = mapped_column(
+        ForeignKey("websites.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+    owner_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    subpath: Mapped[str] = mapped_column(String(120), default="")
+    app_name: Mapped[str] = mapped_column(String(120), default="Node.js Application")
+    template: Mapped[str] = mapped_column(String(40), default="express-api")
+    framework: Mapped[str] = mapped_column(String(64), default="Node.js")
+    node_major: Mapped[str] = mapped_column(String(8), default="22")
+    start_mode: Mapped[str] = mapped_column(String(16), default="node")
+    start_arg: Mapped[str] = mapped_column(String(120), default="server.js")
+    port: Mapped[Optional[int]] = mapped_column(Integer, unique=True, nullable=True, index=True)
+    memory_mb: Mapped[int] = mapped_column(Integer, default=512)
+    node_env: Mapped[str] = mapped_column(String(24), default="production")
+    process_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    systemd_sandbox: Mapped[bool] = mapped_column(Boolean, default=True)
+    db_account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("database_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    db_created_by_manager: Mapped[bool] = mapped_column(Boolean, default=False)
+    git_repo: Mapped[str] = mapped_column(String(255), default="")
+    git_branch: Mapped[str] = mapped_column(String(80), default="main")
+    git_build_script: Mapped[str] = mapped_column(String(64), default="")
+    last_deploy_at: Mapped[str] = mapped_column(String(64), default="")
+    last_deploy_status: Mapped[str] = mapped_column(String(32), default="")
+    webhook_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    webhook_token: Mapped[str] = mapped_column(Text, default="")
+    last_npm_logs: Mapped[str] = mapped_column(Text, default="[]")
+    installed_at: Mapped[str] = mapped_column(String(64), default="")
+    updated_at: Mapped[str] = mapped_column(String(64), default="")
+    detached: Mapped[bool] = mapped_column(Boolean, default=False)
+
+

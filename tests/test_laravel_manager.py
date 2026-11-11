@@ -1441,12 +1441,20 @@ def test_p1_b5_remove_purges_app_syncs_vhost_and_protects_sibling_wp_database(tm
     assert lm.LARAVEL_NGINX_SEC_BEGIN not in site.nginx_custom
     assert "# keep custom comment" in site.nginx_custom
 
-    # Case B: Exact `lv_rm_db` in `.env` -> drops ONLY `lv_rm_db` via `teardown.drop_database_record`
+    # Case B: Exact `lv_rm_db` in state (created by manager) -> drops ONLY `lv_rm_db` via `teardown.drop_database_record`
     site.document_root = "public_html/public"
     site.nginx_rewrite_mode = "laravel"
     db_exact = MagicMock()
     db_exact.query.return_value.filter.return_value.first.side_effect = [user, lv_db]
-    state_exact = {"instances": {"81": {"installed": True}}}
+    state_exact = {
+        "instances": {
+            "81": {
+                "installed": True,
+                "db_name": "lv_rm_db",
+                "db_created_by_manager": True,
+            }
+        }
+    }
 
     with patch.object(lm.settings, "command_dry_run", False), \
             patch.object(lm, "_get_accessible_website", return_value=site), \
@@ -1467,6 +1475,57 @@ def test_p1_b5_remove_purges_app_syncs_vhost_and_protects_sibling_wp_database(tm
 
     mock_drop_b.assert_called_once_with(db_exact, lv_db)
     assert "lv_rm_db" in res_b["message"]
+
+    # Case C (Round 16 P1-A): Reusing existing DB (`wp_main_db` bound to site 80) on site 81:
+    # - install with db_mode="existing" does NOT change wp_db.website_id (remains 80)
+    # - remove_laravel_instance(81, drop_database=True) does NOT drop wp_db
+    # - after remove, wp_db.website_id == 80
+    site.document_root = "public_html"
+    site.nginx_rewrite_mode = "none"
+    saved_store: dict = {"instances": {}}
+    db_reuse = MagicMock()
+
+    def _query_side_effect(model):
+        q = MagicMock()
+        if model.__name__ == "User":
+            q.filter.return_value.first.return_value = user
+        elif model.__name__ == "Website":
+            q.filter.return_value.all.return_value = [site]
+        elif model.__name__ == "DatabaseAccount":
+            q.filter.return_value.first.return_value = wp_db
+        return q
+
+    db_reuse.query.side_effect = _query_side_effect
+    wp_db.db_password = lm.encrypt("WpSecretPass123!")
+
+    with patch.object(lm.settings, "command_dry_run", True), \
+            patch.object(lm, "_get_accessible_website", return_value=site), \
+            patch.object(lm, "_load_toolkit_state", side_effect=lambda: saved_store), \
+            patch.object(
+                lm,
+                "_update_instance_state",
+                side_effect=lambda k, fn: (fn(saved_store["instances"].setdefault(str(k), {})), saved_store)[1],
+            ), \
+            patch.object(lm, "_pop_instance_state", side_effect=lambda k: saved_store["instances"].pop(str(k), None)), \
+            patch.object(lm, "_build_instance_summary", return_value={"id": 81}), \
+            patch("app.api.websites._rewrite_website_vhost"), \
+            patch.object(lm.teardown, "drop_database_record") as mock_drop_c:
+        lm.install_laravel_instance(
+            lm.LaravelInstallPayload(
+                website_id=81,
+                app_name="Laravel Reuse DB",
+                db_mode="existing",
+                database_id=wp_db.id,
+            ),
+            db=db_reuse,
+            current_user=user,
+        )
+        assert wp_db.website_id == 80
+        assert saved_store["instances"]["81"]["db_created_by_manager"] is False
+
+        lm.remove_laravel_instance(81, drop_database=True, db=db_reuse, current_user=user)
+        mock_drop_c.assert_not_called()
+        assert wp_db.website_id == 80
 
 
 def test_p1_b6_blocks_subpath_occupied_sites_non_empty_dirs_and_cross_app_security(tmp_path):

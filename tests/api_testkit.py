@@ -23,6 +23,8 @@ _CLEAN_TABLES = (
     "webhook_outbox",
     "webhook_endpoints",
     "provisioning_accounts",
+    "nodejs_instances",
+    "site_apps",
     "database_accounts",
     "websites",
     "api_tokens",

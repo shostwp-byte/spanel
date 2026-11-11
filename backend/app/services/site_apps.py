@@ -21,10 +21,11 @@ from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.core.config import settings
-from app.models.entities import SiteApp, User, Website
+from app.core.database import SessionLocal
+from app.models.entities import NodejsInstance, SiteApp, User, Website
 from app.services import site_users
 from app.services.shell import shell
 
@@ -181,11 +182,26 @@ def listening_ports() -> set[int]:
     return ports
 
 
-def reserved_ports(db: Session, exclude_app_id: int | None = None) -> set[int]:
+def reserved_ports(
+    db: Session,
+    exclude_app_id: int | None = None,
+    exclude_nodejs_website_id: int | None = None,
+) -> set[int]:
     query = select(SiteApp.port)
     if exclude_app_id is not None:
         query = query.where(SiteApp.id != exclude_app_id)
-    return {row for row in db.scalars(query) if row}
+    ports = {row for row in db.scalars(query) if row}
+    try:
+        nj_query = select(NodejsInstance.port).where(
+            NodejsInstance.detached.is_(False),
+            NodejsInstance.port.is_not(None),
+        )
+        if exclude_nodejs_website_id is not None:
+            nj_query = nj_query.where(NodejsInstance.website_id != exclude_nodejs_website_id)
+        ports |= {int(row) for row in db.scalars(nj_query) if row}
+    except Exception:
+        pass
+    return ports
 
 
 def allocate_port(db: Session, preferred: int | None = None, exclude_app_id: int | None = None) -> int:
@@ -202,7 +218,10 @@ def allocate_port(db: Session, preferred: int | None = None, exclude_app_id: int
 
 
 def app_limit_for(user: User) -> int:
-    package = getattr(user, "package", None)
+    try:
+        package = getattr(user, "package", None)
+    except Exception:
+        package = None
     if not package:
         return 0
     raw = getattr(package, "node_apps_limit", None)
@@ -210,13 +229,28 @@ def app_limit_for(user: User) -> int:
 
 
 def memory_ceiling_for(user: User) -> int:
-    package = getattr(user, "package", None)
+    try:
+        package = getattr(user, "package", None)
+    except Exception:
+        package = None
     ceiling = int(getattr(package, "node_app_memory_mb", 0) or 0) if package else 0
     return ceiling or DEFAULT_MEMORY_MB
 
 
 def count_apps_for_owner(db: Session, owner_id: int) -> int:
-    return db.query(SiteApp).filter(SiteApp.owner_id == owner_id).count()
+    total = db.query(SiteApp).filter(SiteApp.owner_id == owner_id).count()
+    try:
+        total += (
+            db.query(NodejsInstance)
+            .filter(
+                NodejsInstance.owner_id == owner_id,
+                NodejsInstance.detached.is_(False),
+            )
+            .count()
+        )
+    except Exception:
+        pass
+    return total
 
 
 def ensure_app_quota(db: Session, user: User, is_admin: bool = False) -> None:
@@ -229,9 +263,42 @@ def ensure_app_quota(db: Session, user: User, is_admin: bool = False) -> None:
         raise ValueError(f"This package allows at most {limit} application(s)")
 
 
-def app_port_for_website(website: Website) -> Optional[int]:
+def app_port_for_website(website: Website, db: Optional[Session] = None) -> Optional[int]:
     app = getattr(website, "app", None)
-    return app.port if app else None
+    if app and getattr(app, "port", None):
+        return app.port
+    website_id = getattr(website, "id", None)
+    if not website_id:
+        return None
+    try:
+        sess = db or object_session(website)
+        if sess is not None:
+            row = (
+                sess.query(NodejsInstance.port)
+                .filter(
+                    NodejsInstance.website_id == int(website_id),
+                    NodejsInstance.detached.is_(False),
+                    NodejsInstance.port.is_not(None),
+                )
+                .first()
+            )
+            if row and row[0] and PORT_RANGE_START <= int(row[0]) <= PORT_RANGE_END:
+                return int(row[0])
+        with SessionLocal() as session:
+            row = (
+                session.query(NodejsInstance.port)
+                .filter(
+                    NodejsInstance.website_id == int(website_id),
+                    NodejsInstance.detached.is_(False),
+                    NodejsInstance.port.is_not(None),
+                )
+                .first()
+            )
+            if row and row[0] and PORT_RANGE_START <= int(row[0]) <= PORT_RANGE_END:
+                return int(row[0])
+    except Exception:
+        pass
+    return None
 
 
 # --- container and environment validation -----------------------------------

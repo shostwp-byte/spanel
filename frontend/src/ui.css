@@ -94,8 +94,8 @@ h1,h2,h3,h4{letter-spacing:0}
 .content-body{padding:24px 28px 36px}
 
 /* Panels are static: they do not light up under the pointer. */
-.section{padding:24px;gap:16px;border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);margin-bottom:24px;background:var(--surface);border:1px solid var(--border);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);transition:all 0.3s ease;animation:fadeUp 0.4s cubic-bezier(0.16, 1, 0.3, 1)}
-.section:hover{box-shadow:var(--shadow-md);border-color:var(--primary-soft);transform:translateY(-2px)}
+.section{padding:24px;gap:16px;border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);margin-bottom:24px;background:var(--surface);border:1px solid var(--border);transition:all 0.3s ease}
+.section:hover{box-shadow:var(--shadow-md);border-color:var(--primary-soft)}
 .section h2{font-size:16px;font-weight:600;line-height:1.3;color:var(--text);margin:0 0 2px}
 .section h3{font-size:14px;font-weight:600}
 .section-title{align-items:center;flex-wrap:wrap}
@@ -1990,10 +1990,12 @@ table.table {
 
 /* Package Import Modal (DirectAdmin / cPanel / Plesk) */
 .section {
-  backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
   transform: none !important;
   animation: none !important;
+  filter: none !important;
+  contain: none !important;
 }
 .section:hover {
   transform: none !important;
@@ -3345,7 +3347,8 @@ input[type="checkbox"].sp-switch-input:disabled,
 }
 
 .modal,
-.modal-card {
+.modal-card,
+.modal-content {
   background: var(--bg-elevated, #ffffff) !important;
   color: var(--text, #0f172a);
   border-radius: 16px !important;
@@ -3479,7 +3482,8 @@ input[type="checkbox"].sp-switch-input:disabled,
 }
 
 :root[data-theme="dark"] .modal,
-:root[data-theme="dark"] .modal-card {
+:root[data-theme="dark"] .modal-card,
+:root[data-theme="dark"] .modal-content {
   background: var(--bg-elevated, #1e293b) !important;
   border-color: var(--border-strong, #475569) !important;
   box-shadow: 0 24px 48px rgba(0, 0, 0, 0.65) !important;

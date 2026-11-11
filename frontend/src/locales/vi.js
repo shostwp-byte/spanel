@@ -2977,6 +2977,7 @@ export const vi = {
   "/ is XFS: add rootflags=uquota to GRUB_CMDLINE_LINUX in /etc/default/grub, run update-grub and reboot.": "Phân vùng / dùng XFS: hãy thêm rootflags=uquota vào GRUB_CMDLINE_LINUX trong /etc/default/grub, chạy update-grub rồi khởi động lại máy chủ.",
   "Only the panel's own accounting applies; PHP and SFTP can write past the limit.": "Hiện chỉ áp dụng bộ đếm của Panel; các tiến trình PHP và SFTP vẫn có thể ghi vượt hạn mức nếu chưa bật Kernel Quota.",
   "Kernel quota needs ext4 or xfs; {mount} is on {fstype}.": "Kernel Quota yêu cầu hệ thống tập tin ext4 hoặc xfs; {mount} hiện đang dùng {fstype}.",
+  "Node.js Manager": "Quản lý Node.js",
 };
 
 /* Said in English by the people who run these servers. Translating them

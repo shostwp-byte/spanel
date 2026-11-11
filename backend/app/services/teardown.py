@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 
-from app.models.entities import DatabaseAccount, SftpAccount, SiteApp, WebauthnCredential
+from app.models.entities import DatabaseAccount, NodejsInstance, SftpAccount, SiteApp, WebauthnCredential
 from app.services import db_backends, mariadb, sftp_accounts, site_apps
 
 logger = logging.getLogger("spanel.teardown")
@@ -96,6 +96,10 @@ def purge_owner_apps(db, owner_id: int) -> list[str]:
         db.delete(app)
         db.flush()
         removed.append(app.name)
+    db.query(NodejsInstance).filter(NodejsInstance.owner_id == owner_id).delete(
+        synchronize_session=False
+    )
+    db.flush()
     return removed
 
 

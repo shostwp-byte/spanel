@@ -29,13 +29,64 @@ jobs:
         run: python -m compileall -q backend/app
       - name: Security boundary guard (MariaDB API calls)
         run: |
-          bad=$(git grep -n "mariadb\.drop_database\|create_database_credentials" -- backend/app/api \
-            | grep -v "^backend/app/api/databases\.py:" || true)
+          bad=$(git grep -n "mariadb\.drop_database\|create_database_credentials" -- backend/app \
+            | grep -Ev "^backend/app/(api/databases|api/remote_mysql|services/teardown|services/mariadb|services/db_backends|services/remote_mysql|services/backup|services/da_import|services/provisioning|services/wordpress_live)\.py:" || true)
           if [ -n "$bad" ]; then
-            echo "Direct mariadb.drop_database / create_database_credentials calls outside databases.py:" >&2
+            echo "Direct mariadb.drop_database / create_database_credentials calls outside allowed modules:" >&2
             echo "$bad" >&2
             exit 1
           fi
+      - name: Security boundary guard (API route authentication)
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          HTTP_DECOS = {"get", "post", "put", "delete", "patch", "websocket"}
+          AUTH_HELPERS = {
+              "get_current_user",
+              "require_admin",
+              "_authorize",
+              "_get_provisioning_token",
+              "peer_auth",
+              "authenticate_peer",
+              "_streamed_upload_auth",
+              "_verify_peer",
+              "mcp.authenticate",
+          }
+          ALLOWED_PUBLIC = {
+              "auth.py:login",
+              "auth.py:sso_login",
+              "databases.py:consume_phpmyadmin_sso",
+              "demo_mode.py:public_accounts",
+              "mcp.py:mcp_endpoint_get",
+              "mcp.py:mcp_endpoint_delete",
+              "nodejs_manager.py:public_nodejs_webhook_deploy",
+              "panel_settings.py:public_panel_settings",
+              "resellers.py:get_whitelabel_public",
+              "site_apps.py:git_webhook_auto_deploy",
+          }
+          unauthenticated = []
+          for p in sorted(pathlib.Path("backend/app/api").glob("*.py")):
+              src = p.read_text(encoding="utf-8")
+              router_has_auth = "Depends(require_admin)" in src or "Depends(get_current_user)" in src.split("def ", 1)[0]
+              if router_has_auth:
+                  continue
+              tree = ast.parse(src, filename=str(p))
+              for node in tree.body:
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      decos = [
+                          d for d in node.decorator_list
+                          if isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr in HTTP_DECOS
+                      ]
+                      if not decos:
+                          continue
+                      fn_src = ast.get_source_segment(src, node) or ""
+                      key = f"{p.name}:{node.name}"
+                      if not any(h in fn_src for h in AUTH_HELPERS) and key not in ALLOWED_PUBLIC:
+                          unauthenticated.append(key)
+          if unauthenticated:
+              print("Unauthenticated API endpoints outside allowlist:", unauthenticated, file=sys.stderr)
+              sys.exit(1)
+          PY
       - name: Migrations apply to an empty database
         working-directory: backend
         env:
@@ -65,12 +116,144 @@ jobs:
           exit $status
       - name: Security boundary guard (systemd EnvironmentFile)
         run: |
-          bad=$(git grep -n 'EnvironmentFile=.*\(/home\|app_target\|site_root\)' -- installer || true)
+          bad=$(git grep -n 'EnvironmentFile=.*\(/home\|HOME_ROOT\|app_target\|site_root\|app_dir\)' -- installer || true)
           if [ -n "$bad" ]; then
             echo "Unsafe systemd EnvironmentFile pointing into tenant directory:" >&2
             echo "$bad" >&2
             exit 1
           fi
+
+  helper-integration:
+    name: Helper integration (systemd & Node.js worker)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+      - name: Install pinned Node.js 22 into /opt/spanel/node/22 with SHA256 verification
+        run: |
+          NODE_VER="v22.14.0"
+          NODE_SHA256="69b09dba5c8dcb05c4e4273a4340db1005abeafe3927efda2bc5b249e80437ec"
+          TARBALL="/tmp/node-${NODE_VER}-linux-x64.tar.xz"
+          curl -fsSL "https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-linux-x64.tar.xz" -o "$TARBALL"
+          echo "${NODE_SHA256}  ${TARBALL}" | sha256sum -c -
+          sudo install -d -m 0755 /opt/spanel/node/22
+          sudo tar -xJf "$TARBALL" -C /opt/spanel/node/22 --strip-components=1
+          rm -f "$TARBALL"
+          /opt/spanel/node/22/bin/node -v
+      - name: Exercise nodejs-worker-sync, symlink .env guard, status, and delete under systemd
+        env:
+          PYTHONPATH: backend
+        run: |
+          set -euo pipefail
+          sudo useradd -m -d /home/spaneltest -s /bin/bash spaneltest
+          sudo chmod 0755 /home/spaneltest
+          SITE_ROOT="/home/spaneltest/example.com"
+          APP_DIR="${SITE_ROOT}/public_html"
+          sudo install -d -o spaneltest -g spaneltest -m 0755 "$SITE_ROOT" "$APP_DIR"
+
+          cat <<'JS' | sudo -u spaneltest tee "${APP_DIR}/server.js" >/dev/null
+          const http = require('http');
+          const port = Number(process.env.PORT || 21055);
+          http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, port, node_env: process.env.NODE_ENV }));
+          }).listen(port, '127.0.0.1');
+          JS
+
+          # 1.2: Build helper args from Python _worker_sync_helper_args
+          mapfile -t SYNC_ARGS < <(python - <<'PY'
+          from pathlib import Path
+          from app.api.nodejs_manager import _worker_sync_helper_args
+          args = _worker_sync_helper_args(
+              "spaneltest",
+              Path("/home/spaneltest/example.com"),
+              Path("/home/spaneltest/example.com/public_html"),
+              node_major="22",
+              port=21055,
+              memory_mb=512,
+              start_mode="node",
+              start_arg="server.js",
+              node_env="production",
+              enabled=True,
+          )
+          for a in args:
+              print(a)
+          PY
+          )
+
+          # Positive control (P1-B): regular .env owned by spaneltest must be loaded into worker environ
+          echo "APP_MARKER=ok" | sudo -u spaneltest tee "${APP_DIR}/.env" >/dev/null
+          sudo -u spaneltest chmod 0640 "${APP_DIR}/.env"
+          sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-sync "${SYNC_ARGS[@]}"
+
+          # Wait for HTTP 200 on 127.0.0.1:21055
+          ok=0
+          for _ in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:21055/ | grep -q '"ok":true'; then
+              ok=1
+              break
+            fi
+            sleep 0.5
+          done
+          test "$ok" -eq 1
+
+          STATUS_POS="$(sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-status spaneltest "$SITE_ROOT")"
+          PID_POS="$(STATUS_OUT="$STATUS_POS" python - <<'PY'
+          import os
+          from app.api.nodejs_manager import _parse_kv_output
+          kv = _parse_kv_output(os.environ["STATUS_OUT"])
+          assert kv.get("state") == "active", kv
+          pid = int(kv.get("main_pid") or 0)
+          assert pid > 0, kv
+          print(pid)
+          PY
+          )"
+          ENVIRON_POS="$(sudo cat "/proc/${PID_POS}/environ" | tr '\0' '\n')"
+          grep -q '^PORT=21055$' <<<"$ENVIRON_POS"
+          grep -q '^APP_MARKER=ok$' <<<"$ENVIRON_POS"
+
+          # Negative control (1.1 / P0-1 & P1-B): symlink site .env -> /root/secret.env (0600 root:root)
+          echo "ROOT_ONLY_SECRET=top_secret_panel_master_key" | sudo tee /root/secret.env >/dev/null
+          sudo chmod 0600 /root/secret.env
+          sudo -u spaneltest ln -sf /root/secret.env "${APP_DIR}/.env"
+          sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-sync "${SYNC_ARGS[@]}"
+
+          # 1.3: Verify nodejs-worker-status output parsed via _parse_kv_output
+          STATUS_OUT="$(sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-status spaneltest "$SITE_ROOT")"
+          MAIN_PID="$(STATUS_OUT="$STATUS_OUT" python - <<'PY'
+          import os
+          from app.api.nodejs_manager import _parse_kv_output
+          kv = _parse_kv_output(os.environ["STATUS_OUT"])
+          assert kv.get("state") == "active", kv
+          pid = int(kv.get("main_pid") or 0)
+          assert pid > 0, kv
+          print(pid)
+          PY
+          )"
+
+          # 1.1: Verify /proc/<pid>/environ is readable via sudo cat and ROOT_ONLY_SECRET is NOT present
+          ENVIRON="$(sudo cat "/proc/${MAIN_PID}/environ" | tr '\0' '\n')"
+          grep -q '^PORT=21055$' <<<"$ENVIRON"
+          ! grep -q 'ROOT_ONLY_SECRET' <<<"$ENVIRON"
+          ! grep -q '^APP_MARKER=ok$' <<<"$ENVIRON"
+
+          # 6: Verify nodejs-worker-delete removes both unit file and env file
+          sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-delete spaneltest "$SITE_ROOT"
+          shopt -s nullglob
+          units=(/etc/systemd/system/spanel-nodejs-spaneltest-*.service)
+          envs=(/var/lib/spanel/nodejs/spanel-nodejs-spaneltest-*.env)
+          test "${#units[@]}" -eq 0
+          test "${#envs[@]}" -eq 0
 
   whmcs-module:
     name: WHMCS module (PHP ${{ matrix.php }})

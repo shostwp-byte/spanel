@@ -1178,6 +1178,7 @@ def _create_panel_database(
         import_pw,
         password_hash=None if use_temp_pw else (db_password_hash or None),
         allow_existing_user=True,
+        allow_existing_database=True,
     )
     temp_sql: Optional[Path] = None
     try:
@@ -1196,6 +1197,7 @@ def _create_panel_database(
                     "",
                     password_hash=db_password_hash,
                     allow_existing_user=True,
+                    allow_existing_database=True,
                 )
     except Exception:
         mariadb.drop_database(db_name, db_user)
