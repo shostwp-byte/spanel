@@ -8076,33 +8076,9 @@ copy_site_env_as_user() {
 resolve_or_install_node_bin_dir() {
   local major="$1" dir=""
   require_node_major "$major"
-  if dir="$(resolve_node_bin_dir "$major" 2>/dev/null)"; then
-    printf '%s' "$dir"
-    return 0
-  fi
-  if install_node_major "$major" >/dev/null 2>&1; then
-    if dir="$(resolve_node_bin_dir "$major" 2>/dev/null)"; then
-      printf '%s' "$dir"
-      return 0
-    fi
-  fi
-  if [[ -d /opt/spanel/node ]]; then
-    for d in $(ls -1d /opt/spanel/node/* 2>/dev/null | sort -Vr); do
-      if [[ -x "$d/bin/node" ]]; then
-        printf '%s/bin' "$d"
-        return 0
-      fi
-    done
-  fi
-  if [[ -x /usr/bin/node ]]; then
-    printf '/usr/bin'
-    return 0
-  fi
-  if [[ -x /usr/local/bin/node ]]; then
-    printf '/usr/local/bin'
-    return 0
-  fi
-  return 1
+  dir="$(resolve_node_bin_dir "$major" 2>/dev/null)" || return 1
+  printf '%s' "$dir"
+  return 0
 }
 
 delete_nodejs_worker_units() {
@@ -13203,9 +13179,9 @@ EOF
     umask 022
     terminal_path="/usr/local/bin:/usr/bin:/bin"
     if [[ -n "$node_version" ]]; then
-      if node_bin_dir="$(resolve_or_install_node_bin_dir "$node_version" 2>/dev/null)"; then
-        terminal_path="${node_bin_dir}:${terminal_path}"
-      fi
+      node_bin_dir="$(resolve_node_bin_dir "$node_version" 2>/dev/null)" \
+        || deny "Node ${node_version} is not installed; run node-install ${node_version} first"
+      terminal_path="${node_bin_dir}:${terminal_path}"
     elif [[ ! -x /usr/bin/node && -d /opt/spanel/node ]]; then
       for d in $(ls -1d /opt/spanel/node/* 2>/dev/null | sort -Vr); do
         if [[ -x "$d/bin/node" ]]; then

@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.database import engine, get_db
-from app.core.permissions import Role, is_admin_role, normalize_role
+from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, SiteApp, User, Website
 from app.services import addons, mariadb, nginx, site_apps, site_users, teardown, wordpress_live
@@ -2032,7 +2032,7 @@ def install_node_version_endpoint(
     payload: NodeVersionInstallRequest,
     current_user: User = Depends(get_current_user),
 ):
-    _require_end_user_nodejs_access(current_user)
+    ensure_role(current_user.role, Role.admin)
     clean_major = _validate_node_major(payload.node_major)
     try:
         output = site_apps.install_node(clean_major)

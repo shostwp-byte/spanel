@@ -140,6 +140,7 @@ export function NodejsManagerPage({
   navigateToPage: propNavigate,
 }) {
   const ctx = useAppContext() || {};
+  const isAdmin = Boolean(ctx.actualRole === 'admin' || ctx.isAdmin);
   const request = propRequest || ctx.request;
   const websites = propWebsites || ctx.websites || [];
   const requestRef = useRef(request);
@@ -1027,12 +1028,15 @@ export function NodejsManagerPage({
                   value={pDraft.node_major}
                   onChange={e => updatePDraft({ node_major: e.target.value })}
                 >
-                  {nodeVersions.map(v => (
-                    <option key={v} value={v}>
-                      Node.js v{v} {v === '24' ? '(Current)' : '(LTS)'}{' '}
-                      {installedNodeVersions.includes(v) ? '✓' : '(Tự động cài)'}
-                    </option>
-                  ))}
+                  {nodeVersions.map(v => {
+                    const isVerInstalled = installedNodeVersions.includes(v);
+                    return (
+                      <option key={v} value={v} disabled={!isVerInstalled}>
+                        Node.js v{v} {v === '24' ? '(Current)' : '(LTS)'}{' '}
+                        {isVerInstalled ? '✓' : '(Liên hệ quản trị)'}
+                      </option>
+                    );
+                  })}
                 </select>
               </label>
 
@@ -2364,11 +2368,15 @@ export function NodejsManagerPage({
                               value={installForm.node_major}
                               onChange={e => setInstallForm(prev => ({ ...prev, node_major: e.target.value }))}
                             >
-                              {nodeVersions.map(v => (
-                                <option key={v} value={v}>
-                                  Node.js v{v} {v === '24' ? '(Current)' : '(LTS)'}
-                                </option>
-                              ))}
+                              {nodeVersions.map(v => {
+                                const isVerInstalled = installedNodeVersions.includes(v);
+                                return (
+                                  <option key={v} value={v} disabled={!isVerInstalled}>
+                                    Node.js v{v} {v === '24' ? '(Current)' : '(LTS)'}{' '}
+                                    {isVerInstalled ? '✓' : '(Liên hệ quản trị)'}
+                                  </option>
+                                );
+                              })}
                             </select>
                           </label>
 
@@ -2969,21 +2977,33 @@ export function NodejsManagerPage({
                                 /opt/spanel/node/{ver}/bin/node
                               </div>
                             </div>
-                            <button
-                              type="button"
-                              className={isInstalled ? 'secondary-light mini' : 'mini'}
-                              disabled={isBusy}
-                              onClick={() => handleInstallNodeMajor(ver)}
-                            >
-                              <Download size={13} />
-                              <span>
-                                {isBusy
-                                  ? `Đang tải v${ver}...`
-                                  : isInstalled
-                                  ? 'Đã cài đặt · Cập nhật lại'
-                                  : `Cài đặt Node v${ver}`}
+                            {isAdmin ? (
+                              <button
+                                type="button"
+                                className={isInstalled ? 'secondary-light mini' : 'mini'}
+                                disabled={isBusy}
+                                onClick={() => handleInstallNodeMajor(ver)}
+                              >
+                                <Download size={13} />
+                                <span>
+                                  {isBusy
+                                    ? `Đang tải v${ver}...`
+                                    : isInstalled
+                                    ? 'Đã cài đặt · Cập nhật lại'
+                                    : `Cài đặt Node v${ver}`}
+                                </span>
+                              </button>
+                            ) : (
+                              <span
+                                className="badge"
+                                style={{
+                                  fontSize: '11.5px',
+                                  color: isInstalled ? '#16a34a' : 'var(--text-muted)',
+                                }}
+                              >
+                                {isInstalled ? 'Đã cài đặt ✓' : 'Chưa cài đặt · Liên hệ quản trị'}
                               </span>
-                            </button>
+                            )}
                           </div>
                         );
                       })}
