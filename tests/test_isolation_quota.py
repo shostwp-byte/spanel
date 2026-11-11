@@ -546,9 +546,19 @@ def test_create_database_credentials_refuses_existing_database_unless_restore():
             mariadb.create_database_credentials("wp_alice_db", "u_bob_new", "StrongPass123!")
         assert not any("GRANT ALL PRIVILEGES" in s for s in executed)
 
-        # Restore path explicitly sets allow_existing_user=True (which implies allow_existing_db=True).
+        # allow_existing_user=True alone does NOT allow attaching to an existing DB
+        with pytest.raises(ValueError, match="MariaDB database 'wp_alice_db' already exists"):
+            mariadb.create_database_credentials(
+                "wp_alice_db", "u_alice_restore", "StrongPass123!", allow_existing_user=True
+            )
+
+        # Restore path explicitly sets allow_existing_database=True.
         res = mariadb.create_database_credentials(
-            "wp_alice_db", "u_alice_restore", "StrongPass123!", allow_existing_user=True
+            "wp_alice_db",
+            "u_alice_restore",
+            "StrongPass123!",
+            allow_existing_user=True,
+            allow_existing_database=True,
         )
         assert res["db_name"] == "wp_alice_db"
         assert any("GRANT ALL PRIVILEGES ON `wp_alice_db`.*" in s for s in executed)

@@ -1441,12 +1441,12 @@ def test_p1_b5_remove_purges_app_syncs_vhost_and_protects_sibling_wp_database(tm
     assert lm.LARAVEL_NGINX_SEC_BEGIN not in site.nginx_custom
     assert "# keep custom comment" in site.nginx_custom
 
-    # Case B: Exact `lv_rm_db` in `.env` -> drops ONLY `lv_rm_db` via `teardown.drop_database_record`
+    # Case B: Exact `lv_rm_db` in state -> drops ONLY `lv_rm_db` via `teardown.drop_database_record`
     site.document_root = "public_html/public"
     site.nginx_rewrite_mode = "laravel"
     db_exact = MagicMock()
     db_exact.query.return_value.filter.return_value.first.side_effect = [user, lv_db]
-    state_exact = {"instances": {"81": {"installed": True}}}
+    state_exact = {"instances": {"81": {"installed": True, "db_name": "lv_rm_db"}}}
 
     with patch.object(lm.settings, "command_dry_run", False), \
             patch.object(lm, "_get_accessible_website", return_value=site), \

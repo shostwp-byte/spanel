@@ -1687,6 +1687,7 @@ function AppContent() {
   // installed at all, and the customer's package has to include it. Admins skip
   // the second one, never the first.
   const appsFeatureEnabled = applicationAddonInstalled && (actualRole === 'admin' || siteApps.limit > 0);
+  const nodejsManagerEnabled = appsFeatureEnabled && !!siteApps.nodejs_manager_enabled;
   const roleScopedWebsites = React.useMemo(() => {
     if (isUser && currentUser) {
       return (websites || []).filter(site => site.owner_id === currentUser.id);
@@ -2159,6 +2160,7 @@ function AppContent() {
         max_total_websites: data.max_total_websites,
         occupied_websites_count: data.occupied_websites_count,
         website_quota_reached: !!data.website_quota_reached,
+        nodejs_manager_enabled: !!data.nodejs_manager_enabled,
       });
     }
   }
@@ -3560,7 +3562,7 @@ function AppContent() {
       { key: 'application', title: 'Application', items: [
         ...(appsFeatureEnabled ? [
           ['docker_manager', 'Docker', Boxes],
-          ['nodejs_manager', 'Node.js', NodejsIcon],
+          ...(nodejsManagerEnabled ? [['nodejs_manager', 'Node.js', NodejsIcon]] : []),
         ] : []),
         ['laravel_manager', 'Laravel', LaravelIcon],
         ['wordpress_manager', 'WordPress Manager', WordPressIcon],
@@ -4809,7 +4811,7 @@ function AppContent() {
     // Reachable by URL after the addon is removed, so it answers for itself
     // rather than rendering a page whose every request would be refused.
     if (page === 'wordpress_manager') return <WordPressManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} />;
-    if (page === 'nodejs_manager') return appsFeatureEnabled ? <NodejsManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} /> : renderAddonMissing('application');
+    if (page === 'nodejs_manager') return nodejsManagerEnabled ? <NodejsManagerPage request={request} websites={roleScopedWebsites} openWebsiteFileManager={openWebsiteFileManager} navigateToPage={navigateToPage} /> : renderAddonMissing('application');
     if (page === 'laravel_manager') return <LaravelManagerPage request={request} websites={roleScopedWebsites} phpVersions={phpVersions} openWebsiteFileManager={openWebsiteFileManager} openWebsiteTerminal={openWebsiteTerminal} navigateToPage={navigateToPage} />;
     if (page === 'docker_manager' || page === 'applications') return appsFeatureEnabled ? <ApplicationsPage request={request} API={API} setPage={setPage} isReseller={isReseller} fileAppId={fileAppId} setFileAppId={setFileAppId} setFileListPath={setFileListPath} EMPTY_SITE_APP_DRAFT={EMPTY_SITE_APP_DRAFT} loadSiteApps={loadSiteApps} /> : renderAddonMissing('application');
     if (page === 'ssl') return <SslPage request={request} loadCfZone={loadCfZone} refreshAll={refreshAll} enableSsl={enableSsl} />;

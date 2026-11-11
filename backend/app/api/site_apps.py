@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.models.entities import SiteApp, User
@@ -191,6 +192,7 @@ def list_site_apps(
         "max_total_websites": quota_info["max_total_websites"],
         "occupied_websites_count": quota_info["occupied_websites_count"],
         "website_quota_reached": quota_info["website_quota_reached"],
+        "nodejs_manager_enabled": bool(getattr(settings, "nodejs_manager_enabled", False)),
     }
 
 

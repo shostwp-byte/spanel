@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     # silently leaking through. Set STRICT_DECRYPT=false during a one-shot
     # migration window only.
     strict_decrypt: bool = True
+    # Node.js Manager feature flag (4.3): disabled by default until verified on staging VPS.
+    nodejs_manager_enabled: bool = False
 
     @field_validator("secret_key")
     @classmethod

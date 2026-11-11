@@ -1016,3 +1016,38 @@ def test_full_nodejs_lifecycle_install_process_npm_env_security_remove(monkeypat
             assert len(after_remove["instances"]) == 0
         finally:
             db.close()
+
+
+def test_stage_4_nodejs_manager_feature_flag_default_disabled(monkeypatch):
+    """4.3:
+    - Settings().nodejs_manager_enabled defaults to False.
+    - When nodejs_manager_enabled is False, router returns 404 for all endpoints.
+    """
+    from app.core.config import Settings
+
+    assert Settings().nodejs_manager_enabled is False
+    monkeypatch.setattr(settings, "nodejs_manager_enabled", False)
+
+    _, SessionLocal = _setup_test_db()
+    db = SessionLocal()
+    pkg = UserPackage(name="node-pkg", node_apps_limit=5, node_app_memory_mb=1024)
+    db.add(pkg)
+    db.commit()
+    db.refresh(pkg)
+    user = User(
+        username="alice",
+        email="alice@example.com",
+        hashed_password="x",
+        role="end_user",
+        package_id=pkg.id,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    db.close()
+
+    holder = {"user": user}
+    client = _build_test_client(SessionLocal, holder)
+    assert client.get("/api/nodejs-manager/instances").status_code == 404
+    assert client.post("/api/nodejs-manager/webhook/1", json={}).status_code == 404
+

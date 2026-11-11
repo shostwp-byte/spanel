@@ -46,10 +46,21 @@ async def _capture_nodejs_access_role(request: Request):
         _NODEJS_ACCESS_ROLE_CTX.reset(token)
 
 
+def _require_nodejs_manager_enabled() -> None:
+    if not getattr(settings, "nodejs_manager_enabled", False):
+        raise HTTPException(
+            status_code=404,
+            detail="Node.js Manager is disabled on this server",
+        )
+
+
 router = APIRouter(
     prefix="/nodejs-manager",
     tags=["nodejs-manager"],
-    dependencies=[Depends(_capture_nodejs_access_role)],
+    dependencies=[
+        Depends(_require_nodejs_manager_enabled),
+        Depends(_capture_nodejs_access_role),
+    ],
 )
 logger = logging.getLogger("spanel.nodejs_manager")
 
