@@ -191,6 +191,8 @@ export function NodejsManagerPage({
   const [customPkgInputs, setCustomPkgInputs] = useState({});
   // Git deploy form drafts keyed by instance id
   const [gitDrafts, setGitDrafts] = useState({});
+  // One-time revealed webhook secrets keyed by instance id
+  const [webhookSecrets, setWebhookSecrets] = useState({});
 
   // Modals state
   const [showInstallModal, setShowInstallModal] = useState(false);
@@ -602,6 +604,15 @@ export function NodejsManagerPage({
         body: JSON.stringify({ enabled, rotate_token: rotateToken }),
       });
       if (res?.instance) replaceSingleInstance(res.instance);
+      if (res?.webhook_secret) {
+        setWebhookSecrets(prev => ({ ...prev, [inst.id]: res.webhook_secret }));
+      } else if (!enabled) {
+        setWebhookSecrets(prev => {
+          const next = { ...prev };
+          delete next[inst.id];
+          return next;
+        });
+      }
       setNotice(res?.message || 'Đã cập nhật Webhook.');
     } catch (err) {
       setError(err?.message || 'Không thể cập nhật Webhook.');
@@ -1543,46 +1554,102 @@ export function NodejsManagerPage({
               }}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
-                <strong style={{ fontSize: '13px' }}>Webhook CI/CD (GitHub / GitLab Push)</strong>
-                <div style={{ display: 'flex', gap: '6px' }}>
+                <strong style={{ fontSize: '13px' }}>
+                  Webhook CI/CD (GitHub / GitLab Push — Yêu cầu chữ ký HMAC)
+                </strong>
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                  {inst.webhook_enabled && inst.webhook_path && (
+                    <button
+                      type="button"
+                      className="secondary-light mini"
+                      onClick={() =>
+                        copyText(
+                          `${window.location.origin}${inst.webhook_path}`,
+                          'Đã sao chép URL Webhook Auto-Deploy.'
+                        )
+                      }
+                    >
+                      <Copy size={12} />
+                      <span>Sao chép Webhook URL</span>
+                    </button>
+                  )}
                   <button
                     type="button"
-                    className="secondary-light mini"
+                    className={inst.webhook_enabled ? 'secondary-light mini' : 'mini'}
+                    disabled={busyMap[`wh_${inst.id}`]}
                     onClick={() =>
-                      copyText(
-                        `${window.location.origin}${inst.webhook_path}`,
-                        'Đã sao chép URL Webhook Auto-Deploy.'
-                      )
+                      handleWebhookConfig(inst, {
+                        enabled: !inst.webhook_enabled,
+                        rotateToken: !inst.webhook_enabled,
+                      })
                     }
                   >
-                    <Copy size={12} />
-                    <span>Sao chép Webhook URL</span>
+                    <span>{inst.webhook_enabled ? 'Tắt Webhook' : 'Bật Webhook'}</span>
                   </button>
-                  <button
-                    type="button"
-                    className="secondary-light mini"
-                    disabled={busyMap[`wh_${inst.id}`]}
-                    onClick={() => handleWebhookConfig(inst, { enabled: true, rotateToken: true })}
-                  >
-                    <RotateCcw size={12} />
-                    <span>Đổi khóa Token</span>
-                  </button>
+                  {inst.webhook_enabled && (
+                    <button
+                      type="button"
+                      className="secondary-light mini"
+                      disabled={busyMap[`wh_${inst.id}`]}
+                      onClick={() => handleWebhookConfig(inst, { enabled: true, rotateToken: true })}
+                    >
+                      <RotateCcw size={12} />
+                      <span>Đổi khóa Token &amp; Secret</span>
+                    </button>
+                  )}
                 </div>
               </div>
-              <div
-                style={{
-                  fontFamily: 'var(--font-mono, monospace)',
-                  fontSize: '12px',
-                  padding: '8px 10px',
-                  borderRadius: '6px',
-                  background: 'var(--surface)',
-                  border: '1px solid var(--border)',
-                  wordBreak: 'break-all',
-                }}
-              >
-                POST {window.location.origin}
-                {inst.webhook_path}
-              </div>
+              {inst.webhook_enabled && inst.webhook_path ? (
+                <>
+                  <div
+                    style={{
+                      fontFamily: 'var(--font-mono, monospace)',
+                      fontSize: '12px',
+                      padding: '8px 10px',
+                      borderRadius: '6px',
+                      background: 'var(--surface)',
+                      border: '1px solid var(--border)',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    POST {window.location.origin}
+                    {inst.webhook_path}
+                  </div>
+                  {webhookSecrets[inst.id] && (
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: '8px',
+                        padding: '8px 10px',
+                        borderRadius: '6px',
+                        background: 'var(--surface)',
+                        border: '1px dashed var(--primary)',
+                        fontSize: '12px',
+                      }}
+                    >
+                      <span style={{ fontFamily: 'var(--font-mono, monospace)', wordBreak: 'break-all' }}>
+                        <strong>Webhook Secret (chỉ hiện 1 lần):</strong> {webhookSecrets[inst.id]}
+                      </span>
+                      <button
+                        type="button"
+                        className="secondary-light mini"
+                        onClick={() =>
+                          copyText(webhookSecrets[inst.id], 'Đã sao chép Webhook Signing Secret.')
+                        }
+                      >
+                        <Copy size={12} />
+                        <span>Sao chép Secret</span>
+                      </button>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="hint" style={{ fontSize: '12px' }}>
+                  Webhook mặc định tắt để bảo mật. Nhấn &ldquo;Bật Webhook&rdquo; để sinh URL ngẫu nhiên và khóa ký HMAC (<code>X-Hub-Signature-256</code> / <code>X-Gitlab-Token</code>).
+                </div>
+              )}
             </div>
           </div>
         )}

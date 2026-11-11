@@ -15,15 +15,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.config import settings
-from app.core.database import engine, get_db
+from app.core.database import SessionLocal, engine, get_db
 from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
+from app.core.rate_limit import enforce_rate_limit
 from app.core.secrets import decrypt, encrypt
 from app.models.entities import DatabaseAccount, SiteApp, User, Website
 from app.services import addons, mariadb, nginx, site_apps, site_users, teardown, wordpress_live
@@ -1613,13 +1615,101 @@ def _ensure_install_target_dir_clean(
             )
 
 
-def _webhook_token_for(site: Website, saved: Dict[str, Any]) -> str:
-    custom = (saved.get("webhook_token") or "").strip()
-    if custom:
-        return custom
-    secret = (settings.secret_key or "spanel-nodejs-webhook").strip().encode("utf-8")
-    msg = f"nodejs-webhook:{site.id}:{site.owner_id}:{site.domain}".encode("utf-8")
-    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+def _require_webhook_secret_key() -> bytes:
+    secret = (settings.webhook_secret_key or settings.secret_key or "").strip()
+    if not secret:
+        raise RuntimeError("SECRET_KEY is required for Node.js webhook signing")
+    return secret.encode("utf-8")
+
+
+def _decrypt_webhook_token(saved: Dict[str, Any]) -> str:
+    enc = (saved.get("webhook_token") or "").strip()
+    if not enc:
+        return ""
+    try:
+        tok = decrypt(enc).strip()
+        return tok
+    except Exception:
+        return ""
+
+
+def _webhook_signing_secret_for(site: Website, raw_token: str) -> str:
+    """Domain-separated HMAC signing secret for GitHub (X-Hub-Signature-256) / GitLab (X-Gitlab-Token)."""
+    secret = _require_webhook_secret_key()
+    msg = f"nodejs-webhook-secret:{site.id}:{site.owner_id}:{raw_token}".encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def _verify_nodejs_github_signature(
+    site: Website, raw_token: str, raw_body: bytes, signature_header: Optional[str]
+) -> bool:
+    sig = (signature_header or "").strip().lower()
+    if not sig.startswith("sha256="):
+        return False
+    secret = _webhook_signing_secret_for(site, raw_token).encode("utf-8")
+    expected = "sha256=" + hmac.new(secret, raw_body or b"", hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _verify_nodejs_gitlab_token(
+    site: Website, raw_token: str, token_header: Optional[str]
+) -> bool:
+    provided = (token_header or "").strip()
+    if not provided:
+        return False
+    expected = _webhook_signing_secret_for(site, raw_token)
+    return hmac.compare_digest(expected, provided)
+
+
+def _deploy_locks_dir() -> Path:
+    data_dir = Path(os.environ.get("SPANEL_DATA_DIR") or "/var/lib/spanel")
+    candidate = data_dir / "locks"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        if os.access(candidate, os.W_OK):
+            return candidate
+    except OSError:
+        pass
+    fallback = Path(tempfile.gettempdir()) / "spanel-locks"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _deploy_lock_path(website_id: int) -> Path:
+    return _deploy_locks_dir() / f"nodejs-deploy-{int(website_id)}.lock"
+
+
+def _acquire_deploy_lock(website_id: int, stale_seconds: int = 900) -> Path:
+    lock_path = _deploy_lock_path(website_id)
+    for attempt in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, f"{os.getpid()}:{time.time()}\n".encode("utf-8"))
+            finally:
+                os.close(fd)
+            return lock_path
+        except FileExistsError:
+            if attempt == 0:
+                try:
+                    age = time.time() - lock_path.stat().st_mtime
+                    if age > stale_seconds:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+            raise HTTPException(
+                status_code=409,
+                detail="Một tiến trình Git Deploy khác đang chạy cho website này. Vui lòng đợi hoàn tất.",
+            )
+
+
+def _release_deploy_lock(lock_path: Optional[Path]) -> None:
+    if lock_path is not None:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _compute_nodejs_dir_signature(
@@ -1770,8 +1860,9 @@ def _inspect_nodejs_instance(
         db_user = ""
         db_host = "localhost"
 
-    webhook_tok = _webhook_token_for(site, saved)
-    webhook_path = f"/api/nodejs-manager/webhook/{site.id}/{webhook_tok}"
+    wh_enabled = bool(saved.get("webhook_enabled", False))
+    webhook_tok = _decrypt_webhook_token(saved) if wh_enabled else ""
+    webhook_path = f"/api/nodejs-manager/webhook/{site.id}/{webhook_tok}" if (wh_enabled and webhook_tok) else ""
 
     result = {
         "id": site.id,
@@ -1811,7 +1902,7 @@ def _inspect_nodejs_instance(
         "git_build_script": saved.get("git_build_script") or "",
         "last_deploy_at": saved.get("last_deploy_at") or "",
         "last_deploy_status": saved.get("last_deploy_status") or "",
-        "webhook_enabled": bool(saved.get("webhook_enabled", True)),
+        "webhook_enabled": wh_enabled,
         "webhook_path": webhook_path,
         "security_checks": security_checks,
         "security_score": security_score,
@@ -2320,6 +2411,8 @@ def install_nodejs_instance(
                     "db_account_id": db_acc.id if db_acc is not None else None,
                     "git_repo": git_repo if install_source == "git" else "",
                     "git_branch": git_branch,
+                    "webhook_enabled": False,
+                    "webhook_token": "",
                     "last_npm_logs": npm_logs[-12:],
                     "installed_at": now_iso,
                 }
@@ -2891,15 +2984,19 @@ def trigger_nodejs_git_deploy(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
-    return _execute_git_deploy_pipeline(
-        site,
-        db,
-        git_repo=payload.git_repo,
-        git_branch=payload.git_branch,
-        run_npm_install=payload.run_npm_install,
-        build_script=payload.build_script,
-        restart_process=payload.restart_process,
-    )
+    lock_path = _acquire_deploy_lock(site.id)
+    try:
+        return _execute_git_deploy_pipeline(
+            site,
+            db,
+            git_repo=payload.git_repo,
+            git_branch=payload.git_branch,
+            run_npm_install=payload.run_npm_install,
+            build_script=payload.build_script,
+            restart_process=payload.restart_process,
+        )
+    finally:
+        _release_deploy_lock(lock_path)
 
 
 @router.post("/instances/{website_id}/webhook")
@@ -2911,40 +3008,142 @@ def configure_nodejs_webhook(
 ):
     site = _get_accessible_website(website_id, db, current_user)
     inst_key = str(site.id)
+    state_before = _load_toolkit_state()
+    saved_before = (state_before.get("instances") or {}).get(inst_key) or {}
+    existing_raw_token = _decrypt_webhook_token(saved_before)
+
+    issued_token: Optional[str] = None
+    issued_secret: Optional[str] = None
+    if payload.enabled and (payload.rotate_token or not existing_raw_token):
+        issued_token = secrets.token_urlsafe(32)
+        issued_secret = _webhook_signing_secret_for(site, issued_token)
 
     def _mutate_wh(inst: Dict[str, Any]) -> None:
         inst["webhook_enabled"] = bool(payload.enabled)
-        if payload.rotate_token:
-            inst["webhook_token"] = secrets.token_hex(16)
+        if issued_token is not None:
+            inst["webhook_token"] = encrypt(issued_token)
+        elif not payload.enabled and payload.rotate_token:
+            inst["webhook_token"] = ""
 
     state = _update_instance_state(inst_key, _mutate_wh)
     instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
-    return {
+    resp: Dict[str, Any] = {
         "instance": instance_info,
-        "message": "Đã cập nhật cấu hình Webhook Auto-Deploy.",
+        "message": (
+            "Đã bật Webhook Auto-Deploy và cấp khóa ký HMAC mới."
+            if issued_token
+            else (
+                "Đã bật Webhook Auto-Deploy."
+                if payload.enabled
+                else "Đã tắt Webhook Auto-Deploy."
+            )
+        ),
     }
+    if issued_token and issued_secret:
+        resp["webhook_token"] = issued_token
+        resp["webhook_secret"] = issued_secret
+        resp["webhook_path"] = f"/api/nodejs-manager/webhook/{site.id}/{issued_token}"
+    return resp
 
 
-@router.post("/webhook/{website_id}/{token}")
-def public_nodejs_webhook_deploy(
+def _run_background_webhook_deploy(website_id: int, lock_path: Path) -> None:
+    try:
+        with SessionLocal() as bg_db:
+            site = bg_db.query(Website).filter(Website.id == website_id).first()
+            if site is not None:
+                _execute_git_deploy_pipeline(site, bg_db)
+    except Exception as exc:
+        logger.warning("Background Node.js webhook deploy failed for website_id=%s: %s", website_id, exc)
+    finally:
+        _release_deploy_lock(lock_path)
+
+
+@router.post("/webhook/{website_id}/{token}", status_code=202)
+async def public_nodejs_webhook_deploy(
     website_id: int,
     token: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    raw_body = await request.body()
+    gh_sig = request.headers.get("X-Hub-Signature-256")
+    gl_token = request.headers.get("X-Gitlab-Token")
+    if gh_sig is None and gl_token is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing webhook signature header (X-Hub-Signature-256 or X-Gitlab-Token is required)",
+        )
+
     site = db.query(Website).filter(Website.id == website_id).first()
     if not site:
-        raise HTTPException(status_code=404, detail="Website not found")
+        raise HTTPException(status_code=403, detail="Invalid or disabled webhook")
     state = _load_toolkit_state()
     saved = (state.get("instances") or {}).get(str(site.id)) or {}
-    if not saved or not saved.get("webhook_enabled", True):
+    if not saved or saved.get("detached") or not bool(saved.get("webhook_enabled", False)):
         raise HTTPException(status_code=403, detail="Webhook is disabled for this Node.js application")
 
-    expected = _webhook_token_for(site, saved)
-    if not hmac.compare_digest(expected, (token or "").strip()):
+    expected_token = _decrypt_webhook_token(saved)
+    provided_token = (token or "").strip()
+    if not expected_token or not provided_token or not hmac.compare_digest(expected_token, provided_token):
         raise HTTPException(status_code=403, detail="Invalid webhook token")
 
-    res = _execute_git_deploy_pipeline(site, db)
-    return {"status": "ok", "message": res.get("message")}
+    if gh_sig is not None and not _verify_nodejs_github_signature(site, expected_token, raw_body, gh_sig):
+        raise HTTPException(status_code=403, detail="Invalid X-Hub-Signature-256 HMAC signature")
+    if gl_token is not None and not _verify_nodejs_gitlab_token(site, expected_token, gl_token):
+        raise HTTPException(status_code=403, detail="Invalid X-Gitlab-Token header")
+
+    enforce_rate_limit(
+        request,
+        "nodejs_webhook",
+        max_requests=6,
+        window_seconds=60,
+        key_suffix=str(site.id),
+    )
+
+    gh_event = (request.headers.get("X-GitHub-Event") or "").strip().lower()
+    if gh_event == "ping":
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok", "event": "ping", "message": "Webhook ping acknowledged"},
+        )
+    if gh_event and gh_event != "push":
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok", "skipped": True, "reason": f"Ignored event {gh_event}"},
+        )
+
+    target_branch = (saved.get("git_branch") or "main").strip()
+    pushed_branch = ""
+    if raw_body:
+        try:
+            payload_json = json.loads(raw_body.decode("utf-8"))
+            if isinstance(payload_json, dict):
+                ref = str(payload_json.get("ref") or "")
+                if ref.startswith("refs/heads/"):
+                    pushed_branch = ref[len("refs/heads/"):]
+        except Exception:
+            pass
+    if pushed_branch and pushed_branch != target_branch:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "skipped": True,
+                "reason": f"Push to {pushed_branch} does not match target branch {target_branch}",
+            },
+        )
+
+    lock_path = _acquire_deploy_lock(site.id)
+    background_tasks.add_task(_run_background_webhook_deploy, site.id, lock_path)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "accepted",
+            "website_id": site.id,
+            "message": "Webhook deploy queued in background.",
+        },
+    )
 
 
 @router.get("/instances/{website_id}/logs")
