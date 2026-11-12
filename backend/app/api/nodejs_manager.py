@@ -1430,6 +1430,25 @@ def _parse_env_details(env_text: str, default_port: int = 21000) -> Dict[str, An
             if key:
                 raw_vars[key] = val
 
+    db_url = raw_vars.get("DATABASE_URL") or ""
+    url_host = ""
+    url_port = ""
+    url_name = ""
+    url_user = ""
+    url_pass = ""
+    if db_url and db_url.lower().startswith(("mysql://", "mariadb://")):
+        try:
+            from urllib.parse import unquote, urlsplit
+
+            sp = urlsplit(db_url)
+            url_host = sp.hostname or ""
+            url_port = str(sp.port) if sp.port else ""
+            url_name = unquote((sp.path or "").lstrip("/").split("/", 1)[0])
+            url_user = unquote(sp.username or "")
+            url_pass = unquote(sp.password or "")
+        except Exception:
+            pass
+
     return {
         "variables": raw_vars,
         "app_name": raw_vars.get("APP_NAME") or "Node.js Application",
@@ -1440,13 +1459,106 @@ def _parse_env_details(env_text: str, default_port: int = 21000) -> Dict[str, An
         "tz": raw_vars.get("TZ") or "Asia/Ho_Chi_Minh",
         "jwt_secret": raw_vars.get("JWT_SECRET") or "",
         "log_level": raw_vars.get("LOG_LEVEL") or "info",
-        "db_host": raw_vars.get("DB_HOST") or "localhost",
-        "db_port": raw_vars.get("DB_PORT") or "3306",
-        "db_name": raw_vars.get("DB_DATABASE") or raw_vars.get("DB_NAME") or "",
-        "db_user": raw_vars.get("DB_USERNAME") or raw_vars.get("DB_USER") or "",
-        "db_password": raw_vars.get("DB_PASSWORD") or "",
-        "database_url": raw_vars.get("DATABASE_URL") or "",
+        "db_host": raw_vars.get("DB_HOST") or raw_vars.get("MYSQL_HOST") or url_host or "localhost",
+        "db_port": raw_vars.get("DB_PORT") or raw_vars.get("MYSQL_PORT") or url_port or "3306",
+        "db_name": raw_vars.get("DB_DATABASE") or raw_vars.get("DB_NAME") or raw_vars.get("MYSQL_DATABASE") or url_name or "",
+        "db_user": raw_vars.get("DB_USERNAME") or raw_vars.get("DB_USER") or raw_vars.get("MYSQL_USER") or url_user or "",
+        "db_password": raw_vars.get("DB_PASSWORD") or raw_vars.get("MYSQL_PASSWORD") or url_pass or "",
+        "database_url": db_url,
     }
+
+
+def _ensure_nodejs_local_db_grants(
+    site: Website,
+    db: Session,
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    saved: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Ensure local MariaDB accounts bound to or configured in `.env` / `.env.local` of this
+    Node.js application have privileges across all loopback hosts ('localhost', '127.0.0.1', '::1')."""
+    if settings.command_dry_run:
+        return
+    saved = saved or {}
+    site_owner = db.query(User).filter(User.id == site.owner_id).first()
+    is_admin_owner = bool(site_owner is not None and is_admin_role(getattr(site_owner, "role", None)))
+
+    # 1. Bound DatabaseAccount on the instance
+    raw_acc_id = saved.get("db_account_id")
+    if raw_acc_id is not None and not isinstance(raw_acc_id, bool):
+        try:
+            acc = (
+                db.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.id == int(raw_acc_id),
+                    DatabaseAccount.owner_id == site.owner_id,
+                    DatabaseAccount.db_host_id.is_(None),
+                )
+                .first()
+            )
+            if acc and acc.db_name and acc.db_user and acc.db_password:
+                mariadb.ensure_local_database_user_hosts(
+                    acc.db_name.strip(),
+                    acc.db_user.strip(),
+                    decrypt(acc.db_password),
+                )
+        except Exception as exc:
+            logger.debug("Could not sync bound Node.js DatabaseAccount loopback hosts: %s", exc)
+
+    # 2. Inspect .env and .env.local for loopback MySQL credentials owned by this tenant
+    for env_file in (".env.local", ".env"):
+        try:
+            raw_text = _read_app_file(app_dir, env_file, linux_user=linux_user, site_root=site_root)
+        except Exception:
+            raw_text = ""
+        if not raw_text:
+            continue
+        parsed = _parse_env_details(raw_text)
+        host_val = (parsed.get("db_host") or "localhost").strip().lower()
+        if host_val not in {"localhost", "127.0.0.1", "::1"}:
+            continue
+        db_name = (parsed.get("db_name") or "").strip()
+        db_user = (parsed.get("db_user") or "").strip()
+        db_pass = parsed.get("db_password") or ""
+        if not (db_name and db_user and db_pass):
+            continue
+        try:
+            mariadb._reject_reserved_database(db_name)
+            mariadb._reject_reserved_user(mariadb._validate_identifier(db_user))
+        except ValueError:
+            continue
+
+        # Never touch a database or user belonging to another panel user
+        other_db = (
+            db.query(DatabaseAccount)
+            .filter(DatabaseAccount.db_name == db_name, DatabaseAccount.owner_id != site.owner_id)
+            .first()
+        )
+        if other_db is not None:
+            continue
+        other_user = (
+            db.query(DatabaseAccount)
+            .filter(DatabaseAccount.db_user == db_user, DatabaseAccount.owner_id != site.owner_id)
+            .first()
+        )
+        if other_user is not None:
+            continue
+
+        own_db = (
+            db.query(DatabaseAccount)
+            .filter(
+                DatabaseAccount.db_name == db_name,
+                DatabaseAccount.owner_id == site.owner_id,
+                DatabaseAccount.db_host_id.is_(None),
+            )
+            .first()
+        )
+        if own_db is not None or is_admin_owner:
+            try:
+                mariadb.ensure_local_database_user_hosts(db_name, db_user, db_pass)
+            except Exception as exc:
+                logger.debug("Could not sync Node.js %s loopback DB user %s: %s", env_file, db_user, exc)
 
 
 def _format_env_value(val: Any) -> str:
@@ -2694,6 +2806,8 @@ def install_nodejs_instance(
             updated_env = _update_env_text(env_content, {"PORT": str(port)})
             _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
 
+        _ensure_nodejs_local_db_grants(site, db, linux_user, site_root, app_dir, saved_after)
+
         # Start systemd worker & sync Nginx vhost
         _sync_nodejs_worker_unit(
             linux_user,
@@ -2850,6 +2964,9 @@ def manage_nodejs_process(
         if env_raw:
             updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
             _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
+
+    if enabled:
+        _ensure_nodejs_local_db_grants(site, db, linux_user, site_root, app_dir, saved_after)
 
     _sync_nodejs_worker_unit(
         linux_user,
@@ -3052,6 +3169,7 @@ def update_nodejs_env(
         inst["node_env"] = parsed.get("node_env") or "production"
 
     state = _update_instance_state(inst_key, _sync_env_meta, db=db)
+    _ensure_nodejs_local_db_grants(site, db, linux_user, site_root, app_dir, saved)
 
     if payload.restart_after_save and saved.get("process_enabled", True):
         _sync_nodejs_worker_unit(
@@ -3284,6 +3402,7 @@ def _execute_git_deploy_pipeline(
             )
 
     if restart_process:
+        _ensure_nodejs_local_db_grants(site, db, linux_user, site_root, app_dir, saved)
         _sync_nodejs_worker_unit(
             linux_user,
             site_root,

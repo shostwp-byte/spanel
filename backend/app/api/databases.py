@@ -347,6 +347,11 @@ def change_database_password(database_id: int, payload: DatabasePasswordUpdate, 
     item = get_accessible_database(database_id, db, current_user)
     try:
         db_backends.backend_for(item).change_password(item.db_user, payload.password)
+        if item.db_host_id is None:
+            try:
+                mariadb.ensure_local_database_user_hosts(item.db_name, item.db_user, payload.password)
+            except Exception as exc:
+                logger.debug("Could not refresh local loopback grants after password change: %s", exc)
     except RemoteDatabaseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     item.db_password = encrypt(payload.password)

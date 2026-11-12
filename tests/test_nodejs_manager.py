@@ -1472,3 +1472,49 @@ def test_nodejs_thread_and_tasks_max_bounds_prevent_eagain():
         assert pkg.tasks_max == 2048
         assert user.tasks_max == 2048
 
+
+def test_mariadb_loopback_hosts_and_nodejs_env_local_sync(tmp_path, monkeypatch):
+    """Verify MariaDB user creation, password change, and drop cover 'localhost',
+    '127.0.0.1', and '::1' (so Node.js TCP connections under skip_name_resolve=1
+    never fail with Access denied for 'user'@'127.0.0.1'), and verify .env.local
+    sync grants loopback hosts only for tenant-owned databases.
+    """
+    executed_sql: list[str] = []
+
+    def fake_run_sql(sql: str, *, check: bool = True):
+        executed_sql.append(sql)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(settings, "command_dry_run", True)
+    with patch.object(mariadb, "database_exists", return_value=False), patch.object(
+        mariadb, "user_exists", return_value=False
+    ), patch.object(mariadb, "_run_sql", side_effect=fake_run_sql):
+        mariadb.create_database_credentials("english_kids_world", "ekw_app", "SecretPass123!")
+        assert executed_sql
+        create_sql = executed_sql[-1]
+        for host in ("localhost", "127.0.0.1", "::1"):
+            assert f"CREATE USER IF NOT EXISTS 'ekw_app'@'{host}'" in create_sql
+            assert f"GRANT ALL PRIVILEGES ON `english_kids_world`.* TO 'ekw_app'@'{host}';" in create_sql
+
+        executed_sql.clear()
+        mariadb.change_database_password("ekw_app", "NewSecret456!")
+        pw_sql = executed_sql[-1]
+        for host in ("localhost", "127.0.0.1", "::1"):
+            assert f"ALTER USER 'ekw_app'@'{host}' IDENTIFIED BY 'NewSecret456!';" in pw_sql
+
+        executed_sql.clear()
+        mariadb.drop_database("english_kids_world", "ekw_app")
+        drop_sql = executed_sql[-1]
+        for host in ("localhost", "127.0.0.1", "::1"):
+            assert f"DROP USER IF EXISTS 'ekw_app'@'{host}';" in drop_sql
+
+    # Verify DATABASE_URL parsing in _parse_env_details
+    parsed_url = nm._parse_env_details(
+        'DATABASE_URL="mysql://ekw_app:MyPass789!@127.0.0.1:3306/english_kids_world"\n'
+    )
+    assert parsed_url["db_host"] == "127.0.0.1"
+    assert parsed_url["db_name"] == "english_kids_world"
+    assert parsed_url["db_user"] == "ekw_app"
+    assert parsed_url["db_password"] == "MyPass789!"
+
+

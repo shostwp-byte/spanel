@@ -1474,8 +1474,33 @@ refresh_spanel_mariadb_grants() {
 CREATE USER IF NOT EXISTS 'spanel'@'localhost' IDENTIFIED BY '${password}';
 ALTER USER 'spanel'@'localhost' IDENTIFIED BY '${password}';
 GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'localhost' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS 'spanel'@'127.0.0.1' IDENTIFIED BY '${password}';
+ALTER USER 'spanel'@'127.0.0.1' IDENTIFIED BY '${password}';
+GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'127.0.0.1' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS 'spanel'@'::1' IDENTIFIED BY '${password}';
+ALTER USER 'spanel'@'::1' IDENTIFIED BY '${password}';
+GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'::1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
+  # Sync existing tenant @'localhost' accounts to @'127.0.0.1' and @'::1' for TCP loopback clients (Node.js under skip_name_resolve=1)
+  "$mysql_bin" -N -B -e "
+    SELECT u.User, IFNULL(u.authentication_string, ''), d.Db
+    FROM mysql.user u
+    JOIN mysql.db d ON u.User = d.User AND u.Host = d.Host
+    WHERE u.Host = 'localhost'
+      AND u.User NOT IN ('root', 'mysql', 'mariadb.sys', 'debian-sys-maint', 'spanel', '');
+  " 2>/dev/null | while IFS=$'\t' read -r db_u db_hash db_n; do
+    [[ "$db_u" =~ ^[a-z0-9_]{1,64}$ ]] || continue
+    [[ "$db_n" =~ ^[a-z0-9_]{1,64}$ ]] || continue
+    [[ "$db_hash" =~ ^\*[0-9A-Fa-f]{40}$ ]] || continue
+    "$mysql_bin" <<SQL 2>/dev/null || true
+CREATE USER IF NOT EXISTS '${db_u}'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING '${db_hash}';
+GRANT ALL PRIVILEGES ON \`${db_n}\`.* TO '${db_u}'@'127.0.0.1';
+CREATE USER IF NOT EXISTS '${db_u}'@'::1' IDENTIFIED VIA mysql_native_password USING '${db_hash}';
+GRANT ALL PRIVILEGES ON \`${db_n}\`.* TO '${db_u}'@'::1';
+FLUSH PRIVILEGES;
+SQL
+  done || true
   cat >"$defaults_file" <<MYCNF
 [client]
 user=spanel

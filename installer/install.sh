@@ -699,10 +699,18 @@ setup_panel_user() {
   mariadb -e "
     CREATE USER IF NOT EXISTS 'spanel'@'localhost' IDENTIFIED BY '${mariadb_password}';
     GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'localhost' WITH GRANT OPTION;
+    CREATE USER IF NOT EXISTS 'spanel'@'127.0.0.1' IDENTIFIED BY '${mariadb_password}';
+    GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'127.0.0.1' WITH GRANT OPTION;
+    CREATE USER IF NOT EXISTS 'spanel'@'::1' IDENTIFIED BY '${mariadb_password}';
+    GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'::1' WITH GRANT OPTION;
     FLUSH PRIVILEGES;
   " 2>/dev/null || mysql -e "
     CREATE USER IF NOT EXISTS 'spanel'@'localhost' IDENTIFIED BY '${mariadb_password}';
     GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'localhost' WITH GRANT OPTION;
+    CREATE USER IF NOT EXISTS 'spanel'@'127.0.0.1' IDENTIFIED BY '${mariadb_password}';
+    GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'127.0.0.1' WITH GRANT OPTION;
+    CREATE USER IF NOT EXISTS 'spanel'@'::1' IDENTIFIED BY '${mariadb_password}';
+    GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'::1' WITH GRANT OPTION;
     FLUSH PRIVILEGES;
   "
 

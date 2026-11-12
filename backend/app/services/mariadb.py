@@ -79,6 +79,13 @@ RESERVED_DB_USERS = frozenset({
     "spanel",
 })
 
+# Under skip_name_resolve = 1, MariaDB distinguishes Unix socket connections
+# ('localhost') from TCP loopback connections ('127.0.0.1' and '::1'). Node.js
+# drivers (mysql2, Prisma, Sequelize, TypeORM, Drizzle) connect over TCP even
+# when configured with host=localhost or host=127.0.0.1, so every local tenant
+# database user is provisioned across all three loopback hosts.
+LOCAL_CLIENT_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
+
 RESERVED_DATABASES = frozenset({
     "mysql",
     "information_schema",
@@ -179,14 +186,21 @@ def create_database(seed: str, prefix: str = "wp", db_name: str | None = None, i
     _reject_reserved_user(db_user)
     db_password = random_password()
     create_clause = "CREATE DATABASE IF NOT EXISTS" if if_not_exists else "CREATE DATABASE"
-    sql = (
-        f"{create_clause} {_quote_identifier(db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
-        f"CREATE USER IF NOT EXISTS {_quote_sql_string(db_user)}@'localhost' IDENTIFIED BY {_quote_sql_string(db_password)};\n"
-        f"ALTER USER {_quote_sql_string(db_user)}@'localhost' IDENTIFIED BY {_quote_sql_string(db_password)};\n"
-        f"GRANT ALL PRIVILEGES ON {_quote_identifier(db_name)}.* TO {_quote_sql_string(db_user)}@'localhost';\n"
-        "FLUSH PRIVILEGES;\n"
-    )
-    _run_sql(sql)
+    q_db = _quote_identifier(db_name)
+    q_user = _quote_sql_string(db_user)
+    q_pw = _quote_sql_string(db_password)
+    statements = [
+        f"{create_clause} {q_db} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
+    ]
+    for client_host in LOCAL_CLIENT_HOSTS:
+        q_host = _quote_sql_string(client_host)
+        statements.extend([
+            f"CREATE USER IF NOT EXISTS {q_user}@{q_host} IDENTIFIED BY {q_pw};",
+            f"ALTER USER {q_user}@{q_host} IDENTIFIED BY {q_pw};",
+            f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_user}@{q_host};",
+        ])
+    statements.append("FLUSH PRIVILEGES;")
+    _run_sql("\n".join(statements) + "\n")
     enforce_db_user_resource_limits(db_user)
     return {"db_name": db_name, "db_user": db_user, "db_password": db_password}
 
@@ -228,42 +242,73 @@ def create_database_credentials(
         )
 
     auth = _auth_clause(db_password, password_hash)
-    create_db_clause = "CREATE DATABASE IF NOT EXISTS" if allow_existing_db else "CREATE DATABASE"
+    create_db_clause = "CREATE DATABASE IF NOT EXISTS" if allow_db else "CREATE DATABASE"
+    q_db = _quote_identifier(db_name)
+    q_user = _quote_sql_string(db_user)
     statements = [
-        f"{create_db_clause} {_quote_identifier(db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
-        f"CREATE USER IF NOT EXISTS {_quote_sql_string(db_user)}@'localhost' {auth};",
+        f"{create_db_clause} {q_db} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
     ]
-    if allow_existing_user:
-        # Only a restore sets the password of an account that was already there.
-        statements.append(f"ALTER USER {_quote_sql_string(db_user)}@'localhost' {auth};")
-    statements += [
-        f"GRANT ALL PRIVILEGES ON {_quote_identifier(db_name)}.* TO {_quote_sql_string(db_user)}@'localhost';",
-        "FLUSH PRIVILEGES;",
-    ]
+    for client_host in LOCAL_CLIENT_HOSTS:
+        q_host = _quote_sql_string(client_host)
+        statements.append(f"CREATE USER IF NOT EXISTS {q_user}@{q_host} {auth};")
+        if allow_existing_user:
+            # Only a restore/sync sets the password of an account that was already there.
+            statements.append(f"ALTER USER {q_user}@{q_host} {auth};")
+        statements.append(f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_user}@{q_host};")
+    statements.append("FLUSH PRIVILEGES;")
     _run_sql("\n".join(statements) + "\n")
     enforce_db_user_resource_limits(db_user)
     return {"db_name": db_name, "db_user": db_user, "db_password": db_password}
 
 
+def ensure_local_database_user_hosts(
+    db_name: str,
+    db_user: str,
+    db_password: str,
+    *,
+    password_hash: str | None = None,
+) -> Dict[str, str]:
+    """Ensure a local MariaDB user exists and holds privileges on db_name across all
+    loopback hosts ('localhost', '127.0.0.1', '::1')."""
+    return create_database_credentials(
+        db_name,
+        db_user,
+        db_password,
+        password_hash=password_hash,
+        allow_existing_user=True,
+        allow_existing_database=True,
+    )
+
+
 def drop_database(db_name: str, db_user: str):
     safe_db = _reject_reserved_database(db_name)
-    _reject_reserved_user(_validate_identifier(db_user))
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    q_user = _quote_sql_string(safe_user)
+    drop_users = "".join(
+        f"DROP USER IF EXISTS {q_user}@{_quote_sql_string(host)};\n"
+        for host in LOCAL_CLIENT_HOSTS
+    )
     sql = (
         f"DROP DATABASE IF EXISTS {_quote_identifier(safe_db)};\n"
-        f"DROP USER IF EXISTS {_quote_sql_string(_validate_identifier(db_user))}@'localhost';\n"
+        f"{drop_users}"
         "FLUSH PRIVILEGES;\n"
     )
     return _run_sql(sql)
 
 
 def change_database_password(db_user: str, db_password: str):
-    _reject_reserved_user(_validate_identifier(db_user))
-    sql = (
-        f"ALTER USER {_quote_sql_string(_validate_identifier(db_user))}@'localhost' "
-        f"IDENTIFIED BY {_quote_sql_string(db_password)};\n"
-        "FLUSH PRIVILEGES;\n"
-    )
-    return _run_sql(sql)
+    safe_user = _validate_identifier(db_user)
+    _reject_reserved_user(safe_user)
+    q_user = _quote_sql_string(safe_user)
+    q_pw = _quote_sql_string(db_password)
+    stmts = []
+    for host in LOCAL_CLIENT_HOSTS:
+        q_host = _quote_sql_string(host)
+        stmts.append(f"CREATE USER IF NOT EXISTS {q_user}@{q_host} IDENTIFIED BY {q_pw};")
+        stmts.append(f"ALTER USER {q_user}@{q_host} IDENTIFIED BY {q_pw};")
+    stmts.append("FLUSH PRIVILEGES;")
+    return _run_sql("\n".join(stmts) + "\n")
 
 
 def export_database(db_name: str, output_file: str):
@@ -439,20 +484,18 @@ def set_database_write_lock(db_name: str, db_user: str, locked: bool) -> None:
     safe_user = _validate_identifier(db_user)
     _reject_reserved_user(safe_user)
     q_db = _quote_identifier(safe_db)
-    q_user = f"{_quote_sql_string(safe_user)}@'localhost'"
+    q_user_name = _quote_sql_string(safe_user)
 
-    if locked:
-        sql = (
-            f"REVOKE ALL PRIVILEGES ON {q_db}.* FROM {q_user};\n"
-            f"GRANT SELECT, DELETE, DROP, REFERENCES, SHOW VIEW, TRIGGER ON {q_db}.* TO {q_user};\n"
-            "FLUSH PRIVILEGES;\n"
-        )
-    else:
-        sql = (
-            f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_user};\n"
-            "FLUSH PRIVILEGES;\n"
-        )
-    _run_sql(sql, check=False)
+    stmts = []
+    for host in LOCAL_CLIENT_HOSTS:
+        q_user = f"{q_user_name}@{_quote_sql_string(host)}"
+        if locked:
+            stmts.append(f"REVOKE ALL PRIVILEGES ON {q_db}.* FROM {q_user};")
+            stmts.append(f"GRANT SELECT, DELETE, DROP, REFERENCES, SHOW VIEW, TRIGGER ON {q_db}.* TO {q_user};")
+        else:
+            stmts.append(f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_user};")
+    stmts.append("FLUSH PRIVILEGES;")
+    _run_sql("\n".join(stmts) + "\n", check=False)
 
 
 def account_lock_sql(db_user: str, locked: bool, client_host: str = "localhost") -> str:
@@ -548,18 +591,20 @@ def enforce_db_user_resource_limits(
     _reject_reserved_user(safe_user)
     if settings.command_dry_run:
         return
-    q_user = f"{_quote_sql_string(safe_user)}@'localhost'"
+    q_user_name = _quote_sql_string(safe_user)
     conns = max(5, min(500, int(max_user_connections or 25)))
     stmt_sec = max(2, min(300, int(max_statement_time or 15)))
-    res = _run_sql(
-        f"ALTER USER {q_user} WITH MAX_USER_CONNECTIONS {conns} MAX_STATEMENT_TIME {stmt_sec};\n",
-        check=False,
-    )
+    stmts_with_time = [
+        f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {conns} MAX_STATEMENT_TIME {stmt_sec};"
+        for host in LOCAL_CLIENT_HOSTS
+    ]
+    res = _run_sql("\n".join(stmts_with_time) + "\n", check=False)
     if res.returncode != 0:
-        _run_sql(
-            f"ALTER USER {q_user} WITH MAX_USER_CONNECTIONS {conns};\n",
-            check=False,
-        )
+        stmts_fallback = [
+            f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {conns};"
+            for host in LOCAL_CLIENT_HOSTS
+        ]
+        _run_sql("\n".join(stmts_fallback) + "\n", check=False)
 
 
 
@@ -618,6 +663,76 @@ def enforce_db_user_hourly_limits(
     return _run_sql(sql, check=False).returncode == 0
 
 
+def sync_local_loopback_accounts() -> int:
+    """Ensure all existing local MariaDB accounts (both DatabaseAccount records and
+    mysql.user@'localhost' entries) also exist and hold grants on @'127.0.0.1' and @'::1'."""
+    if settings.command_dry_run:
+        return 0
+    synced = 0
+    try:
+        from app.core.database import SessionLocal
+        from app.core.secrets import decrypt
+        from app.models.entities import DatabaseAccount
+
+        with SessionLocal() as session:
+            accounts = (
+                session.query(DatabaseAccount)
+                .filter(DatabaseAccount.db_host_id.is_(None))
+                .all()
+            )
+            for acc in accounts:
+                if not (acc.db_name and acc.db_user and acc.db_password):
+                    continue
+                try:
+                    raw_pw = decrypt(acc.db_password)
+                    ensure_local_database_user_hosts(acc.db_name.strip(), acc.db_user.strip(), raw_pw)
+                    synced += 1
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    try:
+        res = _run_sql(
+            "SELECT u.User, IFNULL(u.authentication_string, ''), d.Db "
+            "FROM mysql.user u "
+            "JOIN mysql.db d ON u.User = d.User AND u.Host = d.Host "
+            "WHERE u.Host = 'localhost';\n",
+            check=False,
+        )
+        stmts: list[str] = []
+        for idx, line in enumerate((res.stdout or "").splitlines()):
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            u_name, auth_hash, db_name = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if idx == 0 and u_name.upper() == "USER":
+                continue
+            try:
+                safe_u = _validate_identifier(u_name)
+                _reject_reserved_user(safe_u)
+                safe_db = _reject_reserved_database(db_name)
+            except ValueError:
+                continue
+            if not _NATIVE_PASSWORD_HASH_RE.match(auth_hash):
+                continue
+            q_u = _quote_sql_string(safe_u)
+            q_db = _quote_identifier(safe_db)
+            for host in ("127.0.0.1", "::1"):
+                q_h = _quote_sql_string(host)
+                stmts.append(
+                    f"CREATE USER IF NOT EXISTS {q_u}@{q_h} IDENTIFIED VIA mysql_native_password USING '{auth_hash}';"
+                )
+                stmts.append(f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_u}@{q_h};")
+        if stmts:
+            stmts.append("FLUSH PRIVILEGES;")
+            _run_sql("\n".join(stmts) + "\n", check=False)
+            synced += 1
+    except Exception:
+        pass
+    return synced
+
+
 def ensure_mysql_governor_settings() -> None:
     """Enable MariaDB userstat=1 (per-user CPU/row statistics) and InnoDB Buffer Pool scan resistance
     (innodb_old_blocks_time=1000, innodb_old_blocks_pct=37) so a scraped site cannot evict other users' hot RAM cache."""
@@ -637,6 +752,7 @@ def ensure_mysql_governor_settings() -> None:
         "SET GLOBAL userstat = 1; SET GLOBAL innodb_old_blocks_pct = 37; SET GLOBAL innodb_old_blocks_time = 1000;\n",
         check=False,
     )
+    sync_local_loopback_accounts()
 
 
 def collect_user_statistics() -> dict[str, dict]:
