@@ -37,7 +37,7 @@ export const DEFAULT_PKG_STATE = {
   node_apps_limit: 0,
   node_app_memory_mb: 512,
   cpu_quota_percent: 100,
-  tasks_max: 80,
+  tasks_max: 2048,
   memory_high_mb: 768,
   memory_max_mb: 1024,
   io_read_mbps: 100,
@@ -831,7 +831,7 @@ export function PackagesPage({ mode = 'users' }) {
                   label: t('Max Processes / Tasks (tasks.max)'),
                   field: 'tasks_max',
                   unit: 'PIDs',
-                  defaultFallback: 80,
+                  defaultFallback: 2048,
                   zeroIsUnlimited: true,
                 })}
                 {renderQuotaRow({

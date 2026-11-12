@@ -106,7 +106,7 @@ def _ensure_resource_limit_columns() -> None:
             ("iops_write_max", "INTEGER NOT NULL DEFAULT 0"),
             ("memory_high_mb", "INTEGER NOT NULL DEFAULT 1024"),
             ("memory_max_mb", "INTEGER NOT NULL DEFAULT 2048"),
-            ("tasks_max", "INTEGER NOT NULL DEFAULT 512"),
+            ("tasks_max", "INTEGER NOT NULL DEFAULT 2048"),
             ("mysql_storage_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_db_size_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_queries_per_hour", "INTEGER NOT NULL DEFAULT 0"),
@@ -124,7 +124,7 @@ def _ensure_resource_limit_columns() -> None:
             ("iops_write_max", "INTEGER NOT NULL DEFAULT 0"),
             ("memory_high_mb", "INTEGER NOT NULL DEFAULT 1024"),
             ("memory_max_mb", "INTEGER NOT NULL DEFAULT 2048"),
-            ("tasks_max", "INTEGER NOT NULL DEFAULT 512"),
+            ("tasks_max", "INTEGER NOT NULL DEFAULT 2048"),
             ("mysql_storage_limit_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_db_size_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("mysql_max_queries_per_hour", "INTEGER NOT NULL DEFAULT 0"),
@@ -161,6 +161,10 @@ def _ensure_resource_limit_columns() -> None:
                 for col_name, col_ddl in cols:
                     if col_name not in existing:
                         conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"))
+            if inspector.has_table("user_packages"):
+                conn.execute(text("UPDATE user_packages SET tasks_max = 2048 WHERE tasks_max IN (80, 512)"))
+            if inspector.has_table("users"):
+                conn.execute(text("UPDATE users SET tasks_max = 2048 WHERE tasks_max IN (80, 512)"))
             if inspector.has_table("users") and inspector.has_table("user_packages"):
                 sync_cols = [
                     "database_limit",

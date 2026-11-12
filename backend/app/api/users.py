@@ -211,7 +211,7 @@ def _apply_package_limits(user: User, package: UserPackage | None) -> None:
         user.iops_write_max = getattr(package, "iops_write_max", 0)
         user.memory_high_mb = getattr(package, "memory_high_mb", 1024)
         user.memory_max_mb = getattr(package, "memory_max_mb", 2048)
-        user.tasks_max = getattr(package, "tasks_max", 512)
+        user.tasks_max = getattr(package, "tasks_max", 2048)
         user.mysql_storage_limit_mb = getattr(package, "mysql_storage_limit_mb", 0)
         user.mysql_max_db_size_mb = getattr(package, "mysql_max_db_size_mb", 0)
         user.mysql_max_queries_per_hour = getattr(package, "mysql_max_queries_per_hour", 0)

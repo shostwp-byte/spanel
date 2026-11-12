@@ -189,7 +189,7 @@ def apply_user_cgroup_limits(user: User) -> bool:
         str(max(0, int(getattr(user, "cpu_quota_percent", 100) or 0))),
         str(max(0, int(getattr(user, "memory_high_mb", 1024) or 0))),
         str(max(0, int(getattr(user, "memory_max_mb", 2048) or 0))),
-        str(max(0, int(getattr(user, "tasks_max", 512) or 0))),
+        str(max(0, int(getattr(user, "tasks_max", 2048) or 0))),
         str(max(0, int(getattr(user, "io_read_mbps", 0) or 0))),
         str(max(0, int(getattr(user, "io_write_mbps", 0) or 0))),
         str(max(0, int(getattr(user, "iops_read_max", 0) or 0))),
@@ -677,7 +677,7 @@ def collect_live_process_metrics(db: Session) -> None:
         live = agg.get(u.id) or {}
         cpu_q = int(getattr(u, "cpu_quota_percent", 100) or 100)
         mem_max = int(getattr(u, "memory_max_mb", 2048) or 0) * BYTES_PER_MB
-        tasks_max = int(getattr(u, "tasks_max", 512) or 0)
+        tasks_max = int(getattr(u, "tasks_max", 2048) or 0)
 
         total_cpu = float(live.get("cpu_percent") or 0.0)
         mysql_cpu = float(live.get("mysql_cpu_percent") or 0.0)

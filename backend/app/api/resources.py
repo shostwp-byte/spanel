@@ -88,7 +88,7 @@ def _build_user_resource_row(
     cpu_quota_percent = int(getattr(user, "cpu_quota_percent", 100) or 0)
     memory_high_mb = int(getattr(user, "memory_high_mb", 1024) or 0)
     memory_max_mb = int(getattr(user, "memory_max_mb", 2048) or 0)
-    tasks_max = int(getattr(user, "tasks_max", 512) or 0)
+    tasks_max = int(getattr(user, "tasks_max", 2048) or 0)
 
     owner = managers.get(user.reseller_id) if user.reseller_id else primary_admin
 
@@ -402,7 +402,7 @@ def update_user_resource_limits(
         user.iops_write_max = getattr(pkg, "iops_write_max", 0)
         user.memory_high_mb = getattr(pkg, "memory_high_mb", 1024)
         user.memory_max_mb = getattr(pkg, "memory_max_mb", 2048)
-        user.tasks_max = getattr(pkg, "tasks_max", 512)
+        user.tasks_max = getattr(pkg, "tasks_max", 2048)
         user.mysql_storage_limit_mb = getattr(pkg, "mysql_storage_limit_mb", 0)
         user.mysql_max_db_size_mb = getattr(pkg, "mysql_max_db_size_mb", 0)
         user.mysql_max_queries_per_hour = getattr(pkg, "mysql_max_queries_per_hour", 0)

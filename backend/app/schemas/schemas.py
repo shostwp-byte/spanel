@@ -237,7 +237,7 @@ class UserPackageCreate(BaseModel):
     iops_write_max: int = Field(default=0, ge=-1, le=10000000)
     memory_high_mb: int = Field(default=1024, ge=-1, le=1048576)
     memory_max_mb: int = Field(default=2048, ge=-1, le=1048576)
-    tasks_max: int = Field(default=512, ge=-1, le=1000000)
+    tasks_max: int = Field(default=2048, ge=-1, le=1000000)
     mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_queries_per_hour: int = Field(default=0, ge=-1, le=1000000000)
@@ -361,7 +361,7 @@ class UserPackageOut(BaseModel):
     iops_write_max: int = 0
     memory_high_mb: int = 1024
     memory_max_mb: int = 2048
-    tasks_max: int = 512
+    tasks_max: int = 2048
     mysql_storage_limit_mb: int = 0
     mysql_max_db_size_mb: int = 0
     mysql_used_bytes: int = 0
@@ -408,7 +408,7 @@ class UserPackageOut(BaseModel):
     iops_write_max: int = 0
     memory_high_mb: int = 1024
     memory_max_mb: int = 2048
-    tasks_max: int = 512
+    tasks_max: int = 2048
     mysql_storage_limit_mb: int = 0
     mysql_max_db_size_mb: int = 0
     mysql_max_queries_per_hour: int = 0
@@ -450,7 +450,7 @@ class UserCreate(BaseModel):
     iops_write_max: int = Field(default=0, ge=-1, le=10000000)
     memory_high_mb: int = Field(default=1024, ge=-1, le=1048576)
     memory_max_mb: int = Field(default=2048, ge=-1, le=1048576)
-    tasks_max: int = Field(default=512, ge=-1, le=1000000)
+    tasks_max: int = Field(default=2048, ge=-1, le=1000000)
     mysql_storage_limit_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_db_size_mb: int = Field(default=0, ge=-1, le=1048576)
     mysql_max_queries_per_hour: int = Field(default=0, ge=-1, le=1000000000)

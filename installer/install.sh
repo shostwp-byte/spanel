@@ -941,6 +941,8 @@ Environment=SPANEL_USE_HELPER=true
 ExecStart=/usr/local/sbin/spanel-api-start
 Restart=always
 RestartSec=3
+TasksMax=infinity
+LimitNPROC=infinity
 
 # Hardening. These settings must not block the sudo helper; privileged work is
 # restricted by /usr/local/sbin/spanel-helper and /etc/sudoers.d/spanel.

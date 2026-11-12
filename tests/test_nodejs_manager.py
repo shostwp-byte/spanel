@@ -1446,5 +1446,29 @@ def test_nginx_error_log_endpoint_returns_string_content(tmp_path, monkeypatch):
             assert "connect() failed (111: Connection refused)" in body["content"]
 
 
+def test_nodejs_thread_and_tasks_max_bounds_prevent_eagain():
+    """Verify Cgroups v2 TasksMax=2048 floor and Rust/Tokio/Rayon/Node threadpool bounds
+    to prevent `OS can't spawn worker thread: Resource temporarily unavailable (os error 11)`
+    during Next.js (`@next/swc`) builds on multi-core servers.
+    """
+    helper_text = (REPO_ROOT / "installer" / "files" / "spanel-helper.sh").read_text(encoding="utf-8")
+    assert "TasksMax=2048" in helper_text
+    assert "LimitNPROC=4096" in helper_text
+    assert "TOKIO_WORKER_THREADS=4" in helper_text
+    assert "RAYON_NUM_THREADS=4" in helper_text
+    assert "UV_THREADPOOL_SIZE=4" in helper_text
+    assert "NEXT_TELEMETRY_DISABLED=1" in helper_text
+    assert "npm_config_jobs=4" in helper_text
+    assert "cgroup_tasks_max=2048" in helper_text
 
+    pkg = UserPackage(name="default-tasks-pkg")
+    user = User(username="u1", email="u1@example.com", hashed_password="x")
+    _, SessionLocal = _setup_test_db()
+    with SessionLocal() as db:
+        db.add_all([pkg, user])
+        db.commit()
+        db.refresh(pkg)
+        db.refresh(user)
+        assert pkg.tasks_max == 2048
+        assert user.tasks_max == 2048
 

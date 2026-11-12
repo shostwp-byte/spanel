@@ -133,7 +133,7 @@ export function ResourceMonitorPage({ request, isAdmin, isReseller }) {
       cpu_quota_percent: userRow.cpu_quota_percent ?? 100,
       memory_high_mb: userRow.memory_high_mb ?? 1024,
       memory_max_mb: userRow.memory_max_mb ?? 2048,
-      tasks_max: userRow.tasks_max ?? 512,
+      tasks_max: userRow.tasks_max ?? 2048,
       io_read_mbps: userRow.io_read_mbps ?? 0,
       io_write_mbps: userRow.io_write_mbps ?? 0,
       iops_read_max: userRow.iops_read_max ?? 0,

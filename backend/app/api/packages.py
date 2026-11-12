@@ -156,7 +156,7 @@ def _default_package_dict(name: str, is_reseller: bool = False) -> dict:
         "node_apps_limit": 0,
         "node_app_memory_mb": 512,
         "cpu_quota_percent": 100,
-        "tasks_max": 80,
+        "tasks_max": 2048,
         "memory_high_mb": 768,
         "memory_max_mb": 1024,
         "io_read_mbps": 100,
@@ -305,7 +305,7 @@ def _map_da_dict_to_package(name: str, raw: dict, is_reseller: bool = False) -> 
         pkg["memory_max_mb"] = mem
         pkg["memory_high_mb"] = max(256, int(mem * 0.75)) if mem > 0 else 0
     if "tasks_max" in kv or "lve_nproc" in kv or "lve_ep" in kv:
-        pkg["tasks_max"] = _parse_int_quota(kv.get("tasks_max") or kv.get("lve_nproc") or kv.get("lve_ep"), 80)
+        pkg["tasks_max"] = _parse_int_quota(kv.get("tasks_max") or kv.get("lve_nproc") or kv.get("lve_ep"), 2048)
     return pkg
 
 

@@ -8079,8 +8079,25 @@ copy_site_env_as_user() {
 
 prepare_nodejs_app_as_user() {
   local user="$1" app_target="$2" bin_dir="$3" start_arg="${4:-start}"
-  local bin_entry first_line need_install=0
+  local bin_entry first_line need_install=0 uid_num total_cores c0 c1 c2 c3
+  local -a cpu_cap=()
   [[ -f "${app_target}/package.json" && -x "${bin_dir}/npm" ]] || return 0
+
+  uid_num="$(id -u "$user" 2>/dev/null || echo 1000)"
+  [[ "$uid_num" =~ ^[0-9]+$ ]] || uid_num=1000
+  total_cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  [[ "$total_cores" =~ ^[0-9]+$ ]] || total_cores=1
+  if (( total_cores > 4 )) && command -v taskset >/dev/null 2>&1; then
+    c0=$(( uid_num % total_cores ))
+    c1=$(( (uid_num + 1) % total_cores ))
+    c2=$(( (uid_num + 2) % total_cores ))
+    c3=$(( (uid_num + 3) % total_cores ))
+    if taskset -c "${c0},${c1},${c2},${c3}" true >/dev/null 2>&1; then
+      cpu_cap=(taskset -c "${c0},${c1},${c2},${c3}")
+    elif taskset -c 0-3 true >/dev/null 2>&1; then
+      cpu_cap=(taskset -c 0-3)
+    fi
+  fi
 
   # 1. Repair or remove broken zip-extracted symlink stubs in node_modules/.bin
   # (extract_zip writes zip symlink entries as regular 0644 files containing "../<pkg>/.../bin/<cli>").
@@ -8115,14 +8132,24 @@ prepare_nodejs_app_as_user() {
   fi
 
   if (( need_install == 1 )); then
-    runuser -u "$user" -- env -i \
+    runuser -u "$user" -- "${cpu_cap[@]}" env -i \
       HOME="${HOME_ROOT}/${user}" \
       npm_config_cache="${HOME_ROOT}/${user}/.npm" \
+      npm_config_jobs=4 \
+      UV_THREADPOOL_SIZE=4 \
+      RAYON_NUM_THREADS=4 \
+      TOKIO_WORKER_THREADS=4 \
+      NEXT_TELEMETRY_DISABLED=1 \
       PATH="${app_target}/node_modules/.bin:${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
       "${bin_dir}/npm" install --include=dev --no-audit --no-fund --prefix "$app_target" >/dev/null 2>&1 \
-    || runuser -u "$user" -- env -i \
+    || runuser -u "$user" -- "${cpu_cap[@]}" env -i \
       HOME="${HOME_ROOT}/${user}" \
       npm_config_cache="${HOME_ROOT}/${user}/.npm" \
+      npm_config_jobs=4 \
+      UV_THREADPOOL_SIZE=4 \
+      RAYON_NUM_THREADS=4 \
+      TOKIO_WORKER_THREADS=4 \
+      NEXT_TELEMETRY_DISABLED=1 \
       PATH="${app_target}/node_modules/.bin:${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
       "${bin_dir}/npm" install --include=dev --legacy-peer-deps --no-audit --no-fund --prefix "$app_target" >/dev/null 2>&1 \
     || true
@@ -8140,10 +8167,15 @@ prepare_nodejs_app_as_user() {
   # 4. If Next.js production start is configured and .next/BUILD_ID is missing, build as the site user
   if [[ "$start_arg" != "dev" && -x "${app_target}/node_modules/.bin/next" && ! -f "${app_target}/.next/BUILD_ID" ]]; then
     if grep -q '"build"' "${app_target}/package.json" 2>/dev/null; then
-      runuser -u "$user" -- env -i \
+      runuser -u "$user" -- "${cpu_cap[@]}" env -i \
         HOME="${HOME_ROOT}/${user}" \
         NODE_ENV=production \
         npm_config_cache="${HOME_ROOT}/${user}/.npm" \
+        npm_config_jobs=4 \
+        UV_THREADPOOL_SIZE=4 \
+        RAYON_NUM_THREADS=4 \
+        TOKIO_WORKER_THREADS=4 \
+        NEXT_TELEMETRY_DISABLED=1 \
         PATH="${app_target}/node_modules/.bin:${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
         "${bin_dir}/npm" --prefix "$app_target" run build >/dev/null 2>&1 || true
     fi
@@ -8263,6 +8295,11 @@ Group=${user}
 Slice=user-${uid}.slice
 WorkingDirectory=${app_target}
 UMask=0027
+Environment=UV_THREADPOOL_SIZE=4
+Environment=RAYON_NUM_THREADS=4
+Environment=TOKIO_WORKER_THREADS=4
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=npm_config_jobs=4
 EnvironmentFile=-${env_file}
 Environment=HOST=127.0.0.1
 Environment=PORT=${port}
@@ -8276,7 +8313,8 @@ RestartSec=5
 TimeoutStopSec=30
 MemoryAccounting=yes
 MemoryMax=${memory_mb}M
-TasksMax=256
+TasksMax=2048
+LimitNPROC=4096
 LimitNOFILE=8192
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -8757,6 +8795,11 @@ Type=simple
 User=${user}
 Group=${user}
 WorkingDirectory=${app_dir}
+Environment=UV_THREADPOOL_SIZE=4
+Environment=RAYON_NUM_THREADS=4
+Environment=TOKIO_WORKER_THREADS=4
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=npm_config_jobs=4
 EnvironmentFile=-${env_file}
 # HOST is forced so a misconfigured app cannot bind a public interface. The
 # firewall is the second layer here, not the only one.
@@ -8770,7 +8813,8 @@ Restart=always
 RestartSec=5
 MemoryAccounting=yes
 MemoryMax=${memory}M
-TasksMax=256
+TasksMax=2048
+LimitNPROC=4096
 LimitNOFILE=8192
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -8841,7 +8885,8 @@ Restart=always
 RestartSec=5
 MemoryAccounting=yes
 MemoryMax=${memory}M
-TasksMax=256
+TasksMax=2048
+LimitNPROC=4096
 LimitNOFILE=8192
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -8898,7 +8943,7 @@ ExecStart=/usr/bin/docker run --rm --name ${container} \\
   --memory ${memory}m \\
   --memory-swap ${memory}m \\
   --cpus ${cpus} \\
-  --pids-limit 256 \\
+  --pids-limit 2048 \\
   --cap-drop ALL \\
   --security-opt no-new-privileges \\
   --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \\
@@ -10402,7 +10447,9 @@ classify_all_tenant_workers() {
           echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
         fi
         if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
+          (( tasks_max < 2048 )) && tasks_max=2048
           echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
+          echo "$tasks_max" >"${cg_slice}/pids.max" 2>/dev/null || true
         fi
         if [[ -n "$io_majmin" ]] && io_line="$(render_io_max_line "$io_majmin" "$io_r" "$io_w" "$iops_r" "$iops_w")"; then
           echo "$io_line" >"${cg_scope}/io.max" 2>/dev/null || true
@@ -12756,6 +12803,10 @@ EOF
     chmod 0640 "/etc/spanel/limits/${u_name}.env"
 
     base_dev="$(tenant_io_base_device)"
+    cgroup_tasks_max="$tasks_max"
+    if (( cgroup_tasks_max > 0 && cgroup_tasks_max < 2048 )); then
+      cgroup_tasks_max=2048
+    fi
 
     {
       echo "# Generated by SPanel Resource Limits for user ${u_name} (UID ${u_uid})"
@@ -12779,8 +12830,8 @@ EOF
       else
         echo "MemoryMax=infinity"
       fi
-      if (( tasks_max > 0 )); then
-        echo "TasksMax=${tasks_max}"
+      if (( cgroup_tasks_max > 0 )); then
+        echo "TasksMax=${cgroup_tasks_max}"
       else
         echo "TasksMax=infinity"
       fi
@@ -12801,7 +12852,7 @@ EOF
       CPUQuota="$( (( cpu_pct > 0 )) && printf '%s%%' "$cpu_pct" || printf '' )" \
       MemoryHigh="$( (( mem_high > 0 )) && printf '%sM' "$mem_high" || printf 'infinity' )" \
       MemoryMax="$( (( mem_max > 0 )) && printf '%sM' "$mem_max" || printf 'infinity' )" \
-      TasksMax="$( (( tasks_max > 0 )) && printf '%s' "$tasks_max" || printf 'infinity' )" >/dev/null 2>&1 || true
+      TasksMax="$( (( cgroup_tasks_max > 0 )) && printf '%s' "$cgroup_tasks_max" || printf 'infinity' )" >/dev/null 2>&1 || true
 
     # Tune PHP-FPM pools owned by this user to respect persisted limits. The
     # account's own masters already run inside the slice limited above; pools
@@ -13386,7 +13437,32 @@ EOF
         [[ -n "$phpunit_bin" ]] || deny "phpunit not found (install it globally or with composer)"
         exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$php_bin" -d open_basedir="${terminal_cli_open_basedir}:$(dirname "$phpunit_bin")" "$phpunit_bin" "$@"
         ;;
-      node|npm|npx|yarn|git)
+      node|npm|npx|yarn)
+        node_cpu_cap=()
+        uid_num="$(id -u "$user" 2>/dev/null || echo 1000)"
+        [[ "$uid_num" =~ ^[0-9]+$ ]] || uid_num=1000
+        total_cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+        [[ "$total_cores" =~ ^[0-9]+$ ]] || total_cores=1
+        if (( total_cores > 4 )) && command -v taskset >/dev/null 2>&1; then
+          c0=$(( uid_num % total_cores ))
+          c1=$(( (uid_num + 1) % total_cores ))
+          c2=$(( (uid_num + 2) % total_cores ))
+          c3=$(( (uid_num + 3) % total_cores ))
+          if taskset -c "${c0},${c1},${c2},${c3}" true >/dev/null 2>&1; then
+            node_cpu_cap=(taskset -c "${c0},${c1},${c2},${c3}")
+          elif taskset -c 0-3 true >/dev/null 2>&1; then
+            node_cpu_cap=(taskset -c 0-3)
+          fi
+        fi
+        exec "${terminal_runner[@]}" "${node_cpu_cap[@]}" env "${terminal_env[@]}" \
+          "UV_THREADPOOL_SIZE=4" \
+          "RAYON_NUM_THREADS=4" \
+          "TOKIO_WORKER_THREADS=4" \
+          "NEXT_TELEMETRY_DISABLED=1" \
+          "npm_config_jobs=4" \
+          "$cmd" "$@"
+        ;;
+      git)
         exec "${terminal_runner[@]}" env "${terminal_env[@]}" "$cmd" "$@"
         ;;
       ls|cat|mkdir|rmdir|rm|cp|mv|chmod|chown|grep|find|tar|zip|unzip|diff|head|tail|less|du|df|sed|awk|wc|sort|uniq|stat|file|touch)
@@ -13729,8 +13805,30 @@ EOF
     [[ -f "${app_dir}/package.json" ]] || deny "no package.json in ${app_name}"
     bin_dir="$(resolve_node_bin_dir "$app_node_major")" \
       || deny "Node ${app_node_major} is not installed; run node-install ${app_node_major} first"
-    exec timeout 900 runuser -u "$user" -- env -i \
+    node_cpu_cap=()
+    uid_num="$(id -u "$user" 2>/dev/null || echo 1000)"
+    [[ "$uid_num" =~ ^[0-9]+$ ]] || uid_num=1000
+    total_cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    [[ "$total_cores" =~ ^[0-9]+$ ]] || total_cores=1
+    if (( total_cores > 4 )) && command -v taskset >/dev/null 2>&1; then
+      c0=$(( uid_num % total_cores ))
+      c1=$(( (uid_num + 1) % total_cores ))
+      c2=$(( (uid_num + 2) % total_cores ))
+      c3=$(( (uid_num + 3) % total_cores ))
+      if taskset -c "${c0},${c1},${c2},${c3}" true >/dev/null 2>&1; then
+        node_cpu_cap=(taskset -c "${c0},${c1},${c2},${c3}")
+      elif taskset -c 0-3 true >/dev/null 2>&1; then
+        node_cpu_cap=(taskset -c 0-3)
+      fi
+    fi
+    exec timeout 900 runuser -u "$user" -- "${node_cpu_cap[@]}" env -i \
       HOME="${HOME_ROOT}/${user}" \
+      npm_config_cache="${HOME_ROOT}/${user}/.npm" \
+      npm_config_jobs=4 \
+      UV_THREADPOOL_SIZE=4 \
+      RAYON_NUM_THREADS=4 \
+      TOKIO_WORKER_THREADS=4 \
+      NEXT_TELEMETRY_DISABLED=1 \
       PATH="${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
       NODE_ENV=production \
       "${bin_dir}/npm" install --omit=dev --no-audit --no-fund --prefix "$app_dir"
