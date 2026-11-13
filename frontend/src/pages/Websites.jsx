@@ -5,6 +5,7 @@ import { NoAutofillInput } from '../components/NoAutofillInput.jsx';
 import { PasswordField, PasswordResultBox } from '../components/PasswordField.jsx';
 import { useAppContext } from '../contexts/AppContext.jsx';
 import { t } from '../i18n.js';
+import { PERMISSIONS_UI_ITEMS, parsePermissionsPolicy, buildPermissionsPolicy } from '../utils/permissionsPolicy.js';
 
 const Terminal = React.lazy(() =>
   import('../components/Terminal')
@@ -259,6 +260,10 @@ export function WebsitesPage({
     if (nextRewrite !== (original.nginx_rewrite_mode || (original.app_type === 'wordpress' ? 'front_controller' : 'none'))) {
       body.nginx_rewrite_mode = nextRewrite;
     }
+    const nextPp = (websiteSettingsForm.permissions_policy || '').trim();
+    if (nextPp !== (original.permissions_policy || '').trim()) {
+      body.permissions_policy = nextPp;
+    }
     if (Object.keys(body).length === 0) return;
 
     const data = await request(`/websites/${nginxCustomEditing.id}`, {
@@ -267,6 +272,25 @@ export function WebsitesPage({
     }, `Saving ${nginxCustomEditing.domain} settings...`);
     if (data) {
       setNotice(`Updated settings for ${nginxCustomEditing.domain}.`);
+      setWebsiteSettingsForm(websiteConfigForm(data));
+      setNginxCustomEditing(prev => prev ? ({ ...prev, site: data }) : prev);
+      await refreshAll();
+    }
+  }
+
+  async function savePermissionsPolicy(customValue = undefined) {
+    if (!nginxCustomEditing) return;
+    const targetPolicy = (customValue !== undefined ? customValue : (websiteSettingsForm.permissions_policy || '')).trim();
+    const data = await request(`/websites/${nginxCustomEditing.id}/permissions-policy`, {
+      method: 'PATCH',
+      body: JSON.stringify({ permissions_policy: targetPolicy }),
+    }, t('Updating Permissions-Policy and reloading Nginx...'));
+    if (data) {
+      setNotice(
+        targetPolicy
+          ? `Updated Permissions-Policy for ${nginxCustomEditing.domain}.`
+          : `Reset Permissions-Policy to default for ${nginxCustomEditing.domain}.`
+      );
       setWebsiteSettingsForm(websiteConfigForm(data));
       setNginxCustomEditing(prev => prev ? ({ ...prev, site: data }) : prev);
       await refreshAll();
@@ -487,6 +511,61 @@ export function WebsitesPage({
             onClick={() => handleTransferWebsiteOwner(nginxCustomEditing.id, transferOwnerTargetId)}
           >
             <Users size={14}/>{t('Transfer Owner')}
+          </button>
+        </div>
+      </div>}
+      {!fullConfig && <div className="site-aliases settings-domain-manager">
+        <div className="domain-manager-head">
+          <h3>Browser Permissions (HTTP Permissions-Policy)</h3>
+          <p className="hint">
+            {(websiteSettingsForm.permissions_policy || '').trim()
+              ? 'Custom policy active: Nginx emits one merged Permissions-Policy header keeping all other security restrictions.'
+              : (settingsSite.app_type === 'application'
+                ? 'Default (Auto-Merge): Nginx automatically merges app headers (e.g. Next.js microphone=(self)) with hardened defaults without duplicate headers.'
+                : 'Default: All sensitive browser APIs (camera, microphone, geolocation, etc.) are blocked ().')}
+          </p>
+        </div>
+        <div className="website-settings-grid" style={{ marginTop: '8px' }}>
+          {PERMISSIONS_UI_ITEMS.slice(0, 4).map(item => {
+            const parsedMap = parsePermissionsPolicy(websiteSettingsForm.permissions_policy);
+            const currentVal = parsedMap[item.key] || '()';
+            const selectOptions = ['()', '(self)', '*'];
+            if (!selectOptions.includes(currentVal)) selectOptions.push(currentVal);
+            return (
+              <label key={item.key}>
+                <span>{item.label}</span>
+                <select
+                  value={currentVal}
+                  disabled={!!loading}
+                  onChange={e => {
+                    const nextMap = { ...parsedMap, [item.key]: e.target.value };
+                    setWebsiteSettingsForm(prev => ({
+                      ...prev,
+                      permissions_policy: buildPermissionsPolicy(nextMap),
+                    }));
+                  }}
+                >
+                  {selectOptions.map(opt => (
+                    <option key={opt} value={opt}>
+                      {opt === '()' ? 'Blocked ()' : opt === '(self)' ? 'Same origin (self)' : opt === '*' ? 'Allow all (*)' : opt}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            );
+          })}
+        </div>
+        <div className="website-settings-actions" style={{ marginTop: '10px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <button type="button" disabled={!!loading} onClick={() => savePermissionsPolicy()}>
+            <ShieldCheck size={14}/>Save Permissions-Policy
+          </button>
+          <button
+            type="button"
+            className="secondary-light"
+            disabled={!!loading || !(settingsSite.permissions_policy || websiteSettingsForm.permissions_policy)}
+            onClick={() => savePermissionsPolicy('')}
+          >
+            <RotateCcw size={14}/>Reset Default
           </button>
         </div>
       </div>}

@@ -655,6 +655,46 @@ map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
 }
+
+# Upstream-aware Permissions-Policy feature maps for proxied apps (Next.js / Node.js).
+# Preserves SPanel's hardened defaults for omitted directives while honoring
+# app-declared directives without emitting duplicate Permissions-Policy headers.
+map $upstream_http_permissions_policy $spanel_pp_camera {
+    default "camera=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>camera[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_microphone {
+    default "microphone=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>microphone[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_geolocation {
+    default "geolocation=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>geolocation[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_payment {
+    default "payment=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>payment[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_usb {
+    default "usb=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>usb[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_bluetooth {
+    default "bluetooth=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>bluetooth[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_magnetometer {
+    default "magnetometer=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>magnetometer[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_gyroscope {
+    default "gyroscope=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>gyroscope[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_accelerometer {
+    default "accelerometer=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>accelerometer[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
 NGINX
 }
 
@@ -683,6 +723,58 @@ for root in roots:
         if new_text != text:
             path.write_text(new_text, encoding="utf-8")
             print(f"Updated CSP worker-src in {path}")
+PY
+}
+
+migrate_nginx_permissions_policy_headers() {
+  python3 - <<'PY'
+import re
+from pathlib import Path
+
+roots = [Path("/etc/nginx/sites-available"), Path("/etc/nginx/sites-enabled")]
+default_line_re = re.compile(
+    r'([ \t]*)add_header\s+Permissions-Policy\s+"camera=\(\),\s*microphone=\(\),\s*geolocation=\(\),\s*payment=\(\),\s*usb=\(\),\s*bluetooth=\(\),\s*magnetometer=\(\),\s*gyroscope=\(\),\s*accelerometer=\(\)"\s+always;'
+)
+dynamic_val = (
+    "$spanel_pp_camera, $spanel_pp_microphone, $spanel_pp_geolocation, "
+    "$spanel_pp_payment, $spanel_pp_usb, $spanel_pp_bluetooth, "
+    "$spanel_pp_magnetometer, $spanel_pp_gyroscope, $spanel_pp_accelerometer"
+)
+
+for root in roots:
+    if not root.exists():
+        continue
+    for path in sorted(root.glob("*.conf")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="latin-1")
+        new_text = text
+
+        if "# SPANEL PROXY BEGIN" in new_text:
+            if "proxy_hide_header Permissions-Policy;" not in new_text:
+                new_text = new_text.replace(
+                    "        proxy_redirect off;",
+                    "        proxy_hide_header Permissions-Policy;\n\n        proxy_redirect off;",
+                    1,
+                )
+            if "$spanel_pp_microphone" not in new_text:
+                new_text = default_line_re.sub(
+                    rf'\1add_header Permissions-Policy "{dynamic_val}" always;',
+                    new_text,
+                )
+        elif "fastcgi_pass unix:" in new_text and "fastcgi_hide_header Permissions-Policy;" not in new_text:
+            new_text = new_text.replace(
+                '        fastcgi_param HTTP_PROXY "";',
+                '        fastcgi_param HTTP_PROXY "";\n        fastcgi_hide_header Permissions-Policy;',
+                1,
+            )
+
+        if new_text != text:
+            path.write_text(new_text, encoding="utf-8")
+            print(f"Updated Permissions-Policy dedup in {path}")
 PY
 }
 
@@ -2123,9 +2215,14 @@ if ! step_inputs_changed site-refresh "${SITE_REFRESH_INPUTS[@]}" && ! legacy_ph
 elif id -u spanel >/dev/null 2>&1; then
   log "Refreshing managed site configuration"
   sudo -u spanel env HOME="$APP_DIR" SPANEL_USE_HELPER=true "$APP_DIR/backend/.venv/bin/python" - <<'PY'
+import re
+from pathlib import Path
+from app.api.websites import _rewrite_website_vhost
 from app.core.database import SessionLocal
 from app.models.entities import Website
 from app.services import nginx, site_users, waf
+
+_MANUAL_PP_RE = re.compile(r"(?mi)^[ \t]*add_header[ \t]+Permissions-Policy[ \t]+([\"'])([^$\r\n'\"]+)\1")
 
 with SessionLocal() as db:
     websites = db.query(Website).all()
@@ -2144,6 +2241,21 @@ with SessionLocal() as db:
     with nginx.deferred_reload():
         for website in websites:
             try:
+                # Preserve any custom Permissions-Policy edited directly on disk
+                # prior to this upgrade before rewriting the managed vhost.
+                if not (getattr(website, "permissions_policy", None) or "").strip():
+                    try:
+                        vhost_file = Path(f"/etc/nginx/sites-available/{website.domain}.conf")
+                        if vhost_file.is_file():
+                            vhost_txt = vhost_file.read_text(encoding="utf-8", errors="ignore")
+                            m_pp = _MANUAL_PP_RE.search(vhost_txt)
+                            if m_pp:
+                                normalized_pp = nginx.normalize_permissions_policy(m_pp.group(2))
+                                if normalized_pp and normalized_pp != nginx.DEFAULT_PERMISSIONS_POLICY:
+                                    website.permissions_policy = normalized_pp
+                                    db.commit()
+                    except Exception:
+                        pass
                 if website.linux_user:
                     runtime_php_version = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
                     site_users.ensure_site_runtime(website.domain, website.root_path, runtime_php_version, website.linux_user)
@@ -2162,21 +2274,7 @@ with SessionLocal() as db:
                 if getattr(website, "nginx_config_mode", "managed") != "managed":
                     website.nginx_config_mode = "managed"
                     db.commit()
-                app_type = website.app_type or "wordpress"
-                runtime_php_version = website.php_version if app_type in {"wordpress", "php"} else None
-                nginx.rewrite_vhost(
-                    website.domain,
-                    website.root_path,
-                    app_type=app_type,
-                    php_version=website.php_version,
-                    custom_directives=website.nginx_custom or "",
-                    php_fpm_socket_override=site_users.site_php_fpm_socket(website.linux_user, website.root_path, runtime_php_version),
-                    waf_enabled=website.waf_enabled,
-                    http_flood_enabled=website.http_flood_enabled,
-                    http_flood_config=website.http_flood_config or "",
-                    document_root=getattr(website, "document_root", "public_html") or "public_html",
-                    rewrite_mode=getattr(website, "nginx_rewrite_mode", "none") or "none",
-                )
+                _rewrite_website_vhost(website)
             except Exception as exc:
                 print(f"WARNING: could not refresh permissions for {website.domain}: {exc}")
     try:
@@ -2434,6 +2532,7 @@ fi
 log "Reloading nginx"
 update_progress 92 "restarting" "Restarting services and reloading nginx"
 migrate_nginx_wordpress_csp_worker_src
+migrate_nginx_permissions_policy_headers
 migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary

@@ -28,6 +28,7 @@ from app.schemas.schemas import (
     WebsiteNginxConfig,
     WebsiteNginxCustom,
     WebsiteOut,
+    WebsitePermissionsPolicyUpdate,
     WebsiteUpdate,
     WebsiteWafUpdate,
     WebsiteWordPressInstall,
@@ -360,6 +361,10 @@ def _rewrite_website_vhost(website: Website, **overrides) -> str:
         "aliases": overrides.pop("aliases", _alias_domains(website)),
         "redirects": overrides.pop("redirects", _redirect_domains(website)),
         "app_port": overrides.pop("app_port", site_apps.app_port_for_website(website)),
+        "permissions_policy": overrides.pop(
+            "permissions_policy",
+            getattr(website, "permissions_policy", None) or "",
+        ),
     }
     if overrides.pop("include_ssl", True):
         rewrite_kwargs.update(_rewrite_ssl_kwargs(website))
@@ -715,6 +720,7 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
                 php_fpm_socket_override=site_users.site_php_fpm_socket(linux_user, root_path, payload.php_version),
                 document_root="public_html",
                 rewrite_mode="front_controller",
+                permissions_policy=payload.permissions_policy or "",
             )
         except HTTPException:
             teardown.rollback_uncommitted_database(db_info)
@@ -750,6 +756,7 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
                 document_root="public_html",
                 rewrite_mode="none",
                 app_port=selected_app.port if selected_app else None,
+                permissions_policy=payload.permissions_policy or "",
             )
         except HTTPException:
             _cleanup_failed_site(root_path, linux_user, domain=payload.domain)
@@ -768,6 +775,7 @@ def create_website(payload: WebsiteCreate, request: Request, db: Session = Depen
         php_version=payload.php_version,
         app_type=app_type_value,
         nginx_rewrite_mode="front_controller" if app_type_value == "wordpress" else "none",
+        permissions_policy=payload.permissions_policy or "",
         app_id=selected_app.id if (not install_wp and selected_app) else None,
         status="active",
     )
@@ -1331,11 +1339,29 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
         website.owner_id = payload.owner_id
     if payload.nginx_custom is not None:
         try:
-            nginx.update_custom_block(website.domain, payload.nginx_custom)
+            nginx.update_custom_block(
+                website.domain,
+                payload.nginx_custom,
+                permissions_policy=getattr(website, "permissions_policy", None) or "",
+            )
         except (RuntimeError, ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         website.nginx_custom = payload.nginx_custom
         website.nginx_config_mode = "managed"
+    if payload.permissions_policy is not None and payload.permissions_policy != (getattr(website, "permissions_policy", None) or ""):
+        previous_pp = getattr(website, "permissions_policy", None) or ""
+        try:
+            _rewrite_website_vhost(website, permissions_policy=payload.permissions_policy)
+        except (RuntimeError, ValueError, OSError, FileNotFoundError) as exc:
+            website.permissions_policy = previous_pp
+            raise HTTPException(status_code=400, detail=f"Cannot update Permissions-Policy: {exc}") from exc
+        website.permissions_policy = payload.permissions_policy
+        website.nginx_config_mode = "managed"
+        try:
+            from app.api.nodejs_manager import invalidate_nodejs_inspect_cache
+            invalidate_nodejs_inspect_cache(website.id)
+        except Exception:
+            pass
     if payload.nginx_rewrite_mode is not None and payload.nginx_rewrite_mode != _website_rewrite_mode(website):
         app_type = website.app_type or "wordpress"
         next_rewrite_mode = "front_controller" if app_type == "wordpress" else "none" if app_type == "static" else payload.nginx_rewrite_mode
@@ -1521,6 +1547,47 @@ def get_website_log(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.patch("/{website_id}/permissions-policy", response_model=WebsiteOut)
+def set_website_permissions_policy(
+    website_id: int,
+    payload: WebsitePermissionsPolicyUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    website = _get_authorized_website(db, website_id, current_user)
+    try:
+        next_policy = payload.normalized_policy()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    previous = getattr(website, "permissions_policy", None) or ""
+    website.permissions_policy = next_policy
+    try:
+        _rewrite_website_vhost(website, permissions_policy=next_policy)
+    except (RuntimeError, ValueError, OSError, FileNotFoundError) as exc:
+        website.permissions_policy = previous
+        raise HTTPException(status_code=400, detail=f"Cannot update Permissions-Policy: {exc}") from exc
+
+    website.nginx_config_mode = "managed"
+    db.commit()
+    db.refresh(website)
+    try:
+        from app.api.nodejs_manager import invalidate_nodejs_inspect_cache
+        invalidate_nodejs_inspect_cache(website.id)
+    except Exception:
+        pass
+    log_action(
+        db,
+        current_user.id,
+        "update_permissions_policy",
+        website.domain,
+        next_policy or "default",
+        request=request,
+    )
+    return website
+
+
 @router.put("/{website_id}/nginx-custom", response_model=WebsiteOut)
 def set_website_nginx_custom(website_id: int, payload: WebsiteNginxCustom, request: Request, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = db.query(Website).filter(Website.id == website_id).first()
@@ -1529,13 +1596,22 @@ def set_website_nginx_custom(website_id: int, payload: WebsiteNginxCustom, reque
     if not _is_authorized_for_website(db, website, current_user):
         ensure_role(current_user.role, Role.admin)
     try:
-        nginx.update_custom_block(website.domain, payload.nginx_custom)
+        nginx.update_custom_block(
+            website.domain,
+            payload.nginx_custom,
+            permissions_policy=getattr(website, "permissions_policy", None) or "",
+        )
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     website.nginx_custom = payload.nginx_custom
     website.nginx_config_mode = "managed"
     db.commit()
     db.refresh(website)
+    try:
+        from app.api.nodejs_manager import invalidate_nodejs_inspect_cache
+        invalidate_nodejs_inspect_cache(website.id)
+    except Exception:
+        pass
     log_action(db, current_user.id, "update_nginx_custom", website.domain, request=request)
     return website
 

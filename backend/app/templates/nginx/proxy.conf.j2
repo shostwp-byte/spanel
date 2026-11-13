@@ -43,7 +43,13 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), bluetooth=(), magnetometer=(), gyroscope=(), accelerometer=()" always;
+{% if not custom_sets_permissions_policy %}
+{% if permissions_policy %}
+    add_header Permissions-Policy '{{ permissions_policy }}' always;
+{% else %}
+    add_header Permissions-Policy "$spanel_pp_camera, $spanel_pp_microphone, $spanel_pp_geolocation, $spanel_pp_payment, $spanel_pp_usb, $spanel_pp_bluetooth, $spanel_pp_magnetometer, $spanel_pp_gyroscope, $spanel_pp_accelerometer" always;
+{% endif %}
+{% endif %}
 
     autoindex off;
 
@@ -70,6 +76,10 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-Host $host;
         proxy_set_header X-Forwarded-Port $server_port;
+
+        # Prevent duplicate/conflicting Permissions-Policy headers when upstream also sets one;
+        # Nginx emits a single unified policy from $spanel_pp_* (or website override).
+        proxy_hide_header Permissions-Policy;
 
         proxy_redirect off;
         # Off so server-sent events and long-polling reach the browser as they

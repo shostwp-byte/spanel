@@ -514,11 +514,235 @@ CACHE_HEADER_NAMES = frozenset(
         "x-fastcgi-cache",
     }
 )
+CUSTOM_ALLOWED_HEADER_NAMES = CACHE_HEADER_NAMES | {"permissions-policy"}
+
+DEFAULT_PERMISSIONS_POLICY_FEATURES: tuple[str, ...] = (
+    "camera",
+    "microphone",
+    "geolocation",
+    "payment",
+    "usb",
+    "bluetooth",
+    "magnetometer",
+    "gyroscope",
+    "accelerometer",
+)
+EXTRA_PERMISSIONS_POLICY_FEATURES = frozenset(
+    {
+        "autoplay",
+        "clipboard-read",
+        "clipboard-write",
+        "display-capture",
+        "encrypted-media",
+        "fullscreen",
+        "hid",
+        "midi",
+        "picture-in-picture",
+        "publickey-credentials-create",
+        "publickey-credentials-get",
+        "screen-wake-lock",
+        "serial",
+        "speaker-selection",
+        "web-share",
+        "xr-spatial-tracking",
+    }
+)
+ALLOWED_PERMISSIONS_POLICY_FEATURES = frozenset(DEFAULT_PERMISSIONS_POLICY_FEATURES) | EXTRA_PERMISSIONS_POLICY_FEATURES
+DEFAULT_PERMISSIONS_POLICY = ", ".join(f"{feat}=()" for feat in DEFAULT_PERMISSIONS_POLICY_FEATURES)
+PROXY_DYNAMIC_PERMISSIONS_POLICY = ", ".join(f"$spanel_pp_{feat}" for feat in DEFAULT_PERMISSIONS_POLICY_FEATURES)
+
+_PP_UNSAFE_RE = re.compile(r"[\x00\r\n;{}\$\\\\']")
+_PP_ORIGIN_TOKEN_RE = re.compile(r"^https?://[A-Za-z0-9.*:-]{1,253}$")
+_PP_DIRECTIVE_RE = re.compile(r"^([a-z][a-z0-9-]{0,47})\s*=\s*(.+)$")
+_PP_ADD_HEADER_RE = re.compile(
+    r"(?mi)(?:^|[;{}])\s*add_header\s+Permissions-Policy\s+([^;{}]+);"
+)
+_PP_ADD_HEADER_ARG_RE = re.compile(
+    r'^(?:"([^"\r\n$]*)"|\'([^\'\r\n$]*)\')(?:\s+always)?\s*$',
+    re.IGNORECASE,
+)
+
 ADD_HEADER_NAME_RE = re.compile(
     r"(?mi)(?:^|[;{}])\s*add_header\s+"
     r"([!#$%&'*+\-.^_`|~0-9A-Za-z]+)(?=\s)"
 )
 TRY_FILES_RE = re.compile(r"(?mi)^\s*try_files\s+([^;{}]+);")
+
+
+def _normalize_permissions_policy_allowlist(raw_val: str) -> str:
+    value = (raw_val or "").strip()
+    if _PP_UNSAFE_RE.search(value):
+        raise ValueError("Permissions-Policy value contains disallowed characters")
+    if value in {"", "()"}:
+        return "()"
+    if value == "*":
+        return "*"
+    if value in {"self", "(self)"}:
+        return "(self)"
+    if not (value.startswith("(") and value.endswith(")")):
+        if _PP_ORIGIN_TOKEN_RE.fullmatch(value):
+            return f'("{value}")'
+        raise ValueError(f"Unsupported Permissions-Policy allowlist: {value}")
+    inner = value[1:-1].strip()
+    if not inner:
+        return "()"
+    normalized_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for token in inner.split():
+        cleaned_token = token.strip()
+        if not cleaned_token:
+            continue
+        if cleaned_token == "self":
+            canonical = "self"
+        elif cleaned_token.startswith('"') and cleaned_token.endswith('"') and len(cleaned_token) >= 2:
+            origin = cleaned_token[1:-1]
+            if not _PP_ORIGIN_TOKEN_RE.fullmatch(origin):
+                raise ValueError(f"Invalid Permissions-Policy origin: {cleaned_token}")
+            canonical = f'"{origin}"'
+        elif _PP_ORIGIN_TOKEN_RE.fullmatch(cleaned_token):
+            canonical = f'"{cleaned_token}"'
+        else:
+            raise ValueError(f"Unsupported Permissions-Policy origin token: {cleaned_token}")
+        if canonical not in seen_tokens:
+            seen_tokens.add(canonical)
+            normalized_tokens.append(canonical)
+    return f"({' '.join(normalized_tokens)})" if normalized_tokens else "()"
+
+
+def normalize_permissions_policy(
+    policy: Optional[str] = None,
+    directives: Optional[dict[str, str]] = None,
+) -> str:
+    """Validate and normalize a Permissions-Policy string or directive map.
+
+    Always preserves SPanel's 9 hardened default directives when customized so
+    allowing one feature (e.g. ``microphone=(self)``) never drops protections
+    for ``camera``, ``geolocation``, ``payment``, ``usb``, etc.
+    Returns ``""`` when reset to SPanel default / upstream auto-merge mode.
+    """
+    raw_text = "" if policy is None else str(policy).strip()
+    if _PP_UNSAFE_RE.search(raw_text):
+        raise ValueError("Permissions-Policy contains unsafe characters")
+
+    if directives is None and (not raw_text or raw_text.lower() == "default"):
+        return ""
+
+    if directives is not None and not isinstance(directives, dict):
+        raise ValueError("directives must be an object mapping feature names to allowlists")
+
+    merged: dict[str, str] = {feat: "()" for feat in DEFAULT_PERMISSIONS_POLICY_FEATURES}
+
+    if raw_text and raw_text.lower() != "default":
+        seen_in_raw: set[str] = set()
+        for segment in raw_text.split(","):
+            item = segment.strip()
+            if not item:
+                raise ValueError("Malformed empty segment in Permissions-Policy")
+            m = _PP_DIRECTIVE_RE.fullmatch(item)
+            if not m:
+                raise ValueError(f"Invalid Permissions-Policy directive: {item}")
+            feat, raw_allowlist = m.group(1).lower(), m.group(2)
+            if feat not in ALLOWED_PERMISSIONS_POLICY_FEATURES:
+                raise ValueError(f"Unsupported Permissions-Policy feature: {feat}")
+            if feat in seen_in_raw:
+                raise ValueError(f"Duplicate Permissions-Policy feature: {feat}")
+            seen_in_raw.add(feat)
+            merged[feat] = _normalize_permissions_policy_allowlist(raw_allowlist)
+
+    if directives is not None:
+        if not directives and not raw_text:
+            return ""
+        all_default = not raw_text
+        for raw_key, raw_val in directives.items():
+            feat = str(raw_key or "").strip().lower()
+            if feat not in ALLOWED_PERMISSIONS_POLICY_FEATURES:
+                raise ValueError(f"Unsupported Permissions-Policy feature: {feat}")
+            if raw_val is None or str(raw_val).strip().lower() == "default":
+                if feat in DEFAULT_PERMISSIONS_POLICY_FEATURES:
+                    merged[feat] = "()"
+                else:
+                    merged.pop(feat, None)
+            else:
+                all_default = False
+                merged[feat] = _normalize_permissions_policy_allowlist(str(raw_val))
+        if all_default:
+            return ""
+
+    ordered_keys = list(DEFAULT_PERMISSIONS_POLICY_FEATURES) + sorted(
+        k for k in merged.keys() if k not in DEFAULT_PERMISSIONS_POLICY_FEATURES
+    )
+    return ", ".join(f"{k}={merged[k]}" for k in ordered_keys)
+
+
+def parse_permissions_policy_map(policy: Optional[str]) -> dict[str, str]:
+    """Return the parsed feature->allowlist map including SPanel defaults."""
+    normalized = normalize_permissions_policy(policy)
+    result = {feat: "()" for feat in DEFAULT_PERMISSIONS_POLICY_FEATURES}
+    if not normalized:
+        return result
+    for item in normalized.split(","):
+        k, _, v = item.strip().partition("=")
+        if k:
+            result[k.strip()] = v.strip()
+    return result
+
+
+def custom_sets_server_permissions_policy(content: Optional[str]) -> bool:
+    """Return True when custom Nginx sets Permissions-Policy at server scope (depth 0)."""
+    if not content:
+        return False
+    depth = 0
+    in_quote: Optional[str] = None
+    in_comment = False
+    server_chunks: list[str] = []
+    i = 0
+    n = len(content)
+    while i < n:
+        ch = content[i]
+        if in_comment:
+            if ch == "\n":
+                in_comment = False
+                if depth == 0:
+                    server_chunks.append("\n")
+            i += 1
+            continue
+        if in_quote is not None:
+            if ch == "\\" and i + 1 < n:
+                if depth == 0:
+                    server_chunks.append(content[i : i + 2])
+                i += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+            if depth == 0:
+                server_chunks.append(ch)
+            i += 1
+            continue
+        if ch == "#":
+            in_comment = True
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            if depth == 0:
+                server_chunks.append(ch)
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            if depth == 0:
+                server_chunks.append(";")
+            i += 1
+            continue
+        if depth == 0:
+            server_chunks.append(ch)
+        i += 1
+    top_level = "".join(server_chunks)
+    return bool(re.search(r"(?mi)(?:^|;)\s*add_header\s+Permissions-Policy\b", top_level))
 
 
 def _check_php_version(php_version: str | None) -> str | None:
@@ -939,15 +1163,29 @@ def validate_custom_nginx(content: Optional[str]) -> str:
         {
             header
             for header in add_header_names
-            if header.lower() not in CACHE_HEADER_NAMES
+            if header.lower() not in CUSTOM_ALLOWED_HEADER_NAMES
         },
         key=str.lower,
     )
     if unsupported_headers:
         raise ValueError(
-            "Custom add_header may only set cache-related headers; disallowed: "
+            "Custom add_header may only set cache-related headers or Permissions-Policy; disallowed: "
             + ", ".join(unsupported_headers)
         )
+    if any(header.lower() == "permissions-policy" for header in add_header_names):
+        pp_occurrences = len(
+            re.findall(r"(?mi)(?:^|[;{}])\s*add_header\s+Permissions-Policy\b", text)
+        )
+        pp_matches = list(_PP_ADD_HEADER_RE.finditer(text))
+        if pp_occurrences != len(pp_matches):
+            raise ValueError("Malformed add_header Permissions-Policy directive")
+        for match in pp_matches:
+            arg_match = _PP_ADD_HEADER_ARG_RE.fullmatch(match.group(1).strip())
+            if not arg_match:
+                raise ValueError("Permissions-Policy must be a valid quoted header string")
+            raw_pp_val = arg_match.group(1) if arg_match.group(1) is not None else arg_match.group(2)
+            if not normalize_permissions_policy(raw_pp_val):
+                raise ValueError("Permissions-Policy value cannot be empty")
     try_files_matches = list(TRY_FILES_RE.finditer(text))
     for match in try_files_matches:
         arguments = match.group(1).split()
@@ -1441,6 +1679,7 @@ def render_vhost(
     app_port: int | None = None,
     blocked_bots=None,
     bind_address: Optional[str] = None,
+    permissions_policy: str = "",
 ) -> str:
     server_names = _server_names(domain, aliases)
     safe_domain = server_names[0]
@@ -1451,7 +1690,9 @@ def render_vhost(
     resolved_root = Path(root_path).resolve()
     if not site_users.is_site_root_for_domain(resolved_root, safe_domain):
         raise ValueError("root_path must be the managed root for this domain")
-    validate_custom_nginx(custom_directives)
+    safe_custom = validate_custom_nginx(custom_directives)
+    safe_permissions_policy = normalize_permissions_policy(permissions_policy)
+    custom_sets_pp = custom_sets_server_permissions_policy(safe_custom)
     effective_document_root = _effective_document_root(document_root, safe_rewrite_mode)
     resolved_document_root = site_users.document_root(resolved_root, effective_document_root)
     include_path = custom_include_path(safe_domain)
@@ -1490,6 +1731,8 @@ def render_vhost(
         app_port=safe_app_port,
         proxy_timeout=PROXY_TIMEOUT_SECONDS,
         http3_enabled=_nginx_supports_http3(),
+        permissions_policy=safe_permissions_policy,
+        custom_sets_permissions_policy=custom_sets_pp,
     )
     # Applied to the rendered output rather than through the templates: it is
     # one block, identical for all four app types, and this keeps it in step
@@ -1544,6 +1787,7 @@ def write_vhost(
     app_port: int | None = None,
     blocked_bots=None,
     bind_address: Optional[str] = None,
+    permissions_policy: str = "",
 ) -> str:
     resolved_ip = bind_address or get_website_ip(_safe_domain(domain))
     return rewrite_vhost(
@@ -1567,6 +1811,7 @@ def write_vhost(
         redirects=redirects,
         app_port=app_port,
         blocked_bots=blocked_bots,
+        permissions_policy=permissions_policy,
     )
 
 
@@ -1595,6 +1840,7 @@ def rewrite_vhost(
     app_port: int | None = None,
     blocked_bots=None,
     bind_address: Optional[str] = None,
+    permissions_policy: str = "",
 ) -> str:
     target = _vhost_path(domain)
     resolved_ip = bind_address or get_website_ip(_safe_domain(domain))
@@ -1625,6 +1871,7 @@ def rewrite_vhost(
         redirects=None,
         app_port=app_port,
         blocked_bots=blocked_bots,
+        permissions_policy=permissions_policy,
     )
     if settings.command_dry_run:
         return _append_redirect_vhosts(content, domain, redirects, ssl_cert_path, ssl_key_path, ssl_ca_path)
@@ -1649,7 +1896,36 @@ def rewrite_wordpress_vhost(domain: str, root_path: str, php_version: str) -> st
     return rewrite_vhost(domain, root_path, app_type="wordpress", php_version=php_version)
 
 
-def update_custom_block(domain: str, custom_directives: str) -> str:
+def _sync_server_permissions_policy_header(
+    content: str,
+    custom_sets_pp: bool,
+    permissions_policy: str = "",
+) -> str:
+    """Keep server-scope Permissions-Policy deduplicated against custom includes."""
+    pp_line_re = re.compile(r"(?mi)^[ \t]*add_header[ \t]+Permissions-Policy\b[^\n]*\n?")
+    if custom_sets_pp:
+        return pp_line_re.sub("", content)
+    if pp_line_re.search(content):
+        return content
+    safe_pp = normalize_permissions_policy(permissions_policy)
+    if safe_pp:
+        header_line = f"    add_header Permissions-Policy '{safe_pp}' always;\n"
+    elif "# SPANEL PROXY BEGIN" in content:
+        header_line = f'    add_header Permissions-Policy "{PROXY_DYNAMIC_PERMISSIONS_POLICY}" always;\n'
+    else:
+        header_line = f'    add_header Permissions-Policy "{DEFAULT_PERMISSIONS_POLICY}" always;\n'
+    hsts_anchor = '    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;'
+    if hsts_anchor in content:
+        return content.replace(hsts_anchor, f"{hsts_anchor}\n{header_line.rstrip()}", 1)
+    return content
+
+
+def update_custom_block(
+    domain: str,
+    custom_directives: str,
+    *,
+    permissions_policy: str = "",
+) -> str:
     target = _vhost_path(domain)
     safe_custom = validate_custom_nginx(custom_directives)
     if settings.command_dry_run:
@@ -1658,6 +1934,11 @@ def update_custom_block(domain: str, custom_directives: str) -> str:
         raise FileNotFoundError(str(target))
     existing = target.read_text(encoding="utf-8")
     positioned = _ensure_custom_include_position(existing, domain)
+    positioned = _sync_server_permissions_policy_header(
+        positioned,
+        custom_sets_server_permissions_policy(safe_custom),
+        permissions_policy=permissions_policy,
+    )
     custom_snapshot = _custom_include_snapshot(domain)
     _write_custom_include(domain, safe_custom)
     if positioned != existing:
@@ -1710,6 +1991,7 @@ def harden_existing_wordpress_vhost(
     ssl_ca_path: str | None = None,
     aliases: list[str] | tuple[str, ...] | None = None,
     redirects: list[str] | tuple[str, ...] | None = None,
+    permissions_policy: str = "",
 ) -> str:
     return rewrite_vhost(
         domain,
@@ -1728,6 +2010,7 @@ def harden_existing_wordpress_vhost(
         ssl_ca_path=ssl_ca_path,
         aliases=aliases,
         redirects=redirects,
+        permissions_policy=permissions_policy,
     )
 
 

@@ -77,8 +77,26 @@ export function CustomHttpdPage({ request, websites = [] }) {
               placeholder={t('Enter custom nginx directives here...')}
             />
             <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '10px' }}>
-              {t('Example: add_header X-Frame-Options "SAMEORIGIN";')}
+              {t('Example: add_header X-Frame-Options "SAMEORIGIN";')} — Permissions-Policy:{' '}
+              <code>add_header Permissions-Policy "camera=(), microphone=(self), geolocation=(), payment=(), usb=(), bluetooth=(), magnetometer=(), gyroscope=(), accelerometer=()" always;</code>
             </p>
+            <div style={{ marginTop: '10px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="secondary-light"
+                disabled={loading}
+                onClick={() => {
+                  const snippet = 'add_header Permissions-Policy "camera=(), microphone=(self), geolocation=(), payment=(), usb=(), bluetooth=(), magnetometer=(), gyroscope=(), accelerometer=()" always;';
+                  setCustomConfig(prev => {
+                    const cur = (prev || '').trim();
+                    if (/add_header\s+Permissions-Policy\b/i.test(cur)) return prev;
+                    return cur ? `${cur}\n${snippet}` : snippet;
+                  });
+                }}
+              >
+                + Insert Microphone (self) Permissions-Policy
+              </button>
+            </div>
             
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px', paddingTop: '15px', borderTop: '1px solid var(--border)', flexWrap: 'wrap' }}>
               <button type="button" onClick={() => setSelectedSite(null)} disabled={loading} style={{ background: 'var(--surface)', border: '1px solid var(--border)', padding: '8px 20px', borderRadius: '4px', cursor: 'pointer', color: 'var(--text)', fontSize: '13px', fontWeight: '500' }}>

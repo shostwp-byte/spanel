@@ -959,30 +959,16 @@ def unsuspend_user(user_id: int, request: Request, db: Session = Depends(get_db)
     user.is_active = True
 
     websites = db.query(Website).filter(Website.owner_id == user.id).all()
-    for website in websites:
-        website.status = "active"
-        rewrite_mode = "front_controller" if website.app_type == "wordpress" else (website.nginx_rewrite_mode or "none")
-        php_socket = site_users.site_php_fpm_socket(website.linux_user, website.root_path, website.php_version) if website.app_type in {"wordpress", "php"} else None
-        nginx.rewrite_vhost(
-            website.domain,
-            website.root_path,
-            app_type=website.app_type,
-            php_version=website.php_version,
-            php_fpm_socket_override=php_socket,
-            custom_directives=website.nginx_custom or "",
-            document_root=website.document_root or "public_html",
-            rewrite_mode=rewrite_mode,
-            waf_enabled=website.waf_enabled,
-            http_flood_enabled=website.http_flood_enabled,
-            http_flood_config=website.http_flood_config or "",
-            aliases=[a.domain for a in (website.aliases or []) if a.mode == "alias"],
-            redirects=[a.domain for a in (website.aliases or []) if a.mode == "redirect"],
-        )
-        if website.linux_user:
-            try:
-                site_users.unlock_linux_user(website.linux_user)
-            except Exception:
-                pass
+    if websites:
+        from app.api.websites import _rewrite_website_vhost
+        for website in websites:
+            website.status = "active"
+            _rewrite_website_vhost(website)
+            if website.linux_user:
+                try:
+                    site_users.unlock_linux_user(website.linux_user)
+                except Exception:
+                    pass
 
     teardown.set_owner_sftp_accounts_locked(db, user.id, False)
     teardown.set_owner_databases_locked(db, user.id, False)

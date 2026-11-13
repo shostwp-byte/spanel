@@ -150,6 +150,9 @@ def _ensure_resource_limit_columns() -> None:
         "provisioning_accounts": [
             ("reseller_id", "INTEGER DEFAULT NULL"),
         ],
+        "websites": [
+            ("permissions_policy", "TEXT NOT NULL DEFAULT ''"),
+        ],
     }
     try:
         inspector = inspect(engine)

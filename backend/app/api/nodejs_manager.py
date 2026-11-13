@@ -2099,6 +2099,7 @@ def _compute_nodejs_dir_signature(
         getattr(site, "app_type", None) or "",
         bool(getattr(site, "ssl_enabled", False)),
         getattr(site, "nginx_custom", "") or "",
+        getattr(site, "permissions_policy", None) or "",
         saved.get("updated_at") or "",
         saved.get("port") or 0,
         saved.get("node_major") or "22",
@@ -2278,6 +2279,7 @@ def _inspect_nodejs_instance(
         "webhook_path": webhook_path,
         "security_checks": security_checks,
         "security_score": security_score,
+        "permissions_policy": getattr(site, "permissions_policy", None) or "",
         "installed_at": saved.get("installed_at") or getattr(site, "created_at", None) or "",
     }
 
@@ -2342,6 +2344,11 @@ class SecurityActionRequest(BaseModel):
     check_id: Optional[str] = Field(default=None, max_length=64)
     enabled: bool = True
     apply_all: bool = False
+
+
+class NodejsPermissionsPolicyRequest(BaseModel):
+    permissions_policy: Optional[str] = Field(default=None, max_length=2048)
+    directives: Optional[Dict[str, str]] = None
 
 
 class GitDeployRequest(BaseModel):
@@ -3283,6 +3290,60 @@ def update_nodejs_security(
     return {
         "instance": instance_info,
         "message": "Đã áp dụng cấu hình bảo mật Production cho ứng dụng Node.js.",
+    }
+
+
+@router.post("/instances/{website_id}/permissions-policy")
+def update_nodejs_permissions_policy(
+    website_id: int,
+    payload: NodejsPermissionsPolicyRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services import nginx
+
+    site = _get_accessible_website(website_id, db, current_user)
+    state = _load_toolkit_state(db)
+    inst_key = str(site.id)
+    saved = dict((state.get("instances") or {}).get(inst_key) or {})
+    linux_user, site_root, _ = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
+    port = int(saved.get("port") or _allocate_nodejs_port(db, exclude_website_id=site.id))
+
+    try:
+        next_policy = nginx.normalize_permissions_policy(
+            payload.permissions_policy, payload.directives
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    previous = getattr(site, "permissions_policy", None) or ""
+    site.permissions_policy = next_policy
+    try:
+        _sync_nodejs_nginx_vhost(site, linux_user, site_root, port, strict=True)
+    except HTTPException:
+        site.permissions_policy = previous
+        raise
+    except Exception as exc:
+        site.permissions_policy = previous
+        raise HTTPException(
+            status_code=400,
+            detail=f"Không thể cập nhật Permissions-Policy trên Nginx cho {site.domain}: {exc}",
+        ) from exc
+
+    site.nginx_config_mode = "managed"
+    db.add(site)
+    db.commit()
+    db.refresh(site)
+    invalidate_nodejs_inspect_cache(site.id)
+    instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
+    return {
+        "instance": instance_info,
+        "permissions_policy": next_policy,
+        "message": (
+            f"Đã khôi phục Permissions-Policy mặc định (tự động gộp theo ứng dụng) cho {site.domain}."
+            if not next_policy
+            else f"Đã cập nhật Permissions-Policy trên Nginx cho {site.domain}."
+        ),
     }
 
 

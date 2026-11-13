@@ -94,19 +94,12 @@ def install_app(payload: AppInstallRequest, background_tasks: BackgroundTasks, r
     public_path = str(site_users.document_root(root_path, website.document_root or "public_html"))
     site_users.fix_site_path(public_path, linux_user)
 
-    php_socket = (
-        site_users.site_php_fpm_socket(linux_user, root_path, website.php_version)
-        if website.app_type in {"wordpress", "php"}
-        else None
-    )
-    nginx.rewrite_vhost(
-        website.domain,
-        root_path,
-        app_type=website.app_type,
-        php_version=website.php_version,
-        php_fpm_socket_override=php_socket,
-        document_root=website.document_root or "public_html",
-        rewrite_mode=website.nginx_rewrite_mode or "none",
+    from app.api.websites import _rewrite_website_vhost
+
+    _rewrite_website_vhost(
+        website,
+        root_path=root_path,
+        linux_user=linux_user,
     )
 
     # Queue background task to download files

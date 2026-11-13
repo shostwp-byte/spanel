@@ -494,6 +494,46 @@ map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
 }
+
+# Upstream-aware Permissions-Policy feature maps for proxied apps (Next.js / Node.js).
+# Preserves SPanel's hardened defaults for omitted directives while honoring
+# app-declared directives without emitting duplicate Permissions-Policy headers.
+map $upstream_http_permissions_policy $spanel_pp_camera {
+    default "camera=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>camera[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_microphone {
+    default "microphone=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>microphone[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_geolocation {
+    default "geolocation=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>geolocation[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_payment {
+    default "payment=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>payment[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_usb {
+    default "usb=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>usb[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_bluetooth {
+    default "bluetooth=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>bluetooth[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_magnetometer {
+    default "magnetometer=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>magnetometer[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_gyroscope {
+    default "gyroscope=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>gyroscope[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
+map $upstream_http_permissions_policy $spanel_pp_accelerometer {
+    default "accelerometer=()";
+    "~*(?:^|,)[ \t]*(?<spanel_pp_val>accelerometer[ \t]*=[ \t]*(?:\([A-Za-z0-9_:/.* \t\x22-]*\)|\*|self))[ \t]*(?:,|$)" $spanel_pp_val;
+}
 NGINX
 }
 

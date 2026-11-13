@@ -668,6 +668,7 @@ function websiteConfigForm(site = {}) {
     app_type: appType,
     php_version: site.php_version || '8.4',
     app_id: site.app_id ? String(site.app_id) : '',
+    permissions_policy: site.permissions_policy || '',
     nginx_rewrite_mode: appType === 'wordpress'
       ? 'front_controller'
       : appType === 'static' || isProxiedAppType(appType)

@@ -286,15 +286,17 @@ def run_custombuild_action(
             return {"message": f"Service {target} restarted.", "log": entry}
 
         if action == "rebuild_nginx":
+            from app.api.websites import _rewrite_website_vhost
             from app.services import nginx as nginx_service
             websites = db.query(Website).all()
             rebuilt = 0
-            for site in websites:
-                try:
-                    nginx_service.rewrite_vhost(site)
-                    rebuilt += 1
-                except Exception:
-                    pass
+            with nginx_service.deferred_reload():
+                for site in websites:
+                    try:
+                        _rewrite_website_vhost(site)
+                        rebuilt += 1
+                    except Exception:
+                        pass
             res = system_service.service_action("nginx", "restart")
             out = f"Verified/rebuilt {rebuilt} vhost configuration(s) and reloaded Nginx."
             entry = _append_log("Rebuild Nginx Vhosts", out, "ok" if res.returncode == 0 else "error")

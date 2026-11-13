@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
+  PERMISSIONS_UI_ITEMS,
+  parsePermissionsPolicy,
+  buildPermissionsPolicy,
+} from '../utils/permissionsPolicy.js';
+import {
   RefreshCw,
   Plus,
   Search,
@@ -191,6 +196,8 @@ export function NodejsManagerPage({
   const [customPkgInputs, setCustomPkgInputs] = useState({});
   // Git deploy form drafts keyed by instance id
   const [gitDrafts, setGitDrafts] = useState({});
+  // Browser Permissions-Policy drafts keyed by instance id
+  const [permissionsDrafts, setPermissionsDrafts] = useState({});
   // One-time revealed webhook secrets keyed by instance id
   const [webhookSecrets, setWebhookSecrets] = useState({});
 
@@ -275,6 +282,15 @@ export function NodejsManagerPage({
             run_npm_install: true,
             restart_process: true,
           };
+        }
+      }
+      return next;
+    });
+    setPermissionsDrafts(prev => {
+      const next = { ...prev };
+      for (const inst of instList) {
+        if (next[inst.id] === undefined) {
+          next[inst.id] = inst.permissions_policy || '';
         }
       }
       return next;
@@ -367,6 +383,10 @@ export function NodejsManagerPage({
           memory_mb: Number(updated.memory_mb || 512),
           node_env: updated.node_env || 'production',
         },
+      }));
+      setPermissionsDrafts(prev => ({
+        ...prev,
+        [updated.id]: updated.permissions_policy || '',
       }));
     },
     []
@@ -566,6 +586,32 @@ export function NodejsManagerPage({
       setNotice(res?.message || 'Đã cập nhật cấu hình bảo mật Node.js.');
     } catch (err) {
       setError(err?.message || 'Không thể áp dụng cấu hình bảo mật.');
+    } finally {
+      markBusy(busyKey, false);
+    }
+  };
+
+  const handlePermissionsPolicySave = async (inst, overridePolicy = undefined) => {
+    const busyKey = `pp_${inst.id}`;
+    const targetPolicy = (
+      overridePolicy !== undefined
+        ? overridePolicy
+        : permissionsDrafts[inst.id] ?? inst.permissions_policy ?? ''
+    ).trim();
+    markBusy(busyKey, true);
+    try {
+      const res = await request(`/nodejs-manager/instances/${inst.id}/permissions-policy`, {
+        method: 'POST',
+        body: JSON.stringify({ permissions_policy: targetPolicy }),
+      });
+      if (res?.instance) replaceSingleInstance(res.instance);
+      setPermissionsDrafts(prev => ({
+        ...prev,
+        [inst.id]: res?.permissions_policy ?? targetPolicy,
+      }));
+      setNotice(res?.message || 'Đã cập nhật HTTP Permissions-Policy trên Nginx.');
+    } catch (err) {
+      setError(err?.message || 'Không thể cập nhật Permissions-Policy.');
     } finally {
       markBusy(busyKey, false);
     }
@@ -1478,6 +1524,118 @@ export function NodejsManagerPage({
                 );
               })}
             </div>
+
+            {(() => {
+              const currentDraftPolicy =
+                permissionsDrafts[inst.id] !== undefined
+                  ? permissionsDrafts[inst.id]
+                  : inst.permissions_policy || '';
+              const parsedPP = parsePermissionsPolicy(currentDraftPolicy);
+              const ppBusy = !!busyMap[`pp_${inst.id}`];
+              const hasExplicitPP = Boolean((inst.permissions_policy || '').trim());
+              return (
+                <div
+                  style={{
+                    padding: '14px 16px',
+                    borderRadius: '10px',
+                    background: 'var(--surface-alt)',
+                    border: '1px solid var(--border)',
+                    display: 'grid',
+                    gap: '12px',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '10px',
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: '13.5px' }}>
+                        Quyền trình duyệt (HTTP Permissions-Policy — Microphone / Camera / Geolocation)
+                      </div>
+                      <div className="hint" style={{ fontSize: '12px', marginTop: '2px' }}>
+                        {hasExplicitPP
+                          ? 'Đang áp dụng cấu hình cố định từ SPanel trên Nginx (giữ nguyên các chính sách bảo mật còn lại và chỉ xuất 1 header duy nhất).'
+                          : 'Mặc định thông minh: Nginx tự động gộp Permissions-Policy do Next.js / Node.js trả về (ví dụ microphone=(self)) với chính sách bảo mật mặc định (), không gửi 2 header xung đột.'}
+                      </div>
+                    </div>
+                    <span className={`badge ${hasExplicitPP ? 'info' : 'ok'}`} style={{ fontSize: '11px' }}>
+                      {hasExplicitPP ? 'Ghi đè thủ công' : 'Tự động gộp từ App'}
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))',
+                      gap: '10px',
+                    }}
+                  >
+                    {PERMISSIONS_UI_ITEMS.slice(0, 4).map(item => {
+                      const curVal = parsedPP[item.key] || '()';
+                      const opts = ['()', '(self)', '*'];
+                      if (!opts.includes(curVal)) opts.push(curVal);
+                      return (
+                        <label key={item.key} style={{ display: 'grid', gap: '4px', fontSize: '12px' }}>
+                          <span style={{ fontWeight: 600 }}>{item.label}</span>
+                          <select
+                            value={curVal}
+                            disabled={ppBusy}
+                            onChange={e => {
+                              const nextMap = { ...parsedPP, [item.key]: e.target.value };
+                              setPermissionsDrafts(prev => ({
+                                ...prev,
+                                [inst.id]: buildPermissionsPolicy(nextMap),
+                              }));
+                            }}
+                          >
+                            {opts.map(opt => (
+                              <option key={opt} value={opt}>
+                                {opt === '()'
+                                  ? 'Chặn hoàn toàn ()'
+                                  : opt === '(self)'
+                                    ? 'Cho phép cùng nguồn (self)'
+                                    : opt === '*'
+                                      ? 'Cho phép mọi nguồn (*)'
+                                      : opt}
+                              </option>
+                            ))}
+                          </select>
+                          <span className="hint" style={{ fontSize: '11px' }}>
+                            {item.hint}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+                    <button
+                      type="button"
+                      className="mini"
+                      disabled={ppBusy}
+                      onClick={() => handlePermissionsPolicySave(inst)}
+                    >
+                      <ShieldCheck size={13} />
+                      <span>{ppBusy ? 'Đang áp dụng...' : 'Lưu quyền trình duyệt'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-light mini"
+                      disabled={ppBusy || (!hasExplicitPP && !currentDraftPolicy)}
+                      onClick={() => handlePermissionsPolicySave(inst, '')}
+                    >
+                      <RotateCcw size={13} />
+                      <span>Mặc định (Tự động theo App)</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         )}
 

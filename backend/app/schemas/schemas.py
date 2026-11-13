@@ -661,6 +661,16 @@ class WebsiteCreate(BaseModel):
     admin_user: str = "admin"
     admin_email: Optional[EmailStr] = None
     admin_password: Optional[str] = None
+    permissions_policy: Optional[str] = None
+
+    @field_validator("permissions_policy")
+    @classmethod
+    def validate_permissions_policy(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        from app.services import nginx
+
+        return nginx.normalize_permissions_policy(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -730,8 +740,18 @@ class WebsiteUpdate(BaseModel):
     owner_id: Optional[int] = None
     nginx_custom: Optional[str] = None
     nginx_rewrite_mode: Optional[str] = None
+    permissions_policy: Optional[str] = None
     waf_enabled: Optional[bool] = None
     http_flood_enabled: Optional[bool] = None
+
+    @field_validator("permissions_policy")
+    @classmethod
+    def validate_permissions_policy(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        from app.services import nginx
+
+        return nginx.normalize_permissions_policy(value)
 
     @field_validator("php_version")
     @classmethod
@@ -766,6 +786,16 @@ class WebsiteUpdate(BaseModel):
 
 class WebsiteNginxCustom(BaseModel):
     nginx_custom: str = ""
+
+
+class WebsitePermissionsPolicyUpdate(BaseModel):
+    permissions_policy: Optional[str] = None
+    directives: Optional[dict[str, str]] = None
+
+    def normalized_policy(self) -> str:
+        from app.services import nginx
+
+        return nginx.normalize_permissions_policy(self.permissions_policy, self.directives)
 
 
 class WebsiteNginxConfig(BaseModel):
@@ -1068,6 +1098,7 @@ class WebsiteOut(BaseModel):
     nginx_custom: str = ""
     nginx_config_mode: str = "managed"
     nginx_rewrite_mode: str = "none"
+    permissions_policy: str = ""
     waf_enabled: bool = True
     waf_default_rules: str = ""
     waf_custom_rules: str = ""
@@ -1097,6 +1128,8 @@ class WebsiteOut(BaseModel):
         if not self.ssl_mode:
             self.ssl_mode = "letsencrypt" if self.ssl_enabled else "none"
         self.ssl_has_ca = bool(self.ssl_ca_path)
+        if self.permissions_policy is None:
+            self.permissions_policy = ""
         return self
 
 
