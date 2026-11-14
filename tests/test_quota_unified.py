@@ -990,7 +990,7 @@ def test_rename_domain_moves_runtime_rewrites_vhost_and_renames_subdomains(tmp_p
         ):
             updated = websites_api.update_website(
                 site.id,
-                WebsiteUpdate(domain="new-site.test"),
+                WebsiteUpdate(domain="new-site.test", rename_children=True),
                 db,
                 user,
             )

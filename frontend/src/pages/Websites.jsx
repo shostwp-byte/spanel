@@ -89,6 +89,7 @@ export function WebsitesPage({
   const [renameModalOpen, setRenameModalOpen] = useState(false);
   const [renameTargetId, setRenameTargetId] = useState('');
   const [renameNewDomain, setRenameNewDomain] = useState('');
+  const [renameChildren, setRenameChildren] = useState(false);
   const [transferOwnerTargetId, setTransferOwnerTargetId] = useState('');
   const endUsers = React.useMemo(
     () => (users || []).filter(u => u && u.role !== 'admin' && u.role !== 'reseller'),
@@ -895,12 +896,13 @@ export function WebsitesPage({
     }
     const data = await request(
       `/websites/${targetId}`,
-      { method: 'PATCH', body: JSON.stringify({ domain: cleanNew }) },
+      { method: 'PATCH', body: JSON.stringify({ domain: cleanNew, rename_children: !!renameChildren }) },
       t('Renaming domain to {domain}...', { domain: cleanNew })
     );
     if (data) {
       setRenameModalOpen(false);
       setRenameNewDomain('');
+      setRenameChildren(false);
       if (nginxCustomEditing && String(nginxCustomEditing.id) === String(targetId)) {
         setNginxCustomEditing(prev => prev ? ({ ...prev, domain: data.domain || cleanNew, site: data }) : prev);
       }
@@ -908,6 +910,11 @@ export function WebsitesPage({
         setFileListPath('public_html');
       }
       setNotice(t('Renamed domain to {domain}.', { domain: data.domain || cleanNew }));
+      if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+        setError(data.warnings.join(' · '));
+      } else if (data.transfer_warning) {
+        setError(data.transfer_warning);
+      }
       await loadWebsiteList(websiteSearch, false);
       if (refreshAll) await refreshAll();
     }
@@ -936,6 +943,11 @@ export function WebsitesPage({
           user: targetUser?.username || String(cleanOwnerId),
         })
       );
+      if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+        setError(data.warnings.join(' · '));
+      } else if (data.transfer_warning) {
+        setError(data.transfer_warning);
+      }
       setNginxCustomEditing(prev => (prev && prev.id === cleanSiteId ? { ...prev, site: data } : prev));
       await loadWebsiteList(websiteSearch, false);
       if (refreshAll) await refreshAll();
@@ -3039,6 +3051,26 @@ export function WebsitesPage({
                     placeholder="new-domain.com"
                   />
                 </div>
+
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    fontSize: '13px',
+                    color: 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={renameChildren}
+                    onChange={e => setRenameChildren(e.target.checked)}
+                    style={{ width: '15px', height: '15px', margin: 0 }}
+                  />
+                  <span>{t('Also rename child subdomains belonging to this domain')}</span>
+                </label>
               </div>
 
               <div
