@@ -1023,10 +1023,17 @@ try:
     from app.models.entities import NodejsInstance, Website
 
     with SessionLocal() as db:
-        rows = db.query(NodejsInstance).all()
+        # NodejsInstance is a table with real columns (8cec410); it has no
+        # .data dict. Reading row.data raised AttributeError outside the
+        # per-row try, so this migration used to skip every instance.
+        rows = (
+            db.query(NodejsInstance)
+            .filter(NodejsInstance.detached.is_(False), NodejsInstance.process_enabled.is_(True))
+            .all()
+        )
         for row in rows:
-            data = row.data if isinstance(row.data, dict) else {}
-            if not data.get("installed") or data.get("detached") or not data.get("process_enabled", True):
+            data = nm._row_to_instance_dict(row)
+            if data.get("port") is None:
                 continue
             site = db.query(Website).filter(Website.id == row.website_id).first()
             if site is None:
@@ -1040,9 +1047,9 @@ try:
                     site_root,
                     app_dir,
                     node_major=str(data.get("node_major") or "22"),
-                    start_mode=str(data.get("start_mode") or "npm"),
-                    start_arg=str(data.get("start_arg") or "start"),
-                    port=int(data.get("port") or 21000),
+                    start_mode=str(data.get("start_mode") or "node"),
+                    start_arg=str(data.get("start_arg") or "server.js"),
+                    port=int(data["port"]),
                     memory_mb=int(data.get("memory_mb") or 512),
                     node_env=str(data.get("node_env") or "production"),
                     enabled=True,

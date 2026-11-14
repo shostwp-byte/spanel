@@ -351,3 +351,43 @@ def test_p1_6_app_units_hide_other_tenants_homes(writer):
     assert "ProtectHome=tmpfs" in body
     assert "BindReadOnlyPaths=${HOME_ROOT}/${user}" in body
     assert "ProtectSystem=strict" in body
+
+
+# --------------------------------------------------------------------------- P1-7
+
+
+def _update_heredoc(tag: str) -> str:
+    text = UPDATE_SH.read_text(encoding="utf-8")
+    start = text.index(f"<<'{tag}'\n") + len(f"<<'{tag}'\n")
+    return text[start: text.index(f"\n{tag}\n", start)]
+
+
+def test_p1_7_update_migration_resyncs_running_nodejs_units(monkeypatch, capsys):
+    from app.core import database as core_db
+
+    db = _session()
+    alice, site = _alice_site(db)
+    other = Website(domain="off.example.com", root_path="/home/alice/off.example.com", linux_user="alice", owner_id=alice.id)
+    gone = Website(domain="gone.example.com", root_path="/home/alice/gone.example.com", linux_user="alice", owner_id=alice.id)
+    db.add_all([other, gone])
+    db.commit()
+    db.add_all([
+        NodejsInstance(website_id=site.id, owner_id=alice.id, port=21020, detached=False, process_enabled=True,
+                       start_mode="npm", start_arg="start", memory_mb=640),
+        NodejsInstance(website_id=other.id, owner_id=alice.id, port=21021, detached=False, process_enabled=False),
+        NodejsInstance(website_id=gone.id, owner_id=alice.id, port=None, detached=True, process_enabled=True),
+    ])
+    db.commit()
+    calls = []
+    monkeypatch.setattr(core_db, "SessionLocal", _sessionmaker_for(db))
+    monkeypatch.setattr(nm, "_sync_nodejs_worker_unit", lambda *a, **k: calls.append((a, k)) or {"status": "running"})
+
+    exec(compile(_update_heredoc("PY_REPAIR_NODEJS"), "update.sh:PY_REPAIR_NODEJS", "exec"), {"__name__": "__main__"})
+
+    err = capsys.readouterr().err
+    assert "skipped" not in err, err
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "alice" and str(args[1]) == str(Path(site.root_path))
+    assert kwargs["port"] == 21020 and kwargs["start_mode"] == "npm" and kwargs["memory_mb"] == 640
+    assert kwargs["enabled"] is True
