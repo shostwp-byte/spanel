@@ -164,10 +164,9 @@ def _ensure_resource_limit_columns() -> None:
                 for col_name, col_ddl in cols:
                     if col_name not in existing:
                         conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"))
-            if inspector.has_table("user_packages"):
-                conn.execute(text("UPDATE user_packages SET tasks_max = 2048 WHERE tasks_max IN (80, 512)"))
-            if inspector.has_table("users"):
-                conn.execute(text("UPDATE users SET tasks_max = 2048 WHERE tasks_max IN (80, 512)"))
+            # The one-time raise of the old 80/512 TasksMax defaults is the
+            # tasks_max_2048_once migration; doing it here ran on every start
+            # and overwrote 80 or 512 set on purpose by an admin.
             if inspector.has_table("users") and inspector.has_table("user_packages"):
                 sync_cols = [
                     "database_limit",
