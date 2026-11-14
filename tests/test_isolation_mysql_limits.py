@@ -23,9 +23,11 @@ HOURLY = ("mysql_max_queries_per_hour", "mysql_max_updates_per_hour", "mysql_max
 def test_hourly_limits_sql_sets_all_three_and_zero_means_unlimited():
     from app.services import mariadb
 
-    assert mariadb.hourly_limits_sql("u_shop", 50000, 5000, 600) == (
-        "ALTER USER 'u_shop'@'localhost' WITH MAX_QUERIES_PER_HOUR 50000"
+    # Every loopback host: a TCP client must not escape the package's limits.
+    assert mariadb.hourly_limits_sql("u_shop", 50000, 5000, 600) == "".join(
+        f"ALTER USER IF EXISTS 'u_shop'@'{host}' WITH MAX_QUERIES_PER_HOUR 50000"
         " MAX_UPDATES_PER_HOUR 5000 MAX_CONNECTIONS_PER_HOUR 600;\n"
+        for host in ("localhost", "127.0.0.1", "::1")
     )
     # Lowering a package to "no limit" must lift what was set before.
     assert mariadb.hourly_limits_sql("u_shop", 0, -1, None).endswith(

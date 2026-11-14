@@ -32,8 +32,14 @@ def _accounts(db):
 def test_local_account_lock_sql():
     from app.services import mariadb
 
-    assert mariadb.account_lock_sql("blog", True) == "ALTER USER 'blog'@'localhost' ACCOUNT LOCK;\n"
-    assert mariadb.account_lock_sql("blog", False) == "ALTER USER 'blog'@'localhost' ACCOUNT UNLOCK;\n"
+    # Every loopback host: suspending must also stop logins over 127.0.0.1 / ::1.
+    hosts = ("localhost", "127.0.0.1", "::1")
+    assert mariadb.account_lock_sql("blog", True) == "".join(
+        f"ALTER USER IF EXISTS 'blog'@'{h}' ACCOUNT LOCK;\n" for h in hosts
+    )
+    assert mariadb.account_lock_sql("blog", False) == "".join(
+        f"ALTER USER IF EXISTS 'blog'@'{h}' ACCOUNT UNLOCK;\n" for h in hosts
+    )
     with pytest.raises(ValueError):
         mariadb.account_lock_sql("root", True)
     with pytest.raises(ValueError):
@@ -55,13 +61,13 @@ def test_local_lock_kills_open_sessions(monkeypatch):
     monkeypatch.setattr(settings, "command_dry_run", False)
     monkeypatch.setattr(mariadb, "_run_sql", fake_run_sql)
     mariadb.set_account_locked("blog", True)
-    assert sent[0] == "ALTER USER 'blog'@'localhost' ACCOUNT LOCK;\n"
+    assert sent[0] == mariadb.account_lock_sql("blog", True)
     assert "WHERE USER = 'blog'" in sent[1]
     assert sent[2] == "KILL CONNECTION 41;\nKILL CONNECTION 42;\n"
 
     sent.clear()
     mariadb.set_account_locked("blog", False)
-    assert sent == ["ALTER USER 'blog'@'localhost' ACCOUNT UNLOCK;\n"]
+    assert sent == [mariadb.account_lock_sql("blog", False)]
 
 
 def test_remote_lock_covers_every_host_part_and_kills_sessions(server):

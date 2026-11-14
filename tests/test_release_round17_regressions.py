@@ -159,3 +159,104 @@ def test_p1_2_no_reference_to_the_missing_sync_function():
     text = (REPO_ROOT / "backend" / "app" / "api" / "websites.py").read_text(encoding="utf-8")
     assert "_sync_systemd_unit" not in text
 
+
+# --------------------------------------------------------------------------- P1-3
+
+LOOPBACK = ("localhost", "127.0.0.1", "::1")
+
+
+def _capture_sql(monkeypatch):
+    from app.services import mariadb
+
+    sent: list[str] = []
+    monkeypatch.setattr(mariadb.settings, "command_dry_run", False)
+    monkeypatch.setattr(
+        mariadb, "_run_sql",
+        lambda sql, check=True: sent.append(sql) or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    return sent
+
+
+def _locked_tenant(db):
+    from app.core.secrets import encrypt
+    from app.models.entities import DatabaseAccount
+
+    owner = User(
+        username="carol", email="carol@example.com", hashed_password="x", role="end_user",
+        is_active=False, mysql_max_queries_per_hour=900,
+    )
+    db.add(owner)
+    db.commit()
+    db.refresh(owner)
+    acc = DatabaseAccount(
+        owner_id=owner.id, db_name="carol_wp", db_user="carol_wp",
+        db_password=encrypt("s3cret-pw"), write_locked=True,
+    )
+    db.add(acc)
+    db.commit()
+    return owner, acc
+
+
+def _sessionmaker_for(db):
+    return sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False, expire_on_commit=False)
+
+
+def _assert_locked_on_every_host(sql: str):
+    for host in LOOPBACK:
+        target = f"'carol_wp'@'{host}'"
+        assert f"REVOKE ALL PRIVILEGES ON `carol_wp`.* FROM {target};" in sql
+        assert f"GRANT SELECT, DELETE, DROP, REFERENCES, SHOW VIEW, TRIGGER ON `carol_wp`.* TO {target};" in sql
+        assert f"ALTER USER {target} ACCOUNT LOCK;" in sql
+        assert f"ALTER USER IF EXISTS {target} WITH MAX_QUERIES_PER_HOUR 900" in sql
+    assert "GRANT ALL" not in sql
+
+
+def test_p1_3_startup_sync_keeps_write_lock_suspension_and_hourly_limits(monkeypatch):
+    from app.core import database as core_db
+    from app.services import mariadb
+
+    db = _session()
+    _locked_tenant(db)
+    sent = _capture_sql(monkeypatch)
+    monkeypatch.setattr(core_db, "SessionLocal", _sessionmaker_for(db))
+    assert mariadb.sync_local_loopback_accounts() == 1
+    sql = "".join(sent)
+    _assert_locked_on_every_host(sql)
+    # Accounts the panel does not track are no longer copied to TCP hosts.
+    assert "mysql.user" not in sql
+
+
+def test_p1_3_password_change_cannot_lift_the_write_lock(monkeypatch):
+    from app.core import database as core_db
+    from app.services import mariadb
+
+    db = _session()
+    _locked_tenant(db)
+    sent = _capture_sql(monkeypatch)
+    monkeypatch.setattr(core_db, "SessionLocal", _sessionmaker_for(db))
+    monkeypatch.setattr(mariadb, "database_exists", lambda name: True)
+    monkeypatch.setattr(mariadb, "user_exists", lambda name: True)
+    # databases.change_database_password calls exactly this after the ALTER USER.
+    mariadb.ensure_local_database_user_hosts("carol_wp", "carol_wp", "new-password")
+    _assert_locked_on_every_host("".join(sent))
+
+
+def test_p1_3_write_lock_and_unlock_cover_every_host(monkeypatch):
+    from app.services import mariadb
+
+    sent = _capture_sql(monkeypatch)
+    mariadb.set_database_write_lock("carol_wp", "carol_wp", True)
+    mariadb.set_database_write_lock("carol_wp", "carol_wp", False)
+    locked, unlocked = sent
+    for host in LOOPBACK:
+        assert f"GRANT SELECT, DELETE, DROP, REFERENCES, SHOW VIEW, TRIGGER ON `carol_wp`.* TO 'carol_wp'@'{host}';" in locked
+        assert f"GRANT ALL PRIVILEGES ON `carol_wp`.* TO 'carol_wp'@'{host}';" in unlocked
+
+
+def test_p1_3_update_sh_no_longer_grants_all_to_tenant_loopback_hosts():
+    text = UPDATE_SH.read_text(encoding="utf-8")
+    body = text[text.index("refresh_spanel_mariadb_grants() {"):]
+    body = body[: body.index("\n}\n")]
+    assert r"GRANT ALL PRIVILEGES ON \`" not in body
+    assert "${db_u}" not in body
+

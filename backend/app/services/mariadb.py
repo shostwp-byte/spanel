@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import contextvars
 from datetime import datetime
+import logging
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,8 @@ from typing import Dict, Iterator, Optional
 
 from app.core.config import settings
 from app.services.shell import shell
+
+logger = logging.getLogger("spanel.mariadb")
 
 _IMPORT_CREDS_CTX: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
     "spanel_mariadb_import_creds", default=None
@@ -85,6 +88,25 @@ RESERVED_DB_USERS = frozenset({
 # when configured with host=localhost or host=127.0.0.1, so every local tenant
 # database user is provisioned across all three loopback hosts.
 LOCAL_CLIENT_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
+
+# What a database keeps while it is over its MySQL quota (set_database_write_lock):
+# the site stays readable and the owner can still delete rows or drop tables.
+WRITE_LOCKED_PRIVILEGES = "SELECT, DELETE, DROP, REFERENCES, SHOW VIEW, TRIGGER"
+
+
+def _grant_statements(q_db: str, q_user_at_host: str, write_locked: bool) -> list[str]:
+    """GRANT for one account on one host, honouring the quota write lock.
+
+    Every place that (re)creates an account on a loopback host goes through
+    here, so recreating a host can never hand a locked database its write
+    privileges back.
+    """
+    if write_locked:
+        return [
+            f"REVOKE ALL PRIVILEGES ON {q_db}.* FROM {q_user_at_host};",
+            f"GRANT {WRITE_LOCKED_PRIVILEGES} ON {q_db}.* TO {q_user_at_host};",
+        ]
+    return [f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_user_at_host};"]
 
 RESERVED_DATABASES = frozenset({
     "mysql",
@@ -210,6 +232,8 @@ def create_database_credentials(
     allow_existing_user: bool = False,
     allow_existing_database: bool = False,
     allow_existing_db: bool | None = None,
+    write_locked: bool = False,
+    account_locked: bool = False,
 ) -> Dict[str, str]:
     """Create a database and the account that owns it.
 
@@ -254,7 +278,9 @@ def create_database_credentials(
         if allow_existing_user:
             # Only a restore/sync sets the password of an account that was already there.
             statements.append(f"ALTER USER {q_user}@{q_host} {auth};")
-        statements.append(f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_user}@{q_host};")
+        statements.extend(_grant_statements(q_db, f"{q_user}@{q_host}", write_locked))
+        if account_locked:
+            statements.append(f"ALTER USER {q_user}@{q_host} ACCOUNT LOCK;")
     statements.append("FLUSH PRIVILEGES;")
     _run_sql("\n".join(statements) + "\n")
     enforce_db_user_resource_limits(db_user)
@@ -267,17 +293,66 @@ def ensure_local_database_user_hosts(
     db_password: str,
     *,
     password_hash: str | None = None,
+    write_locked: bool | None = None,
+    account_locked: bool | None = None,
+    hourly_limits: tuple[int, int, int] | None = None,
 ) -> Dict[str, str]:
     """Ensure a local MariaDB user exists and holds privileges on db_name across all
-    loopback hosts ('localhost', '127.0.0.1', '::1')."""
-    return create_database_credentials(
+    loopback hosts ('localhost', '127.0.0.1', '::1').
+
+    The hosts are recreated in the state the panel keeps for the account: a
+    database over its quota stays write-locked, a suspended owner's account
+    stays ACCOUNT LOCKed, and the package's hourly limits apply on every
+    host. Anything not given is read from the panel's DatabaseAccount row.
+    """
+    if write_locked is None or account_locked is None or hourly_limits is None:
+        found = _panel_account_state(db_name, db_user)
+        write_locked = found[0] if write_locked is None else write_locked
+        account_locked = found[1] if account_locked is None else account_locked
+        hourly_limits = found[2] if hourly_limits is None else hourly_limits
+    result = create_database_credentials(
         db_name,
         db_user,
         db_password,
         password_hash=password_hash,
         allow_existing_user=True,
         allow_existing_database=True,
+        write_locked=bool(write_locked),
+        account_locked=bool(account_locked),
     )
+    if any(hourly_limits or ()):
+        enforce_db_user_hourly_limits(db_user, *hourly_limits)
+    return result
+
+
+def account_state(acc) -> tuple[bool, bool, tuple[int, int, int]]:
+    """(write_locked, account_locked, hourly limits) the panel keeps for a DatabaseAccount row."""
+    owner = getattr(acc, "owner", None)
+    suspended = owner is not None and getattr(owner, "is_active", True) is False
+    limits = owner_hourly_limits(owner) if owner is not None else (0, 0, 0)
+    return bool(getattr(acc, "write_locked", False)), suspended, limits
+
+
+def _panel_account_state(db_name: str, db_user: str) -> tuple[bool, bool, tuple[int, int, int]]:
+    try:
+        from app.core.database import SessionLocal
+        from app.models.entities import DatabaseAccount
+
+        with SessionLocal() as session:
+            acc = (
+                session.query(DatabaseAccount)
+                .filter(
+                    DatabaseAccount.db_host_id.is_(None),
+                    DatabaseAccount.db_user == db_user,
+                    DatabaseAccount.db_name == db_name,
+                )
+                .first()
+            )
+            if acc is not None:
+                return account_state(acc)
+    except Exception:
+        logger.warning("could not read the panel state of %s/%s", db_user, db_name, exc_info=True)
+    return False, False, (0, 0, 0)
 
 
 def drop_database(db_name: str, db_user: str):
@@ -489,21 +564,23 @@ def set_database_write_lock(db_name: str, db_user: str, locked: bool) -> None:
     stmts = []
     for host in LOCAL_CLIENT_HOSTS:
         q_user = f"{q_user_name}@{_quote_sql_string(host)}"
-        if locked:
-            stmts.append(f"REVOKE ALL PRIVILEGES ON {q_db}.* FROM {q_user};")
-            stmts.append(f"GRANT SELECT, DELETE, DROP, REFERENCES, SHOW VIEW, TRIGGER ON {q_db}.* TO {q_user};")
-        else:
-            stmts.append(f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_user};")
+        stmts.extend(_grant_statements(q_db, q_user, locked))
     stmts.append("FLUSH PRIVILEGES;")
     _run_sql("\n".join(stmts) + "\n", check=False)
 
 
-def account_lock_sql(db_user: str, locked: bool, client_host: str = "localhost") -> str:
-    """ALTER USER ... ACCOUNT LOCK/UNLOCK (MariaDB >= 10.4.2, MySQL >= 5.7.6)."""
+def account_lock_sql(db_user: str, locked: bool) -> str:
+    """ALTER USER ... ACCOUNT LOCK/UNLOCK (MariaDB >= 10.4.2, MySQL >= 5.7.6)
+    on every loopback host the account exists on - locking only 'localhost'
+    left a suspended owner connecting over 127.0.0.1."""
     safe_user = _validate_identifier(db_user)
     _reject_reserved_user(safe_user)
     clause = "ACCOUNT LOCK" if locked else "ACCOUNT UNLOCK"
-    return f"ALTER USER {_quote_sql_string(safe_user)}@{_quote_sql_string(client_host)} {clause};\n"
+    q_user = _quote_sql_string(safe_user)
+    return "".join(
+        f"ALTER USER IF EXISTS {q_user}@{_quote_sql_string(host)} {clause};\n"
+        for host in LOCAL_CLIENT_HOSTS
+    )
 
 
 def set_account_locked(db_user: str, locked: bool) -> None:
@@ -634,11 +711,15 @@ def hourly_limits_sql(
     """
     safe_user = _validate_identifier(db_user)
     _reject_reserved_user(safe_user)
-    return (
-        f"ALTER USER {_quote_sql_string(safe_user)}@'localhost' WITH"
+    q_user = _quote_sql_string(safe_user)
+    limits = (
         f" MAX_QUERIES_PER_HOUR {_hourly_value(max_queries_per_hour)}"
         f" MAX_UPDATES_PER_HOUR {_hourly_value(max_updates_per_hour)}"
         f" MAX_CONNECTIONS_PER_HOUR {_hourly_value(max_connections_per_hour)};\n"
+    )
+    return "".join(
+        f"ALTER USER IF EXISTS {q_user}@{_quote_sql_string(host)} WITH{limits}"
+        for host in LOCAL_CLIENT_HOSTS
     )
 
 
@@ -664,12 +745,19 @@ def enforce_db_user_hourly_limits(
 
 
 def sync_local_loopback_accounts() -> int:
-    """Ensure all existing local MariaDB accounts (both DatabaseAccount records and
-    mysql.user@'localhost' entries) also exist and hold grants on @'127.0.0.1' and @'::1'."""
+    """Make every local DatabaseAccount exist on all LOCAL_CLIENT_HOSTS, in the
+    state the panel keeps for it (write lock, suspension, hourly limits).
+
+    Runs at every backend start. Accounts the panel does not track are left
+    alone: copying them, with GRANT ALL, used to undo every quota write lock
+    on restart and to mint TCP logins for accounts nobody here manages.
+    """
     if settings.command_dry_run:
         return 0
     synced = 0
     try:
+        from sqlalchemy.orm import joinedload
+
         from app.core.database import SessionLocal
         from app.core.secrets import decrypt
         from app.models.entities import DatabaseAccount
@@ -677,59 +765,28 @@ def sync_local_loopback_accounts() -> int:
         with SessionLocal() as session:
             accounts = (
                 session.query(DatabaseAccount)
+                .options(joinedload(DatabaseAccount.owner))
                 .filter(DatabaseAccount.db_host_id.is_(None))
                 .all()
             )
             for acc in accounts:
                 if not (acc.db_name and acc.db_user and acc.db_password):
                     continue
+                write_locked, account_locked, limits = account_state(acc)
                 try:
-                    raw_pw = decrypt(acc.db_password)
-                    ensure_local_database_user_hosts(acc.db_name.strip(), acc.db_user.strip(), raw_pw)
+                    ensure_local_database_user_hosts(
+                        acc.db_name.strip(),
+                        acc.db_user.strip(),
+                        decrypt(acc.db_password),
+                        write_locked=write_locked,
+                        account_locked=account_locked,
+                        hourly_limits=limits,
+                    )
                     synced += 1
                 except Exception:
-                    continue
+                    logger.warning("could not sync loopback hosts of %s", acc.db_user, exc_info=True)
     except Exception:
-        pass
-
-    try:
-        res = _run_sql(
-            "SELECT u.User, IFNULL(u.authentication_string, ''), d.Db "
-            "FROM mysql.user u "
-            "JOIN mysql.db d ON u.User = d.User AND u.Host = d.Host "
-            "WHERE u.Host = 'localhost';\n",
-            check=False,
-        )
-        stmts: list[str] = []
-        for idx, line in enumerate((res.stdout or "").splitlines()):
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            u_name, auth_hash, db_name = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            if idx == 0 and u_name.upper() == "USER":
-                continue
-            try:
-                safe_u = _validate_identifier(u_name)
-                _reject_reserved_user(safe_u)
-                safe_db = _reject_reserved_database(db_name)
-            except ValueError:
-                continue
-            if not _NATIVE_PASSWORD_HASH_RE.match(auth_hash):
-                continue
-            q_u = _quote_sql_string(safe_u)
-            q_db = _quote_identifier(safe_db)
-            for host in ("127.0.0.1", "::1"):
-                q_h = _quote_sql_string(host)
-                stmts.append(
-                    f"CREATE USER IF NOT EXISTS {q_u}@{q_h} IDENTIFIED VIA mysql_native_password USING '{auth_hash}';"
-                )
-                stmts.append(f"GRANT ALL PRIVILEGES ON {q_db}.* TO {q_u}@{q_h};")
-        if stmts:
-            stmts.append("FLUSH PRIVILEGES;")
-            _run_sql("\n".join(stmts) + "\n", check=False)
-            synced += 1
-    except Exception:
-        pass
+        logger.warning("could not sync loopback MariaDB accounts", exc_info=True)
     return synced
 
 
