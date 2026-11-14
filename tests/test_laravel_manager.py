@@ -1275,7 +1275,9 @@ def test_p1_b2_systemd_queue_worker_unit_generation_and_live_status(tmp_path):
         assert "TasksMax=64" in unit_body
         assert "NoNewPrivileges=yes" in unit_body
         assert "ProtectSystem=strict" in unit_body
-        assert "ProtectHome=read-only" in unit_body
+        # Other tenants' homes are hidden, not just read-only (round 17 P1-6).
+        assert "ProtectHome=tmpfs" in unit_body
+        assert f"BindReadOnlyPaths={home_dir.as_posix()}/shostc" in unit_body
         assert "-d open_basedir=" in unit_body
         assert "artisan queue:work --queue=high,default --tries=3 --timeout=90 --memory=256" in unit_body
 

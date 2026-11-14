@@ -335,3 +335,19 @@ def test_p1_5_helper_runs_no_tenant_npm_scripts():
     assert "run build" not in body
     assert "runuser -u \"$user\" -- \"${cpu_cap[@]}\"" not in body
 
+
+# --------------------------------------------------------------------------- P1-6
+
+
+@pytest.mark.parametrize(
+    "writer", ["sync_laravel_worker_unit", "sync_nodejs_worker_unit", "write_node_app_unit", "write_python_app_unit"]
+)
+def test_p1_6_app_units_hide_other_tenants_homes(writer):
+    """ProtectHome=read-only only made /home read-only: an app could still read
+    every other tenant's 0644 site files. Hide /home and bind back only the
+    unit user's own home (the CI helper-integration job reads across tenants)."""
+    body = _helper_function(writer)
+    assert "ProtectHome=read-only" not in body
+    assert "ProtectHome=tmpfs" in body
+    assert "BindReadOnlyPaths=${HOME_ROOT}/${user}" in body
+    assert "ProtectSystem=strict" in body

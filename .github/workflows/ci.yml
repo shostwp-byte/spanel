@@ -161,12 +161,27 @@ jobs:
           APP_DIR="${SITE_ROOT}/public_html"
           sudo install -d -o spaneltest -g spaneltest -m 0755 "$SITE_ROOT" "$APP_DIR"
 
+          # Round 17 P1-6: another tenant, laid out like the panel lays them out
+          # (home 0751, site files 0644). Plain spaneltest can read the file;
+          # spaneltest's app unit must not see it.
+          sudo useradd -m -d /home/spanelother -s /bin/bash spanelother
+          sudo chmod 0751 /home/spanelother
+          echo "OTHER_TENANT_SECRET" | sudo -u spanelother tee /home/spanelother/secret.txt >/dev/null
+          sudo chmod 0644 /home/spanelother/secret.txt
+          sudo -u spaneltest cat /home/spanelother/secret.txt | grep -q OTHER_TENANT_SECRET
+
           cat <<'JS' | sudo -u spaneltest tee "${APP_DIR}/server.js" >/dev/null
           const http = require('http');
+          const fs = require('fs');
           const port = Number(process.env.PORT || 21055);
+          const canRead = (p) => { try { fs.readFileSync(p); return true; } catch (e) { return false; } };
           http.createServer((req, res) => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, port, node_env: process.env.NODE_ENV }));
+            res.end(JSON.stringify({
+              ok: true, port, node_env: process.env.NODE_ENV,
+              own: canRead(__filename),
+              other: canRead('/home/spanelother/secret.txt'),
+            }));
           }).listen(port, '127.0.0.1');
           JS
 
@@ -218,6 +233,10 @@ jobs:
             sleep 0.5
           done
           test "$ok" -eq 1
+          PROBE="$(curl -fsS http://127.0.0.1:21055/)"
+          echo "$PROBE"
+          grep -q '"own":true' <<<"$PROBE"
+          grep -q '"other":false' <<<"$PROBE"
 
           STATUS_POS="$(sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-status spaneltest "$SITE_ROOT")"
           PID_POS="$(STATUS_OUT="$STATUS_POS" python - <<'PY'
