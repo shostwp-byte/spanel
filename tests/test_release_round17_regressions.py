@@ -314,3 +314,24 @@ def test_p1_4_admin_owned_site_gets_no_bypass(monkeypatch, tmp_path):
     monkeypatch.setattr(nm, "_read_app_file", _env_reader({".env": env}))
     nm._ensure_nodejs_local_db_grants(site, db, "root1", tmp_path, tmp_path, {})
     assert calls == []
+
+
+# --------------------------------------------------------------------------- P1-5
+
+
+def _helper_function(name: str) -> str:
+    text = HELPER.read_text(encoding="utf-8")
+    start = text.index(f"\n{name}() {{\n")
+    return text[start: text.index("\n}\n", start)]
+
+
+def test_p1_5_helper_runs_no_tenant_npm_scripts():
+    """npm install / npm run build run the tenant's code. They belong to the
+    jailed terminal-exec path in the API, not to a bare runuser in the helper
+    (the CI helper-integration job checks a postinstall script never runs)."""
+    body = _helper_function("prepare_nodejs_app_as_user")
+    assert "/npm\" install" not in body
+    assert " install --" not in body
+    assert "run build" not in body
+    assert "runuser -u \"$user\" -- \"${cpu_cap[@]}\"" not in body
+
