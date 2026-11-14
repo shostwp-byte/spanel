@@ -260,3 +260,57 @@ def test_p1_3_update_sh_no_longer_grants_all_to_tenant_loopback_hosts():
     assert r"GRANT ALL PRIVILEGES ON \`" not in body
     assert "${db_u}" not in body
 
+
+# --------------------------------------------------------------------------- P1-4
+
+
+def _env_reader(files: dict[str, str]):
+    return lambda app_dir, rel, linux_user=None, site_root=None: files.get(rel, "")
+
+
+def test_p1_4_env_cannot_reset_an_account_the_panel_does_not_track(monkeypatch, tmp_path):
+    from app.core.secrets import encrypt
+    from app.models.entities import DatabaseAccount
+    from app.services import mariadb
+
+    db = _session()
+    alice, site = _alice_site(db)
+    db.add(DatabaseAccount(owner_id=alice.id, db_name="alice_app", db_user="alice_app", db_password=encrypt("stored-pw")))
+    db.commit()
+    calls = []
+    monkeypatch.setattr(nm.settings, "command_dry_run", False)
+    monkeypatch.setattr(mariadb, "ensure_local_database_user_hosts", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(mariadb, "create_database_credentials", lambda *a, **k: calls.append(("create", a, k)))
+
+    # ext_app exists in MariaDB but has no DatabaseAccount: the tenant's file
+    # names the tenant's own database to slip past the ownership checks.
+    env = "DB_HOST=127.0.0.1\nDB_DATABASE=alice_app\nDB_USERNAME=ext_app\nDB_PASSWORD=attacker-chosen\n"
+    monkeypatch.setattr(nm, "_read_app_file", _env_reader({".env": env}))
+    nm._ensure_nodejs_local_db_grants(site, db, "alice", tmp_path, tmp_path, {})
+    assert calls == []
+
+    # Pointing at the owner's own tracked account syncs it with the STORED password.
+    env_own = "DB_HOST=127.0.0.1\nDB_DATABASE=alice_app\nDB_USERNAME=alice_app\nDB_PASSWORD=whatever-the-file-says\n"
+    monkeypatch.setattr(nm, "_read_app_file", _env_reader({".env": env_own}))
+    nm._ensure_nodejs_local_db_grants(site, db, "alice", tmp_path, tmp_path, {})
+    assert calls == [(("alice_app", "alice_app", "stored-pw"), {})]
+
+
+def test_p1_4_admin_owned_site_gets_no_bypass(monkeypatch, tmp_path):
+    from app.services import mariadb
+
+    db = _session()
+    root = User(username="root1", email="r@example.com", hashed_password="x", role="admin")
+    db.add(root)
+    db.commit()
+    db.refresh(root)
+    site = Website(domain="adm.example.com", root_path="/home/root1/adm.example.com", linux_user="root1", owner_id=root.id)
+    db.add(site)
+    db.commit()
+    calls = []
+    monkeypatch.setattr(nm.settings, "command_dry_run", False)
+    monkeypatch.setattr(mariadb, "ensure_local_database_user_hosts", lambda *a, **k: calls.append(a))
+    env = "DB_HOST=localhost\nDB_DATABASE=pdns\nDB_USERNAME=pdns_admin\nDB_PASSWORD=x\n"
+    monkeypatch.setattr(nm, "_read_app_file", _env_reader({".env": env}))
+    nm._ensure_nodejs_local_db_grants(site, db, "root1", tmp_path, tmp_path, {})
+    assert calls == []
