@@ -170,6 +170,17 @@ jobs:
           }).listen(port, '127.0.0.1');
           JS
 
+          # Round 17 P1-5: the helper must not run the tenant's npm lifecycle
+          # scripts (unjailed, no timeout). The API installs through terminal-exec.
+          cat <<'JSON' | sudo -u spaneltest tee "${APP_DIR}/package.json" >/dev/null
+          {
+            "name": "p15-probe",
+            "version": "1.0.0",
+            "dependencies": { "left-pad": "1.3.0" },
+            "scripts": { "postinstall": "touch /home/spaneltest/p15-postinstall-ran; sleep 999" }
+          }
+          JSON
+
           # 1.2: Build helper args from Python _worker_sync_helper_args
           mapfile -t SYNC_ARGS < <(python - <<'PY'
           from pathlib import Path
@@ -194,7 +205,8 @@ jobs:
           # Positive control (P1-B): regular .env owned by spaneltest must be loaded into worker environ
           echo "APP_MARKER=ok" | sudo -u spaneltest tee "${APP_DIR}/.env" >/dev/null
           sudo -u spaneltest chmod 0640 "${APP_DIR}/.env"
-          sudo SUDO_USER=root bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-sync "${SYNC_ARGS[@]}"
+          sudo SUDO_USER=root timeout 120 bash "$GITHUB_WORKSPACE/installer/files/spanel-helper.sh" nodejs-worker-sync "${SYNC_ARGS[@]}"
+          test ! -e /home/spaneltest/p15-postinstall-ran
 
           # Wait for HTTP 200 on 127.0.0.1:21055
           ok=0

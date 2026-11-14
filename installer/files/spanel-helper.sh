@@ -8119,27 +8119,15 @@ copy_site_env_as_user() {
   mv -f -- "$tmp_dest" "$dest"
 }
 
+# File repairs only, as the site user. npm install and npm run build are the
+# tenant's code (lifecycle scripts, the build script) and run from the API
+# through terminal-exec: /home jail, timeout, the user's slice. Running them
+# here as well, with a bare runuser, gave a build script a second, unjailed
+# run it could tell apart from the jailed one and wait for.
 prepare_nodejs_app_as_user() {
-  local user="$1" app_target="$2" bin_dir="$3" start_arg="${4:-start}"
-  local bin_entry first_line need_install=0 uid_num total_cores c0 c1 c2 c3
-  local -a cpu_cap=()
+  local user="$1" app_target="$2" bin_dir="$3"
+  local bin_entry first_line
   [[ -f "${app_target}/package.json" && -x "${bin_dir}/npm" ]] || return 0
-
-  uid_num="$(id -u "$user" 2>/dev/null || echo 1000)"
-  [[ "$uid_num" =~ ^[0-9]+$ ]] || uid_num=1000
-  total_cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-  [[ "$total_cores" =~ ^[0-9]+$ ]] || total_cores=1
-  if (( total_cores > 4 )) && command -v taskset >/dev/null 2>&1; then
-    c0=$(( uid_num % total_cores ))
-    c1=$(( (uid_num + 1) % total_cores ))
-    c2=$(( (uid_num + 2) % total_cores ))
-    c3=$(( (uid_num + 3) % total_cores ))
-    if taskset -c "${c0},${c1},${c2},${c3}" true >/dev/null 2>&1; then
-      cpu_cap=(taskset -c "${c0},${c1},${c2},${c3}")
-    elif taskset -c 0-3 true >/dev/null 2>&1; then
-      cpu_cap=(taskset -c 0-3)
-    fi
-  fi
 
   # 1. Repair or remove broken zip-extracted symlink stubs in node_modules/.bin
   # (extract_zip writes zip symlink entries as regular 0644 files containing "../<pkg>/.../bin/<cli>").
@@ -8150,77 +8138,24 @@ prepare_nodejs_app_as_user() {
         first_line="$(runuser -u "$user" -- head -n 1 -- "$bin_entry" 2>/dev/null || true)"
         first_line="${first_line%$'\r'}"
         if [[ "$first_line" == ../* && "$first_line" != '#!'* ]]; then
-          if [[ "$first_line" =~ ^\.\./[A-Za-z0-9._/@-]+$ && -f "${app_target}/node_modules/.bin/${first_line}" ]]; then
+          if [[ "$first_line" =~ ^\.\./[A-Za-z0-9._/@-]+$ ]] && runuser -u "$user" -- test -f "${app_target}/node_modules/.bin/${first_line}"; then
             runuser -u "$user" -- ln -snf -- "$first_line" "$bin_entry" >/dev/null 2>&1 || true
             runuser -u "$user" -- chmod u+x,go+rx -- "${app_target}/node_modules/.bin/${first_line}" >/dev/null 2>&1 || true
           else
             runuser -u "$user" -- rm -f -- "$bin_entry" >/dev/null 2>&1 || true
-            need_install=1
           fi
         fi
       fi
     done
   fi
 
-  # 2. Install dependencies as the site user if node_modules/.bin or key framework CLI is missing
-  if grep -qE '"(dependencies|devDependencies)"' "${app_target}/package.json" 2>/dev/null; then
-    if [[ ! -d "${app_target}/node_modules" || ! -d "${app_target}/node_modules/.bin" ]]; then
-      need_install=1
-    elif [[ -z "$(ls -A "${app_target}/node_modules/.bin" 2>/dev/null || true)" ]]; then
-      need_install=1
-    elif grep -q '"next"' "${app_target}/package.json" 2>/dev/null && [[ ! -e "${app_target}/node_modules/.bin/next" ]]; then
-      need_install=1
-    fi
-  fi
-
-  if (( need_install == 1 )); then
-    runuser -u "$user" -- "${cpu_cap[@]}" env -i \
-      HOME="${HOME_ROOT}/${user}" \
-      npm_config_cache="${HOME_ROOT}/${user}/.npm" \
-      npm_config_jobs=4 \
-      UV_THREADPOOL_SIZE=4 \
-      RAYON_NUM_THREADS=4 \
-      TOKIO_WORKER_THREADS=4 \
-      NEXT_TELEMETRY_DISABLED=1 \
-      PATH="${app_target}/node_modules/.bin:${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
-      "${bin_dir}/npm" install --include=dev --no-audit --no-fund --prefix "$app_target" >/dev/null 2>&1 \
-    || runuser -u "$user" -- "${cpu_cap[@]}" env -i \
-      HOME="${HOME_ROOT}/${user}" \
-      npm_config_cache="${HOME_ROOT}/${user}/.npm" \
-      npm_config_jobs=4 \
-      UV_THREADPOOL_SIZE=4 \
-      RAYON_NUM_THREADS=4 \
-      TOKIO_WORKER_THREADS=4 \
-      NEXT_TELEMETRY_DISABLED=1 \
-      PATH="${app_target}/node_modules/.bin:${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
-      "${bin_dir}/npm" install --include=dev --legacy-peer-deps --no-audit --no-fund --prefix "$app_target" >/dev/null 2>&1 \
-    || true
-  fi
-
-  # 3. Restore execute bit on node_modules/.bin and symlink target scripts (stripped by archive extraction)
+  # 2. Restore execute bit on node_modules/.bin and symlink target scripts (stripped by archive extraction)
   if [[ -d "${app_target}/node_modules/.bin" ]]; then
     runuser -u "$user" -- chmod -R u+x,go+rx -- "${app_target}/node_modules/.bin" >/dev/null 2>&1 || true
     runuser -u "$user" -- find -L "${app_target}/node_modules/.bin" -maxdepth 1 -type f -exec chmod u+x,go+rx -- {} + >/dev/null 2>&1 || true
   fi
   if [[ -d "${app_target}/node_modules/next/dist/bin" ]]; then
     runuser -u "$user" -- chmod -R u+x,go+rx -- "${app_target}/node_modules/next/dist/bin" >/dev/null 2>&1 || true
-  fi
-
-  # 4. If Next.js production start is configured and .next/BUILD_ID is missing, build as the site user
-  if [[ "$start_arg" != "dev" && -x "${app_target}/node_modules/.bin/next" && ! -f "${app_target}/.next/BUILD_ID" ]]; then
-    if grep -q '"build"' "${app_target}/package.json" 2>/dev/null; then
-      runuser -u "$user" -- "${cpu_cap[@]}" env -i \
-        HOME="${HOME_ROOT}/${user}" \
-        NODE_ENV=production \
-        npm_config_cache="${HOME_ROOT}/${user}/.npm" \
-        npm_config_jobs=4 \
-        UV_THREADPOOL_SIZE=4 \
-        RAYON_NUM_THREADS=4 \
-        TOKIO_WORKER_THREADS=4 \
-        NEXT_TELEMETRY_DISABLED=1 \
-        PATH="${app_target}/node_modules/.bin:${bin_dir}:/usr/local/bin:/usr/bin:/bin" \
-        "${bin_dir}/npm" --prefix "$app_target" run build >/dev/null 2>&1 || true
-    fi
   fi
 }
 
@@ -8318,7 +8253,7 @@ sync_nodejs_worker_unit() {
 
   install -d -o "$user" -g "$user" -m 0700 "${HOME_ROOT}/${user}/.npm"
   install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
-  prepare_nodejs_app_as_user "$user" "$app_target" "$bin_dir" "$start_arg"
+  prepare_nodejs_app_as_user "$user" "$app_target" "$bin_dir"
   copy_site_env_as_user "$user" "$app_target" "$env_file"
   tmp_file="${unit_file}.spanel-tmp-$$"
 
