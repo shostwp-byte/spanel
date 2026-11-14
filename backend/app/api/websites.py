@@ -1014,6 +1014,69 @@ def delete_website_alias(
     return {"ok": True}
 
 
+def _resync_site_workers(db: Session, website: Website) -> list[str]:
+    """Recreate the Node.js and Laravel queue worker units of ``website``.
+
+    ``site-runtime-move`` deletes them before moving the site directory,
+    because their units name the old path; nothing else brings them back.
+    Failures are logged and returned, never raised: the rename itself has
+    already happened and the owner can restart the process from the manager.
+    """
+    problems: list[str] = []
+    node_inst = (
+        db.query(NodejsInstance)
+        .filter(NodejsInstance.website_id == website.id, NodejsInstance.detached.is_(False))
+        .first()
+    )
+    if node_inst is not None and node_inst.port is not None:
+        try:
+            from app.api import nodejs_manager as nm
+
+            inst = nm._row_to_instance_dict(node_inst)
+            linux_user, site_root, app_dir = nm._resolve_nodejs_paths(website, db, inst.get("subpath") or "")
+            res = nm._sync_nodejs_worker_unit(
+                linux_user,
+                site_root,
+                app_dir,
+                node_major=str(inst.get("node_major") or "22"),
+                start_mode=str(inst.get("start_mode") or "node"),
+                start_arg=str(inst.get("start_arg") or "server.js"),
+                port=int(inst["port"]),
+                memory_mb=int(inst.get("memory_mb") or 512),
+                node_env=str(inst.get("node_env") or "production"),
+                enabled=bool(inst.get("process_enabled")),
+                strict=False,
+            )
+            if res.get("status") == "error":
+                problems.append("nodejs")
+        except Exception:
+            logger.exception("could not recreate the Node.js unit of %s", website.domain)
+            problems.append("nodejs")
+    try:
+        from app.api import laravel_manager as lm
+
+        saved = (lm._load_toolkit_state().get("instances") or {}).get(str(website.id)) or {}
+        q_cfg = saved.get("queue_worker") or {}
+        if saved and q_cfg.get("enabled"):
+            linux_user, site_root, app_dir = lm._resolve_laravel_paths(website, db, saved.get("subpath") or "")
+            res = lm._sync_laravel_worker_unit(
+                linux_user,
+                site_root,
+                app_dir,
+                (website.php_version or "8.3"),
+                q_cfg,
+                strict=False,
+            )
+            if res.get("status") == "error":
+                problems.append("laravel-queue")
+    except Exception:
+        logger.exception("could not recreate the Laravel queue worker of %s", website.domain)
+        problems.append("laravel-queue")
+    if problems:
+        logger.warning("after moving %s, these workers are not running: %s", website.domain, ", ".join(problems))
+    return problems
+
+
 def _rename_single_website(
     db: Session,
     website: Website,
@@ -1101,16 +1164,8 @@ def _rename_single_website(
                 except Exception:
                     pass
 
-        from app.models.entities import NodejsInstance
-
-        node_inst = db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).first()
-        if node_inst is not None:
-            try:
-                from app.api.nodejs_manager import _sync_systemd_unit
-
-                _sync_systemd_unit(website, node_inst)
-            except Exception:
-                pass
+        if moved_runtime:
+            _resync_site_workers(db, website)
 
         try:
             ssl.release_site_certificates(db, old_domain, exclude_website_id=website.id)
@@ -1144,7 +1199,10 @@ def _rename_single_website(
                     Path(new_root_path).rename(old_root_path)
                 _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
             except Exception:
-                pass
+                logger.exception("rename rollback of %s could not restore the site runtime", old_domain)
+            # The move back deleted the workers' units again (they pointed at
+            # the new path); recreate them at the old one.
+            _resync_site_workers(db, website)
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=400, detail=f"Cannot rename domain: {exc}") from exc
@@ -1332,6 +1390,7 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
                 )
                 website.root_path = new_root_path
                 website.linux_user = new_linux_user
+                _resync_site_workers(db, website)
             except storage_quota.StorageQuotaExceeded as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
             except (RuntimeError, ValueError) as exc:
@@ -2247,10 +2306,14 @@ def transfer_website_owner(
                 website.linux_user = old_linux_user
                 _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
             except Exception:
-                pass
+                logger.exception("transfer rollback of %s could not restore the site runtime", website.domain)
+            _resync_site_workers(db, website)
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=f"Failed to transfer website ownership: {exc}") from exc
+
+    if moved_runtime:
+        _resync_site_workers(db, website)
 
     storage_quota.forget_user_storage(old_owner_id)
     storage_quota.forget_user_storage(target_owner.id)
