@@ -401,6 +401,7 @@ def test_site_runtime_move_refuses_an_existing_target(tmp_path):
     marker = source_dir / "public_html" / "index.php"
     marker.write_text("<?php echo 'alice';", encoding="utf-8")
 
+    calls = tmp_path / "calls.log"
     case_block = _site_runtime_move_case_block()
     harness = (
         "set -euo pipefail\n"
@@ -410,6 +411,8 @@ def test_site_runtime_move_refuses_an_existing_target(tmp_path):
         'require_managed_path() { echo "$1"; }\n'
         'ensure_panel_user_home() { mkdir -p "$HOME_ROOT/$1"; }\n'
         "delete_site_php_pools() { :; }\n"
+        'delete_laravel_worker_units() { echo "laravel $1 $2" >> "$TEST_CALLS"; }\n'
+        'delete_nodejs_worker_units() { echo "nodejs $1 $2" >> "$TEST_CALLS"; }\n'
         "harden_site_dir_path() { :; }\n"
         "own_site_tree() { :; }\n"
         "ensure_php_pool() { :; }\n"
@@ -431,12 +434,14 @@ def test_site_runtime_move_refuses_an_existing_target(tmp_path):
             tmp_path,
             harness + f'run_move bob "{source_dir.as_posix()}" "{bob_dir.as_posix()}" 8.4\n',
             check=False,
-            env={"TEST_HOME": home.as_posix()},
+            env={"TEST_HOME": home.as_posix(), "TEST_CALLS": calls.as_posix()},
         )
         assert proc_dir.returncode != 0
         assert "target path already exists" in proc_dir.stderr
         assert marker.read_text(encoding="utf-8") == "<?php echo 'alice';"
         assert bob_keep.read_text(encoding="utf-8") == "bob-original"
+        # A refused move must not tear down the source site's workers.
+        assert not calls.exists()
 
         # 2. Existing regular file at target -> refused
         file_target = home / "bob" / "file-target.example"
@@ -445,7 +450,7 @@ def test_site_runtime_move_refuses_an_existing_target(tmp_path):
             tmp_path,
             harness + f'run_move bob "{source_dir.as_posix()}" "{file_target.as_posix()}" 8.4\n',
             check=False,
-            env={"TEST_HOME": home.as_posix()},
+            env={"TEST_HOME": home.as_posix(), "TEST_CALLS": calls.as_posix()},
         )
         assert proc_file.returncode != 0
         assert "target path already exists" in proc_file.stderr
@@ -465,7 +470,7 @@ def test_site_runtime_move_refuses_an_existing_target(tmp_path):
                 tmp_path,
                 harness + f'run_move bob "{source_dir.as_posix()}" "{link_target.as_posix()}" 8.4\n',
                 check=False,
-                env={"TEST_HOME": home.as_posix()},
+                env={"TEST_HOME": home.as_posix(), "TEST_CALLS": calls.as_posix()},
             )
             assert proc_link.returncode != 0
             assert "target path already exists" in proc_link.stderr
@@ -478,11 +483,17 @@ def test_site_runtime_move_refuses_an_existing_target(tmp_path):
             tmp_path,
             harness + f'run_move bob "{source_dir.as_posix()}" "{clean_target.as_posix()}" 8.4\n',
             check=True,
-            env={"TEST_HOME": home.as_posix()},
+            env={"TEST_HOME": home.as_posix(), "TEST_CALLS": calls.as_posix()},
         )
         assert proc_ok.returncode == 0
         assert (clean_target / "public_html" / "index.php").read_text(encoding="utf-8") == "<?php echo 'alice';"
         assert not source_dir.exists()
+        # The units pointing at the old path are removed before the move;
+        # websites.py recreates them at the new path afterwards.
+        assert calls.read_text(encoding="utf-8").splitlines() == [
+            f"laravel alice {source_dir.as_posix()}",
+            f"nodejs alice {source_dir.as_posix()}",
+        ]
 
         # 5. P2-2: Source does not exist and target does not exist -> creates target/public_html
         missing_source = home / "alice" / "already-gone.example"
@@ -491,7 +502,7 @@ def test_site_runtime_move_refuses_an_existing_target(tmp_path):
             tmp_path,
             harness + f'run_move bob "{missing_source.as_posix()}" "{fresh_target.as_posix()}" 8.4\n',
             check=True,
-            env={"TEST_HOME": home.as_posix()},
+            env={"TEST_HOME": home.as_posix(), "TEST_CALLS": calls.as_posix()},
         )
         assert proc_missing_src.returncode == 0
         assert (fresh_target / "public_html").is_dir()
