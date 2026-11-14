@@ -454,7 +454,7 @@ def test_php_tune_counts_and_lists_pools_across_both_masters(tmp_path):
 
 def test_update_retires_moved_pools_only_after_the_site_refresh():
     text = (REPO_ROOT / "installer" / "update.sh").read_text(encoding="utf-8")
-    refresh = text.index("nginx.rewrite_vhost(")
+    refresh = text.index("_rewrite_website_vhost(website)")
     prune = text.index("spanel-helper php-fpm-legacy-prune")
     assert refresh < prune
     # Sites left on a distro master keep being retried by later updates.
