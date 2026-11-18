@@ -722,6 +722,7 @@ class WebsiteWordPressInstall(BaseModel):
 
 class WebsiteUpdate(BaseModel):
     domain: Optional[str] = None
+    rename_children: bool = False
     php_version: Optional[str] = None
 
     @field_validator("domain")
@@ -1119,6 +1120,7 @@ class WebsiteOut(BaseModel):
     app_id: Optional[int] = None
     aliases: list[WebsiteAliasOut] = Field(default_factory=list)
     transfer_warning: Optional[str] = None
+    warnings: list[str] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

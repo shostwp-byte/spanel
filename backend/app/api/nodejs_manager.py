@@ -1476,37 +1476,27 @@ def _ensure_nodejs_local_db_grants(
     app_dir: Path,
     saved: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Ensure local MariaDB accounts bound to or configured in `.env` / `.env.local` of this
-    Node.js application have privileges across all loopback hosts ('localhost', '127.0.0.1', '::1')."""
+    """Give the site owner's own database accounts their TCP loopback hosts
+    ('127.0.0.1', '::1') so a Node.js driver can log in.
+
+    Only accounts the panel tracks for this owner are touched, and always
+    with the password the panel stored. `.env` / `.env.local` only point at
+    which of those accounts the app uses: the file is written by the tenant,
+    and taking a user name and password from it used to reset the password
+    of any MariaDB account the panel does not track.
+    """
     if settings.command_dry_run:
         return
     saved = saved or {}
-    site_owner = db.query(User).filter(User.id == site.owner_id).first()
-    is_admin_owner = bool(site_owner is not None and is_admin_role(getattr(site_owner, "role", None)))
+    wanted: list[tuple[str, Any]] = []
 
-    # 1. Bound DatabaseAccount on the instance
     raw_acc_id = saved.get("db_account_id")
     if raw_acc_id is not None and not isinstance(raw_acc_id, bool):
         try:
-            acc = (
-                db.query(DatabaseAccount)
-                .filter(
-                    DatabaseAccount.id == int(raw_acc_id),
-                    DatabaseAccount.owner_id == site.owner_id,
-                    DatabaseAccount.db_host_id.is_(None),
-                )
-                .first()
-            )
-            if acc and acc.db_name and acc.db_user and acc.db_password:
-                mariadb.ensure_local_database_user_hosts(
-                    acc.db_name.strip(),
-                    acc.db_user.strip(),
-                    decrypt(acc.db_password),
-                )
-        except Exception as exc:
-            logger.debug("Could not sync bound Node.js DatabaseAccount loopback hosts: %s", exc)
+            wanted.append(("id", int(raw_acc_id)))
+        except (TypeError, ValueError):
+            pass
 
-    # 2. Inspect .env and .env.local for loopback MySQL credentials owned by this tenant
     for env_file in (".env.local", ".env"):
         try:
             raw_text = _read_app_file(app_dir, env_file, linux_user=linux_user, site_root=site_root)
@@ -1520,45 +1510,31 @@ def _ensure_nodejs_local_db_grants(
             continue
         db_name = (parsed.get("db_name") or "").strip()
         db_user = (parsed.get("db_user") or "").strip()
-        db_pass = parsed.get("db_password") or ""
-        if not (db_name and db_user and db_pass):
+        if db_name and db_user:
+            wanted.append(("names", (db_name, db_user)))
+
+    done: set[int] = set()
+    for kind, key in wanted:
+        query = db.query(DatabaseAccount).filter(
+            DatabaseAccount.owner_id == site.owner_id,
+            DatabaseAccount.db_host_id.is_(None),
+        )
+        if kind == "id":
+            query = query.filter(DatabaseAccount.id == key)
+        else:
+            query = query.filter(DatabaseAccount.db_name == key[0], DatabaseAccount.db_user == key[1])
+        acc = query.first()
+        if acc is None or acc.id in done or not (acc.db_name and acc.db_user and acc.db_password):
             continue
+        done.add(acc.id)
         try:
-            mariadb._reject_reserved_database(db_name)
-            mariadb._reject_reserved_user(mariadb._validate_identifier(db_user))
-        except ValueError:
-            continue
-
-        # Never touch a database or user belonging to another panel user
-        other_db = (
-            db.query(DatabaseAccount)
-            .filter(DatabaseAccount.db_name == db_name, DatabaseAccount.owner_id != site.owner_id)
-            .first()
-        )
-        if other_db is not None:
-            continue
-        other_user = (
-            db.query(DatabaseAccount)
-            .filter(DatabaseAccount.db_user == db_user, DatabaseAccount.owner_id != site.owner_id)
-            .first()
-        )
-        if other_user is not None:
-            continue
-
-        own_db = (
-            db.query(DatabaseAccount)
-            .filter(
-                DatabaseAccount.db_name == db_name,
-                DatabaseAccount.owner_id == site.owner_id,
-                DatabaseAccount.db_host_id.is_(None),
+            mariadb.ensure_local_database_user_hosts(
+                acc.db_name.strip(),
+                acc.db_user.strip(),
+                decrypt(acc.db_password),
             )
-            .first()
-        )
-        if own_db is not None or is_admin_owner:
-            try:
-                mariadb.ensure_local_database_user_hosts(db_name, db_user, db_pass)
-            except Exception as exc:
-                logger.debug("Could not sync Node.js %s loopback DB user %s: %s", env_file, db_user, exc)
+        except Exception as exc:
+            logger.warning("Could not sync loopback hosts of database user %s: %s", acc.db_user, exc)
 
 
 def _format_env_value(val: Any) -> str:

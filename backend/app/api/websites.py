@@ -1014,13 +1014,82 @@ def delete_website_alias(
     return {"ok": True}
 
 
+def _resync_site_workers(db: Session, website: Website) -> list[str]:
+    """Recreate the Node.js and Laravel queue worker units of ``website``.
+
+    ``site-runtime-move`` deletes them before moving the site directory,
+    because their units name the old path; nothing else brings them back.
+    Failures are logged and returned, never raised: the rename itself has
+    already happened and the owner can restart the process from the manager.
+    """
+    problems: list[str] = []
+    node_inst = (
+        db.query(NodejsInstance)
+        .filter(NodejsInstance.website_id == website.id, NodejsInstance.detached.is_(False))
+        .first()
+    )
+    if node_inst is not None and node_inst.port is not None:
+        try:
+            from app.api import nodejs_manager as nm
+
+            inst = nm._row_to_instance_dict(node_inst)
+            linux_user, site_root, app_dir = nm._resolve_nodejs_paths(website, db, inst.get("subpath") or "")
+            res = nm._sync_nodejs_worker_unit(
+                linux_user,
+                site_root,
+                app_dir,
+                node_major=str(inst.get("node_major") or "22"),
+                start_mode=str(inst.get("start_mode") or "node"),
+                start_arg=str(inst.get("start_arg") or "server.js"),
+                port=int(inst["port"]),
+                memory_mb=int(inst.get("memory_mb") or 512),
+                node_env=str(inst.get("node_env") or "production"),
+                enabled=bool(inst.get("process_enabled")),
+                strict=False,
+            )
+            if res.get("status") == "error":
+                problems.append("nodejs")
+        except Exception:
+            logger.exception("could not recreate the Node.js unit of %s", website.domain)
+            problems.append("nodejs")
+    try:
+        from app.api import laravel_manager as lm
+
+        saved = (lm._load_toolkit_state().get("instances") or {}).get(str(website.id)) or {}
+        q_cfg = saved.get("queue_worker") or {}
+        if saved and q_cfg.get("enabled"):
+            linux_user, site_root, app_dir = lm._resolve_laravel_paths(website, db, saved.get("subpath") or "")
+            res = lm._sync_laravel_worker_unit(
+                linux_user,
+                site_root,
+                app_dir,
+                (website.php_version or "8.3"),
+                q_cfg,
+                strict=False,
+            )
+            if res.get("status") == "error":
+                problems.append("laravel-queue")
+    except Exception:
+        logger.exception("could not recreate the Laravel queue worker of %s", website.domain)
+        problems.append("laravel-queue")
+    if problems:
+        logger.warning("after moving %s, these workers are not running: %s", website.domain, ", ".join(problems))
+    return problems
+
+
+def _format_worker_warning(domain: str, problems: list[str]) -> Optional[str]:
+    if not problems:
+        return None
+    return f"Website {domain} moved, but background worker(s) could not be restarted: {', '.join(problems)}"
+
+
 def _rename_single_website(
     db: Session,
     website: Website,
     new_domain: str,
     owner: User | None,
     current_user_id: int | None = None,
-) -> None:
+) -> list[str]:
     old_domain = website.domain
     old_root_path = website.root_path
     old_linux_user = website.linux_user
@@ -1043,6 +1112,7 @@ def _rename_single_website(
     old_alias_ssl = [(alias_row, bool(alias_row.ssl_enabled)) for alias_row in (getattr(website, "aliases", []) or [])]
     runtime_php = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
     moved_runtime = False
+    rename_warnings: list[str] = []
 
     try:
         if new_linux_user and old_root_path != new_root_path:
@@ -1098,30 +1168,25 @@ def _rename_single_website(
                     sftp_acc.chroot_path = sftp_accounts.ensure_account(
                         new_linux_user, sftp_acc.linux_user, new_root_path
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("could not update SFTP chroot for %s on %s: %s", sftp_acc.linux_user, new_domain, exc)
 
-        from app.models.entities import NodejsInstance
-
-        node_inst = db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).first()
-        if node_inst is not None:
-            try:
-                from app.api.nodejs_manager import _sync_systemd_unit
-
-                _sync_systemd_unit(website, node_inst)
-            except Exception:
-                pass
+        if moved_runtime:
+            worker_msg = _format_worker_warning(new_domain, _resync_site_workers(db, website))
+            if worker_msg:
+                rename_warnings.append(worker_msg)
 
         try:
             ssl.release_site_certificates(db, old_domain, exclude_website_id=website.id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("could not release old SSL certificates for %s: %s", old_domain, exc)
         try:
             dns.zone_for_new_website(db, website)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("could not create DNS zone for %s: %s", new_domain, exc)
         if current_user_id is not None:
             log_action(db, current_user_id, "rename_website", old_domain, new_domain)
+        return rename_warnings
     except Exception as exc:
         website.domain = old_domain
         website.root_path = old_root_path
@@ -1144,19 +1209,29 @@ def _rename_single_website(
                     Path(new_root_path).rename(old_root_path)
                 _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
             except Exception:
-                pass
+                logger.exception("rename rollback of %s could not restore the site runtime", old_domain)
+            # The move back deleted the workers' units again (they pointed at
+            # the new path); recreate them at the old one.
+            _resync_site_workers(db, website)
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=400, detail=f"Cannot rename domain: {exc}") from exc
 
 
 @router.patch("/{website_id}", response_model=WebsiteOut)
-def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def update_website(
+    website_id: int,
+    payload: WebsiteUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    response: Response = None,
+):
     website = db.query(Website).filter(Website.id == website_id).first()
     if not website:
         raise HTTPException(status_code=404, detail="Website not found")
     if not _is_authorized_for_website(db, website, current_user):
         ensure_role(current_user.role, Role.admin)
+    accumulated_warnings: list[str] = []
     if payload.domain is not None and payload.domain != website.domain:
         if _hostname_conflicts(db, payload.domain):
             raise HTTPException(status_code=409, detail="Domain already exists")
@@ -1166,20 +1241,31 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
             raise HTTPException(status_code=409, detail="That name is the webmail address of a mail domain here.")
         old_domain = website.domain
         owner = db.query(User).filter(User.id == website.owner_id).first() if website.owner_id else None
-        child_sites = [
-            s
-            for s in db.query(Website).filter(Website.owner_id == website.owner_id, Website.id != website.id).all()
-            if (s.domain or "").strip().lower().endswith("." + old_domain.lower())
-        ]
-        _rename_single_website(db, website, payload.domain, owner, current_user.id)
+        child_sites = (
+            [
+                s
+                for s in db.query(Website).filter(Website.owner_id == website.owner_id, Website.id != website.id).all()
+                if (s.domain or "").strip().lower().endswith("." + old_domain.lower())
+            ]
+            if payload.rename_children
+            else []
+        )
+        accumulated_warnings.extend(_rename_single_website(db, website, payload.domain, owner, current_user.id))
         for child in child_sites:
+            old_child_domain = child.domain
             prefix = child.domain[: -(len(old_domain) + 1)]
             new_child_domain = f"{prefix}.{payload.domain}".lower()
             if site_users.DOMAIN_RE.match(new_child_domain) and not _hostname_conflicts(db, new_child_domain):
                 try:
-                    _rename_single_website(db, child, new_child_domain, owner, current_user.id)
-                except Exception:
-                    pass
+                    accumulated_warnings.extend(
+                        _rename_single_website(db, child, new_child_domain, owner, current_user.id)
+                    )
+                except Exception as exc:
+                    detail = getattr(exc, "detail", None) or str(exc)
+                    logger.warning("could not rename child website %s -> %s: %s", old_child_domain, new_child_domain, detail)
+                    accumulated_warnings.append(
+                        f"Child website {old_child_domain} could not be renamed to {new_child_domain}: {detail}"
+                    )
         if website.owner_id:
             storage_quota.forget_user_storage(website.owner_id)
     if payload.php_version is not None:
@@ -1332,6 +1418,12 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
                 )
                 website.root_path = new_root_path
                 website.linux_user = new_linux_user
+                website.owner_id = payload.owner_id
+                for node_row in db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).all():
+                    node_row.owner_id = payload.owner_id
+                worker_msg = _format_worker_warning(website.domain, _resync_site_workers(db, website))
+                if worker_msg:
+                    accumulated_warnings.append(worker_msg)
             except storage_quota.StorageQuotaExceeded as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
             except (RuntimeError, ValueError) as exc:
@@ -1417,6 +1509,12 @@ def update_website(website_id: int, payload: WebsiteUpdate, db: Session = Depend
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.commit()
     db.refresh(website)
+    if accumulated_warnings:
+        website.warnings = accumulated_warnings
+        joined = " ".join(accumulated_warnings)
+        website.transfer_warning = joined
+        if response is not None:
+            response.headers["X-SPanel-Warning"] = " ".join(joined.splitlines())
     log_action(db, current_user.id, "update_website", website.domain)
     return website
 
@@ -2179,6 +2277,8 @@ def transfer_website_owner(
             _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
 
         website.owner_id = target_owner.id
+        for node_row in db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).all():
+            node_row.owner_id = target_owner.id
         for db_acc in db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).all():
             db_acc.owner_id = target_owner.id
 
@@ -2247,21 +2347,27 @@ def transfer_website_owner(
                 website.linux_user = old_linux_user
                 _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
             except Exception:
-                pass
+                logger.exception("transfer rollback of %s could not restore the site runtime", website.domain)
+            _resync_site_workers(db, website)
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=f"Failed to transfer website ownership: {exc}") from exc
 
+    transfer_warnings: list[str] = []
+    if moved_runtime:
+        worker_msg = _format_worker_warning(website.domain, _resync_site_workers(db, website))
+        if worker_msg:
+            transfer_warnings.append(worker_msg)
+
     storage_quota.forget_user_storage(old_owner_id)
     storage_quota.forget_user_storage(target_owner.id)
-    transfer_warning: Optional[str] = None
     if mail_changed:
         try:
             from app.services import mail
 
             mail.sync(db)
         except Exception as exc:
-            transfer_warning = f"Website ownership transferred, but mail server sync failed: {exc}"
+            transfer_warnings.append(f"Website ownership transferred, but mail server sync failed: {exc}")
             logger.warning(
                 "Mail sync failed after transferring website %s (id=%s) to %s: %s",
                 website.domain,
@@ -2271,9 +2377,11 @@ def transfer_website_owner(
             )
 
     db.refresh(website)
-    if transfer_warning:
+    transfer_warning: Optional[str] = " ".join(transfer_warnings) if transfer_warnings else None
+    if transfer_warnings:
+        website.warnings = transfer_warnings
         website.transfer_warning = transfer_warning
-        if response is not None:
+        if response is not None and transfer_warning:
             response.headers["X-SPanel-Warning"] = " ".join(transfer_warning.splitlines())
 
     audit_detail = f"new_owner={target_owner.username}"

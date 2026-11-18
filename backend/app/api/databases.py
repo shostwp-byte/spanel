@@ -319,12 +319,14 @@ def create_phpmyadmin_sso(database_id: int, request: Request, db: Session = Depe
         )
     if item.db_host_id is None:
         try:
-            mariadb.create_database_credentials(
+            write_locked, account_locked, hourly_limits = mariadb.account_state(item)
+            mariadb.ensure_local_database_user_hosts(
                 item.db_name,
                 item.db_user,
                 db_password,
-                allow_existing_user=True,
-                allow_existing_database=True,
+                write_locked=write_locked,
+                account_locked=account_locked,
+                hourly_limits=hourly_limits,
             )
         except Exception as exc:
             logger.debug("Could not refresh local MariaDB credentials before phpMyAdmin SSO: %s", exc)
@@ -349,7 +351,15 @@ def change_database_password(database_id: int, payload: DatabasePasswordUpdate, 
         db_backends.backend_for(item).change_password(item.db_user, payload.password)
         if item.db_host_id is None:
             try:
-                mariadb.ensure_local_database_user_hosts(item.db_name, item.db_user, payload.password)
+                write_locked, account_locked, hourly_limits = mariadb.account_state(item)
+                mariadb.ensure_local_database_user_hosts(
+                    item.db_name,
+                    item.db_user,
+                    payload.password,
+                    write_locked=write_locked,
+                    account_locked=account_locked,
+                    hourly_limits=hourly_limits,
+                )
             except Exception as exc:
                 logger.debug("Could not refresh local loopback grants after password change: %s", exc)
     except RemoteDatabaseError as exc:

@@ -1023,10 +1023,17 @@ try:
     from app.models.entities import NodejsInstance, Website
 
     with SessionLocal() as db:
-        rows = db.query(NodejsInstance).all()
+        # NodejsInstance is a table with real columns (8cec410); it has no
+        # .data dict. Reading row.data raised AttributeError outside the
+        # per-row try, so this migration used to skip every instance.
+        rows = (
+            db.query(NodejsInstance)
+            .filter(NodejsInstance.detached.is_(False), NodejsInstance.process_enabled.is_(True))
+            .all()
+        )
         for row in rows:
-            data = row.data if isinstance(row.data, dict) else {}
-            if not data.get("installed") or data.get("detached") or not data.get("process_enabled", True):
+            data = nm._row_to_instance_dict(row)
+            if data.get("port") is None:
                 continue
             site = db.query(Website).filter(Website.id == row.website_id).first()
             if site is None:
@@ -1040,9 +1047,9 @@ try:
                     site_root,
                     app_dir,
                     node_major=str(data.get("node_major") or "22"),
-                    start_mode=str(data.get("start_mode") or "npm"),
-                    start_arg=str(data.get("start_arg") or "start"),
-                    port=int(data.get("port") or 21000),
+                    start_mode=str(data.get("start_mode") or "node"),
+                    start_arg=str(data.get("start_arg") or "server.js"),
+                    port=int(data["port"]),
                     memory_mb=int(data.get("memory_mb") or 512),
                     node_env=str(data.get("node_env") or "production"),
                     enabled=True,
@@ -1054,9 +1061,85 @@ try:
                     f"WARNING: Node.js worker unit repair skipped for site_id={row.website_id}: {inner_exc}",
                     file=sys.stderr,
                 )
+
+        try:
+            from app.api import laravel_manager as lm
+
+            l_instances = (lm._load_toolkit_state().get("instances") or {})
+            for site_id_str, saved in l_instances.items():
+                if not isinstance(saved, dict):
+                    continue
+                q_cfg = saved.get("queue_worker") or {}
+                if not q_cfg.get("enabled"):
+                    continue
+                site = db.query(Website).filter(Website.id == int(site_id_str)).first()
+                if site is None:
+                    continue
+                linux_user, site_root, app_dir = lm._resolve_laravel_paths(
+                    site, db, saved.get("subpath") or ""
+                )
+                lm._sync_laravel_worker_unit(
+                    linux_user,
+                    site_root,
+                    app_dir,
+                    (site.php_version or "8.3"),
+                    q_cfg,
+                    strict=False,
+                )
+                print(f"Resynced Laravel queue worker unit for {site.domain}")
+        except Exception as l_exc:
+            print(f"WARNING: Laravel worker unit repair skipped: {l_exc}", file=sys.stderr)
 except Exception as exc:
     print(f"WARNING: Node.js worker unit migration skipped: {exc}", file=sys.stderr)
 PY_REPAIR_NODEJS
+  ) || true
+
+  local app_u unit_user need_reload=0 u_svc
+  local -a touched_app_units=()
+  for app_u in /etc/systemd/system/spanel-app-*.service; do
+    [[ -f "$app_u" ]] || continue
+    grep -q '^ProtectHome=read-only$' "$app_u" 2>/dev/null || continue
+    unit_user="$(awk -F= '$1=="User"{print $2; exit}' "$app_u" 2>/dev/null || true)"
+    [[ "$unit_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ && -d "/home/${unit_user}" ]] || continue
+    sed -i "s|^ProtectHome=read-only$|ProtectHome=tmpfs\nBindReadOnlyPaths=/home/${unit_user}|" "$app_u" 2>/dev/null || continue
+    need_reload=1
+    touched_app_units+=("$(basename "$app_u")")
+  done
+  if (( need_reload == 1 )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    for u_svc in "${touched_app_units[@]}"; do
+      systemctl try-restart "$u_svc" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+migrate_sync_user_slice_limits_from_db() {
+  local db_path="$APP_DIR/backend/spanel.db"
+  [[ -f "$db_path" ]] || return 0
+  local py_bin="$APP_DIR/backend/.venv/bin/python"
+  [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
+
+  (cd "$APP_DIR/backend" && sudo -u spanel env \
+    HOME="$APP_DIR" \
+    PYTHONPATH="$APP_DIR/backend" \
+    SPANEL_USE_HELPER=true \
+    "$py_bin" - <<'PY_SYNC_SLICE_LIMITS'
+import sys
+
+try:
+    from app.core.database import SessionLocal
+    from app.core.permissions import is_admin_role
+    from app.models.entities import User
+    from app.services import resource_monitor
+
+    with SessionLocal() as db:
+        for user in db.query(User).all():
+            if is_admin_role(user.role):
+                continue
+            resource_monitor.apply_user_cgroup_limits(user)
+except Exception as exc:
+    print(f"WARNING: user slice limits sync skipped: {exc}", file=sys.stderr)
+PY_SYNC_SLICE_LIMITS
   ) || true
 }
 
@@ -1308,28 +1391,10 @@ ProtectProc=invisible
 ReadWritePaths=
 ReadWritePaths=${APP_DIR} /home /var/backups/spanel /etc/nginx/conf.d /etc/nginx/spanel/custom /tmp /var/lib/spanel /home/admin/spanel_backups/da /var/lib/spanel/da-import /var/lib/spanel/import-stage
 SERVICE
-  # Upgrade legacy low TasksMax / pids.max limits (80/256/512) on existing tenant slices and Node.js units
-  # so Next.js / Tokio / Rayon multi-threaded builds do not fail with EAGAIN (os error 11).
-  for lf in /etc/spanel/limits/*.env; do
-    [[ -f "$lf" ]] || continue
-    sed -i -E 's/^TASKS_MAX=(80|256|512)$/TASKS_MAX=2048/' "$lf" 2>/dev/null || true
-  done
-  for sc in /etc/systemd/system/user-*.slice.d/50-spanel-limits.conf; do
-    [[ -f "$sc" ]] || continue
-    cur_tm="$(awk -F= '$1=="TasksMax"{print $2; exit}' "$sc" 2>/dev/null || true)"
-    if [[ "$cur_tm" =~ ^[0-9]+$ ]] && (( cur_tm > 0 && cur_tm < 2048 )); then
-      sed -i -E 's/^TasksMax=[0-9]+$/TasksMax=2048/' "$sc" 2>/dev/null || true
-      slice_name="$(basename "$(dirname "$sc")" .d)"
-      systemctl set-property "$slice_name" TasksMax=2048 >/dev/null 2>&1 || true
-    fi
-  done
-  for cg_p in /sys/fs/cgroup/user.slice/user-*.slice/pids.max /sys/fs/cgroup/user.slice/user-*.slice/spanel.scope/pids.max; do
-    [[ -f "$cg_p" ]] || continue
-    cur_p="$(cat "$cg_p" 2>/dev/null || true)"
-    if [[ "$cur_p" =~ ^[0-9]+$ ]] && (( cur_p > 0 && cur_p < 2048 )); then
-      echo 2048 >"$cg_p" 2>/dev/null || true
-    fi
-  done
+  # Upgrade legacy TasksMax=256 only on Node.js / SiteApp systemd units; user
+  # slice TasksMax comes from the panel database (one-time tasks_max_2048_once
+  # migration + apply_user_cgroup_limits) so admin-configured package/user
+  # TasksMax values (such as 80, 300, or 512) are never overwritten on update.
   for nu in /etc/systemd/system/spanel-nodejs-*.service /etc/systemd/system/spanel-app-*.service; do
     [[ -f "$nu" ]] || continue
     sed -i -E 's/^TasksMax=256$/TasksMax=2048/' "$nu" 2>/dev/null || true
@@ -1574,25 +1639,10 @@ ALTER USER 'spanel'@'::1' IDENTIFIED BY '${password}';
 GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'::1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
-  # Sync existing tenant @'localhost' accounts to @'127.0.0.1' and @'::1' for TCP loopback clients (Node.js under skip_name_resolve=1)
-  "$mysql_bin" -N -B -e "
-    SELECT u.User, IFNULL(u.authentication_string, ''), d.Db
-    FROM mysql.user u
-    JOIN mysql.db d ON u.User = d.User AND u.Host = d.Host
-    WHERE u.Host = 'localhost'
-      AND u.User NOT IN ('root', 'mysql', 'mariadb.sys', 'debian-sys-maint', 'spanel', '');
-  " 2>/dev/null | while IFS=$'\t' read -r db_u db_hash db_n; do
-    [[ "$db_u" =~ ^[a-z0-9_]{1,64}$ ]] || continue
-    [[ "$db_n" =~ ^[a-z0-9_]{1,64}$ ]] || continue
-    [[ "$db_hash" =~ ^\*[0-9A-Fa-f]{40}$ ]] || continue
-    "$mysql_bin" <<SQL 2>/dev/null || true
-CREATE USER IF NOT EXISTS '${db_u}'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING '${db_hash}';
-GRANT ALL PRIVILEGES ON \`${db_n}\`.* TO '${db_u}'@'127.0.0.1';
-CREATE USER IF NOT EXISTS '${db_u}'@'::1' IDENTIFIED VIA mysql_native_password USING '${db_hash}';
-GRANT ALL PRIVILEGES ON \`${db_n}\`.* TO '${db_u}'@'::1';
-FLUSH PRIVILEGES;
-SQL
-  done || true
+  # Tenant accounts get their 127.0.0.1 / ::1 hosts from the backend
+  # (mariadb.sync_local_loopback_accounts, run at every start), which knows
+  # which databases are write-locked over quota and which owners are
+  # suspended. A GRANT ALL here would undo both on every update.
   cat >"$defaults_file" <<MYCNF
 [client]
 user=spanel
@@ -2537,6 +2587,7 @@ migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
 warn_legacy_privileged_owned_resources
+migrate_sync_user_slice_limits_from_db
 migrate_repair_nodejs_worker_units
 # The empty database earlier updates left behind when the cron migration ran
 # from frontend/ (see migrate_site_cron_php_binary).
