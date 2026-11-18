@@ -1574,25 +1574,10 @@ ALTER USER 'spanel'@'::1' IDENTIFIED BY '${password}';
 GRANT ALL PRIVILEGES ON *.* TO 'spanel'@'::1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
-  # Sync existing tenant @'localhost' accounts to @'127.0.0.1' and @'::1' for TCP loopback clients (Node.js under skip_name_resolve=1)
-  "$mysql_bin" -N -B -e "
-    SELECT u.User, IFNULL(u.authentication_string, ''), d.Db
-    FROM mysql.user u
-    JOIN mysql.db d ON u.User = d.User AND u.Host = d.Host
-    WHERE u.Host = 'localhost'
-      AND u.User NOT IN ('root', 'mysql', 'mariadb.sys', 'debian-sys-maint', 'spanel', '');
-  " 2>/dev/null | while IFS=$'\t' read -r db_u db_hash db_n; do
-    [[ "$db_u" =~ ^[a-z0-9_]{1,64}$ ]] || continue
-    [[ "$db_n" =~ ^[a-z0-9_]{1,64}$ ]] || continue
-    [[ "$db_hash" =~ ^\*[0-9A-Fa-f]{40}$ ]] || continue
-    "$mysql_bin" <<SQL 2>/dev/null || true
-CREATE USER IF NOT EXISTS '${db_u}'@'127.0.0.1' IDENTIFIED VIA mysql_native_password USING '${db_hash}';
-GRANT ALL PRIVILEGES ON \`${db_n}\`.* TO '${db_u}'@'127.0.0.1';
-CREATE USER IF NOT EXISTS '${db_u}'@'::1' IDENTIFIED VIA mysql_native_password USING '${db_hash}';
-GRANT ALL PRIVILEGES ON \`${db_n}\`.* TO '${db_u}'@'::1';
-FLUSH PRIVILEGES;
-SQL
-  done || true
+  # Tenant accounts get their 127.0.0.1 / ::1 hosts from the backend
+  # (mariadb.sync_local_loopback_accounts, run at every start), which knows
+  # which databases are write-locked over quota and which owners are
+  # suspended. A GRANT ALL here would undo both on every update.
   cat >"$defaults_file" <<MYCNF
 [client]
 user=spanel
