@@ -521,3 +521,72 @@ def test_p1_7_update_migration_resyncs_running_nodejs_units(monkeypatch, capsys)
     assert len(laravel_calls) == 1
     assert laravel_calls[0][0][0] == "alice"
 
+
+# --------------------------------------------------------------------------- P1-8
+
+
+def test_p1_8_startup_keeps_a_tasks_max_the_admin_chose(monkeypatch):
+    from sqlalchemy import text
+
+    from app.core import database as core_db
+    from app.models.entities import UserPackage
+
+    db = _session()
+    eng = db.get_bind()
+    db.add_all([UserPackage(name="small", tasks_max=512), UserPackage(name="tiny", tasks_max=80)])
+    db.add(User(username="dave", email="d@example.com", hashed_password="x", role="end_user", tasks_max=512))
+    db.commit()
+    monkeypatch.setattr(core_db, "engine", eng)
+    core_db._ensure_resource_limit_columns()
+    core_db._ensure_resource_limit_columns()
+    with eng.connect() as conn:
+        assert sorted(r[0] for r in conn.execute(text("SELECT tasks_max FROM user_packages"))) == [80, 512]
+        assert [r[0] for r in conn.execute(text("SELECT tasks_max FROM users"))] == [512]
+
+
+def test_p1_8_old_defaults_are_raised_once_by_migration():
+    import importlib.util
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import text
+
+    path = REPO_ROOT / "backend" / "alembic" / "versions" / "tasks_max_2048_once.py"
+    spec = importlib.util.spec_from_file_location("tasks_max_2048_once", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    eng = create_engine("sqlite://", poolclass=StaticPool)
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE user_packages (id INTEGER PRIMARY KEY, tasks_max INTEGER)"))
+        conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, tasks_max INTEGER)"))
+        conn.execute(text("INSERT INTO user_packages (tasks_max) VALUES (80), (512), (300)"))
+        conn.execute(text("INSERT INTO users (tasks_max) VALUES (512), (4096)"))
+        ctx = MigrationContext.configure(conn)
+        with Operations.context(ctx):
+            mod.upgrade()
+        assert [r[0] for r in conn.execute(text("SELECT tasks_max FROM user_packages ORDER BY id"))] == [2048, 2048, 300]
+        assert [r[0] for r in conn.execute(text("SELECT tasks_max FROM users ORDER BY id"))] == [2048, 4096]
+    assert mod.down_revision == "website_permissions_policy"
+
+
+def test_p1_8_update_sh_does_not_force_user_slice_tasks_max_to_2048(monkeypatch):
+    from app.core import database as core_db
+    from app.services import resource_monitor
+
+    text = UPDATE_SH.read_text(encoding="utf-8")
+    assert "s/^TASKS_MAX=(80|256|512)$/TASKS_MAX=2048/" not in text
+    assert "systemctl set-property \"$slice_name\" TasksMax=2048" not in text
+
+    db = _session()
+    db.add_all([
+        User(username="dave", email="d@example.com", hashed_password="x", role="end_user", tasks_max=300),
+        User(username="root1", email="r@example.com", hashed_password="x", role="admin", tasks_max=2048),
+    ])
+    db.commit()
+    applied = []
+    monkeypatch.setattr(core_db, "SessionLocal", _sessionmaker_for(db))
+    monkeypatch.setattr(resource_monitor, "apply_user_cgroup_limits", lambda u: applied.append((u.username, u.tasks_max)) or True)
+    exec(compile(_update_heredoc("PY_SYNC_SLICE_LIMITS"), "update.sh:PY_SYNC_SLICE_LIMITS", "exec"), {"__name__": "__main__"})
+    assert applied == [("dave", 300)]
+

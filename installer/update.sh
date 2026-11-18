@@ -1113,6 +1113,36 @@ PY_REPAIR_NODEJS
   fi
 }
 
+migrate_sync_user_slice_limits_from_db() {
+  local db_path="$APP_DIR/backend/spanel.db"
+  [[ -f "$db_path" ]] || return 0
+  local py_bin="$APP_DIR/backend/.venv/bin/python"
+  [[ -x "$py_bin" ]] || py_bin="/usr/bin/python3"
+
+  (cd "$APP_DIR/backend" && sudo -u spanel env \
+    HOME="$APP_DIR" \
+    PYTHONPATH="$APP_DIR/backend" \
+    SPANEL_USE_HELPER=true \
+    "$py_bin" - <<'PY_SYNC_SLICE_LIMITS'
+import sys
+
+try:
+    from app.core.database import SessionLocal
+    from app.core.permissions import is_admin_role
+    from app.models.entities import User
+    from app.services import resource_monitor
+
+    with SessionLocal() as db:
+        for user in db.query(User).all():
+            if is_admin_role(user.role):
+                continue
+            resource_monitor.apply_user_cgroup_limits(user)
+except Exception as exc:
+    print(f"WARNING: user slice limits sync skipped: {exc}", file=sys.stderr)
+PY_SYNC_SLICE_LIMITS
+  ) || true
+}
+
 ensure_terminal_tools() {
   local missing=()
   command -v composer >/dev/null 2>&1 || missing+=(composer)
@@ -1361,28 +1391,10 @@ ProtectProc=invisible
 ReadWritePaths=
 ReadWritePaths=${APP_DIR} /home /var/backups/spanel /etc/nginx/conf.d /etc/nginx/spanel/custom /tmp /var/lib/spanel /home/admin/spanel_backups/da /var/lib/spanel/da-import /var/lib/spanel/import-stage
 SERVICE
-  # Upgrade legacy low TasksMax / pids.max limits (80/256/512) on existing tenant slices and Node.js units
-  # so Next.js / Tokio / Rayon multi-threaded builds do not fail with EAGAIN (os error 11).
-  for lf in /etc/spanel/limits/*.env; do
-    [[ -f "$lf" ]] || continue
-    sed -i -E 's/^TASKS_MAX=(80|256|512)$/TASKS_MAX=2048/' "$lf" 2>/dev/null || true
-  done
-  for sc in /etc/systemd/system/user-*.slice.d/50-spanel-limits.conf; do
-    [[ -f "$sc" ]] || continue
-    cur_tm="$(awk -F= '$1=="TasksMax"{print $2; exit}' "$sc" 2>/dev/null || true)"
-    if [[ "$cur_tm" =~ ^[0-9]+$ ]] && (( cur_tm > 0 && cur_tm < 2048 )); then
-      sed -i -E 's/^TasksMax=[0-9]+$/TasksMax=2048/' "$sc" 2>/dev/null || true
-      slice_name="$(basename "$(dirname "$sc")" .d)"
-      systemctl set-property "$slice_name" TasksMax=2048 >/dev/null 2>&1 || true
-    fi
-  done
-  for cg_p in /sys/fs/cgroup/user.slice/user-*.slice/pids.max /sys/fs/cgroup/user.slice/user-*.slice/spanel.scope/pids.max; do
-    [[ -f "$cg_p" ]] || continue
-    cur_p="$(cat "$cg_p" 2>/dev/null || true)"
-    if [[ "$cur_p" =~ ^[0-9]+$ ]] && (( cur_p > 0 && cur_p < 2048 )); then
-      echo 2048 >"$cg_p" 2>/dev/null || true
-    fi
-  done
+  # Upgrade legacy TasksMax=256 only on Node.js / SiteApp systemd units; user
+  # slice TasksMax comes from the panel database (one-time tasks_max_2048_once
+  # migration + apply_user_cgroup_limits) so admin-configured package/user
+  # TasksMax values (such as 80, 300, or 512) are never overwritten on update.
   for nu in /etc/systemd/system/spanel-nodejs-*.service /etc/systemd/system/spanel-app-*.service; do
     [[ -f "$nu" ]] || continue
     sed -i -E 's/^TasksMax=256$/TasksMax=2048/' "$nu" 2>/dev/null || true
@@ -2575,6 +2587,7 @@ migrate_protect_php_from_autoremove
 migrate_user_backup_dir_owner
 migrate_site_cron_php_binary
 warn_legacy_privileged_owned_resources
+migrate_sync_user_slice_limits_from_db
 migrate_repair_nodejs_worker_units
 # The empty database earlier updates left behind when the cron migration ran
 # from frontend/ (see migrate_site_cron_php_binary).
