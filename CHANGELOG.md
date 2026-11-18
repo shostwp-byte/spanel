@@ -4,6 +4,18 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
+## [Unreleased]
+
+### 🚀 Kích hoạt chính thức Node.js Manager & Hoàn thiện Nhóm P2 (`Round 17 P2-1..P2-5`)
+- **Mặc định bật `nodejs_manager_enabled = True`:** Sau khi khép kín toàn bộ các hạng mục bảo mật và vận hành P1–P2 của đợt thẩm định Lần 17, tính năng **Node.js Manager** được bật mặc định trên `main` (vẫn giữ cơ chế công tắc ngắt khẩn cấp `NODEJS_MANAGER_ENABLED=false`).
+- **Chặn thao tác trên Website chưa khởi tạo hoặc đã gỡ Node.js Manager (`P2-1`):** Toàn bộ nhóm endpoint `/api/nodejs-manager/instances/{website_id}/*` kiểm tra bắt buộc sự tồn tại của bản ghi `NodejsInstance` đang hoạt động (`detached == False`), trả `404` rõ ràng nếu chưa khởi tạo.
+- **Chạy nền bất đồng bộ (`202 Accepted`) cho `process` & `git-deploy` kèm theo dõi trạng thái trực tiếp (`P2-2`):** Chuyển các tác vụ `npm install` / `npm run build` / `git-deploy` sang chạy nền với khóa theo site, bổ sung endpoint `GET /api/nodejs-manager/instances/{website_id}/operation-status` và banner tiến độ thời gian thực trên giao diện `NodejsManager.jsx` để tránh lỗi `504 Gateway Timeout`.
+- **Khóa triển khai nhận diện PID sống/chết & chuẩn hóa TTL (`P2-4`):** Giảm timeout `nodejs-worker-sync` về `60s`, nâng `_DEPLOY_LOCK_TTL_SECONDS` lên `2400s` khớp trần thực thi mới, và tự động thu hồi khóa mồ côi ngay lập tức nếu tiến trình giữ khóa đã kết thúc (`_pid_is_alive`).
+- **Giữ nguyên chứng chỉ SSL hợp lệ khi đổi tên miền & khôi phục WAF an toàn khi rollback (`P2-3`):** Bảo toàn trạng thái HTTPS của website và các alias giữ nguyên khi chứng chỉ Wildcard / Shared / Manual hoặc Let's Encrypt sẵn có bao phủ tên miền mới; tránh xóa nhầm chứng chỉ còn bao phủ alias của chính site trong `release_site_certificates`; đồng bộ lại file WAF của domain cũ trước khi ghi lại vhost cũ và dọn sạch vhost/WAF của domain mới khi rollback.
+- **Khóa chặt hạn mức Pool & trần tài nguyên của Reseller trên mọi đường cập nhật (`P2-5`):** Áp dụng thống nhất kiểm tra quyền sở hữu gói (`_package_for_payload`), tổng dung lượng/website/database của Reseller (`_enforce_reseller_quotas`, chặn giá trị `<= 0` không giới hạn khi tắt overselling) và trần cgroup/MySQL (`_enforce_reseller_resource_ceilings`) trên `POST /api/resources/users/{id}/limits`, `PATCH /api/users/{id}` và `POST`/`PATCH /api/packages`.
+
+---
+
 ## [v1.0.10] — 2026-11-18
 
 Bản phát hành `v1.0.10` hợp nhất toàn bộ các bản vá bảo mật cách ly đa người thuê, quản lý quyền MariaDB loopback, khôi phục worker khi đổi tên/chuyển chủ website, chuẩn hóa header `Permissions-Policy` theo từng site và hoàn tất đầy đủ 8 hạng mục P1 qua các đợt thẩm định độc lập Lần 15 → Lần 17 (`PR #27`, `PR #28`, `PR #29`):

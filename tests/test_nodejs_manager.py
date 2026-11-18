@@ -1093,14 +1093,14 @@ def test_full_nodejs_lifecycle_install_process_npm_env_security_remove(monkeypat
             db.close()
 
 
-def test_stage_4_nodejs_manager_feature_flag_default_disabled(monkeypatch):
+def test_stage_4_nodejs_manager_feature_flag_kill_switch(monkeypatch):
     """4.3:
-    - Settings().nodejs_manager_enabled defaults to False.
-    - When nodejs_manager_enabled is False, router returns 404 for all endpoints.
+    - Settings().nodejs_manager_enabled defaults to True after Round 17 P2 completion.
+    - When nodejs_manager_enabled is set to False, router returns 404 for all endpoints.
     """
     from app.core.config import Settings
 
-    assert Settings().nodejs_manager_enabled is False
+    assert Settings().nodejs_manager_enabled is True
     monkeypatch.setattr(settings, "nodejs_manager_enabled", False)
 
     _, SessionLocal = _setup_test_db()

@@ -47,7 +47,7 @@ async def _capture_nodejs_access_role(request: Request):
 
 
 def _require_nodejs_manager_enabled() -> None:
-    if not getattr(settings, "nodejs_manager_enabled", False):
+    if not getattr(settings, "nodejs_manager_enabled", True):
         raise HTTPException(
             status_code=404,
             detail="Node.js Manager is disabled on this server",
