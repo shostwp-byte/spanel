@@ -144,8 +144,10 @@ def _enforce_reseller_quotas(
             if target_website_limit <= 0 or allocated_websites + target_website_limit > total_website_limit:
                 raise HTTPException(status_code=403, detail="Reseller website quota exceeded")
         if total_database_limit > 0:
+            from app.services import quota
+
             allocated_databases = sum(
-                int(u.package.database_limit or 0) if u.package else 0 for u in other_users
+                max(0, quota.effective_limit(u, "database_limit")) for u in other_users
             )
             if target_database_limit is not None:
                 if target_database_limit <= 0 or allocated_databases + target_database_limit > total_database_limit:
@@ -191,6 +193,66 @@ def _enforce_reseller_quotas(
             )
             if actual_databases > total_database_limit:
                 raise HTTPException(status_code=403, detail="Reseller database quota exceeded")
+
+
+_RESELLER_CEILING_FIELDS: tuple[str, ...] = (
+    "memory_max_mb",
+    "memory_high_mb",
+    "cpu_quota_percent",
+    "tasks_max",
+    "inode_limit",
+    "bandwidth_limit_mb",
+    "mysql_storage_limit_mb",
+    "mysql_max_db_size_mb",
+    "io_read_mbps",
+    "io_write_mbps",
+    "iops_read_max",
+    "iops_write_max",
+)
+
+
+def _enforce_reseller_resource_ceilings(reseller: User, target: object) -> None:
+    """Prevent a reseller from granting unlimited (<= 0) or higher per-user
+    cgroup / MySQL ceilings than the reseller account itself is allowed."""
+    up = getattr(reseller, "package", None)
+    source = up if (up is not None and bool(getattr(up, "is_reseller_package", False))) else reseller
+    for field in _RESELLER_CEILING_FIELDS:
+        ceiling = int(getattr(source, field, 0) or 0)
+        if ceiling <= 0:
+            continue
+        raw_target = getattr(target, field, None)
+        if raw_target is None:
+            continue
+        target_val = int(raw_target)
+        if target_val <= 0 or target_val > ceiling:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Reseller resource limit exceeded for {field} (maximum {ceiling})",
+            )
+
+
+def _enforce_reseller_package_pool_bounds(reseller: User, package: UserPackage) -> None:
+    """Ensure a reseller-authored UserPackage does not declare single-account
+    storage/website/database limits larger than the reseller's own pool."""
+    rp = getattr(reseller, "reseller_package", None)
+    up = getattr(reseller, "package", None)
+    if rp is not None:
+        total_storage_mb = int(rp.total_storage_mb or 0)
+        total_website_limit = int(rp.total_website_limit or 0)
+        total_database_limit = int(rp.total_database_limit or 0)
+    elif up is not None and bool(getattr(up, "is_reseller_package", False)):
+        total_storage_mb = int(up.storage_limit_mb or 0)
+        total_website_limit = int(up.website_limit or 0)
+        total_database_limit = int(up.database_limit or 0)
+    else:
+        return
+
+    if total_storage_mb > 0 and (int(package.storage_limit_mb or 0) <= 0 or int(package.storage_limit_mb or 0) > total_storage_mb):
+        raise HTTPException(status_code=403, detail="Reseller storage quota exceeded")
+    if total_website_limit > 0 and (int(package.website_limit or 0) < 0 or int(package.website_limit or 0) > total_website_limit):
+        raise HTTPException(status_code=403, detail="Reseller website quota exceeded")
+    if total_database_limit > 0 and (int(package.database_limit or 0) < 0 or int(package.database_limit or 0) > total_database_limit):
+        raise HTTPException(status_code=403, detail="Reseller database quota exceeded")
 
 
 def _apply_package_limits(user: User, package: UserPackage | None) -> None:
@@ -672,10 +734,15 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, db: Session
             current_user,
             target_website_limit=user.website_limit,
             target_storage_mb=user.storage_limit_mb,
-            target_database_limit=effective_pkg.database_limit if effective_pkg else None,
+            target_database_limit=(
+                payload.database_limit
+                if payload.database_limit is not None
+                else (effective_pkg.database_limit if effective_pkg else user.database_limit)
+            ),
             is_create=False,
             exclude_user_id=user.id,
         )
+        _enforce_reseller_resource_ceilings(current_user, user)
 
     if role_changed:
         # New role -> existing tokens with old role claim should be invalidated.

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role, is_admin_role
+from app.core.permissions import Role, ensure_role, is_admin_role, normalize_role
 from app.models.entities import DatabaseAccount, User, UserPackage, Website
 from app.services import db_backends, disk_quota, quota, resource_monitor, storage_quota
 from app.services.remote_mysql import RemoteDatabaseError
@@ -380,9 +380,9 @@ def update_user_resource_limits(
         raise HTTPException(status_code=403, detail="Access denied")
 
     if payload.package_id is not None:
-        pkg = db.query(UserPackage).filter(UserPackage.id == payload.package_id).first()
-        if not pkg:
-            raise HTTPException(status_code=404, detail="Package not found")
+        from app.api.users import _package_for_payload
+
+        pkg = _package_for_payload(db, payload.package_id, current_user)
         user.package_id = pkg.id
         user.package = pkg
 
@@ -431,6 +431,33 @@ def update_user_resource_limits(
             val = getattr(payload, field, None)
             if val is not None:
                 setattr(user, field, val)
+
+    if normalize_role(current_user.role) == Role.reseller:
+        from app.api.users import _enforce_reseller_quotas, _enforce_reseller_resource_ceilings
+        from app.services import quota
+
+        reseller_actor = (
+            db.query(User)
+            .options(selectinload(User.reseller_package), selectinload(User.package))
+            .filter(User.id == current_user.id)
+            .first()
+            or current_user
+        )
+        eff_db_limit = (
+            payload.database_limit
+            if payload.database_limit is not None
+            else (user.package.database_limit if user.package else user.database_limit)
+        )
+        _enforce_reseller_quotas(
+            db,
+            reseller_actor,
+            target_website_limit=quota.effective_limit(user, "website_limit"),
+            target_storage_mb=int(user.storage_limit_mb if user.storage_limit_mb is not None else 0),
+            target_database_limit=eff_db_limit,
+            is_create=False,
+            exclude_user_id=user.id,
+        )
+        _enforce_reseller_resource_ceilings(reseller_actor, user)
 
     db.commit()
     db.refresh(user)

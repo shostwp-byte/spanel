@@ -27,7 +27,7 @@ from app.api import users as users_api
 from app.api import websites as websites_api
 from app.core.config import settings
 from app.core.database import Base, get_db
-from app.core.deps import get_current_user
+from app.api.deps import get_current_user
 from app.models.entities import (
     NodejsInstance,
     ResellerPackage,
@@ -455,6 +455,167 @@ def test_p2_3_rename_legacy_site_without_linux_user_moves_and_rolls_back(tmp_pat
         new_dir = tmp_path / "legacy-new.example.com"
         assert (new_dir / "public_html" / "index.html").read_text(encoding="utf-8") == "legacy"
         assert not old_dir.exists()
+
+
+# --------------------------------------------------------------------------- P2-5
+
+
+def test_p2_5_reseller_cannot_bypass_pool_or_ceilings_via_resource_limits_or_package_update(monkeypatch):
+    from app.api.resources import UserResourceLimitsUpdate
+    from app.schemas.schemas import UserPackageUpdate
+    from app.services import resource_monitor
+
+    monkeypatch.setattr(resource_monitor, "apply_user_cgroup_limits_async", lambda uid: None)
+    monkeypatch.setattr(resource_monitor, "collect_and_enforce_mysql_quotas", lambda db: {})
+
+    _, SessionLocal = _make_db()
+    fake_req = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"), url=SimpleNamespace(scheme="https"))
+
+    with SessionLocal() as db:
+        rpkg = ResellerPackage(
+            name="Reseller10G",
+            slug="res-10g",
+            user_limit=5,
+            total_storage_mb=10240,
+            total_website_limit=10,
+            total_database_limit=5,
+            overselling_enabled=False,
+        )
+        other_res_pkg = UserPackage(name="OtherResPkg", owner_id=999, storage_limit_mb=1024)
+        res_tier_pkg = UserPackage(name="ResellerTier", is_reseller_package=True, storage_limit_mb=50000)
+        db.add_all([rpkg, other_res_pkg, res_tier_pkg])
+        db.flush()
+
+        reseller = User(
+            username="res1",
+            email="res1@example.com",
+            hashed_password="x",
+            role="reseller",
+            reseller_package_id=rpkg.id,
+            memory_max_mb=2048,
+            cpu_quota_percent=100,
+            tasks_max=2048,
+        )
+        db.add(reseller)
+        db.flush()
+
+        own_pkg = UserPackage(
+            name="Res1Starter",
+            owner_id=reseller.id,
+            website_limit=2,
+            storage_limit_mb=4096,
+            database_limit=2,
+            memory_max_mb=1024,
+        )
+        db.add(own_pkg)
+        db.flush()
+
+        cust1 = User(
+            username="cust1",
+            email="c1@example.com",
+            hashed_password="x",
+            role="end_user",
+            reseller_id=reseller.id,
+            package_id=own_pkg.id,
+            website_limit=2,
+            storage_limit_mb=4096,
+            database_limit=2,
+            memory_max_mb=1024,
+        )
+        cust2 = User(
+            username="cust2",
+            email="c2@example.com",
+            hashed_password="x",
+            role="end_user",
+            reseller_id=reseller.id,
+            package_id=own_pkg.id,
+            website_limit=2,
+            storage_limit_mb=4096,
+            database_limit=2,
+            memory_max_mb=1024,
+        )
+        db.add_all([cust1, cust2])
+        db.commit()
+        db.refresh(reseller)
+        db.refresh(cust1)
+        db.refresh(cust2)
+
+        # 1. Unlimited storage (-1 or 0) via POST /resources/users/{id}/limits -> 403
+        for bad_storage in (-1, 0, 7000):  # 4096 (cust2) + 7000 > 10240 pool
+            with pytest.raises(HTTPException) as exc_s:
+                resources_api.update_user_resource_limits(
+                    cust1.id,
+                    UserResourceLimitsUpdate(storage_limit_mb=bad_storage),
+                    fake_req,
+                    db,
+                    reseller,
+                )
+            assert exc_s.value.status_code == 403
+            db.rollback()
+
+        # 2. Exceeding database pool (2 + 4 > 5) or memory ceiling (4096 > 2048 or -1) -> 403
+        with pytest.raises(HTTPException) as exc_db:
+            resources_api.update_user_resource_limits(
+                cust1.id,
+                UserResourceLimitsUpdate(database_limit=4),
+                fake_req,
+                db,
+                reseller,
+            )
+        assert exc_db.value.status_code == 403
+        db.rollback()
+
+        for bad_mem in (-1, 0, 4096):
+            with pytest.raises(HTTPException) as exc_m:
+                resources_api.update_user_resource_limits(
+                    cust1.id,
+                    UserResourceLimitsUpdate(memory_max_mb=bad_mem),
+                    fake_req,
+                    db,
+                    reseller,
+                )
+            assert exc_m.value.status_code == 403
+            db.rollback()
+
+        # 3. Assigning another reseller's package or a reseller-tier package -> 403
+        for forbidden_pkg_id in (other_res_pkg.id, res_tier_pkg.id):
+            with pytest.raises(HTTPException) as exc_p:
+                resources_api.update_user_resource_limits(
+                    cust1.id,
+                    UserResourceLimitsUpdate(package_id=forbidden_pkg_id),
+                    fake_req,
+                    db,
+                    reseller,
+                )
+            assert exc_p.value.status_code == 403
+            db.rollback()
+
+        # 4. Updating own package so cust1 + cust2 exceed 10240 MB pool (6000 * 2 = 12000) -> 403
+        with pytest.raises(HTTPException) as exc_pu:
+            packages_api.update_package(
+                own_pkg.id,
+                UserPackageUpdate(storage_limit_mb=6000),
+                fake_req,
+                db,
+                reseller,
+            )
+        assert exc_pu.value.status_code == 403
+        db.rollback()
+
+        # 5. Valid resource adjustment within pool & ceilings -> 200 OK
+        ok_res = resources_api.update_user_resource_limits(
+            cust1.id,
+            UserResourceLimitsUpdate(storage_limit_mb=5120, database_limit=3, memory_max_mb=1536),
+            fake_req,
+            db,
+            reseller,
+        )
+        assert ok_res["ok"] is True
+        db.refresh(cust1)
+        assert cust1.storage_limit_mb == 5120
+        assert cust1.database_limit == 3
+        assert cust1.memory_max_mb == 1536
+
 
 
 
