@@ -1162,7 +1162,7 @@ def _sync_nodejs_worker_unit(
             enabled=enabled,
         ),
         check=False,
-        timeout=600,
+        timeout=60,
     )
     out = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
     if int(getattr(res, "returncode", 1) or 0) != 0:
@@ -2021,33 +2021,112 @@ def _deploy_lock_path(website_id: int) -> Path:
     return _deploy_locks_dir() / f"nodejs-deploy-{int(website_id)}.lock"
 
 
-_DEPLOY_LOCK_TTL_SECONDS = 1800
+# Worst-case pipeline after P1-5 removed npm from spanel-helper:
+# git clone/fetch (300s) + npm install w/ fallback (300s * 2) + npm run build (300s)
+# + nodejs-worker-sync (60s) = 1,260s. Keep TTL well above the ceiling, and
+# reclaim immediately when the recorded PID is no longer alive.
+_DEPLOY_LOCK_TTL_SECONDS = 2400
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong(0)
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return int(exit_code.value) == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _read_deploy_lock_meta(lock_path: Path) -> Dict[str, Any]:
+    try:
+        raw = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return {}
+    if not raw:
+        return {}
+    if raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    parts = raw.split(":", 2)
+    meta: Dict[str, Any] = {}
+    try:
+        meta["pid"] = int(parts[0])
+    except (ValueError, IndexError):
+        pass
+    try:
+        meta["started_at"] = float(parts[1])
+    except (ValueError, IndexError):
+        pass
+    if len(parts) > 2 and parts[2]:
+        meta["operation"] = parts[2]
+    return meta
 
 
 def _acquire_deploy_lock(
-    website_id: int, stale_seconds: int = _DEPLOY_LOCK_TTL_SECONDS
+    website_id: int,
+    stale_seconds: int = _DEPLOY_LOCK_TTL_SECONDS,
+    operation: str = "git-deploy",
 ) -> Path:
     lock_path = _deploy_lock_path(website_id)
     for attempt in range(2):
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             try:
-                os.write(fd, f"{os.getpid()}:{time.time()}\n".encode("utf-8"))
+                payload = json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "started_at": time.time(),
+                        "operation": operation,
+                    }
+                )
+                os.write(fd, (payload + "\n").encode("utf-8"))
             finally:
                 os.close(fd)
             return lock_path
         except FileExistsError:
+            meta = _read_deploy_lock_meta(lock_path)
             if attempt == 0:
                 try:
-                    age = time.time() - lock_path.stat().st_mtime
-                    if age > stale_seconds:
+                    lock_pid = int(meta.get("pid") or 0)
+                    started_at = float(meta.get("started_at") or lock_path.stat().st_mtime)
+                    age = time.time() - started_at
+                    if (lock_pid > 0 and not _pid_is_alive(lock_pid)) or age > stale_seconds:
                         lock_path.unlink(missing_ok=True)
                         continue
                 except OSError:
                     pass
+            active_op = str(meta.get("operation") or "deploy")
             raise HTTPException(
                 status_code=409,
-                detail="Một tiến trình Git Deploy khác đang chạy cho website này. Vui lòng đợi hoàn tất.",
+                detail=f"Một tác vụ Node.js khác ({active_op}) đang chạy cho website này. Vui lòng đợi hoàn tất.",
             )
 
 

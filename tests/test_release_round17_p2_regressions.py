@@ -156,3 +156,48 @@ def test_p2_1_nodejs_instance_endpoints_reject_uninitialized_and_detached_sites(
             json={"apply_all": True, "enabled": True},
         ).status_code == 404
         assert vhost_calls == []
+
+
+# --------------------------------------------------------------------------- P2-4
+
+
+def test_p2_4_pid_aware_deploy_lock_reclaims_dead_pids_and_holds_live_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(nm, "_deploy_locks_dir", lambda: tmp_path)
+    assert nm._DEPLOY_LOCK_TTL_SECONDS == 2400
+
+    # 1. Live PID (current process) and fresh timestamp -> second caller gets 409 Conflict
+    lock = nm._acquire_deploy_lock(42, operation="git-deploy")
+    try:
+        meta = nm._read_deploy_lock_meta(lock)
+        assert meta["pid"] == os.getpid()
+        assert meta["operation"] == "git-deploy"
+        with pytest.raises(HTTPException) as exc_info:
+            nm._acquire_deploy_lock(42, operation="process:start")
+        assert exc_info.value.status_code == 409
+        assert "git-deploy" in exc_info.value.detail
+    finally:
+        nm._release_deploy_lock(lock)
+
+    # 2. Dead PID written moments ago -> reclaimed immediately without waiting for TTL
+    dead_lock = tmp_path / "nodejs-deploy-43.lock"
+    dead_lock.write_text(
+        json.dumps({"pid": 99999991, "started_at": time.time(), "operation": "crashed-worker"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(nm, "_pid_is_alive", lambda pid: False if pid == 99999991 else (pid == os.getpid()))
+    reclaimed = nm._acquire_deploy_lock(43, operation="process:restart")
+    try:
+        assert nm._read_deploy_lock_meta(reclaimed)["pid"] == os.getpid()
+        assert nm._read_deploy_lock_meta(reclaimed)["operation"] == "process:restart"
+    finally:
+        nm._release_deploy_lock(reclaimed)
+
+    # 3. Live PID whose started_at exceeded stale_seconds -> reclaimed
+    expired_lock = tmp_path / "nodejs-deploy-44.lock"
+    expired_lock.write_text(
+        json.dumps({"pid": os.getpid(), "started_at": time.time() - 3000, "operation": "stuck"}) + "\n",
+        encoding="utf-8",
+    )
+    reclaimed_exp = nm._acquire_deploy_lock(44, stale_seconds=2400, operation="git-deploy")
+    nm._release_deploy_lock(reclaimed_exp)
+

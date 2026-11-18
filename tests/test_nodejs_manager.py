@@ -1133,7 +1133,7 @@ def test_round16_p2_and_p3_regressions(tmp_path, monkeypatch):
     - P2-2: _rollback_failed_install invokes _delete_nodejs_worker_unit when install fails mid-way.
     - P2-3: _update_instance_state raises 409 immediately on non-port IntegrityError and raises 409 after 8 port collisions.
     - P3-3: public_nodejs_webhook_deploy rejects with 403 when package node_apps_limit == 0 or addon is disabled.
-    - P3-4: _DEPLOY_LOCK_TTL_SECONDS is 1800.
+    - P3-4 / Round 17 P2-4: _DEPLOY_LOCK_TTL_SECONDS is 2400 (exceeding 1,260s post-P1-5 ceiling).
     - P3-5: _execute_git_deploy_pipeline runs `git remote set-url origin -- <repo>` when `.git` exists.
     """
     from app.api import websites as websites_api
@@ -1141,7 +1141,7 @@ def test_round16_p2_and_p3_regressions(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "command_dry_run", True)
     monkeypatch.setattr(settings, "secret_key", "round16-test-secret-key-0123456789")
 
-    assert nm._DEPLOY_LOCK_TTL_SECONDS == 1800
+    assert nm._DEPLOY_LOCK_TTL_SECONDS == 2400
 
     _, SessionLocal = _setup_test_db()
     with patch.object(nm, "SessionLocal", SessionLocal), patch(
