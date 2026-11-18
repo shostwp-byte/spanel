@@ -2830,6 +2830,21 @@ def install_nodejs_instance(
     }
 
 
+def _require_active_nodejs_instance(
+    site: Website,
+    state: Dict[str, Any],
+    *,
+    allow_detached: bool = False,
+) -> Dict[str, Any]:
+    saved = dict((state.get("instances") or {}).get(str(site.id)) or {})
+    if not saved or (not allow_detached and saved.get("detached")):
+        raise HTTPException(
+            status_code=404,
+            detail="Ứng dụng Node.js chưa được khởi tạo trên website này.",
+        )
+    return saved
+
+
 @router.post("/instances/{website_id}/process")
 def manage_nodejs_process(
     website_id: int,
@@ -2993,7 +3008,7 @@ def run_npm_action(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
     inst_key = str(site.id)
-    saved = dict((state.get("instances") or {}).get(inst_key) or {})
+    saved = _require_active_nodejs_instance(site, state)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
     node_major = str(saved.get("node_major") or "22")
 
@@ -3104,7 +3119,7 @@ def get_nodejs_env(
 ):
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
-    saved = (state.get("instances") or {}).get(str(site.id)) or {}
+    saved = _require_active_nodejs_instance(site, state)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
     env_raw = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
@@ -3126,7 +3141,7 @@ def update_nodejs_env(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
     inst_key = str(site.id)
-    saved = dict((state.get("instances") or {}).get(inst_key) or {})
+    saved = _require_active_nodejs_instance(site, state)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
     cur_raw = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
@@ -3188,7 +3203,7 @@ def update_nodejs_security(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
     inst_key = str(site.id)
-    saved = dict((state.get("instances") or {}).get(inst_key) or {})
+    saved = _require_active_nodejs_instance(site, state)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
     env_raw = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
@@ -3281,7 +3296,7 @@ def update_nodejs_permissions_policy(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
     inst_key = str(site.id)
-    saved = dict((state.get("instances") or {}).get(inst_key) or {})
+    saved = _require_active_nodejs_instance(site, state)
     linux_user, site_root, _ = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
     port = int(saved.get("port") or _allocate_nodejs_port(db, exclude_website_id=site.id))
 
@@ -3483,6 +3498,7 @@ def trigger_nodejs_git_deploy(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
+    _require_active_nodejs_instance(site, _load_toolkit_state(db))
     lock_path = _acquire_deploy_lock(site.id)
     try:
         return _execute_git_deploy_pipeline(
@@ -3508,7 +3524,7 @@ def configure_nodejs_webhook(
     site = _get_accessible_website(website_id, db, current_user)
     inst_key = str(site.id)
     state_before = _load_toolkit_state(db)
-    saved_before = (state_before.get("instances") or {}).get(inst_key) or {}
+    saved_before = _require_active_nodejs_instance(site, state_before)
     existing_raw_token = _decrypt_webhook_token(saved_before)
 
     issued_token: Optional[str] = None
@@ -3664,7 +3680,7 @@ def get_nodejs_logs(
 ):
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
-    saved = (state.get("instances") or {}).get(str(site.id)) or {}
+    saved = _require_active_nodejs_instance(site, state)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
     clean_kind = (kind or "systemd").strip().lower()
@@ -3727,7 +3743,7 @@ def clear_nodejs_logs(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
     inst_key = str(site.id)
-    saved = (state.get("instances") or {}).get(inst_key) or {}
+    saved = _require_active_nodejs_instance(site, state)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
     clean_kind = (kind if isinstance(kind, str) else "all").strip().lower()
@@ -3755,6 +3771,7 @@ def detach_nodejs_instance(
     current_user: User = Depends(get_current_user),
 ):
     site = _get_accessible_website(website_id, db, current_user)
+    _require_active_nodejs_instance(site, _load_toolkit_state(db))
     inst_key = str(site.id)
 
     def _mark_detached(inst: Dict[str, Any]) -> None:
@@ -3777,7 +3794,7 @@ def remove_nodejs_instance(
     site = _get_accessible_website(website_id, db, current_user)
     state = _load_toolkit_state(db)
     inst_key = str(site.id)
-    saved = dict((state.get("instances") or {}).get(inst_key) or {})
+    saved = _require_active_nodejs_instance(site, state, allow_detached=True)
     linux_user, site_root, app_dir = _resolve_nodejs_paths(site, db, saved.get("subpath") or "")
 
     # Stop and delete systemd worker unit
