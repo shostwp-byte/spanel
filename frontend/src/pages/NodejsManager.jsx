@@ -392,6 +392,76 @@ export function NodejsManagerPage({
     []
   );
 
+  const mountedRef = useRef(true);
+  const pollTimersRef = useRef({});
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      for (const timerId of Object.values(pollTimersRef.current || {})) {
+        clearTimeout(timerId);
+      }
+      pollTimersRef.current = {};
+    };
+  }, []);
+
+  const pollSiteOperation = useCallback(
+    (websiteId, busyKey = null) => {
+      if (!websiteId) return;
+      if (pollTimersRef.current[websiteId]) {
+        clearTimeout(pollTimersRef.current[websiteId]);
+      }
+      const tick = async () => {
+        if (!mountedRef.current) return;
+        const req = requestRef.current;
+        if (!req) return;
+        try {
+          const statusRes = await req(
+            `/nodejs-manager/instances/${websiteId}/operation-status`,
+            { silent: true }
+          );
+          if (!mountedRef.current) return;
+          const op = statusRes?.operation;
+          if (op?.active) {
+            setInstances(prev =>
+              prev.map(item =>
+                item.id === websiteId ? { ...item, active_operation: op } : item
+              )
+            );
+            pollTimersRef.current[websiteId] = setTimeout(tick, 2000);
+            return;
+          }
+          delete pollTimersRef.current[websiteId];
+          if (busyKey) markBusy(busyKey, false);
+          if (statusRes?.instance) {
+            replaceSingleInstance(statusRes.instance);
+          } else {
+            await loadInstances({ silent: true, refresh: true });
+          }
+          if (op?.status === 'failed' && op?.error) {
+            setError(op.error);
+          } else if (op?.message) {
+            setNotice(op.message);
+          }
+        } catch {
+          delete pollTimersRef.current[websiteId];
+          if (busyKey) markBusy(busyKey, false);
+        }
+      };
+      pollTimersRef.current[websiteId] = setTimeout(tick, 1800);
+    },
+    [loadInstances, markBusy, replaceSingleInstance, setError, setNotice]
+  );
+
+  useEffect(() => {
+    for (const inst of instances) {
+      if (inst?.active_operation?.active && !pollTimersRef.current[inst.id]) {
+        pollSiteOperation(inst.id, null);
+      }
+    }
+  }, [instances, pollSiteOperation]);
+
   // Filtered instances
   const filteredInstances = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -530,6 +600,7 @@ export function NodejsManagerPage({
     const draft = customDraft || processDrafts[inst.id] || {};
     const busyKey = `proc_${inst.id}_${action}`;
     markBusy(busyKey, true);
+    let handedToPoller = false;
     try {
       const payload = {
         action,
@@ -545,11 +616,19 @@ export function NodejsManagerPage({
         body: JSON.stringify(payload),
       });
       if (res?.instance) replaceSingleInstance(res.instance);
-      setNotice(res?.message || 'Đã cập nhật trạng thái tiến trình Node.js.');
+      if (res?.queued) {
+        handedToPoller = true;
+        setNotice(res?.message || 'Đã đưa tác vụ tiến trình Node.js vào chạy nền.');
+        pollSiteOperation(inst.id, busyKey);
+      } else if (res) {
+        setNotice(res?.message || 'Đã cập nhật trạng thái tiến trình Node.js.');
+      }
     } catch (err) {
       setError(err?.message || 'Thao tác tiến trình Node.js thất bại.');
     } finally {
-      markBusy(busyKey, false);
+      if (!handedToPoller) {
+        markBusy(busyKey, false);
+      }
     }
   };
 
@@ -621,6 +700,7 @@ export function NodejsManagerPage({
     const draft = gitDrafts[inst.id] || {};
     const busyKey = `git_${inst.id}`;
     markBusy(busyKey, true);
+    let handedToPoller = false;
     try {
       const res = await request(`/nodejs-manager/instances/${inst.id}/git-deploy`, {
         method: 'POST',
@@ -633,11 +713,19 @@ export function NodejsManagerPage({
         }),
       });
       if (res?.instance) replaceSingleInstance(res.instance);
-      setNotice(res?.message || 'Đã triển khai Git Auto-Deploy thành công.');
+      if (res?.queued) {
+        handedToPoller = true;
+        setNotice(res?.message || 'Đã đưa tiến trình Git Deploy vào chạy nền.');
+        pollSiteOperation(inst.id, busyKey);
+      } else if (res) {
+        setNotice(res?.message || 'Đã triển khai Git Auto-Deploy thành công.');
+      }
     } catch (err) {
       setError(err?.message || 'Triển khai từ Git thất bại.');
     } finally {
-      markBusy(busyKey, false);
+      if (!handedToPoller) {
+        markBusy(busyKey, false);
+      }
     }
   };
 
@@ -1042,11 +1130,33 @@ export function NodejsManagerPage({
               </div>
             </div>
 
+            {inst.active_operation?.active && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '10px',
+                  padding: '10px 14px',
+                  borderRadius: '10px',
+                  background: 'var(--primary-10, rgba(37, 99, 235, 0.08))',
+                  border: '1px solid var(--primary-20, rgba(37, 99, 235, 0.22))',
+                  fontSize: '12.5px',
+                  color: 'var(--text)',
+                }}
+              >
+                <RotateCcw size={14} className="spin" style={{ color: 'var(--primary)', flexShrink: 0 }} />
+                <div>
+                  <strong>Đang chạy nền ({inst.active_operation.operation}):</strong>{' '}
+                  {inst.active_operation.message || 'Đang chuẩn bị môi trường và đồng bộ tiến trình...'}
+                </div>
+              </div>
+            )}
+
             {/* Process control buttons */}
             <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px' }}>
               <button
                 type="button"
-                disabled={busyMap[`proc_${inst.id}_start`] || isRunning}
+                disabled={busyMap[`proc_${inst.id}_start`] || Boolean(inst.active_operation?.active) || isRunning}
                 onClick={() => handleProcessAction(inst, 'start')}
               >
                 <Play size={14} />
@@ -1055,7 +1165,7 @@ export function NodejsManagerPage({
               <button
                 type="button"
                 className="secondary-light"
-                disabled={busyMap[`proc_${inst.id}_restart`]}
+                disabled={busyMap[`proc_${inst.id}_restart`] || Boolean(inst.active_operation?.active)}
                 onClick={() => handleProcessAction(inst, 'restart')}
               >
                 <RotateCcw size={14} />

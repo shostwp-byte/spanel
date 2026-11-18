@@ -201,3 +201,111 @@ def test_p2_4_pid_aware_deploy_lock_reclaims_dead_pids_and_holds_live_ones(tmp_p
     reclaimed_exp = nm._acquire_deploy_lock(44, stale_seconds=2400, operation="git-deploy")
     nm._release_deploy_lock(reclaimed_exp)
 
+
+# --------------------------------------------------------------------------- P2-2
+
+
+def test_p2_2_process_start_runs_in_background_with_site_lock_and_operation_status(tmp_path, monkeypatch):
+    _, SessionLocal = _make_db()
+    monkeypatch.setattr(addons, "is_installed", lambda slug: True)
+    monkeypatch.setattr(settings, "nodejs_manager_enabled", True)
+    monkeypatch.setattr(settings, "command_dry_run", False)
+    monkeypatch.setattr(nm, "SessionLocal", SessionLocal)
+    monkeypatch.setattr(nm, "_deploy_locks_dir", lambda: tmp_path / "locks")
+    (tmp_path / "locks").mkdir(parents=True, exist_ok=True)
+
+    site_root = tmp_path / "app.example.com"
+    pub = site_root / "public_html"
+    pub.mkdir(parents=True)
+    (pub / "package.json").write_text('{"name":"demo","scripts":{"start":"node server.js"}}', encoding="utf-8")
+    (pub / "server.js").write_text("console.log('ok');", encoding="utf-8")
+
+    with SessionLocal() as db:
+        pkg = UserPackage(name="pro", node_apps_limit=5, node_app_memory_mb=1024)
+        db.add(pkg)
+        db.flush()
+        alice = User(
+            username="alice",
+            email="alice@example.com",
+            hashed_password="x",
+            role="end_user",
+            package_id=pkg.id,
+        )
+        db.add(alice)
+        db.flush()
+        site = Website(
+            domain="app.example.com",
+            owner_id=alice.id,
+            root_path=str(site_root),
+            document_root="public_html",
+            linux_user="alice",
+            app_type="application",
+            status="active",
+        )
+        db.add(site)
+        db.flush()
+        db.add(
+            NodejsInstance(
+                website_id=site.id,
+                owner_id=alice.id,
+                port=21030,
+                detached=False,
+                process_enabled=False,
+                node_major="22",
+                start_mode="npm",
+                start_arg="start",
+                memory_mb=512,
+            )
+        )
+        db.commit()
+        db.refresh(alice)
+        site_id = site.id
+        alice_ref = alice
+
+    client = _build_nm_client(SessionLocal, {"user": alice_ref})
+    ready_calls = []
+    sync_calls = []
+
+    with patch.object(nm, "_resolve_nodejs_paths", return_value=("alice", site_root, pub)), \
+         patch.object(nm, "_read_app_file", return_value=""), \
+         patch.object(nm, "_is_nodejs_project_dir", return_value=True), \
+         patch.object(nm, "_detect_package_json_metadata", return_value={"framework": "Node.js", "scripts": {"start": "node server.js"}, "packages": []}), \
+         patch.object(nm, "_evaluate_security_checks", return_value=[]), \
+         patch.object(nm, "_query_nodejs_worker_status", return_value={"status": "running", "state": "active", "enabled": True, "port": 21030, "node_major": "22", "start_mode": "npm", "start_arg": "start", "memory_mb": 512, "main_pid": 987, "memory_current_bytes": 1024, "restarts": 0}), \
+         patch.object(nm, "_ensure_nodejs_app_ready", side_effect=lambda *a, **k: ready_calls.append((a, k)) or {"installed": True}), \
+         patch.object(nm, "_ensure_nodejs_local_db_grants"), \
+         patch.object(nm, "_sync_nodejs_worker_unit", side_effect=lambda *a, **k: sync_calls.append((a, k)) or {"status": "running"}), \
+         patch.object(nm, "_sync_nodejs_nginx_vhost"):
+        # 1. Holding the per-site lock blocks concurrent process start with 409 Conflict
+        held = nm._acquire_deploy_lock(site_id, operation="git-deploy")
+        try:
+            r_conflict = client.post(
+                f"/api/nodejs-manager/instances/{site_id}/process",
+                json={"action": "start"},
+            )
+            assert r_conflict.status_code == 409
+        finally:
+            nm._release_deploy_lock(held)
+
+        # 2. HTTP POST /process with action=start returns 202 Accepted and runs background task
+        r_start = client.post(
+            f"/api/nodejs-manager/instances/{site_id}/process",
+            json={"action": "start"},
+        )
+        assert r_start.status_code == 202, r_start.text
+        body = r_start.json()
+        assert body["queued"] is True
+        assert body["status"] == "accepted"
+        assert len(ready_calls) == 1
+        assert len(sync_calls) == 1
+        assert not nm._deploy_lock_path(site_id).exists()
+
+        # 3. GET /operation-status reports completed state and fresh instance payload
+        r_status = client.get(f"/api/nodejs-manager/instances/{site_id}/operation-status")
+        assert r_status.status_code == 200
+        st_data = r_status.json()
+        assert st_data["operation"]["active"] is False
+        assert st_data["operation"]["status"] == "completed"
+        assert st_data["instance"]["status"] == "running"
+
+
