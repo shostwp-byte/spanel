@@ -4,6 +4,25 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
+## [v1.0.10] — 2026-11-18
+
+Bản phát hành `v1.0.10` hợp nhất toàn bộ các bản vá bảo mật cách ly đa người thuê, quản lý quyền MariaDB loopback, khôi phục worker khi đổi tên/chuyển chủ website, chuẩn hóa header `Permissions-Policy` theo từng site và hoàn tất đầy đủ 8 hạng mục P1 qua các đợt thẩm định độc lập Lần 15 → Lần 17 (`PR #27`, `PR #28`, `PR #29`):
+
+> **Lưu ý phát hành:** Mã nguồn **Node.js Manager** đã được hợp nhất vào `main` kèm đầy đủ cơ chế cô lập `systemd` và chốt kiểm thử tích hợp CI, nhưng cờ cấu hình `nodejs_manager_enabled` vẫn giữ mặc định **`False`** (tắt trên môi trường sản xuất) cho tới khi hoàn tất các hạng mục hoàn thiện trải nghiệm nhóm P2.
+
+### 🔒 Bảo mật & Cách ly Đa Người thuê (`Round 16` & `Round 17 P1-3..P1-6`)
+- **Ẩn hoàn toàn `/home` của khách khác trên mọi systemd unit ứng dụng (`P1-6`):** Thay `ProtectHome=read-only` bằng `ProtectHome=tmpfs` kết hợp `BindReadOnlyPaths=/home/<user>` trên cả 4 trình sinh unit (`sync_laravel_worker_unit`, `sync_nodejs_worker_unit`, `write_node_app_unit`, `write_python_app_unit`), đồng thời tự động nâng cấp các unit cũ khi chạy `update.sh` và kiểm chứng trực tiếp trên Ubuntu runner của CI (`own=true`, `own_write=true`, `other=false`).
+- **Chấm dứt chạy `npm install` / `npm run build` ngoài jail trong `spanel-helper` (`P1-5`):** Thu gọn `prepare_nodejs_app_as_user` chỉ sửa stub symlink trong `node_modules/.bin` và bit thực thi dưới quyền user của site; toàn bộ lifecycle/build scripts của khách chỉ chạy qua `terminal-exec` (có mount-namespace jail `/home`, timeout và cgroup `user-<uid>.slice`).
+- **Đồng bộ khóa tạm ngưng (`ACCOUNT LOCK`), khóa ghi vượt quota (`write_locked`) và giới hạn truy vấn theo giờ trên cả 3 host MariaDB (`P1-3`):** Cấp phát tài khoản MariaDB cục bộ trên `localhost`, `127.0.0.1` và `::1` cho các kết nối TCP loopback (dưới `skip_name_resolve = 1`), đồng thời cưỡng chế đồng nhất `ACCOUNT LOCK`, bộ quyền chỉ-đọc/dọn-dẹp khi vượt quota và `MAX_*_PER_HOUR` trên cả 3 host kể cả sau khi khởi động lại panel, đổi mật khẩu DB hoặc đăng nhập phpMyAdmin SSO.
+- **Chặn tuyệt đối việc lấy mật khẩu từ `.env` của khách để `ALTER USER` MariaDB (`P1-4`):** `_ensure_nodejs_local_db_grants` chỉ đồng bộ các bản ghi `DatabaseAccount` thuộc chính chủ sở hữu website bằng mật khẩu đã lưu trong panel, không bao giờ đụng tới tài khoản MariaDB nằm ngoài sự quản lý của panel.
+
+### 🌐 Website, Đổi Tên miền, Quota & Header `Permissions-Policy` (`P1-2`, `P1-7`, `P1-8`)
+- **Đổi tên miền dời thư mục runtime & khôi phục tự động Worker (`42f4559`, `P1-2`, `P1-7`):** Khi đổi tên miền hoặc chuyển chủ sở hữu website, hệ thống dời thư mục site an toàn, cập nhật `NodejsInstance.owner_id`, tự động dựng lại cả systemd unit Node.js và Laravel Queue Worker tại đường dẫn mới (hoặc đường dẫn cũ khi rollback), trả cảnh báo rõ ràng trong HTTP response (`warnings` / `X-SPanel-Warning`) nếu có sự cố, và chỉ đổi tên các subdomain con khi người dùng chủ động bật tùy chọn `rename_children`. Sửa lỗi migration `migrate_repair_nodejs_worker_units` trong `update.sh` để đồng bộ thực sự các unit đang chạy.
+- **Quản lý `Permissions-Policy` theo từng Website & chống xung đột Header (`b147eb5`):** Bổ sung cấu hình `Permissions-Policy` bền vững theo từng website (UI + API + Custom Nginx). Với các ứng dụng reverse proxy (`proxy.conf.j2`), Nginx ẩn header gốc (`proxy_hide_header Permissions-Policy`) và tự động hợp nhất chính sách upstream (như `microphone=(self)` từ Next.js) vào một header duy nhất; với các vhost PHP/WordPress (`fastcgi_hide_header Permissions-Policy`), chính sách do SPanel quản lý tại tầng vhost/UI sẽ được ưu tiên áp dụng thay cho header phát sinh từ plugin PHP nhằm tránh trình duyệt nhận 2 header xung đột.
+- **Chuẩn hóa hạn mức lưu trữ & nâng `TasksMax` đúng một lần (`42f4559`, `a263c4a`, `P1-8`):** Quy ước thống nhất `storage_limit_mb <= 0` là không giới hạn; chuyển việc nâng mặc định `tasks_max` cũ (`80`/`512` → `2048`) sang migration Alembic chạy một lần `tasks_max_2048_once` và gỡ bỏ mọi vòng lặp ghi đè định kỳ khi khởi động hoặc cập nhật để bảo toàn tuyệt đối cấu hình `tasks_max` do Admin chỉ định.
+
+---
+
 ## [v1.0.9] — 2026-11-11
 
 Bản phát hành `v1.0.9` tập trung vào độ ổn định của Kernel Disk Quota sau khi khởi động lại máy chủ, hiệu năng bộ nhớ đệm của WordPress Manager, đồng bộ chủ sở hữu website khi đối chiếu đĩa (`fix-round7-p1`), và quy tắc bảo vệ ranh giới cơ sở dữ liệu / systemd trên CI:
