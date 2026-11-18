@@ -192,7 +192,7 @@ def list_site_apps(
         "max_total_websites": quota_info["max_total_websites"],
         "occupied_websites_count": quota_info["occupied_websites_count"],
         "website_quota_reached": quota_info["website_quota_reached"],
-        "nodejs_manager_enabled": bool(getattr(settings, "nodejs_manager_enabled", False)),
+        "nodejs_manager_enabled": bool(getattr(settings, "nodejs_manager_enabled", True)),
     }
 
 

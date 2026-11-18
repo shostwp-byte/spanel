@@ -12,11 +12,11 @@ from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.core.permissions import Role, ensure_role
+from app.core.permissions import Role, ensure_role, normalize_role
 from app.models.entities import User, UserPackage
 from app.schemas.schemas import UserPackageCreate, UserPackageOut, UserPackageUpdate
 from app.services.audit import log_action
@@ -1545,6 +1545,20 @@ def create_package(
         mysql_max_updates_per_hour=payload.mysql_max_updates_per_hour,
         mysql_max_connections_per_hour=payload.mysql_max_connections_per_hour,
     )
+    if normalize_role(current_user.role) == Role.reseller:
+        from sqlalchemy.orm import selectinload
+
+        from app.api.users import _enforce_reseller_package_pool_bounds, _enforce_reseller_resource_ceilings
+
+        reseller_actor = (
+            db.query(User)
+            .options(selectinload(User.reseller_package), selectinload(User.package))
+            .filter(User.id == current_user.id)
+            .first()
+            or current_user
+        )
+        _enforce_reseller_package_pool_bounds(reseller_actor, package)
+        _enforce_reseller_resource_ceilings(reseller_actor, package)
     db.add(package)
     db.commit()
     db.refresh(package)
@@ -1664,6 +1678,36 @@ def update_package(
         user.mysql_max_queries_per_hour = package.mysql_max_queries_per_hour
         user.mysql_max_updates_per_hour = package.mysql_max_updates_per_hour
         user.mysql_max_connections_per_hour = package.mysql_max_connections_per_hour
+    if normalize_role(current_user.role) == Role.reseller:
+        from sqlalchemy.orm import selectinload
+
+        from app.api.users import (
+            _enforce_reseller_package_pool_bounds,
+            _enforce_reseller_quotas,
+            _enforce_reseller_resource_ceilings,
+        )
+
+        reseller_actor = (
+            db.query(User)
+            .options(selectinload(User.reseller_package), selectinload(User.package))
+            .filter(User.id == current_user.id)
+            .first()
+            or current_user
+        )
+        _enforce_reseller_package_pool_bounds(reseller_actor, package)
+        _enforce_reseller_resource_ceilings(reseller_actor, package)
+        sub_users_on_pkg = [u for u in affected_users if u.reseller_id == reseller_actor.id]
+        if sub_users_on_pkg:
+            probe = sub_users_on_pkg[0]
+            _enforce_reseller_quotas(
+                db,
+                reseller_actor,
+                target_website_limit=probe.website_limit,
+                target_storage_mb=probe.storage_limit_mb,
+                target_database_limit=package.database_limit,
+                is_create=False,
+                exclude_user_id=probe.id,
+            )
     db.commit()
     from app.services import resource_monitor
     for user in affected_users:

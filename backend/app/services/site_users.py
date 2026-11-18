@@ -156,6 +156,16 @@ def site_php_fpm_socket(username: Optional[str], root_path: str | Path, php_vers
     return php_fpm_socket(username, php_version, root_path) if php_version else None
 
 
+LEGACY_SITE_ROOT = Path("/var/www")
+
+
+def legacy_site_root_for_domain(domain: str) -> Path:
+    cleaned = (domain or "").strip().lower()
+    if not DOMAIN_RE.fullmatch(cleaned):
+        raise ValueError("Invalid domain")
+    return LEGACY_SITE_ROOT / cleaned
+
+
 def site_root_for_domain(domain: str) -> str:
     username = linux_user_for_domain(domain)
     return str(HOME_ROOT / username / domain.strip().lower())

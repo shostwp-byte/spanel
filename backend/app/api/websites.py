@@ -1104,7 +1104,7 @@ def _rename_single_website(
         new_root_path = str(site_users.legacy_site_root_for_domain(new_domain))
 
     old_ssl_enabled = website.ssl_enabled
-    old_ssl_mode = getattr(website, "ssl_mode", "letsencrypt")
+    old_ssl_mode = getattr(website, "ssl_mode", "none") or "none"
     old_ssl_source_domain = getattr(website, "ssl_source_domain", None)
     old_ssl_cert_path = website.ssl_cert_path
     old_ssl_key_path = website.ssl_key_path
@@ -1112,6 +1112,9 @@ def _rename_single_website(
     old_alias_ssl = [(alias_row, bool(alias_row.ssl_enabled)) for alias_row in (getattr(website, "aliases", []) or [])]
     runtime_php = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
     moved_runtime = False
+    new_waf_synced = False
+    new_vhost_written = False
+    old_waf_removed = False
     rename_warnings: list[str] = []
 
     try:
@@ -1130,24 +1133,75 @@ def _rename_single_website(
         website.root_path = new_root_path
         if new_linux_user:
             website.linux_user = new_linux_user
-        website.ssl_enabled = False
-        website.ssl_mode = "letsencrypt"
-        website.ssl_source_domain = None
-        website.ssl_cert_path = None
-        website.ssl_key_path = None
-        website.ssl_ca_path = None
-        for alias_row, _ in old_alias_ssl:
-            alias_row.ssl_enabled = False
+
+        # Preserve HTTPS on the site and its unchanged aliases whenever the
+        # existing wildcard/shared/manual certificate (or an existing LE cert
+        # for new_domain) already covers new_domain (P2-3).
+        preserved_ssl = False
+        if old_ssl_enabled and old_ssl_mode in {"cloudflare", "shared", "manual"}:
+            cert_lookup_domain = (
+                (old_ssl_source_domain or old_domain)
+                if old_ssl_mode in {"cloudflare", "shared"}
+                else old_domain
+            )
+            try:
+                sans = ssl.cert_info(cert_lookup_domain).get("sans") or []
+            except Exception:
+                sans = []
+            if sans and ssl.cert_covers(sans, new_domain):
+                preserved_ssl = True
+                website.ssl_enabled = True
+                website.ssl_mode = old_ssl_mode
+                website.ssl_source_domain = old_ssl_source_domain
+                website.ssl_cert_path = old_ssl_cert_path
+                website.ssl_key_path = old_ssl_key_path
+                website.ssl_ca_path = old_ssl_ca_path
+                for alias_row, _ in old_alias_ssl:
+                    alias_row.ssl_enabled = bool(ssl.cert_covers(sans, alias_row.domain))
+
+        if not preserved_ssl:
+            new_le_dir = Path("/etc/letsencrypt/live") / new_domain
+            has_new_le = False
+            try:
+                has_new_le = (new_le_dir / "fullchain.pem").is_file() and (new_le_dir / "privkey.pem").is_file()
+            except OSError:
+                has_new_le = False
+            if has_new_le:
+                preserved_ssl = True
+                website.ssl_enabled = True
+                website.ssl_mode = "letsencrypt"
+                website.ssl_source_domain = None
+                website.ssl_cert_path = None
+                website.ssl_key_path = None
+                website.ssl_ca_path = None
+                _sync_alias_ssl_flags(website)
+            else:
+                website.ssl_enabled = False
+                website.ssl_mode = "none"
+                website.ssl_source_domain = None
+                website.ssl_cert_path = None
+                website.ssl_key_path = None
+                website.ssl_ca_path = None
+                for alias_row, _ in old_alias_ssl:
+                    alias_row.ssl_enabled = False
 
         _ensure_default_waf_file(website.domain)
         waf_res = waf.sync_website_rules(website)
         if waf_res.returncode != 0:
             raise RuntimeError(_command_error(waf_res))
+        new_waf_synced = True
         if website.http_flood_enabled:
             _sync_http_flood_zones(db)
-        _rewrite_website_vhost(website, root_path=new_root_path, linux_user=new_linux_user)
+        _rewrite_website_vhost(
+            website,
+            root_path=new_root_path,
+            linux_user=new_linux_user,
+            preserve_existing_ssl=preserved_ssl,
+        )
+        new_vhost_written = True
         nginx.delete_wordpress_vhost(old_domain)
         waf.remove_site_rules(old_domain)
+        old_waf_removed = True
         if website.http_flood_enabled:
             _sync_http_flood_zones(db)
 
@@ -1177,7 +1231,11 @@ def _rename_single_website(
                 rename_warnings.append(worker_msg)
 
         try:
-            ssl.release_site_certificates(db, old_domain, exclude_website_id=website.id)
+            # Do NOT pass exclude_website_id=website.id here: website.domain is
+            # already new_domain, and we want release_site_certificates to keep
+            # the old certificate if it still covers new_domain or any of this
+            # website's own kept aliases.
+            ssl.release_site_certificates(db, old_domain)
         except Exception as exc:
             logger.warning("could not release old SSL certificates for %s: %s", old_domain, exc)
         try:
@@ -1207,9 +1265,34 @@ def _rename_single_website(
                     )
                 elif not settings.command_dry_run and Path(new_root_path).exists() and not Path(old_root_path).exists():
                     Path(new_root_path).rename(old_root_path)
-                _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
             except Exception:
                 logger.exception("rename rollback of %s could not restore the site runtime", old_domain)
+        if old_waf_removed or new_waf_synced or new_vhost_written or moved_runtime:
+            try:
+                _ensure_default_waf_file(old_domain)
+                waf.sync_website_rules(website)
+            except Exception:
+                logger.exception("rename rollback of %s could not restore old WAF rules", old_domain)
+            try:
+                _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
+            except Exception:
+                logger.exception("rename rollback of %s could not restore old Nginx vhost", old_domain)
+            if new_vhost_written:
+                try:
+                    nginx.delete_wordpress_vhost(new_domain)
+                except Exception:
+                    pass
+            if new_waf_synced:
+                try:
+                    waf.remove_site_rules(new_domain)
+                except Exception:
+                    pass
+            if website.http_flood_enabled:
+                try:
+                    _sync_http_flood_zones(db)
+                except Exception:
+                    pass
+        if moved_runtime:
             # The move back deleted the workers' units again (they pointed at
             # the new path); recreate them at the old one.
             _resync_site_workers(db, website)

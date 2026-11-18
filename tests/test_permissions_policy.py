@@ -306,6 +306,21 @@ def test_api_permissions_policy_persistence_and_tenant_isolation(tmp_path, monke
         db.add(site)
         db.commit()
         db.refresh(site)
+        from app.models.entities import NodejsInstance
+
+        db.add(
+            NodejsInstance(
+                website_id=site.id,
+                owner_id=alice.id,
+                port=21000,
+                detached=False,
+                process_enabled=True,
+                node_major="22",
+                start_mode="npm",
+                start_arg="start",
+            )
+        )
+        db.commit()
         site_id = site.id
         alice_ref, bob_ref = alice, bob
 
