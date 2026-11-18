@@ -1023,10 +1023,17 @@ try:
     from app.models.entities import NodejsInstance, Website
 
     with SessionLocal() as db:
-        rows = db.query(NodejsInstance).all()
+        # NodejsInstance is a table with real columns (8cec410); it has no
+        # .data dict. Reading row.data raised AttributeError outside the
+        # per-row try, so this migration used to skip every instance.
+        rows = (
+            db.query(NodejsInstance)
+            .filter(NodejsInstance.detached.is_(False), NodejsInstance.process_enabled.is_(True))
+            .all()
+        )
         for row in rows:
-            data = row.data if isinstance(row.data, dict) else {}
-            if not data.get("installed") or data.get("detached") or not data.get("process_enabled", True):
+            data = nm._row_to_instance_dict(row)
+            if data.get("port") is None:
                 continue
             site = db.query(Website).filter(Website.id == row.website_id).first()
             if site is None:
@@ -1040,9 +1047,9 @@ try:
                     site_root,
                     app_dir,
                     node_major=str(data.get("node_major") or "22"),
-                    start_mode=str(data.get("start_mode") or "npm"),
-                    start_arg=str(data.get("start_arg") or "start"),
-                    port=int(data.get("port") or 21000),
+                    start_mode=str(data.get("start_mode") or "node"),
+                    start_arg=str(data.get("start_arg") or "server.js"),
+                    port=int(data["port"]),
                     memory_mb=int(data.get("memory_mb") or 512),
                     node_env=str(data.get("node_env") or "production"),
                     enabled=True,
@@ -1054,10 +1061,56 @@ try:
                     f"WARNING: Node.js worker unit repair skipped for site_id={row.website_id}: {inner_exc}",
                     file=sys.stderr,
                 )
+
+        try:
+            from app.api import laravel_manager as lm
+
+            l_instances = (lm._load_toolkit_state().get("instances") or {})
+            for site_id_str, saved in l_instances.items():
+                if not isinstance(saved, dict):
+                    continue
+                q_cfg = saved.get("queue_worker") or {}
+                if not q_cfg.get("enabled"):
+                    continue
+                site = db.query(Website).filter(Website.id == int(site_id_str)).first()
+                if site is None:
+                    continue
+                linux_user, site_root, app_dir = lm._resolve_laravel_paths(
+                    site, db, saved.get("subpath") or ""
+                )
+                lm._sync_laravel_worker_unit(
+                    linux_user,
+                    site_root,
+                    app_dir,
+                    (site.php_version or "8.3"),
+                    q_cfg,
+                    strict=False,
+                )
+                print(f"Resynced Laravel queue worker unit for {site.domain}")
+        except Exception as l_exc:
+            print(f"WARNING: Laravel worker unit repair skipped: {l_exc}", file=sys.stderr)
 except Exception as exc:
     print(f"WARNING: Node.js worker unit migration skipped: {exc}", file=sys.stderr)
 PY_REPAIR_NODEJS
   ) || true
+
+  local app_u unit_user need_reload=0 u_svc
+  local -a touched_app_units=()
+  for app_u in /etc/systemd/system/spanel-app-*.service; do
+    [[ -f "$app_u" ]] || continue
+    grep -q '^ProtectHome=read-only$' "$app_u" 2>/dev/null || continue
+    unit_user="$(awk -F= '$1=="User"{print $2; exit}' "$app_u" 2>/dev/null || true)"
+    [[ "$unit_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ && -d "/home/${unit_user}" ]] || continue
+    sed -i "s|^ProtectHome=read-only$|ProtectHome=tmpfs\nBindReadOnlyPaths=/home/${unit_user}|" "$app_u" 2>/dev/null || continue
+    need_reload=1
+    touched_app_units+=("$(basename "$app_u")")
+  done
+  if (( need_reload == 1 )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    for u_svc in "${touched_app_units[@]}"; do
+      systemctl try-restart "$u_svc" >/dev/null 2>&1 || true
+    done
+  fi
 }
 
 ensure_terminal_tools() {
