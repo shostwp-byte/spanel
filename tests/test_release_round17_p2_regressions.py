@@ -309,3 +309,152 @@ def test_p2_2_process_start_runs_in_background_with_site_lock_and_operation_stat
         assert st_data["instance"]["status"] == "running"
 
 
+# --------------------------------------------------------------------------- P2-3
+
+
+def test_p2_3_rename_preserves_wildcard_ssl_and_alias_ssl_and_keeps_covering_cert(tmp_path):
+    _, SessionLocal = _make_db()
+    with SessionLocal() as db:
+        alice = User(username="alice", email="alice@example.com", hashed_password="x", role="end_user")
+        db.add(alice)
+        db.flush()
+        site = Website(
+            domain="app1.example.com",
+            owner_id=alice.id,
+            root_path=websites_api.site_users.site_root_for_panel_user("alice", "app1.example.com"),
+            document_root="public_html",
+            linux_user="alice",
+            app_type="php",
+            php_version="8.4",
+            ssl_enabled=True,
+            ssl_mode="cloudflare",
+            ssl_source_domain="example.com",
+        )
+        db.add(site)
+        db.flush()
+        alias = WebsiteAlias(
+            website_id=site.id,
+            domain="portal.example.com",
+            mode="alias",
+            ssl_enabled=True,
+        )
+        db.add(alias)
+        db.commit()
+        db.refresh(site)
+
+        deleted_ssl = []
+        with patch.object(websites_api.site_users, "move_site_runtime"), \
+             patch.object(websites_api, "_ensure_default_waf_file"), \
+             patch.object(websites_api.waf, "sync_website_rules", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+             patch.object(websites_api.waf, "remove_site_rules"), \
+             patch.object(websites_api, "_rewrite_website_vhost"), \
+             patch.object(websites_api.nginx, "delete_wordpress_vhost"), \
+             patch.object(websites_api, "_refresh_placeholder_page_if_unchanged"), \
+             patch.object(websites_api.dns, "zone_for_new_website"), \
+             patch.object(websites_api.ssl, "cert_info", return_value={"sans": ["example.com", "*.example.com"]}), \
+             patch.object(websites_api.ssl, "delete_ssl", side_effect=lambda d: deleted_ssl.append(d) or SimpleNamespace(returncode=0, stdout="", stderr="")):
+            websites_api._rename_single_website(db, site, "app2.example.com", alice, alice.id)
+
+        assert site.domain == "app2.example.com"
+        assert site.ssl_enabled is True
+        assert site.ssl_mode == "cloudflare"
+        assert site.ssl_source_domain == "example.com"
+        db.refresh(alias)
+        assert alias.ssl_enabled is True
+        # Certificate still covers app2.example.com and portal.example.com -> never deleted
+        assert deleted_ssl == []
+
+
+def test_p2_3_rename_rollback_restores_old_waf_before_vhost_and_cleans_new_files():
+    _, SessionLocal = _make_db()
+    with SessionLocal() as db:
+        alice = User(username="alice", email="alice@example.com", hashed_password="x", role="end_user")
+        db.add(alice)
+        db.flush()
+        site = Website(
+            domain="old.example.com",
+            owner_id=alice.id,
+            root_path=websites_api.site_users.site_root_for_panel_user("alice", "old.example.com"),
+            document_root="public_html",
+            linux_user="alice",
+            app_type="php",
+            php_version="8.4",
+            ssl_enabled=True,
+            ssl_mode="manual",
+            ssl_cert_path="/etc/ssl/old.crt",
+            ssl_key_path="/etc/ssl/old.key",
+        )
+        db.add(site)
+        db.flush()
+        alias = WebsiteAlias(website_id=site.id, domain="alias.old.example.com", mode="alias", ssl_enabled=True)
+        db.add(alias)
+        db.commit()
+        db.refresh(site)
+
+        events: list[tuple[str, str]] = []
+
+        with patch.object(websites_api.site_users, "move_site_runtime", side_effect=lambda o, n, u, p=None: events.append(("move", f"{o}->{n}"))), \
+             patch.object(websites_api, "_ensure_default_waf_file", side_effect=lambda d: events.append(("ensure_waf", d))), \
+             patch.object(websites_api.waf, "sync_website_rules", side_effect=lambda w: events.append(("sync_waf", w.domain)) or SimpleNamespace(returncode=0, stdout="", stderr="")), \
+             patch.object(websites_api.waf, "remove_site_rules", side_effect=lambda d: events.append(("remove_waf", d))), \
+             patch.object(websites_api, "_rewrite_website_vhost", side_effect=lambda w, **kw: events.append(("rewrite_vhost", w.domain))), \
+             patch.object(websites_api.nginx, "delete_wordpress_vhost", side_effect=lambda d: events.append(("delete_vhost", d))), \
+             patch.object(websites_api, "_refresh_placeholder_page_if_unchanged", side_effect=RuntimeError("boom after waf.remove_site_rules")), \
+             patch.object(websites_api.ssl, "cert_info", return_value={"sans": ["old.example.com"]}):
+            with pytest.raises(HTTPException):
+                websites_api._rename_single_website(db, site, "new.example.com", alice, alice.id)
+
+        assert site.domain == "old.example.com"
+        assert site.ssl_enabled is True
+        assert site.ssl_mode == "manual"
+        assert alias.ssl_enabled is True
+        # Rollback must restore old WAF rules BEFORE rewriting old vhost, and delete new vhost + new WAF rules
+        rollback_events = events[events.index(("remove_waf", "old.example.com")) + 1:]
+        assert ("sync_waf", "old.example.com") in rollback_events
+        assert ("rewrite_vhost", "old.example.com") in rollback_events
+        assert rollback_events.index(("sync_waf", "old.example.com")) < rollback_events.index(("rewrite_vhost", "old.example.com"))
+        assert ("delete_vhost", "new.example.com") in rollback_events
+        assert ("remove_waf", "new.example.com") in rollback_events
+
+
+def test_p2_3_rename_legacy_site_without_linux_user_moves_and_rolls_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "command_dry_run", False)
+    monkeypatch.setattr(
+        websites_api.site_users,
+        "legacy_site_root_for_domain",
+        lambda dom: tmp_path / dom,
+    )
+    old_dir = tmp_path / "legacy-old.example.com"
+    (old_dir / "public_html").mkdir(parents=True)
+    (old_dir / "public_html" / "index.html").write_text("legacy", encoding="utf-8")
+
+    _, SessionLocal = _make_db()
+    with SessionLocal() as db:
+        site = Website(
+            domain="legacy-old.example.com",
+            owner_id=1,
+            root_path=str(old_dir),
+            document_root="public_html",
+            linux_user=None,
+            app_type="static",
+        )
+        db.add(site)
+        db.commit()
+        db.refresh(site)
+
+        with patch.object(websites_api, "_ensure_default_waf_file"), \
+             patch.object(websites_api.waf, "sync_website_rules", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+             patch.object(websites_api.waf, "remove_site_rules"), \
+             patch.object(websites_api, "_rewrite_website_vhost"), \
+             patch.object(websites_api.nginx, "delete_wordpress_vhost"), \
+             patch.object(websites_api, "_refresh_placeholder_page_if_unchanged"), \
+             patch.object(websites_api.ssl, "release_site_certificates"), \
+             patch.object(websites_api.dns, "zone_for_new_website"):
+            websites_api._rename_single_website(db, site, "legacy-new.example.com", None, None)
+
+        new_dir = tmp_path / "legacy-new.example.com"
+        assert (new_dir / "public_html" / "index.html").read_text(encoding="utf-8") == "legacy"
+        assert not old_dir.exists()
+
+
+
