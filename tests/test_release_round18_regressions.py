@@ -739,3 +739,18 @@ def test_v4_owner_change_rollback_restores_runtime_and_workers_and_rename_surfac
                 websites_api._rename_single_website(db, site, "v4-new.example.com", alice, alice.id)
         assert resyncs == []
         assert "disk full during rollback" in exc_ren.value.detail
+
+
+# --------------------------------------------------------------------------- M8
+
+
+def test_m8_nodejs_manager_default_flag_matches_readme_and_changelog():
+    from app.core.config import Settings
+
+    assert Settings().nodejs_manager_enabled is True
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "mặc định ở trạng thái tắt (`NODEJS_MANAGER_ENABLED=false`)" not in readme
+    assert "bật mặc định (`NODEJS_MANAGER_ENABLED=true`)" in readme
+    assert "NODEJS_MANAGER_ENABLED=false" in readme
+    assert "NODEJS_MANAGER_ENABLED=true" in changelog

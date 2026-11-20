@@ -128,29 +128,29 @@ flowchart TB
   - Webhook mặc định tắt, sử dụng token ngẫu nhiên mã hóa kèm secret ký xác thực `HMAC-SHA256` (`X-Hub-Signature-256` / `X-Gitlab-Token`), chạy nền bất đồng bộ (`202 Accepted`) với khóa chống xung đột theo từng website (`409 Conflict`).
   - Tích hợp trình quản lý gói `npm` (`install`, `ci`, `run build`, `prune`, `audit`) và 7 chốt kiểm tra bảo mật tự động (chặn lộ `.env`/`.git` trên Nginx, kiểm tra quyền tệp `0640`, khóa thực thi script trong `uploads`, đồng bộ `NODE_ENV=production`).
 
-##### Hướng dẫn Kích hoạt & Cấu hình Node.js Manager
+##### Hướng dẫn Cấu hình & Bật/Tắt Node.js Manager
 
-Để đảm bảo máy chủ vận hành tinh gọn khi chưa có nhu cầu chạy ứng dụng Node.js, **Node.js Manager** mặc định ở trạng thái tắt (`NODEJS_MANAGER_ENABLED=false`). Quản trị viên thực hiện 4 bước sau để bật đầy đủ tính năng cho máy chủ và khách hàng:
+**Node.js Manager** được **bật mặc định (`NODEJS_MANAGER_ENABLED=true`)** trên SPanel sau khi hoàn tất đầy đủ các chốt cách ly `systemd`, khóa đồng bộ theo site và kiểm thử tích hợp CI. Để kiểm soát chặt chẽ phạm vi sử dụng cho từng khách hàng, tính năng vẫn đi qua **2 lớp cổng bảo vệ** (tiện ích `Application` trong Addon Manager và hạn mức gói `node_apps_limit = 0` mặc định):
 
-1. **Bước 1 — Bật cờ `NODEJS_MANAGER_ENABLED=true` trên máy chủ:**
-   Đăng nhập SSH với quyền `root` và chạy lệnh sau để kích hoạt module trong `/opt/spanel/backend/.env` rồi khởi động lại `spanel-api`:
-   ```bash
-   grep -q '^NODEJS_MANAGER_ENABLED=' /opt/spanel/backend/.env \
-     && sudo sed -i 's/^NODEJS_MANAGER_ENABLED=.*/NODEJS_MANAGER_ENABLED=true/' /opt/spanel/backend/.env \
-     || echo 'NODEJS_MANAGER_ENABLED=true' | sudo tee -a /opt/spanel/backend/.env
-   sudo systemctl restart spanel-api
-   ```
-2. **Bước 2 — Bật tiện ích mở rộng `Application` trong Addon Manager (`/addons`):**
+1. **Bước 1 — Bật tiện ích mở rộng `Application` trong Addon Manager (`/addons`):**
    - Đăng nhập SPanel với quyền **Admin** → truy cập menu **Extra Features → Addon Manager (`/addons`)**.
    - Tại mục **Application (Node/Python/Docker)**, nhấn **Install / Enable** để mở khóa nhóm tính năng ứng dụng trên toàn máy chủ.
-3. **Bước 3 — Cấp hạn mức Node.js trong Gói Dịch vụ (`Manage User Packages` — `/packages`):**
+2. **Bước 2 — Cấp hạn mức Node.js trong Gói Dịch vụ (`Manage User Packages` — `/packages`):**
    - Truy cập **Account Manager → Manage User Packages (`/packages`)**, chọn tạo mới hoặc chỉnh sửa gói dịch vụ của khách hàng:
-     - **Node.js Apps Limit (`node_apps_limit`):** Đặt số lượng ứng dụng Node.js tối đa được phép tạo lớn hơn `0` (ví dụ: `3` hoặc `5`). *(Lưu ý: Nếu gói có hạn mức bằng `0`, tài khoản End User sẽ không thấy menu Node.js và không thể kích hoạt Webhook).*
+     - **Node.js Apps Limit (`node_apps_limit`):** Đặt số lượng ứng dụng Node.js tối đa được phép tạo lớn hơn `0` (ví dụ: `3` hoặc `5`). *(Lưu ý: Mặc định trên các gói cũ là `0` — tài khoản End User sẽ không thấy menu Node.js và không thể kích hoạt Webhook cho đến khi Admin cấp hạn mức).*
      - **Node.js App Memory Ceiling (`node_app_memory_mb`):** Đặt trần bộ nhớ RAM tối đa cho mỗi tiến trình Node.js (ví dụ: `512 MB` hoặc `1024 MB`).
-4. **Bước 4 — Cài đặt Node.js Runtime (`v18` / `v20` / `v22` / `v24`) & Khởi tạo Ứng dụng (`/nodejs-manager`):**
+3. **Bước 3 — Cài đặt Node.js Runtime (`v18` / `v20` / `v22` / `v24`) & Khởi tạo Ứng dụng (`/nodejs-manager`):**
    - Trên thanh công cụ góc trên bên phải của **Admin**, chuyển góc nhìn sang **User** (hoặc dùng **Login as** vào tài khoản khách hàng) → mở menu **Application → Node.js (`/nodejs-manager`)**.
    - **Cài đặt Runtime (chỉ Admin):** Nhấn nút **Node.js Runtimes** trên thanh công cụ để cài đặt 1-Click các phiên bản Node.js LTS (`v22`, `v20`, `v18`, `v24`) vào hệ thống.
    - **Triển khai Ứng dụng (End User):** Nhấn **+ Cài đặt Node.js**, chọn tên miền đích, kiến trúc mẫu (**Starter Template** hoặc **Git Repository**), phiên bản Node.js, giới hạn RAM và chế độ cơ sở dữ liệu để khởi chạy ứng dụng.
+4. **Công tắc tắt khẩn cấp toàn máy chủ (Tùy chọn):**
+   Nếu quản trị viên muốn vô hiệu hóa hoàn toàn toàn bộ API/UI của Node.js Manager trên máy chủ (kể cả khi đã cài addon `Application`), hãy ghi `NODEJS_MANAGER_ENABLED=false` vào `/opt/spanel/backend/.env` và khởi động lại `spanel-api`:
+   ```bash
+   grep -q '^NODEJS_MANAGER_ENABLED=' /opt/spanel/backend/.env \
+     && sudo sed -i 's/^NODEJS_MANAGER_ENABLED=.*/NODEJS_MANAGER_ENABLED=false/' /opt/spanel/backend/.env \
+     || echo 'NODEJS_MANAGER_ENABLED=false' | sudo tee -a /opt/spanel/backend/.env
+   sudo systemctl restart spanel-api
+   ```
 
 #### 🔴 Laravel Manager (`/laravel-manager` — Composer, Artisan, Queue Worker & Bảo mật)
 - **Triển khai & Nhận diện Tự động:**
