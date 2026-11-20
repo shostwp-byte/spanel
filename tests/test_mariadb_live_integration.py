@@ -194,3 +194,80 @@ def test_v1_live_mariadb_write_locked_active_user_can_select_delete_but_not_inse
         assert "denied" in (ddl.stderr or "").lower(), ddl.stderr
     finally:
         mariadb.drop_database(db_name, db_user)
+
+
+def test_v5_live_mariadb_backup_restore_keeps_write_lock_and_account_lock(tmp_path, monkeypatch):
+    """Round 18 V5 live check:
+    Restoring a SQL dump onto a write-locked DB owned by a suspended user must
+    import the SQL dump cleanly and leave all 3 loopback hosts locked and
+    write-locked right afterward.
+    """
+    from app.models.entities import DatabaseAccount, User
+    from app.services import backup, db_backends, mariadb
+
+    monkeypatch.setattr(mariadb.settings, "command_dry_run", False)
+    db_name = "ci_v5_bk_db"
+    db_user = "ci_v5_bk_u"
+    db_pass = "Str0ng!BkPass77"
+
+    sql_dump = tmp_path / "restore.sql"
+    sql_dump.write_text(
+        "CREATE TABLE IF NOT EXISTS restored_tbl (id INT PRIMARY KEY, v VARCHAR(32));\n"
+        "REPLACE INTO restored_tbl VALUES (1, 'from_backup');\n",
+        encoding="utf-8",
+    )
+
+    mariadb.drop_database(db_name, db_user)
+    mariadb.ensure_local_database_user_hosts(
+        db_name,
+        db_user,
+        db_pass,
+        write_locked=True,
+        account_locked=True,
+        hourly_limits=(400, 0, 0),
+    )
+
+    try:
+        owner = User(
+            username="ci_bk_owner",
+            email="bk@example.com",
+            hashed_password="x",
+            role="end_user",
+            is_active=False,
+            mysql_max_queries_per_hour=400,
+        )
+        acc = DatabaseAccount(
+            owner_id=1,
+            db_name=db_name,
+            db_user=db_user,
+            db_password="enc",
+            write_locked=True,
+        )
+        backup._restore_database_and_reapply_locks(
+            db_backends.LocalBackend(),
+            None,
+            db_name,
+            db_user,
+            db_pass,
+            sql_dump,
+            existing_acc=acc,
+            owner=owner,
+        )
+        # 1. Dump actually imported
+        check_data = mariadb._run_sql(f"SELECT v FROM `{db_name}`.restored_tbl WHERE id = 1;\n")
+        assert "from_backup" in (check_data.stdout or "")
+
+        # 2. Suspended user still blocked over TCP 127.0.0.1
+        tcp_locked = _run_as_tenant_tcp(db_user, db_pass, db_name, "SELECT 1;")
+        assert tcp_locked.returncode != 0
+        assert "locked" in (tcp_locked.stderr or "").lower(), tcp_locked.stderr
+
+        # 3. After unsuspending owner, write_lock MUST still block INSERT while allowing SELECT
+        mariadb.set_account_locked(db_user, False)
+        sel_ok = _run_as_tenant_tcp(db_user, db_pass, db_name, "SELECT v FROM restored_tbl WHERE id = 1;")
+        assert sel_ok.returncode == 0 and sel_ok.stdout.strip() == "from_backup"
+        ins_denied = _run_as_tenant_tcp(db_user, db_pass, db_name, "INSERT INTO restored_tbl VALUES (2, 'no');")
+        assert ins_denied.returncode != 0
+        assert "denied" in (ins_denied.stderr or "").lower(), ins_denied.stderr
+    finally:
+        mariadb.drop_database(db_name, db_user)

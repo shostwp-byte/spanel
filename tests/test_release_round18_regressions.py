@@ -83,3 +83,99 @@ def test_v1_create_credentials_locks_atomically_and_avoids_revoke_error_1141_and
         target = f"'shop_u'@'{host}'"
         assert f"CREATE USER IF NOT EXISTS {target} IDENTIFIED BY 'RotatedPass!99' ACCOUNT LOCK;" in sent[0]
         assert f"MAX_USER_CONNECTIONS 10" in sent[1]
+
+
+# --------------------------------------------------------------------------- V5
+
+
+def test_v5_backup_restore_reapplies_write_lock_suspension_and_hourly_limits(tmp_path, monkeypatch):
+    from app.models.entities import DatabaseAccount, User
+    from app.services import backup, db_backends, mariadb
+
+    sql_dump = tmp_path / "dump.sql"
+    sql_dump.write_text("SELECT 1;\n", encoding="utf-8")
+
+    events: list[tuple] = []
+    backend = db_backends.LocalBackend()
+    monkeypatch.setattr(
+        backend,
+        "create_database_credentials",
+        lambda db_name, db_user, db_pw, **kw: events.append(("create_temp", db_name, db_user)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "set_account_locked",
+        lambda db_user, locked: events.append(("unlock_for_import", db_user, locked)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "import_database_as_tenant",
+        lambda db_name, path, **kw: events.append(("import", db_name)),
+    )
+    monkeypatch.setattr(
+        mariadb,
+        "ensure_local_database_user_hosts",
+        lambda db_name, db_user, db_pw, **kw: events.append(
+            ("reapply", db_name, kw["write_locked"], kw["account_locked"], kw["hourly_limits"])
+        ),
+    )
+    monkeypatch.setattr(
+        mariadb,
+        "set_account_locked",
+        lambda db_user, locked: events.append(("kill_and_lock", db_user, locked)),
+    )
+
+    owner = User(
+        username="sus_bk",
+        email="bk@example.com",
+        hashed_password="x",
+        role="end_user",
+        is_active=False,
+        mysql_max_queries_per_hour=500,
+    )
+    acc = DatabaseAccount(
+        owner_id=1,
+        db_name="bk_db",
+        db_user="bk_u",
+        db_password="enc",
+        write_locked=True,
+    )
+
+    backup._restore_database_and_reapply_locks(
+        backend,
+        None,
+        "bk_db",
+        "bk_u",
+        "RestorePass!9",
+        sql_dump,
+        existing_acc=acc,
+        owner=owner,
+    )
+    assert events == [
+        ("create_temp", "bk_db", "bk_u"),
+        ("unlock_for_import", "bk_u", False),
+        ("import", "bk_db"),
+        ("reapply", "bk_db", True, True, (500, 0, 0)),
+        ("kill_and_lock", "bk_u", True),
+    ]
+
+    # Even if SQL import raises mid-way, finally MUST re-apply locks
+    events.clear()
+    monkeypatch.setattr(
+        backend,
+        "import_database_as_tenant",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("corrupt sql")),
+    )
+    with pytest.raises(RuntimeError, match="corrupt sql"):
+        backup._restore_database_and_reapply_locks(
+            backend,
+            None,
+            "bk_db",
+            "bk_u",
+            "RestorePass!9",
+            sql_dump,
+            existing_acc=acc,
+            owner=owner,
+        )
+    assert ("reapply", "bk_db", True, True, (500, 0, 0)) in events
+    assert ("kill_and_lock", "bk_u", True) in events

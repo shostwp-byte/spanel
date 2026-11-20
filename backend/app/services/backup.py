@@ -1371,6 +1371,86 @@ def _extract_member_to_file(archive: Path, member_name: str, output_dir: Path) -
         return target
 
 
+def _restore_database_and_reapply_locks(
+    backend,
+    target_host,
+    db_name: str,
+    db_user: str,
+    db_password: str,
+    sql_path,
+    *,
+    existing_acc: Optional[DatabaseAccount],
+    owner: Optional[User],
+) -> None:
+    """Restore a tenant database while preserving its quota write-lock,
+    owner suspension ACCOUNT LOCK, and MariaDB hourly limits (Round 18 V5).
+
+    Because ``import_database_as_tenant`` connects as the tenant DB user, we
+    only grant temporary write/login access for the duration of the SQL import
+    and unconditionally re-apply the panel's authoritative lock state in
+    ``finally``.
+    """
+    was_write_locked = bool(getattr(existing_acc, "write_locked", False))
+    is_suspended = bool(owner is not None and getattr(owner, "is_active", True) is False)
+    hourly_limits = mariadb.owner_hourly_limits(owner) if owner is not None else (0, 0, 0)
+
+    if sql_path:
+        backend.create_database_credentials(
+            db_name,
+            db_user,
+            db_password,
+            allow_existing_user=True,
+            allow_existing_database=True,
+        )
+        if is_suspended:
+            backend.set_account_locked(db_user, False)
+        try:
+            backend.import_database_as_tenant(
+                db_name, str(sql_path), db_user=db_user, db_password=db_password
+            )
+        finally:
+            if target_host is None:
+                mariadb.ensure_local_database_user_hosts(
+                    db_name,
+                    db_user,
+                    db_password,
+                    write_locked=was_write_locked,
+                    account_locked=is_suspended,
+                    hourly_limits=hourly_limits,
+                )
+                if is_suspended:
+                    mariadb.set_account_locked(db_user, True)
+            else:
+                if was_write_locked:
+                    backend.set_write_lock(db_name, db_user, True)
+                if is_suspended:
+                    backend.set_account_locked(db_user, True)
+    else:
+        if target_host is None:
+            mariadb.ensure_local_database_user_hosts(
+                db_name,
+                db_user,
+                db_password,
+                write_locked=was_write_locked,
+                account_locked=is_suspended,
+                hourly_limits=hourly_limits,
+            )
+            if is_suspended:
+                mariadb.set_account_locked(db_user, True)
+        else:
+            backend.create_database_credentials(
+                db_name,
+                db_user,
+                db_password,
+                allow_existing_user=True,
+                allow_existing_database=True,
+            )
+            if was_write_locked:
+                backend.set_write_lock(db_name, db_user, True)
+            if is_suspended:
+                backend.set_account_locked(db_user, True)
+
+
 def _restore_database_host(db, db_name: str, descriptor) -> tuple[Optional[RemoteDbHost], str]:
     """Where a database from a user backup is recreated, and a note when that
     is not where it was.
@@ -1596,16 +1676,21 @@ def restore_user_backup(
                     if note:
                         database_notes.append(f"{db_name}: {note}")
                     backend = db_backends.backend_for_host(target_host)
-                    backend.create_database_credentials(
-                        db_name, db_user, db_password, allow_existing_user=True, allow_existing_database=True
-                    )
+                    db_account = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
+                    if db_account is None:
+                        db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
                     sql_member = db_info.get("sql_member") or f"databases/{domain}.sql"
                     sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
-                    if sql_path:
-                        backend.import_database_as_tenant(
-                            db_name, str(sql_path), db_user=db_user, db_password=db_password
-                        )
-                    db_account = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
+                    _restore_database_and_reapply_locks(
+                        backend,
+                        target_host,
+                        db_name,
+                        db_user,
+                        db_password,
+                        sql_path,
+                        existing_acc=db_account,
+                        owner=user,
+                    )
                     if db_account is None:
                         db.add(DatabaseAccount(
                             owner_id=website.owner_id,
@@ -1668,23 +1753,25 @@ def restore_user_backup(
                 if note:
                     database_notes.append(f"{db_name}: {note}")
                 backend = db_backends.backend_for_host(target_host)
-                backend.create_database_credentials(
-                    db_name, db_user, db_password, allow_existing_user=True, allow_existing_database=True
-                )
+                db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
                 sql_member = extra_db.get("sql_member")
-                if sql_member:
-                    sql_path = _extract_member_to_file(archive, sql_member, tmp_dir)
-                    if sql_path:
-                        backend.import_database_as_tenant(
-                            db_name, str(sql_path), db_user=db_user, db_password=db_password
-                        )
+                sql_path = _extract_member_to_file(archive, sql_member, tmp_dir) if sql_member else None
+                _restore_database_and_reapply_locks(
+                    backend,
+                    target_host,
+                    db_name,
+                    db_user,
+                    db_password,
+                    sql_path,
+                    existing_acc=db_account,
+                    owner=user,
+                )
                 linked_website_id = None
                 linked_domain = (extra_db.get("website_domain") or "").strip().lower()
                 if linked_domain:
                     linked_site = db.query(Website).filter(Website.domain == linked_domain, Website.owner_id == user.id).first()
                     if linked_site:
                         linked_website_id = linked_site.id
-                db_account = db.query(DatabaseAccount).filter(DatabaseAccount.db_name == db_name).first()
                 if db_account is None:
                     db.add(DatabaseAccount(
                         owner_id=user.id,
