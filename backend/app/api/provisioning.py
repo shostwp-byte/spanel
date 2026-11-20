@@ -6,7 +6,12 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
-from app.api.users import _enforce_reseller_quotas, _reseller_can_grant_terminal
+from app.api.users import (
+    _enforce_reseller_quotas,
+    _enforce_reseller_resource_ceilings,
+    _preview_user_limits,
+    _reseller_can_grant_terminal,
+)
 from app.core.database import get_db
 from app.core.permissions import Role, ensure_role, is_admin_role
 from app.core.rate_limit import enforce_rate_limit
@@ -295,6 +300,9 @@ def _create_account(
             target_database_limit=eff_database_limit,
             is_create=True,
         )
+        preview = _preview_user_limits(package)
+        apply_account_limits(preview, package, payload.limits)
+        _enforce_reseller_resource_ceilings(reseller, preview)
     else:
         _check_reseller_package(db, payload.is_reseller, payload.reseller_package_id)
 
@@ -747,6 +755,9 @@ def _change_package(
             is_create=False,
             exclude_user_id=account.user.id,
         )
+        preview = _preview_user_limits(package)
+        apply_account_limits(preview, package, payload.limits)
+        _enforce_reseller_resource_ceilings(reseller, preview)
     else:
         _check_reseller_package(db, account.user.role == Role.reseller, payload.reseller_package_id)
     account.package_id = package.id

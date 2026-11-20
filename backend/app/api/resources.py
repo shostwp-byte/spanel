@@ -433,7 +433,11 @@ def update_user_resource_limits(
                 setattr(user, field, val)
 
     if normalize_role(current_user.role) == Role.reseller:
-        from app.api.users import _enforce_reseller_quotas, _enforce_reseller_resource_ceilings
+        from app.api.users import (
+            _RESELLER_CEILING_FIELDS,
+            _enforce_reseller_quotas,
+            _enforce_reseller_resource_ceilings,
+        )
         from app.services import quota
 
         reseller_actor = (
@@ -457,7 +461,13 @@ def update_user_resource_limits(
             is_create=False,
             exclude_user_id=user.id,
         )
-        _enforce_reseller_resource_ceilings(reseller_actor, user)
+        if payload.package_id is not None or payload.sync_from_package:
+            touched_ceiling_fields = None
+        else:
+            touched_ceiling_fields = {
+                f for f in _RESELLER_CEILING_FIELDS if getattr(payload, f, None) is not None
+            }
+        _enforce_reseller_resource_ceilings(reseller_actor, user, fields=touched_ceiling_fields)
 
     db.commit()
     db.refresh(user)

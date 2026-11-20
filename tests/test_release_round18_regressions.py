@@ -318,3 +318,131 @@ def test_m1_m5_m6_nodejs_site_lock_blocks_all_mutating_endpoints_and_prevents_re
         assert not reclaimed.with_name(f"{reclaimed.name}.reclaim").exists()
     finally:
         nm._release_deploy_lock(reclaimed)
+
+
+# --------------------------------------------------------------------------- M2 & M3
+
+
+def test_m2_m3_reseller_create_user_checks_ceilings_and_partial_edits_allow_grandfathered_users(monkeypatch):
+    from fastapi import HTTPException
+    from app.api import resources as resources_api
+    from app.api import users as users_api
+    from app.api.resources import UserResourceLimitsUpdate
+    from app.models.entities import ResellerPackage, User, UserPackage
+    from app.schemas.schemas import UserCreate, UserUpdate
+    from app.services import resource_monitor, site_users
+
+    monkeypatch.setattr(resource_monitor, "apply_user_cgroup_limits_async", lambda uid: None)
+    monkeypatch.setattr(resource_monitor, "collect_and_enforce_mysql_quotas", lambda db: {})
+    os_touched: list[str] = []
+    monkeypatch.setattr(site_users, "ensure_panel_user", lambda u, p: os_touched.append(u) or u)
+
+    SessionLocal = _make_session()
+    fake_req = SimpleNamespace(headers={}, client=SimpleNamespace(host="127.0.0.1"), url=SimpleNamespace(scheme="https"))
+
+    with SessionLocal() as db:
+        rpkg = ResellerPackage(
+            name="ResPoolM2",
+            slug="res-pool-m2",
+            user_limit=10,
+            total_storage_mb=20480,
+            total_website_limit=20,
+            total_database_limit=20,
+            overselling_enabled=False,
+        )
+        # Global admin-authored shared package with unlimited RAM (0) and 400% CPU
+        shared_over_pkg = UserPackage(
+            name="AdminGlobalUnlimited",
+            owner_id=None,
+            storage_limit_mb=2048,
+            website_limit=2,
+            database_limit=2,
+            memory_max_mb=0,
+            cpu_quota_percent=400,
+        )
+        db.add_all([rpkg, shared_over_pkg])
+        db.flush()
+
+        reseller = User(
+            username="res_m2",
+            email="res_m2@example.com",
+            hashed_password="x",
+            role="reseller",
+            reseller_package_id=rpkg.id,
+            memory_max_mb=2048,
+            memory_high_mb=1024,
+            cpu_quota_percent=100,
+            tasks_max=2048,
+        )
+        db.add(reseller)
+        db.flush()
+
+        # Grandfathered customer previously given 4096 MB RAM by Admin (> reseller's 2048 MB ceiling)
+        legacy_cust = User(
+            username="legacy_m3",
+            email="old@example.com",
+            hashed_password="x",
+            role="end_user",
+            reseller_id=reseller.id,
+            website_limit=2,
+            storage_limit_mb=2048,
+            database_limit=2,
+            memory_max_mb=4096,
+            cpu_quota_percent=100,
+            tasks_max=2048,
+        )
+        db.add(legacy_cust)
+        db.commit()
+        db.refresh(reseller)
+        db.refresh(legacy_cust)
+
+        # M2: Reseller creating a new customer with AdminGlobalUnlimited MUST be rejected 403
+        # BEFORE ensure_panel_user touches the OS.
+        with pytest.raises(HTTPException) as exc_m2:
+            users_api.create_user(
+                UserCreate(
+                    username="newcust_m2",
+                    email="new@example.com",
+                    password="StrongPassword!123",
+                    role="end_user",
+                    package_id=shared_over_pkg.id,
+                ),
+                fake_req,
+                db,
+                reseller,
+            )
+        assert exc_m2.value.status_code == 403
+        assert os_touched == []
+        db.rollback()
+
+        # M3: Reseller editing ONLY email on grandfathered customer MUST succeed (not blocked by untouched memory_max_mb=4096)
+        out = users_api.update_user(
+            legacy_cust.id,
+            UserUpdate(email="updated@example.com"),
+            fake_req,
+            db,
+            reseller,
+        )
+        assert out["email"] == "updated@example.com"
+
+        # M3: Reseller editing ONLY database_limit via /resources/users/{id}/limits MUST succeed
+        res_ok = resources_api.update_user_resource_limits(
+            legacy_cust.id,
+            UserResourceLimitsUpdate(database_limit=3),
+            fake_req,
+            db,
+            reseller,
+        )
+        assert res_ok["ok"] is True
+
+        # M3: Reseller attempting to explicitly raise/set memory_max_mb above ceiling STILL gets 403
+        with pytest.raises(HTTPException) as exc_m3:
+            resources_api.update_user_resource_limits(
+                legacy_cust.id,
+                UserResourceLimitsUpdate(memory_max_mb=8192),
+                fake_req,
+                db,
+                reseller,
+            )
+        assert exc_m3.value.status_code == 403
+        db.rollback()

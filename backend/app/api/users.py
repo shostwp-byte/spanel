@@ -204,19 +204,70 @@ _RESELLER_CEILING_FIELDS: tuple[str, ...] = (
     "bandwidth_limit_mb",
     "mysql_storage_limit_mb",
     "mysql_max_db_size_mb",
+    "mysql_max_queries_per_hour",
+    "mysql_max_updates_per_hour",
+    "mysql_max_connections_per_hour",
     "io_read_mbps",
     "io_write_mbps",
     "iops_read_max",
     "iops_write_max",
 )
 
+_DEFAULT_USER_RESOURCE_LIMITS: dict[str, int] = {
+    "bandwidth_limit_mb": 0,
+    "inode_limit": 0,
+    "cpu_quota_percent": 100,
+    "io_read_mbps": 0,
+    "io_write_mbps": 0,
+    "iops_read_max": 0,
+    "iops_write_max": 0,
+    "memory_high_mb": 1024,
+    "memory_max_mb": 2048,
+    "tasks_max": 2048,
+    "mysql_storage_limit_mb": 0,
+    "mysql_max_db_size_mb": 0,
+    "mysql_max_queries_per_hour": 0,
+    "mysql_max_updates_per_hour": 0,
+    "mysql_max_connections_per_hour": 0,
+}
 
-def _enforce_reseller_resource_ceilings(reseller: User, target: object) -> None:
+
+def _preview_user_limits(package: UserPackage | None) -> User:
+    """Build an unsaved User instance holding the effective resource limits
+    that a newly created account will inherit (defaults overlaid by package)."""
+    preview = User(
+        username="_preview",
+        email="_preview@invalid",
+        hashed_password="",
+        role=Role.end_user,
+        **_DEFAULT_USER_RESOURCE_LIMITS,
+    )
+    _apply_package_limits(preview, package)
+    return preview
+
+
+def _enforce_reseller_resource_ceilings(
+    reseller: User,
+    target: object,
+    *,
+    fields: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> None:
     """Prevent a reseller from granting unlimited (<= 0) or higher per-user
-    cgroup / MySQL ceilings than the reseller account itself is allowed."""
+    cgroup / MySQL ceilings than the reseller account itself is allowed.
+
+    When ``fields`` is provided (e.g. a partial PATCH / limits update that does
+    not switch packages), only those touched ceiling fields are checked so
+    resellers can still edit unrelated attributes (such as email or active
+    status) on grandfathered accounts (Round 18 M3).
+    """
     up = getattr(reseller, "package", None)
     source = up if (up is not None and bool(getattr(up, "is_reseller_package", False))) else reseller
-    for field in _RESELLER_CEILING_FIELDS:
+    check_fields = (
+        _RESELLER_CEILING_FIELDS
+        if fields is None
+        else tuple(f for f in _RESELLER_CEILING_FIELDS if f in fields)
+    )
+    for field in check_fields:
         ceiling = int(getattr(source, field, 0) or 0)
         if ceiling <= 0:
             continue
@@ -382,6 +433,9 @@ def create_user(payload: UserCreate, request: Request, db: Session = Depends(get
             target_database_limit=effective_database_limit,
             is_create=True,
         )
+        # Round 18 M2: enforce per-user resource ceilings on creation (including
+        # global admin-authored packages) BEFORE touching the OS / Linux user.
+        _enforce_reseller_resource_ceilings(current_user, _preview_user_limits(package))
 
     from app.services.provisioning import linux_user_exists, undo_failed_create
 
@@ -742,7 +796,11 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, db: Session
             is_create=False,
             exclude_user_id=user.id,
         )
-        _enforce_reseller_resource_ceilings(current_user, user)
+        _enforce_reseller_resource_ceilings(
+            current_user,
+            user,
+            fields=None if "package_id" in payload.model_fields_set else set(payload.model_fields_set),
+        )
 
     if role_changed:
         # New role -> existing tokens with old role claim should be invalidated.
