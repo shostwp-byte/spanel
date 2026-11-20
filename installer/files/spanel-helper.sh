@@ -9359,6 +9359,53 @@ require_terminal_cwd() {
 # between customers. /var/lib/php/{sessions,uploads}/<user> match the FPM pool.
 # /tmp and /usr/share/php are what composer and PEAR-era libraries expect. A
 # caller that runs a phar appends that tool's directory itself.
+# Run a command as a panel Linux user inside a private mount namespace where
+# /home is replaced by a tmpfs containing ONLY /home/<user>, placed inside
+# user-<uid>.slice when cgroup v2 is available, and guarded by timeout with
+# --kill-after=10 (Round 18 V2 / P1-5).
+run_in_tenant_home_jail() {
+  local user="$1" cwd="$2" timeout_sec="$3"
+  shift 3
+  local uid_num jail_script
+  require_linux_user "$user"
+  uid_num="$(id -u "$user" 2>/dev/null || true)"
+  [[ "$uid_num" =~ ^[0-9]+$ && "$uid_num" -ge 1000 ]] || deny "panel Linux user does not exist: $user"
+  [[ -d "$cwd" ]] || deny "working directory does not exist: $cwd"
+
+  jail_script='
+    set -e
+    jail_user="$1"
+    jail_root="$2"
+    jail_cwd="$3"
+    jail_uid="$4"
+    shift 4
+    if [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" ]]; then
+      echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" 2>/dev/null || true
+    elif [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" ]]; then
+      echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" 2>/dev/null || true
+    fi
+    jail_home="$jail_root/$jail_user"
+    hold="$(mktemp -d)"
+    mount --bind "$jail_home" "$hold"
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$jail_root"
+    mkdir -p "$jail_home"
+    mount --move "$hold" "$jail_home"
+    rmdir "$hold" 2>/dev/null || true
+    cd "$jail_cwd"
+    exec "$@"
+  '
+
+  local -a runner=(
+    unshare --mount --propagation private --
+    bash -c "$jail_script" spanel-tenant-jail "$user" "$HOME_ROOT" "$cwd" "$uid_num"
+    runuser -u "$user" --
+  )
+  if [[ -n "$timeout_sec" && "$timeout_sec" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+    runner=(timeout --signal=TERM --kill-after=10 "$timeout_sec" "${runner[@]}")
+  fi
+  "${runner[@]}" "$@"
+}
+
 site_open_basedir() {
   local user="$1"
   require_linux_user "$user"
@@ -13356,12 +13403,19 @@ EOF
     # Outside the namespace /home is untouched, and the namespace dies with the
     # command. /etc/passwd stays readable: it is world-readable system data and
     # tools need it, and it no longer leads anywhere now the homes are gone.
+    terminal_uid="$(id -u "$user" 2>/dev/null || true)"
     terminal_jail='
       set -e
       jail_user="$1"
       jail_root="$2"
       jail_cwd="$3"
-      shift 3
+      jail_uid="$4"
+      shift 4
+      if [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" ]]; then
+        echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" 2>/dev/null || true
+      elif [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" ]]; then
+        echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" 2>/dev/null || true
+      fi
       jail_home="$jail_root/$jail_user"
       hold="$(mktemp -d)"
       mount --bind "$jail_home" "$hold"
@@ -13381,7 +13435,7 @@ EOF
     # block on the pipe until the client gives up.
     terminal_runner=(
       unshare --mount --propagation private --
-      bash -c "$terminal_jail" spanel-terminal-jail "$user" "$HOME_ROOT" "$target"
+      bash -c "$terminal_jail" spanel-terminal-jail "$user" "$HOME_ROOT" "$target" "$terminal_uid"
       runuser -u "$user" --
     )
     if [[ -n "$terminal_timeout" ]] && command -v timeout >/dev/null 2>&1; then
@@ -13802,7 +13856,7 @@ EOF
         node_cpu_cap=(taskset -c 0-3)
       fi
     fi
-    exec timeout 900 runuser -u "$user" -- "${node_cpu_cap[@]}" env -i \
+    run_in_tenant_home_jail "$user" "$app_dir" 900 "${node_cpu_cap[@]}" env -i \
       HOME="${HOME_ROOT}/${user}" \
       npm_config_cache="${HOME_ROOT}/${user}/.npm" \
       npm_config_jobs=4 \
@@ -13823,16 +13877,19 @@ EOF
     app_dir="$(ensure_app_directory "$user" "$app_name")"
     venv_dir="${app_dir}/.venv"
     if [[ ! -x "${venv_dir}/bin/python" ]]; then
-      runuser -u "$user" -- python3 -m venv "$venv_dir" \
+      run_in_tenant_home_jail "$user" "$app_dir" 180 env -i \
+        HOME="${HOME_ROOT}/${user}" \
+        PATH="/usr/local/bin:/usr/bin:/bin" \
+        python3 -m venv "$venv_dir" \
         || deny "failed to create Python virtualenv in ${venv_dir}"
     fi
     if [[ -f "${app_dir}/requirements.txt" ]]; then
-      exec timeout 900 runuser -u "$user" -- env -i \
+      run_in_tenant_home_jail "$user" "$app_dir" 900 env -i \
         HOME="${HOME_ROOT}/${user}" \
         PATH="${venv_dir}/bin:/usr/local/bin:/usr/bin:/bin" \
         "${venv_dir}/bin/pip" install --no-cache-dir -r "${app_dir}/requirements.txt"
     elif [[ -f "${app_dir}/pyproject.toml" ]]; then
-      exec timeout 900 runuser -u "$user" -- env -i \
+      run_in_tenant_home_jail "$user" "$app_dir" 900 env -i \
         HOME="${HOME_ROOT}/${user}" \
         PATH="${venv_dir}/bin:/usr/local/bin:/usr/bin:/bin" \
         "${venv_dir}/bin/pip" install --no-cache-dir "$app_dir"
@@ -13848,7 +13905,7 @@ EOF
     require_app_name "$app_name"
     app_dir="$(ensure_app_directory "$user" "$app_name")"
     if [[ -d "${app_dir}/.git" ]]; then
-      timeout 120 runuser -u "$user" -- env -i \
+      run_in_tenant_home_jail "$user" "$app_dir" 120 env -i \
         HOME="${HOME_ROOT}/${user}" \
         PATH="/usr/local/bin:/usr/bin:/bin" \
         git -C "$app_dir" pull --ff-only 2>&1 || true

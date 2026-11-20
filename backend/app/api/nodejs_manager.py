@@ -988,6 +988,58 @@ def _run_npm_install_with_fallback(
     return rc_fb, combined, " ".join(fallback_args)
 
 
+def _has_broken_bin_stubs(
+    app_dir: Path,
+    linux_user: str,
+    site_root: Path,
+    *,
+    framework: str = "",
+    scripts: Optional[Dict[str, str]] = None,
+) -> bool:
+    """Detect broken zip-extracted symlink stubs in node_modules/.bin (Round 18 V6).
+
+    ``extract_zip`` writes symlink entries as regular text files whose first
+    line is a relative path starting with ``../``. If the target package file
+    inside ``node_modules/`` is missing, ``prepare_nodejs_app_as_user`` removes
+    the dangling stub, so Python must trigger ``npm install`` before starting.
+    """
+    from pathlib import PurePosixPath
+
+    candidates: list[str] = []
+    fw_bin = {"Next.js": "next", "NestJS": "nest", "Nuxt": "nuxt", "Remix": "remix"}.get(framework)
+    if fw_bin:
+        candidates.append(fw_bin)
+    for key in ("start", "build"):
+        cmd_body = str((scripts or {}).get(key) or "").strip()
+        if not cmd_body:
+            continue
+        first_tok = cmd_body.split()[0]
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", first_tok) and first_tok not in {
+            "node", "npm", "npx", "yarn", "pnpm", "env", "cross-env",
+        }:
+            candidates.append(first_tok)
+
+    seen: set[str] = set()
+    for bin_name in candidates:
+        if bin_name in seen:
+            continue
+        seen.add(bin_name)
+        rel_bin = f"node_modules/.bin/{bin_name}"
+        if not _app_path_exists(app_dir, rel_bin, linux_user, site_root):
+            continue
+        raw = _read_app_file(app_dir, rel_bin, linux_user=linux_user, site_root=site_root)
+        if not raw:
+            continue
+        first_line = raw.splitlines()[0].rstrip("\r")
+        if first_line.startswith("../") and not first_line.startswith("#!"):
+            if not re.fullmatch(r"\.\./[A-Za-z0-9._/@-]+", first_line):
+                return True
+            target_rel = str(PurePosixPath("node_modules") / first_line[3:])
+            if not _app_path_exists(app_dir, target_rel, linux_user, site_root):
+                return True
+    return False
+
+
 def _ensure_nodejs_app_ready(
     linux_user: str,
     site_root: Path,
@@ -1016,6 +1068,14 @@ def _ensure_nodejs_app_ready(
             need_install = True
         elif framework == "Next.js" and not _app_path_exists(
             app_dir, "node_modules/.bin/next", linux_user, site_root
+        ):
+            need_install = True
+        elif _has_broken_bin_stubs(
+            app_dir,
+            linux_user,
+            site_root,
+            framework=framework,
+            scripts=scripts,
         ):
             need_install = True
 

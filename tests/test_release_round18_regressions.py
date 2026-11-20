@@ -446,3 +446,63 @@ def test_m2_m3_reseller_create_user_checks_ceilings_and_partial_edits_allow_gran
             )
         assert exc_m3.value.status_code == 403
         db.rollback()
+
+
+# --------------------------------------------------------------------------- V2 & V6
+
+
+def test_v2_site_app_dependency_installers_run_inside_tenant_home_jail():
+    helper_text = (REPO_ROOT / "installer" / "files" / "spanel-helper.sh").read_text(encoding="utf-8")
+    assert "run_in_tenant_home_jail()" in helper_text
+    jail_fn = helper_text[helper_text.index("run_in_tenant_home_jail()"):helper_text.index("site_open_basedir()")]
+    assert "unshare --mount --propagation private" in jail_fn
+    assert "timeout --signal=TERM --kill-after=10" in jail_fn
+    assert "user-${jail_uid}.slice" in jail_fn
+
+    for verb in ("site-app-install-deps)", "site-app-python-deps)", "site-app-git-pull)"):
+        start = helper_text.index(verb)
+        block = helper_text[start:helper_text.index(";;", start)]
+        assert "run_in_tenant_home_jail" in block, f"{verb} must use run_in_tenant_home_jail"
+        assert "exec timeout 900 runuser" not in block
+
+
+def test_v6_broken_zip_bin_stub_triggers_npm_install_before_worker_start(tmp_path, monkeypatch):
+    from app.api import nodejs_manager as nm
+    from app.core.config import settings
+
+    app_dir = tmp_path / "nextapp"
+    (app_dir / "node_modules" / ".bin").mkdir(parents=True)
+    (app_dir / "package.json").write_text(
+        '{"name":"demo","dependencies":{"next":"15.0.0"},"scripts":{"start":"next start","build":"next build"}}\n',
+        encoding="utf-8",
+    )
+    # Zip-extracted dangling symlink stub: target ../next/dist/bin/next does NOT exist!
+    (app_dir / "node_modules" / ".bin" / "next").write_text("../next/dist/bin/next\n", encoding="utf-8")
+    (app_dir / ".next").mkdir()
+    (app_dir / ".next" / "BUILD_ID").write_text("abc123\n", encoding="utf-8")
+
+    monkeypatch.setattr(settings, "command_dry_run", False)
+    monkeypatch.setattr(nm, "_app_path_exists", lambda d, rel, u, sr: (d / rel).exists())
+    monkeypatch.setattr(
+        nm,
+        "_read_app_file",
+        lambda d, rel, linux_user=None, site_root=None: (d / rel).read_text(encoding="utf-8") if (d / rel).is_file() else "",
+    )
+
+    install_calls: list[str] = []
+    monkeypatch.setattr(
+        nm,
+        "_run_npm_install_with_fallback",
+        lambda u, d, node_major="22", timeout=300: install_calls.append("npm install") or (0, "ok", "npm install"),
+    )
+
+    # 1. Broken stub -> MUST trigger npm install
+    nm._ensure_nodejs_app_ready("alice", app_dir, app_dir, node_major="22", run_build_if_needed=False)
+    assert install_calls == ["npm install"]
+
+    # 2. Valid target exists -> MUST NOT re-run npm install unnecessarily
+    install_calls.clear()
+    (app_dir / "node_modules" / "next" / "dist" / "bin").mkdir(parents=True)
+    (app_dir / "node_modules" / "next" / "dist" / "bin" / "next").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    nm._ensure_nodejs_app_ready("alice", app_dir, app_dir, node_major="22", run_build_if_needed=False)
+    assert install_calls == []
