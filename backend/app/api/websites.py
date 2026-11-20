@@ -1138,10 +1138,11 @@ def _rename_single_website(
             website.linux_user = new_linux_user
 
         # Preserve HTTPS on the site and its unchanged aliases whenever the
-        # existing wildcard/shared/manual certificate (or an existing LE cert
-        # for new_domain) already covers new_domain (P2-3).
+        # existing wildcard/shared/manual/LE SAN certificate (or an existing LE
+        # certificate for new_domain queried via helper) already covers new_domain
+        # (P2-3 + Round 18 M4).
         preserved_ssl = False
-        if old_ssl_enabled and old_ssl_mode in {"cloudflare", "shared", "manual"}:
+        if old_ssl_enabled and old_ssl_mode in {"letsencrypt", "cloudflare", "shared", "manual"}:
             cert_lookup_domain = (
                 (old_ssl_source_domain or old_domain)
                 if old_ssl_mode in {"cloudflare", "shared"}
@@ -1154,22 +1155,30 @@ def _rename_single_website(
             if sans and ssl.cert_covers(sans, new_domain):
                 preserved_ssl = True
                 website.ssl_enabled = True
-                website.ssl_mode = old_ssl_mode
-                website.ssl_source_domain = old_ssl_source_domain
-                website.ssl_cert_path = old_ssl_cert_path
-                website.ssl_key_path = old_ssl_key_path
-                website.ssl_ca_path = old_ssl_ca_path
+                if old_ssl_mode == "letsencrypt" and old_domain != new_domain:
+                    # Reuse old_domain's Let's Encrypt lineage via shared mode so
+                    # Nginx resolves /etc/letsencrypt/live/<old_domain> and
+                    # release_site_certificates retains the lineage.
+                    website.ssl_mode = "shared"
+                    website.ssl_source_domain = old_domain
+                    website.ssl_cert_path = None
+                    website.ssl_key_path = None
+                    website.ssl_ca_path = None
+                else:
+                    website.ssl_mode = old_ssl_mode
+                    website.ssl_source_domain = old_ssl_source_domain
+                    website.ssl_cert_path = old_ssl_cert_path
+                    website.ssl_key_path = old_ssl_key_path
+                    website.ssl_ca_path = old_ssl_ca_path
                 for alias_row, _ in old_alias_ssl:
                     alias_row.ssl_enabled = bool(ssl.cert_covers(sans, alias_row.domain))
 
         if not preserved_ssl:
-            new_le_dir = Path("/etc/letsencrypt/live") / new_domain
-            has_new_le = False
             try:
-                has_new_le = (new_le_dir / "fullchain.pem").is_file() and (new_le_dir / "privkey.pem").is_file()
-            except OSError:
-                has_new_le = False
-            if has_new_le:
+                new_sans = ssl.cert_info(new_domain).get("sans") or []
+            except Exception:
+                new_sans = []
+            if new_sans and ssl.cert_covers(new_sans, new_domain):
                 preserved_ssl = True
                 website.ssl_enabled = True
                 website.ssl_mode = "letsencrypt"
@@ -1177,7 +1186,8 @@ def _rename_single_website(
                 website.ssl_cert_path = None
                 website.ssl_key_path = None
                 website.ssl_ca_path = None
-                _sync_alias_ssl_flags(website)
+                for alias_row, _ in old_alias_ssl:
+                    alias_row.ssl_enabled = bool(ssl.cert_covers(new_sans, alias_row.domain))
             else:
                 website.ssl_enabled = False
                 website.ssl_mode = "none"
@@ -1260,16 +1270,23 @@ def _rename_single_website(
         website.ssl_ca_path = old_ssl_ca_path
         for alias_row, prev_flag in old_alias_ssl:
             alias_row.ssl_enabled = prev_flag
+        restored_runtime = False
+        rollback_notes: list[str] = []
         if moved_runtime:
             try:
                 if new_linux_user:
                     site_users.move_site_runtime(
                         new_root_path, old_root_path, old_linux_user or new_linux_user, runtime_php
                     )
+                    restored_runtime = True
                 elif not settings.command_dry_run and Path(new_root_path).exists() and not Path(old_root_path).exists():
                     Path(new_root_path).rename(old_root_path)
-            except Exception:
+                    restored_runtime = True
+                else:
+                    restored_runtime = True
+            except Exception as rb_exc:
                 logger.exception("rename rollback of %s could not restore the site runtime", old_domain)
+                rollback_notes.append(f"rollback could not move runtime back to {old_root_path}: {rb_exc}")
         if old_waf_removed or new_waf_synced or new_vhost_written or moved_runtime:
             try:
                 _ensure_default_waf_file(old_domain)
@@ -1295,13 +1312,21 @@ def _rename_single_website(
                     _sync_http_flood_zones(db)
                 except Exception:
                     pass
-        if moved_runtime:
+        if moved_runtime and restored_runtime:
             # The move back deleted the workers' units again (they pointed at
-            # the new path); recreate them at the old one.
-            _resync_site_workers(db, website)
+            # the new path); recreate them at the old one and surface failures.
+            rb_worker_msg = _format_worker_warning(old_domain, _resync_site_workers(db, website))
+            if rb_worker_msg:
+                rollback_notes.append(rb_worker_msg)
         if isinstance(exc, HTTPException):
+            if rollback_notes:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=f"{exc.detail} ({'; '.join(rollback_notes)})",
+                ) from exc
             raise
-        raise HTTPException(status_code=400, detail=f"Cannot rename domain: {exc}") from exc
+        suffix = f" ({'; '.join(rollback_notes)})" if rollback_notes else ""
+        raise HTTPException(status_code=400, detail=f"Cannot rename domain: {exc}{suffix}") from exc
 
 
 @router.patch("/{website_id}", response_model=WebsiteOut)
@@ -1480,6 +1505,13 @@ def update_website(
                 eff_site_limit = effective_website_limit(owner)
                 if not is_admin_role(owner.role) and quota.is_quota_reached(existing_root_domains_count, eff_site_limit):
                     raise HTTPException(status_code=403, detail="Website limit reached")
+            old_owner_id = website.owner_id
+            old_root_path = website.root_path
+            old_linux_user = website.linux_user
+            runtime_php_version = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
+            new_linux_user = None
+            new_root_path = None
+            moved_runtime = False
             try:
                 storage_quota.enforce_user_storage_quota(
                     db,
@@ -1488,8 +1520,8 @@ def update_website(
                 )
                 new_linux_user = site_users.linux_user_for_panel_username(owner.username)
                 new_root_path = site_users.site_root_for_panel_user(owner.username, website.domain)
-                runtime_php_version = website.php_version if (website.app_type or "wordpress") in {"wordpress", "php"} else None
                 site_users.move_site_runtime(website.root_path, new_root_path, new_linux_user, runtime_php_version)
+                moved_runtime = True
                 result = waf.sync_website_rules(website)
                 if result.returncode != 0:
                     raise RuntimeError(_command_error(result))
@@ -1512,8 +1544,45 @@ def update_website(
                     accumulated_warnings.append(worker_msg)
             except storage_quota.StorageQuotaExceeded as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
-            except (RuntimeError, ValueError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (RuntimeError, ValueError, HTTPException) as exc:
+                rollback_notes: list[str] = []
+                if moved_runtime:
+                    website.owner_id = old_owner_id
+                    website.root_path = old_root_path
+                    website.linux_user = old_linux_user
+                    restored_runtime = False
+                    if old_linux_user and new_root_path:
+                        try:
+                            site_users.move_site_runtime(
+                                new_root_path, old_root_path, old_linux_user, runtime_php_version
+                            )
+                            restored_runtime = True
+                        except Exception as rb_exc:
+                            logger.exception("owner-change rollback of %s could not restore runtime", website.domain)
+                            rollback_notes.append(f"rollback could not move runtime back: {rb_exc}")
+                    try:
+                        _ensure_default_waf_file(website.domain)
+                        waf.sync_website_rules(website)
+                    except Exception:
+                        logger.exception("owner-change rollback of %s could not restore WAF rules", website.domain)
+                    try:
+                        _rewrite_website_vhost(
+                            website,
+                            root_path=old_root_path,
+                            linux_user=old_linux_user,
+                            app_type=website.app_type or "wordpress",
+                            php_version=website.php_version,
+                        )
+                    except Exception:
+                        logger.exception("owner-change rollback of %s could not restore vhost", website.domain)
+                    if restored_runtime:
+                        rb_worker_msg = _format_worker_warning(website.domain, _resync_site_workers(db, website))
+                        if rb_worker_msg:
+                            rollback_notes.append(rb_worker_msg)
+                suffix = f" ({'; '.join(rollback_notes)})" if rollback_notes else ""
+                if isinstance(exc, HTTPException):
+                    raise HTTPException(status_code=exc.status_code, detail=f"{exc.detail}{suffix}") from exc
+                raise HTTPException(status_code=400, detail=f"{exc}{suffix}") from exc
         website.owner_id = payload.owner_id
     if payload.nginx_custom is not None:
         try:
@@ -2432,18 +2501,26 @@ def transfer_website_owner(
                     mail_service.move_domain_maildirs(new_linux_user, old_linux_user, dom)
             except Exception:
                 pass
+        rollback_notes: list[str] = []
         if moved_runtime and old_linux_user:
+            restored_runtime = False
             try:
                 site_users.move_site_runtime(new_root_path, old_root_path, old_linux_user, runtime_php)
+                restored_runtime = True
                 website.root_path = old_root_path
                 website.linux_user = old_linux_user
                 _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
-            except Exception:
+            except Exception as rb_exc:
                 logger.exception("transfer rollback of %s could not restore the site runtime", website.domain)
-            _resync_site_workers(db, website)
+                rollback_notes.append(f"rollback could not move runtime back: {rb_exc}")
+            if restored_runtime:
+                rb_worker_msg = _format_worker_warning(website.domain, _resync_site_workers(db, website))
+                if rb_worker_msg:
+                    rollback_notes.append(rb_worker_msg)
+        suffix = f" ({'; '.join(rollback_notes)})" if rollback_notes else ""
         if isinstance(exc, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail=f"Failed to transfer website ownership: {exc}") from exc
+            raise HTTPException(status_code=exc.status_code, detail=f"{exc.detail}{suffix}") from exc
+        raise HTTPException(status_code=500, detail=f"Failed to transfer website ownership: {exc}{suffix}") from exc
 
     transfer_warnings: list[str] = []
     if moved_runtime:
