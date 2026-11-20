@@ -4,7 +4,9 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
-## [Unreleased]
+## [v1.0.11] — 2026-11-20
+
+Bản phát hành `v1.0.11` chính thức kích hoạt **Node.js Manager** mặc định (`NODEJS_MANAGER_ENABLED=true`) sau khi hoàn tất toàn bộ hạng mục nhóm P2 của Thẩm định Lần 17 (`PR #31`) và khép kín 15/15 phát hiện bảo mật, độ tin cậy, cách ly đa người thuê, vận hành không gián đoạn và kiểm thử tích hợp MariaDB thật của Thẩm định Độc lập Lần 18 (`PR #32`):
 
 ### 🔒 Gia cố & Khép kín Toàn bộ Phát hiện Thẩm định Lần 18 (`V1..V6`, `M1..M8`)
 - **MariaDB Loopback `ACCOUNT LOCK` nguyên tử, triệt tiêu `ERROR 1141` & CI MariaDB thật (`V1`, `P1-3`):** Đưa `ACCOUNT LOCK` trực tiếp vào `CREATE USER IF NOT EXISTS` và trước mọi `GRANT`/`REVOKE`; chèn `GRANT` trước `REVOKE ALL PRIVILEGES ON db.*` để các host loopback mới sinh (`127.0.0.1`, `::1`) trên máy nâng cấp từ `1.0.9` không bị lỗi `ERROR 1141`; chia trần `MAX_USER_CONNECTIONS` hợp lý trên 3 host loopback (`10`/host thay vì `25`/host); bổ sung job CI `MariaDB live integration` chạy SQL thật với `skip-name-resolve=1`.
