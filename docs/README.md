@@ -11,9 +11,9 @@ Chào mừng bạn đến với bộ tài liệu chính thức của **SPanel** 
 
 | Tài liệu | Nội dung chính | Đối tượng |
 |---|---|---|
-| [**1. Danh mục Tính năng (`FEATURES.md`)**](FEATURES.md) | Chi tiết toàn bộ tính năng theo 3 cấp độ phân quyền (**Admin / Reseller / User**), quản lý Domains & Subdomains chuẩn DirectAdmin, thông báo phân loại và hệ thống Add-ons. | Admin, Reseller, End User |
+| [**1. Danh mục Tính năng (`FEATURES.md`)**](FEATURES.md) | Chi tiết toàn bộ tính năng theo 3 cấp độ phân quyền (**Admin / Reseller / User**), quản lý Domains & Subdomains tập trung, thông báo phân loại và hệ thống Add-ons. | Admin, Reseller, End User |
 | [**2. Cài đặt & Cập nhật (`INSTALLATION_AND_UPDATE.md`)**](INSTALLATION_AND_UPDATE.md) | Yêu cầu phần cứng, hướng dẫn cài đặt 1 lệnh trên VPS Ubuntu 24.04 LTS, cấu hình biến môi trường `.env` và quy trình cập nhật trực tuyến (Online Update). | Quản trị viên Hệ thống (SysAdmin) |
-| [**3. Quản trị Hệ thống, Bảo mật & CLI (`ADMIN_AND_CLI_GUIDE.md`)**](ADMIN_AND_CLI_GUIDE.md) | Kiến trúc bảo mật tách biệt đặc quyền `spanel-helper`, lệnh cứu hộ `spanel`, tường lửa `iptables + ipset`, WAF ModSecurity và công cụ di chuyển dữ liệu từ DirectAdmin / cPanel. | Quản trị viên Hệ thống (SysAdmin) |
+| [**3. Quản trị Hệ thống, Bảo mật & CLI (`ADMIN_AND_CLI_GUIDE.md`)**](ADMIN_AND_CLI_GUIDE.md) | Kiến trúc bảo mật tách biệt đặc quyền `spanel-helper`, lệnh cứu hộ `spanel`, tường lửa `iptables + ipset`, WAF ModSecurity và công cụ di chuyển dữ liệu (Migration). | Quản trị viên Hệ thống (SysAdmin) |
 | [**4. Tích hợp WHMCS, API & MCP AI (`API_AND_WHMCS.md`)**](API_AND_WHMCS.md) | Hướng dẫn cấu hình module WHMCS tự động hóa cấp phát hosting, đặc tả REST API Provisioning và kết nối trợ lý AI qua giao thức MCP. | Nhà cung cấp dịch vụ Hosting, Developer |
 
 ---
