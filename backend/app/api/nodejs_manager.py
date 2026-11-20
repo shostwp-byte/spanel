@@ -11,9 +11,11 @@ import stat
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import functools
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
@@ -386,6 +388,7 @@ def _update_instance_state(
     *,
     db: Optional[Session] = None,
     allow_port_retry: bool = True,
+    allow_create: bool = False,
 ) -> Dict[str, Any]:
     website_id = int(inst_key)
 
@@ -400,6 +403,11 @@ def _update_instance_state(
             if row is not None:
                 inst = _row_to_instance_dict(row)
             else:
+                if not allow_create:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Ứng dụng Node.js không còn tồn tại trên website này.",
+                    )
                 site = session.query(Website).filter(Website.id == website_id).first()
                 owner_id = int(site.owner_id) if site is not None else 0
                 row = NodejsInstance(website_id=website_id, owner_id=owner_id)
@@ -981,6 +989,58 @@ def _run_npm_install_with_fallback(
     return rc_fb, combined, " ".join(fallback_args)
 
 
+def _has_broken_bin_stubs(
+    app_dir: Path,
+    linux_user: str,
+    site_root: Path,
+    *,
+    framework: str = "",
+    scripts: Optional[Dict[str, str]] = None,
+) -> bool:
+    """Detect broken zip-extracted symlink stubs in node_modules/.bin (Round 18 V6).
+
+    ``extract_zip`` writes symlink entries as regular text files whose first
+    line is a relative path starting with ``../``. If the target package file
+    inside ``node_modules/`` is missing, ``prepare_nodejs_app_as_user`` removes
+    the dangling stub, so Python must trigger ``npm install`` before starting.
+    """
+    from pathlib import PurePosixPath
+
+    candidates: list[str] = []
+    fw_bin = {"Next.js": "next", "NestJS": "nest", "Nuxt": "nuxt", "Remix": "remix"}.get(framework)
+    if fw_bin:
+        candidates.append(fw_bin)
+    for key in ("start", "build"):
+        cmd_body = str((scripts or {}).get(key) or "").strip()
+        if not cmd_body:
+            continue
+        first_tok = cmd_body.split()[0]
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", first_tok) and first_tok not in {
+            "node", "npm", "npx", "yarn", "pnpm", "env", "cross-env",
+        }:
+            candidates.append(first_tok)
+
+    seen: set[str] = set()
+    for bin_name in candidates:
+        if bin_name in seen:
+            continue
+        seen.add(bin_name)
+        rel_bin = f"node_modules/.bin/{bin_name}"
+        if not _app_path_exists(app_dir, rel_bin, linux_user, site_root):
+            continue
+        raw = _read_app_file(app_dir, rel_bin, linux_user=linux_user, site_root=site_root)
+        if not raw:
+            continue
+        first_line = raw.splitlines()[0].rstrip("\r")
+        if first_line.startswith("../") and not first_line.startswith("#!"):
+            if not re.fullmatch(r"\.\./[A-Za-z0-9._/@-]+", first_line):
+                return True
+            target_rel = str(PurePosixPath("node_modules") / first_line[3:])
+            if not _app_path_exists(app_dir, target_rel, linux_user, site_root):
+                return True
+    return False
+
+
 def _ensure_nodejs_app_ready(
     linux_user: str,
     site_root: Path,
@@ -1009,6 +1069,14 @@ def _ensure_nodejs_app_ready(
             need_install = True
         elif framework == "Next.js" and not _app_path_exists(
             app_dir, "node_modules/.bin/next", linux_user, site_root
+        ):
+            need_install = True
+        elif _has_broken_bin_stubs(
+            app_dir,
+            linux_user,
+            site_root,
+            framework=framework,
+            scripts=scripts,
         ):
             need_install = True
 
@@ -1124,6 +1192,7 @@ def _sync_nodejs_worker_unit(
     node_env: str = "production",
     enabled: bool = True,
     strict: bool = True,
+    restart_only_if_changed: bool = False,
 ) -> Dict[str, Any]:
     clean_major = _validate_node_major(node_major)
     clean_mode, clean_arg = _validate_start_config(start_mode, start_arg)
@@ -1149,17 +1218,20 @@ def _sync_nodejs_worker_unit(
 
     res = shell.privileged(
         "nodejs-worker-sync",
-        helper_args=_worker_sync_helper_args(
-            linux_user,
-            site_root,
-            app_dir,
-            node_major=clean_major,
-            port=clean_port,
-            memory_mb=clean_mem,
-            start_mode=clean_mode,
-            start_arg=clean_arg,
-            node_env=clean_env,
-            enabled=enabled,
+        helper_args=(
+            _worker_sync_helper_args(
+                linux_user,
+                site_root,
+                app_dir,
+                node_major=clean_major,
+                port=clean_port,
+                memory_mb=clean_mem,
+                start_mode=clean_mode,
+                start_arg=clean_arg,
+                node_env=clean_env,
+                enabled=enabled,
+            )
+            + (["if-changed"] if restart_only_if_changed else [])
         ),
         check=False,
         timeout=60,
@@ -2090,6 +2162,19 @@ def _read_deploy_lock_meta(lock_path: Path) -> Dict[str, Any]:
     return meta
 
 
+_DEPLOY_LOCK_RECLAIM_GUARD = threading.Lock()
+
+
+def _is_lock_stale(lock_path: Path, meta: Dict[str, Any], stale_seconds: int) -> bool:
+    try:
+        lock_pid = int(meta.get("pid") or 0)
+        started_at = float(meta.get("started_at") or lock_path.stat().st_mtime)
+        age = time.time() - started_at
+        return (lock_pid > 0 and not _pid_is_alive(lock_pid)) or age > stale_seconds
+    except OSError:
+        return False
+
+
 def _acquire_deploy_lock(
     website_id: int,
     stale_seconds: int = _DEPLOY_LOCK_TTL_SECONDS,
@@ -2113,16 +2198,49 @@ def _acquire_deploy_lock(
             return lock_path
         except FileExistsError:
             meta = _read_deploy_lock_meta(lock_path)
-            if attempt == 0:
-                try:
-                    lock_pid = int(meta.get("pid") or 0)
-                    started_at = float(meta.get("started_at") or lock_path.stat().st_mtime)
-                    age = time.time() - started_at
-                    if (lock_pid > 0 and not _pid_is_alive(lock_pid)) or age > stale_seconds:
-                        lock_path.unlink(missing_ok=True)
-                        continue
-                except OSError:
-                    pass
+            if attempt == 0 and _is_lock_stale(lock_path, meta, stale_seconds):
+                # Reclaim stale lock atomically under an auxiliary O_EXCL .reclaim guard
+                # so two workers noticing the same dead PID can never unlink each other's
+                # newly created live lock (Round 18 M6).
+                reclaim_path = lock_path.with_name(f"{lock_path.name}.reclaim")
+                with _DEPLOY_LOCK_RECLAIM_GUARD:
+                    reclaimed_guard = False
+                    for r_attempt in range(2):
+                        try:
+                            rfd = os.open(str(reclaim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                            os.close(rfd)
+                            reclaimed_guard = True
+                            break
+                        except FileExistsError:
+                            try:
+                                if r_attempt == 0 and (time.time() - reclaim_path.stat().st_mtime) > 30:
+                                    reclaim_path.unlink(missing_ok=True)
+                                    continue
+                            except OSError:
+                                pass
+                            break
+                    if reclaimed_guard:
+                        try:
+                            meta = _read_deploy_lock_meta(lock_path)
+                            if not lock_path.exists() or _is_lock_stale(lock_path, meta, stale_seconds):
+                                lock_path.unlink(missing_ok=True)
+                                try:
+                                    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                                    try:
+                                        payload = json.dumps(
+                                            {"pid": os.getpid(), "started_at": time.time(), "operation": operation}
+                                        )
+                                        os.write(fd, (payload + "\n").encode("utf-8"))
+                                    finally:
+                                        os.close(fd)
+                                    return lock_path
+                                except FileExistsError:
+                                    meta = _read_deploy_lock_meta(lock_path)
+                        finally:
+                            try:
+                                reclaim_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
             active_op = str(meta.get("operation") or "deploy")
             raise HTTPException(
                 status_code=409,
@@ -2136,6 +2254,52 @@ def _release_deploy_lock(lock_path: Optional[Path]) -> None:
             lock_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+@contextmanager
+def _site_operation_lock(website_id: int, operation: str) -> Iterator[Path]:
+    """Serialize all mutating Node.js Manager operations per website (Round 18 M1/M5)."""
+    lock_path = _acquire_deploy_lock(website_id, operation=operation)
+    try:
+        yield lock_path
+    finally:
+        _release_deploy_lock(lock_path)
+
+
+def _serialized_site_operation(operation: str) -> Callable:
+    """Decorator that verifies website access (when db/current_user are present)
+    and holds the per-site operation lock for the duration of the endpoint."""
+
+    def _decorator(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def _wrapper(*args, **kwargs):
+            wid = kwargs.get("website_id")
+            if wid is None and args:
+                wid = args[0]
+            db_arg = kwargs.get("db")
+            user_arg = kwargs.get("current_user")
+            if wid is not None and db_arg is not None and user_arg is not None:
+                _get_accessible_website(int(wid), db_arg, user_arg)
+            if wid is not None:
+                with _site_operation_lock(int(wid), operation):
+                    return fn(*args, **kwargs)
+            return fn(*args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def ensure_no_active_nodejs_operation(website_id: int) -> None:
+    """Reject destructive website mutations (delete/rename/transfer) while a
+    Node.js background task holds the per-site lock."""
+    op = _get_site_operation_status(website_id)
+    if op.get("active"):
+        active_op = str(op.get("operation") or "background")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Website đang có tác vụ Node.js ({active_op}) chạy nền. Vui lòng đợi hoàn tất trước khi thực hiện thao tác này.",
+        )
 
 
 def _operation_state_path(website_id: int) -> Path:
@@ -2636,7 +2800,7 @@ def scan_nodejs_instances(
                     inst.setdefault("framework", pkg_meta.get("framework") or "Node.js")
                     inst.setdefault("installed_at", datetime.now(timezone.utc).isoformat())
 
-                state = _update_instance_state(inst_key, _register, db=db)
+                state = _update_instance_state(inst_key, _register, db=db, allow_create=True)
 
     data = list_nodejs_instances(refresh=True, db=db, current_user=current_user)
     return {
@@ -2768,7 +2932,55 @@ def install_nodejs_instance(
 
     orig_app_type = getattr(site, "app_type", "php")
     orig_nginx_custom = getattr(site, "nginx_custom", "") or ""
+    install_lock = _acquire_deploy_lock(site.id, operation="install")
+    try:
+        return _install_nodejs_instance_locked(
+            site=site,
+            payload=payload,
+            db=db,
+            clean_major=clean_major,
+            clean_mode=clean_mode,
+            clean_arg=clean_arg,
+            linux_user=linux_user,
+            site_root=site_root,
+            app_dir=app_dir,
+            install_source=install_source,
+            git_repo=git_repo,
+            git_branch=git_branch,
+            validated_memory_mb=validated_memory_mb,
+            db_mode=db_mode,
+            existing_check=existing_check,
+            port=port,
+            app_url=app_url,
+            orig_app_type=orig_app_type,
+            orig_nginx_custom=orig_nginx_custom,
+        )
+    finally:
+        _release_deploy_lock(install_lock)
 
+
+def _install_nodejs_instance_locked(
+    *,
+    site: Website,
+    payload: NodejsInstallRequest,
+    db: Session,
+    clean_major: str,
+    clean_mode: str,
+    clean_arg: str,
+    linux_user: str,
+    site_root: Path,
+    app_dir: Path,
+    install_source: str,
+    git_repo: str,
+    git_branch: str,
+    validated_memory_mb: int,
+    db_mode: str,
+    existing_check: Optional[DatabaseAccount],
+    port: int,
+    app_url: str,
+    orig_app_type: str,
+    orig_nginx_custom: str,
+) -> Dict[str, Any]:
     # Provision or bind MySQL Database
     db_name = ""
     db_user = ""
@@ -2969,6 +3181,7 @@ def install_nodejs_instance(
             _save_new,
             db=db,
             allow_port_retry=(payload.port is None),
+            allow_create=True,
         )
         saved_after = (state.get("instances") or {}).get(inst_key) or {}
         if saved_after.get("port") and int(saved_after["port"]) != port:
@@ -3068,6 +3281,16 @@ def _run_background_process_task(
             state = _load_toolkit_state(bg_db)
             inst_key = str(site.id)
             saved = dict((state.get("instances") or {}).get(inst_key) or {})
+            if not saved or saved.get("detached"):
+                _write_site_operation_status(
+                    website_id,
+                    operation=op_name,
+                    status="failed",
+                    phase="cancelled",
+                    error="Ứng dụng Node.js đã bị gỡ trước khi tác vụ nền chạy.",
+                    started_at=started_at,
+                )
+                return
             linux_user, site_root, app_dir = _resolve_nodejs_paths(
                 site, bg_db, saved.get("subpath") or ""
             )
@@ -3092,6 +3315,25 @@ def _run_background_process_task(
                     run_build_if_needed=(start_arg != "dev"),
                     strict=False,
                 )
+
+            # Re-verify the instance row still exists and is active before mutating
+            # systemd or Nginx (belt-and-suspenders against orphan units, Round 18 M1).
+            bg_db.expire_all()
+            live_row = (
+                bg_db.query(NodejsInstance)
+                .filter(NodejsInstance.website_id == website_id, NodejsInstance.detached.is_(False))
+                .first()
+            )
+            if live_row is None:
+                _write_site_operation_status(
+                    website_id,
+                    operation=op_name,
+                    status="failed",
+                    phase="cancelled",
+                    error="Ứng dụng Node.js đã bị gỡ trong quá trình chuẩn bị.",
+                    started_at=started_at,
+                )
+                return
 
             if auto_logs:
                 def _save_logs(inst: Dict[str, Any]) -> None:
@@ -3257,18 +3499,25 @@ def manage_nodejs_process(
     else:
         enabled = bool(saved.get("process_enabled", True))
 
-    # Keep .env PORT and NODE_ENV synchronized when port/node_env is updated
-    env_raw = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
-    if env_raw:
-        updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
-        _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
+    op_name = f"process:{action}"
+    # Acquire per-site lock BEFORE any .env write or state mutation (Round 18 M1/M5).
+    lock_path = _acquire_deploy_lock(site.id, operation=op_name)
+    try:
+        # Keep .env PORT and NODE_ENV synchronized when port/node_env is updated
+        env_raw = _read_app_file(app_dir, ".env", linux_user=linux_user, site_root=site_root)
+        if env_raw:
+            updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
+            _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
+    except BaseException:
+        _release_deploy_lock(lock_path)
+        raise
 
     # On HTTP requests enabling/restarting the worker, run npm install + build +
     # systemd sync in the background under the per-site lock (P2-2) so long
     # builds never hold an API worker past the reverse-proxy timeout.
     if enabled and background_tasks is not None:
-        op_name = f"process:{action}"
-        lock_path = _acquire_deploy_lock(site.id, operation=op_name)
+        started_ts = time.time()
+        op_written = False
         try:
             def _mutate_async(inst: Dict[str, Any]) -> None:
                 inst.pop("detached", None)
@@ -3292,36 +3541,45 @@ def manage_nodejs_process(
                 if env_raw:
                     updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
                     _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
-        except Exception:
+
+            op_state = _write_site_operation_status(
+                site.id,
+                operation=op_name,
+                status="running",
+                phase="preparing",
+                message="Đang chuẩn bị phụ thuộc NPM, biên dịch và khởi động tiến trình Node.js...",
+                started_at=started_ts,
+            )
+            op_written = True
+            if response is not None:
+                response.status_code = 202
+            instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
+            background_tasks.add_task(
+                _run_background_process_task,
+                site.id,
+                lock_path,
+                action=action,
+                node_major=node_major,
+                start_mode=start_mode,
+                start_arg=start_arg,
+                port=port,
+                old_port=old_port,
+                memory_mb=memory_mb,
+                node_env=node_env,
+                started_at=started_ts,
+            )
+        except BaseException as exc:
+            if op_written:
+                _write_site_operation_status(
+                    site.id,
+                    operation=op_name,
+                    status="failed",
+                    phase="failed",
+                    error=str(getattr(exc, "detail", None) or exc),
+                    started_at=started_ts,
+                )
             _release_deploy_lock(lock_path)
             raise
-
-        started_ts = time.time()
-        op_state = _write_site_operation_status(
-            site.id,
-            operation=op_name,
-            status="running",
-            phase="preparing",
-            message="Đang chuẩn bị phụ thuộc NPM, biên dịch và khởi động tiến trình Node.js...",
-            started_at=started_ts,
-        )
-        background_tasks.add_task(
-            _run_background_process_task,
-            site.id,
-            lock_path,
-            action=action,
-            node_major=node_major,
-            start_mode=start_mode,
-            start_arg=start_arg,
-            port=port,
-            old_port=old_port,
-            memory_mb=memory_mb,
-            node_env=node_env,
-            started_at=started_ts,
-        )
-        if response is not None:
-            response.status_code = 202
-        instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
         return {
             "status": "accepted",
             "queued": True,
@@ -3330,72 +3588,75 @@ def manage_nodejs_process(
             "message": "Đã đưa tác vụ chuẩn bị & khởi động tiến trình Node.js vào chạy nền.",
         }
 
-    auto_logs: List[Dict[str, Any]] = []
-    if enabled and not settings.command_dry_run:
-        _ensure_nodejs_app_ready(
+    try:
+        auto_logs: List[Dict[str, Any]] = []
+        if enabled and not settings.command_dry_run:
+            _ensure_nodejs_app_ready(
+                linux_user,
+                site_root,
+                app_dir,
+                node_major=node_major,
+                npm_logs=auto_logs,
+                force_install=False,
+                run_build_if_needed=(start_arg != "dev"),
+                strict=False,
+            )
+
+        def _mutate(inst: Dict[str, Any]) -> None:
+            inst.pop("detached", None)
+            inst["node_major"] = node_major
+            inst["start_mode"] = start_mode
+            inst["start_arg"] = start_arg
+            inst["port"] = port
+            inst["memory_mb"] = memory_mb
+            inst["node_env"] = node_env
+            inst["process_enabled"] = enabled
+            for entry in auto_logs:
+                _append_npm_log(
+                    inst,
+                    entry["cmd"],
+                    entry["output"],
+                    ok=(entry["status"] == "ok"),
+                )
+
+        state = _update_instance_state(
+            inst_key,
+            _mutate,
+            db=db,
+            allow_port_retry=(payload.port is None),
+        )
+        saved_after = (state.get("instances") or {}).get(inst_key) or {}
+        if saved_after.get("port") and int(saved_after["port"]) != port:
+            port = int(saved_after["port"])
+            if env_raw:
+                updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
+                _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
+
+        if enabled:
+            _ensure_nodejs_local_db_grants(site, db, linux_user, site_root, app_dir, saved_after)
+
+        _sync_nodejs_worker_unit(
             linux_user,
             site_root,
             app_dir,
             node_major=node_major,
-            npm_logs=auto_logs,
-            force_install=False,
-            run_build_if_needed=(start_arg != "dev"),
-            strict=False,
+            start_mode=start_mode,
+            start_arg=start_arg,
+            port=port,
+            memory_mb=memory_mb,
+            node_env=node_env,
+            enabled=enabled,
+            strict=True,
         )
+        if port != old_port or getattr(site, "app_type", None) != "application":
+            site.app_type = "application"
+            db.add(site)
+            db.commit()
+            _sync_nodejs_nginx_vhost(site, linux_user, site_root, port, strict=False)
 
-    def _mutate(inst: Dict[str, Any]) -> None:
-        inst.pop("detached", None)
-        inst["node_major"] = node_major
-        inst["start_mode"] = start_mode
-        inst["start_arg"] = start_arg
-        inst["port"] = port
-        inst["memory_mb"] = memory_mb
-        inst["node_env"] = node_env
-        inst["process_enabled"] = enabled
-        for entry in auto_logs:
-            _append_npm_log(
-                inst,
-                entry["cmd"],
-                entry["output"],
-                ok=(entry["status"] == "ok"),
-            )
-
-    state = _update_instance_state(
-        inst_key,
-        _mutate,
-        db=db,
-        allow_port_retry=(payload.port is None),
-    )
-    saved_after = (state.get("instances") or {}).get(inst_key) or {}
-    if saved_after.get("port") and int(saved_after["port"]) != port:
-        port = int(saved_after["port"])
-        if env_raw:
-            updated_env = _update_env_text(env_raw, {"PORT": str(port), "NODE_ENV": node_env})
-            _write_app_file(linux_user, site_root, app_dir, ".env", updated_env, "0640")
-
-    if enabled:
-        _ensure_nodejs_local_db_grants(site, db, linux_user, site_root, app_dir, saved_after)
-
-    _sync_nodejs_worker_unit(
-        linux_user,
-        site_root,
-        app_dir,
-        node_major=node_major,
-        start_mode=start_mode,
-        start_arg=start_arg,
-        port=port,
-        memory_mb=memory_mb,
-        node_env=node_env,
-        enabled=enabled,
-        strict=True,
-    )
-    if port != old_port or getattr(site, "app_type", None) != "application":
-        site.app_type = "application"
-        db.add(site)
-        db.commit()
-        _sync_nodejs_nginx_vhost(site, linux_user, site_root, port, strict=False)
-
-    instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
+        instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
+    finally:
+        _release_deploy_lock(lock_path)
     action_labels = {
         "start": "Đã khởi động tiến trình Node.js.",
         "stop": "Đã dừng tiến trình Node.js.",
@@ -3409,6 +3670,7 @@ def manage_nodejs_process(
 
 
 @router.post("/instances/{website_id}/npm")
+@_serialized_site_operation("npm")
 def run_npm_action(
     website_id: int,
     payload: NpmActionRequest,
@@ -3542,6 +3804,7 @@ def get_nodejs_env(
 
 
 @router.put("/instances/{website_id}/env")
+@_serialized_site_operation("env:update")
 def update_nodejs_env(
     website_id: int,
     payload: EnvUpdateRequest,
@@ -3604,6 +3867,7 @@ def update_nodejs_env(
 
 
 @router.post("/instances/{website_id}/security")
+@_serialized_site_operation("security:update")
 def update_nodejs_security(
     website_id: int,
     payload: SecurityActionRequest,
@@ -3695,6 +3959,7 @@ def update_nodejs_security(
 
 
 @router.post("/instances/{website_id}/permissions-policy")
+@_serialized_site_operation("permissions-policy")
 def update_nodejs_permissions_policy(
     website_id: int,
     payload: NodejsPermissionsPolicyRequest,
@@ -3864,6 +4129,17 @@ def _execute_git_deploy_pipeline(
             )
 
     if restart_process:
+        db.expire_all()
+        live_row = (
+            db.query(NodejsInstance)
+            .filter(NodejsInstance.website_id == site.id, NodejsInstance.detached.is_(False))
+            .first()
+        )
+        if live_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Ứng dụng Node.js đã bị gỡ trong quá trình triển khai Git.",
+            )
         _ensure_nodejs_local_db_grants(site, db, linux_user, site_root, app_dir, saved)
         _sync_nodejs_worker_unit(
             linux_user,
@@ -3984,29 +4260,44 @@ def trigger_nodejs_git_deploy(
     lock_path = _acquire_deploy_lock(site.id, operation="git-deploy")
     if background_tasks is not None:
         started_ts = time.time()
-        op_state = _write_site_operation_status(
-            site.id,
-            operation="git-deploy",
-            status="running",
-            phase="deploying",
-            message="Đang đồng bộ Git, cài đặt gói NPM và biên dịch ứng dụng...",
-            started_at=started_ts,
-        )
-        background_tasks.add_task(
-            _run_background_git_deploy,
-            site.id,
-            lock_path,
-            operation="git-deploy",
-            git_repo=payload.git_repo,
-            git_branch=payload.git_branch,
-            run_npm_install=payload.run_npm_install,
-            build_script=payload.build_script,
-            restart_process=payload.restart_process,
-            started_at=started_ts,
-        )
-        if response is not None:
-            response.status_code = 202
-        instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
+        op_written = False
+        try:
+            op_state = _write_site_operation_status(
+                site.id,
+                operation="git-deploy",
+                status="running",
+                phase="deploying",
+                message="Đang đồng bộ Git, cài đặt gói NPM và biên dịch ứng dụng...",
+                started_at=started_ts,
+            )
+            op_written = True
+            if response is not None:
+                response.status_code = 202
+            instance_info = _inspect_nodejs_instance(site, db, state, force_refresh=True)
+            background_tasks.add_task(
+                _run_background_git_deploy,
+                site.id,
+                lock_path,
+                operation="git-deploy",
+                git_repo=payload.git_repo,
+                git_branch=payload.git_branch,
+                run_npm_install=payload.run_npm_install,
+                build_script=payload.build_script,
+                restart_process=payload.restart_process,
+                started_at=started_ts,
+            )
+        except BaseException as exc:
+            if op_written:
+                _write_site_operation_status(
+                    site.id,
+                    operation="git-deploy",
+                    status="failed",
+                    phase="failed",
+                    error=str(getattr(exc, "detail", None) or exc),
+                    started_at=started_ts,
+                )
+            _release_deploy_lock(lock_path)
+            raise
         return {
             "status": "accepted",
             "queued": True,
@@ -4030,6 +4321,7 @@ def trigger_nodejs_git_deploy(
 
 
 @router.post("/instances/{website_id}/webhook")
+@_serialized_site_operation("webhook:configure")
 def configure_nodejs_webhook(
     website_id: int,
     payload: WebhookConfigRequest,
@@ -4179,8 +4471,12 @@ async def public_nodejs_webhook_deploy(
             },
         )
 
-    lock_path = _acquire_deploy_lock(site.id)
-    background_tasks.add_task(_run_background_webhook_deploy, site.id, lock_path)
+    lock_path = _acquire_deploy_lock(site.id, operation="webhook-deploy")
+    try:
+        background_tasks.add_task(_run_background_webhook_deploy, site.id, lock_path)
+    except BaseException:
+        _release_deploy_lock(lock_path)
+        raise
     return JSONResponse(
         status_code=202,
         content={
@@ -4255,6 +4551,7 @@ def get_nodejs_logs(
 
 
 @router.delete("/instances/{website_id}/logs")
+@_serialized_site_operation("logs:clear")
 def clear_nodejs_logs(
     website_id: int,
     kind: str = Query(default="all", max_length=24),
@@ -4286,6 +4583,7 @@ def clear_nodejs_logs(
 
 
 @router.post("/instances/{website_id}/detach")
+@_serialized_site_operation("detach")
 def detach_nodejs_instance(
     website_id: int,
     db: Session = Depends(get_db),
@@ -4306,6 +4604,7 @@ def detach_nodejs_instance(
 
 
 @router.post("/instances/{website_id}/remove")
+@_serialized_site_operation("remove")
 def remove_nodejs_instance(
     website_id: int,
     payload: RemoveNodejsRequest,

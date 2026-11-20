@@ -1054,6 +1054,7 @@ try:
                     node_env=str(data.get("node_env") or "production"),
                     enabled=True,
                     strict=False,
+                    restart_only_if_changed=True,
                 )
                 print(f"Resynced Node.js worker unit for {site.domain}")
             except Exception as inner_exc:
@@ -1085,6 +1086,7 @@ try:
                     (site.php_version or "8.3"),
                     q_cfg,
                     strict=False,
+                    restart_only_if_changed=True,
                 )
                 print(f"Resynced Laravel queue worker unit for {site.domain}")
         except Exception as l_exc:
@@ -1136,7 +1138,7 @@ try:
         for user in db.query(User).all():
             if is_admin_role(user.role):
                 continue
-            resource_monitor.apply_user_cgroup_limits(user)
+            resource_monitor.apply_user_cgroup_limits(user, if_changed=True)
 except Exception as exc:
     print(f"WARNING: user slice limits sync skipped: {exc}", file=sys.stderr)
 PY_SYNC_SLICE_LIMITS

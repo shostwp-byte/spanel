@@ -907,6 +907,7 @@ def test_stage_3_port_uniqueness_retry_and_git_branch_hardening(tmp_path, monkey
             lambda inst: inst.setdefault("port", 21000),
             db=db,
             allow_port_retry=True,
+            allow_create=True,
         )
         assert state["instances"][str(s2.id)]["port"] == 21001
         db.close()

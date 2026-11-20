@@ -1483,6 +1483,7 @@ def _sync_laravel_worker_unit(
     q_cfg: Dict[str, Any],
     *,
     strict: bool = True,
+    restart_only_if_changed: bool = False,
 ) -> Dict[str, Any]:
     workers = max(1, min(8, int(q_cfg.get("workers") or 2)))
     queue_name = re.sub(r"[^a-zA-Z0-9_,-]", "", str(q_cfg.get("queue") or "default").strip()) or "default"
@@ -1499,20 +1500,24 @@ def _sync_laravel_worker_unit(
             "state": "active" if enabled else "inactive",
         }
 
+    helper_args = [
+        linux_user,
+        str(site_root),
+        str(app_dir),
+        clean_php,
+        str(workers),
+        queue_name,
+        str(tries),
+        str(timeout_sec),
+        str(memory_mb),
+        "1" if enabled else "0",
+    ]
+    if restart_only_if_changed:
+        helper_args.append("if-changed")
+
     res = shell.privileged(
         "laravel-worker-sync",
-        helper_args=[
-            linux_user,
-            str(site_root),
-            str(app_dir),
-            clean_php,
-            str(workers),
-            queue_name,
-            str(tries),
-            str(timeout_sec),
-            str(memory_mb),
-            "1" if enabled else "0",
-        ],
+        helper_args=helper_args,
         check=False,
         timeout=60,
     )

@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import contextvars
 from datetime import datetime
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -102,7 +103,13 @@ def _grant_statements(q_db: str, q_user_at_host: str, write_locked: bool) -> lis
     privileges back.
     """
     if write_locked:
+        # Grant WRITE_LOCKED_PRIVILEGES first so mysql.db always has a grant row
+        # for (host, db, user) even on newly created loopback hosts ('127.0.0.1',
+        # '::1') — otherwise REVOKE ALL PRIVILEGES ON db.* aborts with MariaDB
+        # ERROR 1141 ("There is no such grant defined") before ACCOUNT LOCK and
+        # resource limits can run.
         return [
+            f"GRANT {WRITE_LOCKED_PRIVILEGES} ON {q_db}.* TO {q_user_at_host};",
             f"REVOKE ALL PRIVILEGES ON {q_db}.* FROM {q_user_at_host};",
             f"GRANT {WRITE_LOCKED_PRIVILEGES} ON {q_db}.* TO {q_user_at_host};",
         ]
@@ -272,15 +279,19 @@ def create_database_credentials(
     statements = [
         f"{create_db_clause} {q_db} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
     ]
+    lock_clause = " ACCOUNT LOCK" if account_locked else ""
     for client_host in LOCAL_CLIENT_HOSTS:
         q_host = _quote_sql_string(client_host)
-        statements.append(f"CREATE USER IF NOT EXISTS {q_user}@{q_host} {auth};")
+        # Create new loopback hosts already locked when account_locked=True,
+        # and enforce ACCOUNT LOCK immediately before any GRANT/REVOKE so a
+        # suspended account never exists unlocked even if a later step fails.
+        statements.append(f"CREATE USER IF NOT EXISTS {q_user}@{q_host} {auth}{lock_clause};")
         if allow_existing_user:
             # Only a restore/sync sets the password of an account that was already there.
             statements.append(f"ALTER USER {q_user}@{q_host} {auth};")
-        statements.extend(_grant_statements(q_db, f"{q_user}@{q_host}", write_locked))
         if account_locked:
             statements.append(f"ALTER USER {q_user}@{q_host} ACCOUNT LOCK;")
+        statements.extend(_grant_statements(q_db, f"{q_user}@{q_host}", write_locked))
     statements.append("FLUSH PRIVILEGES;")
     _run_sql("\n".join(statements) + "\n")
     enforce_db_user_resource_limits(db_user)
@@ -403,15 +414,18 @@ def change_database_password(db_user: str, db_password: str):
     q_user = _quote_sql_string(safe_user)
     q_pw = _quote_sql_string(db_password)
     locked = _panel_user_is_suspended(safe_user)
+    lock_clause = " ACCOUNT LOCK" if locked else ""
     stmts = []
     for host in LOCAL_CLIENT_HOSTS:
         q_host = _quote_sql_string(host)
-        stmts.append(f"CREATE USER IF NOT EXISTS {q_user}@{q_host} IDENTIFIED BY {q_pw};")
+        stmts.append(f"CREATE USER IF NOT EXISTS {q_user}@{q_host} IDENTIFIED BY {q_pw}{lock_clause};")
         stmts.append(f"ALTER USER {q_user}@{q_host} IDENTIFIED BY {q_pw};")
         if locked:
             stmts.append(f"ALTER USER {q_user}@{q_host} ACCOUNT LOCK;")
     stmts.append("FLUSH PRIVILEGES;")
-    return _run_sql("\n".join(stmts) + "\n")
+    res = _run_sql("\n".join(stmts) + "\n")
+    enforce_db_user_resource_limits(safe_user)
+    return res
 
 
 def export_database(db_name: str, output_file: str):
@@ -697,7 +711,13 @@ def enforce_db_user_resource_limits(
     if settings.command_dry_run:
         return
     q_user_name = _quote_sql_string(safe_user)
-    conns = max(5, min(500, int(max_user_connections or 25)))
+    total_conns = max(5, min(500, int(max_user_connections or 25)))
+    # MariaDB enforces MAX_USER_CONNECTIONS independently per user@host entry.
+    # Distribute the per-account budget across LOCAL_CLIENT_HOSTS (with a floor
+    # of 10/host when total_conns >= 20, else 5/host) so the aggregate ceiling
+    # across localhost/127.0.0.1/::1 stays close to total_conns instead of 3x.
+    per_host_floor = 10 if total_conns >= 20 else 5
+    conns = max(per_host_floor, math.ceil(total_conns / max(1, len(LOCAL_CLIENT_HOSTS))))
     stmt_sec = max(2, min(300, int(max_statement_time or 15)))
     stmts_with_time = [
         f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {conns} MAX_STATEMENT_TIME {stmt_sec};"
