@@ -1090,6 +1090,9 @@ def _rename_single_website(
     owner: User | None,
     current_user_id: int | None = None,
 ) -> list[str]:
+    from app.api.nodejs_manager import ensure_no_active_nodejs_operation
+
+    ensure_no_active_nodejs_operation(website.id)
     old_domain = website.domain
     old_root_path = website.root_path
     old_linux_user = website.linux_user
@@ -1801,6 +1804,9 @@ def set_website_nginx_custom(website_id: int, payload: WebsiteNginxCustom, reque
 def delete_website(website_id: int, request: Request, delete_files: bool = True, delete_database: bool = True, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = _get_authorized_website(db, website_id, current_user)
     _block_if_source(db, website)
+    from app.api.nodejs_manager import ensure_no_active_nodejs_operation
+
+    ensure_no_active_nodejs_operation(website.id)
     domain = website.domain
     db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
     if delete_database and db_item:
@@ -2256,6 +2262,9 @@ def transfer_website_owner(
     website = db.query(Website).filter(Website.id == website_id).first()
     if not website:
         raise HTTPException(status_code=404, detail="Website not found")
+    from app.api.nodejs_manager import ensure_no_active_nodejs_operation
+
+    ensure_no_active_nodejs_operation(website.id)
 
     target_owner = db.query(User).filter(User.id == payload.target_owner_id).first()
     if not target_owner:

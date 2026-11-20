@@ -179,3 +179,142 @@ def test_v5_backup_restore_reapplies_write_lock_suspension_and_hourly_limits(tmp
         )
     assert ("reapply", "bk_db", True, True, (500, 0, 0)) in events
     assert ("kill_and_lock", "bk_u", True) in events
+
+
+# --------------------------------------------------------------------------- M1, M5, M6, M7
+
+
+def test_m1_m5_m6_nodejs_site_lock_blocks_all_mutating_endpoints_and_prevents_resurrection(tmp_path, monkeypatch):
+    import json
+    import os
+    import time
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+    from app.api import nodejs_manager as nm
+    from app.api.deps import get_current_user
+    from app.core.config import settings
+    from app.core.database import get_db
+    from app.models.entities import NodejsInstance, User, UserPackage, Website
+    from app.services import addons
+
+    monkeypatch.setattr(addons, "is_installed", lambda slug: True)
+    monkeypatch.setattr(settings, "nodejs_manager_enabled", True)
+    monkeypatch.setattr(nm, "_deploy_locks_dir", lambda: tmp_path)
+
+    SessionLocal = _make_session()
+    app_dir = tmp_path / "site_app"
+    app_dir.mkdir()
+    (app_dir / "package.json").write_text('{"name":"demo","version":"1.0.0"}\n', encoding="utf-8")
+    (app_dir / ".env").write_text("PORT=21030\nNODE_ENV=production\n", encoding="utf-8")
+
+    with SessionLocal() as db:
+        pkg = UserPackage(name="NodePkgM1", node_apps_limit=5, node_app_memory_mb=1024)
+        db.add(pkg)
+        db.flush()
+        user = User(username="m1user", email="m1@example.com", hashed_password="x", role="end_user", package_id=pkg.id)
+        db.add(user)
+        db.flush()
+        site = Website(
+            domain="m1.example.com",
+            owner_id=user.id,
+            root_path=str(app_dir),
+            document_root="public_html",
+            linux_user="m1user",
+            app_type="application",
+        )
+        db.add(site)
+        db.flush()
+        db.add(
+            NodejsInstance(
+                website_id=site.id,
+                owner_id=user.id,
+                app_name="m1.example.com",
+                port=21030,
+                node_major="22",
+                start_mode="node",
+                start_arg="server.js",
+                memory_mb=512,
+                node_env="production",
+                process_enabled=True,
+                detached=False,
+            )
+        )
+        db.commit()
+        site_id = site.id
+        user_id = user.id
+
+    monkeypatch.setattr(nm, "_resolve_nodejs_paths", lambda s, db, sub="": ("m1user", app_dir, app_dir))
+
+    app = FastAPI()
+    app.include_router(nm.router, prefix="/api")
+
+    def _override_db():
+        s = SessionLocal()
+        try:
+            yield s
+        finally:
+            s.close()
+
+    def _override_user():
+        with SessionLocal() as s:
+            return s.query(User).filter(User.id == user_id).first()
+
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_current_user] = _override_user
+    client = TestClient(app)
+
+    # Hold an active live-PID lock on site_id simulating a running background job
+    held = nm._acquire_deploy_lock(site_id, operation="process:start")
+    try:
+        # M1: EVERY mutating endpoint must return 409 Conflict while lock is held
+        assert client.post(f"/api/nodejs-manager/instances/{site_id}/remove", json={"delete_files": False}).status_code == 409
+        assert client.post(f"/api/nodejs-manager/instances/{site_id}/detach").status_code == 409
+        assert client.post(f"/api/nodejs-manager/instances/{site_id}/process", json={"action": "stop"}).status_code == 409
+        assert client.post(f"/api/nodejs-manager/instances/{site_id}/npm", json={"action": "install"}).status_code == 409
+        assert client.put(f"/api/nodejs-manager/instances/{site_id}/env", json={"mode": "raw", "raw_content": "PORT=21099\n"}).status_code == 409
+        assert client.post(f"/api/nodejs-manager/instances/{site_id}/security", json={"apply_all": True, "enabled": True}).status_code == 409
+        assert client.post(f"/api/nodejs-manager/instances/{site_id}/permissions-policy", json={"permissions_policy": "microphone=(self)"}).status_code == 409
+        assert client.post(f"/api/nodejs-manager/instances/{site_id}/webhook", json={"enabled": True}).status_code == 409
+        assert client.delete(f"/api/nodejs-manager/instances/{site_id}/logs").status_code == 409
+
+        # M5: Failed process request with new port MUST NOT have mutated .env before acquiring lock
+        res_port = client.post(
+            f"/api/nodejs-manager/instances/{site_id}/process",
+            json={"action": "restart", "port": 21088, "node_env": "staging"},
+        )
+        assert res_port.status_code == 409
+        env_text = (app_dir / ".env").read_text(encoding="utf-8")
+        assert "PORT=21030" in env_text and "PORT=21088" not in env_text
+    finally:
+        nm._release_deploy_lock(held)
+
+    # M6: If _inspect_nodejs_instance raises before BackgroundTasks handoff, lock MUST be released!
+    monkeypatch.setattr(
+        nm,
+        "_inspect_nodejs_instance",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom inspect")),
+    )
+    with pytest.raises(RuntimeError, match="boom inspect"):
+        client.post(f"/api/nodejs-manager/instances/{site_id}/process", json={"action": "restart"})
+    assert not nm._deploy_lock_path(site_id).exists()
+
+    # M1: _update_instance_state must NOT resurrect a deleted NodejsInstance by default
+    with SessionLocal() as db:
+        db.query(NodejsInstance).filter(NodejsInstance.website_id == site_id).delete()
+        db.commit()
+        with pytest.raises(HTTPException) as exc_nf:
+            nm._update_instance_state(site_id, lambda inst: inst.update({"node_env": "production"}), db=db)
+        assert exc_nf.value.status_code == 404
+        assert db.query(NodejsInstance).filter(NodejsInstance.website_id == site_id).first() is None
+
+    # M6: Atomic stale-lock reclamation when a dead PID left a lock behind
+    lock_path = nm._deploy_lock_path(site_id)
+    lock_path.write_text(json.dumps({"pid": 99999999, "started_at": time.time(), "operation": "dead"}) + "\n", encoding="utf-8")
+    reclaimed = nm._acquire_deploy_lock(site_id, operation="fresh-op")
+    try:
+        meta = nm._read_deploy_lock_meta(reclaimed)
+        assert meta["pid"] == os.getpid()
+        assert meta["operation"] == "fresh-op"
+        assert not reclaimed.with_name(f"{reclaimed.name}.reclaim").exists()
+    finally:
+        nm._release_deploy_lock(reclaimed)

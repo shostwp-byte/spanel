@@ -412,6 +412,7 @@ export function NodejsManagerPage({
       if (pollTimersRef.current[websiteId]) {
         clearTimeout(pollTimersRef.current[websiteId]);
       }
+      let consecutiveErrors = 0;
       const tick = async () => {
         if (!mountedRef.current) return;
         const req = requestRef.current;
@@ -422,6 +423,7 @@ export function NodejsManagerPage({
             { silent: true }
           );
           if (!mountedRef.current) return;
+          consecutiveErrors = 0;
           const op = statusRes?.operation;
           if (op?.active) {
             setInstances(prev =>
@@ -444,9 +446,19 @@ export function NodejsManagerPage({
           } else if (op?.message) {
             setNotice(op.message);
           }
-        } catch {
+        } catch (err) {
+          if (!mountedRef.current) return;
+          consecutiveErrors += 1;
+          // Retry transient network errors with exponential backoff instead of
+          // abandoning the poll on the first failure (Round 18 M7).
+          if (consecutiveErrors <= 8 && Number(err?.status || 0) !== 404) {
+            const backoffMs = Math.min(15000, 2000 * Math.pow(2, consecutiveErrors - 1));
+            pollTimersRef.current[websiteId] = setTimeout(tick, backoffMs);
+            return;
+          }
           delete pollTimersRef.current[websiteId];
           if (busyKey) markBusy(busyKey, false);
+          setError('Không thể kiểm tra trạng thái tác vụ nền Node.js sau nhiều lần thử. Vui lòng tải lại danh sách.');
         }
       };
       pollTimersRef.current[websiteId] = setTimeout(tick, 1800);
@@ -1032,6 +1044,8 @@ export function NodejsManagerPage({
             <button
               type="button"
               className="secondary-light mini"
+              disabled={Boolean(inst.active_operation?.active)}
+              title={inst.active_operation?.active ? 'Đang có tác vụ nền chạy trên website này' : undefined}
               onClick={() => openEnvModal(inst)}
             >
               <Settings size={13} />
@@ -1064,6 +1078,8 @@ export function NodejsManagerPage({
             <button
               type="button"
               className="danger mini"
+              disabled={Boolean(inst.active_operation?.active)}
+              title={inst.active_operation?.active ? 'Không thể gỡ khi tác vụ nền đang chạy' : undefined}
               onClick={() => {
                 setRemoveOptions({
                   mode: 'detach',
@@ -1174,7 +1190,7 @@ export function NodejsManagerPage({
               <button
                 type="button"
                 className="secondary-light"
-                disabled={busyMap[`proc_${inst.id}_stop`] || !isRunning}
+                disabled={busyMap[`proc_${inst.id}_stop`] || Boolean(inst.active_operation?.active) || !isRunning}
                 onClick={() => handleProcessAction(inst, 'stop')}
               >
                 <Square size={14} />
@@ -1292,7 +1308,7 @@ export function NodejsManagerPage({
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
               <button
                 type="button"
-                disabled={busyMap[`proc_${inst.id}_configure`]}
+                disabled={busyMap[`proc_${inst.id}_configure`] || Boolean(inst.active_operation?.active)}
                 onClick={() => handleProcessAction(inst, 'configure', pDraft)}
               >
                 <Save size={14} />
@@ -1344,7 +1360,7 @@ export function NodejsManagerPage({
                     <button
                       type="button"
                       className="secondary-light mini"
-                      disabled={isBusy}
+                      disabled={isBusy || Boolean(inst.active_operation?.active)}
                       onClick={() => handleNpmAction(inst, item.action)}
                     >
                       <Terminal size={13} />
@@ -1372,14 +1388,14 @@ export function NodejsManagerPage({
                   {scriptKeys.map(sName => {
                     const busyKey = `npm_${inst.id}_run_script_${sName}`;
                     return (
-                      <button
-                        key={sName}
-                        type="button"
-                        className="secondary-light mini"
-                        disabled={busyMap[busyKey]}
-                        title={scriptsMap[sName]}
-                        onClick={() => handleNpmAction(inst, 'run_script', { script: sName })}
-                      >
+                        <button
+                          key={sName}
+                          type="button"
+                          className="secondary-light mini"
+                          disabled={busyMap[busyKey] || Boolean(inst.active_operation?.active)}
+                          title={scriptsMap[sName]}
+                          onClick={() => handleNpmAction(inst, 'run_script', { script: sName })}
+                        >
                         <Play size={12} />
                         <span>{busyMap[busyKey] ? `Đang chạy ${sName}...` : `npm run ${sName}`}</span>
                       </button>
@@ -1410,6 +1426,7 @@ export function NodejsManagerPage({
               <button
                 type="button"
                 disabled={
+                  Boolean(inst.active_operation?.active) ||
                   !String(customPkgInputs[inst.id] || '').trim() ||
                   busyMap[`npm_${inst.id}_add_${String(customPkgInputs[inst.id] || '').trim()}`]
                 }
@@ -1475,7 +1492,7 @@ export function NodejsManagerPage({
                             type="button"
                             className="secondary-light mini"
                             style={{ width: '100%' }}
-                            disabled={busyRem}
+                            disabled={busyRem || Boolean(inst.active_operation?.active)}
                             onClick={() => handleNpmAction(inst, 'remove', { package: pkg.name })}
                           >
                             <span>{busyRem ? 'Đang gỡ...' : 'Đã cài · Gỡ gói'}</span>
@@ -1485,7 +1502,7 @@ export function NodejsManagerPage({
                             type="button"
                             className="secondary-light mini"
                             style={{ width: '100%' }}
-                            disabled={busyAdd}
+                            disabled={busyAdd || Boolean(inst.active_operation?.active)}
                             onClick={() => handleNpmAction(inst, 'add', { package: pkg.name })}
                           >
                             <Plus size={12} />
@@ -1550,7 +1567,7 @@ export function NodejsManagerPage({
               </div>
               <button
                 type="button"
-                disabled={busyMap[`sec_${inst.id}_all`]}
+                disabled={busyMap[`sec_${inst.id}_all`] || Boolean(inst.active_operation?.active)}
                 onClick={() => handleSecurityAction(inst, { applyAll: true, enabled: true })}
               >
                 <ShieldCheck size={14} />
@@ -1609,6 +1626,7 @@ export function NodejsManagerPage({
                           <button
                             type="button"
                             className="secondary-light mini"
+                            disabled={Boolean(inst.active_operation?.active)}
                             onClick={() => handleNpmAction(inst, 'install')}
                           >
                             <span>Chạy npm install</span>
@@ -1618,7 +1636,7 @@ export function NodejsManagerPage({
                         <button
                           type="button"
                           className={chk.passed ? 'secondary-light mini' : 'mini'}
-                          disabled={isBusy}
+                          disabled={isBusy || Boolean(inst.active_operation?.active)}
                           onClick={() =>
                             handleSecurityAction(inst, {
                               checkId: chk.id,
@@ -1641,7 +1659,7 @@ export function NodejsManagerPage({
                   ? permissionsDrafts[inst.id]
                   : inst.permissions_policy || '';
               const parsedPP = parsePermissionsPolicy(currentDraftPolicy);
-              const ppBusy = !!busyMap[`pp_${inst.id}`];
+              const ppBusy = !!busyMap[`pp_${inst.id}`] || Boolean(inst.active_operation?.active);
               const hasExplicitPP = Boolean((inst.permissions_policy || '').trim());
               return (
                 <div
@@ -1810,7 +1828,7 @@ export function NodejsManagerPage({
 
               <button
                 type="button"
-                disabled={busyMap[`git_${inst.id}`]}
+                disabled={busyMap[`git_${inst.id}`] || Boolean(inst.active_operation?.active)}
                 onClick={() => handleGitDeploy(inst)}
               >
                 <GitBranch size={14} />
@@ -1856,7 +1874,7 @@ export function NodejsManagerPage({
                   <button
                     type="button"
                     className={inst.webhook_enabled ? 'secondary-light mini' : 'mini'}
-                    disabled={busyMap[`wh_${inst.id}`]}
+                    disabled={busyMap[`wh_${inst.id}`] || Boolean(inst.active_operation?.active)}
                     onClick={() =>
                       handleWebhookConfig(inst, {
                         enabled: !inst.webhook_enabled,
@@ -1870,7 +1888,7 @@ export function NodejsManagerPage({
                     <button
                       type="button"
                       className="secondary-light mini"
-                      disabled={busyMap[`wh_${inst.id}`]}
+                      disabled={busyMap[`wh_${inst.id}`] || Boolean(inst.active_operation?.active)}
                       onClick={() => handleWebhookConfig(inst, { enabled: true, rotateToken: true })}
                     >
                       <RotateCcw size={12} />
