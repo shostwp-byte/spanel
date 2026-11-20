@@ -1191,6 +1191,7 @@ def _sync_nodejs_worker_unit(
     node_env: str = "production",
     enabled: bool = True,
     strict: bool = True,
+    restart_only_if_changed: bool = False,
 ) -> Dict[str, Any]:
     clean_major = _validate_node_major(node_major)
     clean_mode, clean_arg = _validate_start_config(start_mode, start_arg)
@@ -1214,20 +1215,24 @@ def _sync_nodejs_worker_unit(
             "memory_current_bytes": 42 * 1024 * 1024 if enabled else 0,
         }
 
+    helper_args = _worker_sync_helper_args(
+        linux_user,
+        site_root,
+        app_dir,
+        node_major=clean_major,
+        port=clean_port,
+        memory_mb=clean_mem,
+        start_mode=clean_mode,
+        start_arg=clean_arg,
+        node_env=clean_env,
+        enabled=enabled,
+    )
+    if restart_only_if_changed:
+        helper_args.append("if-changed")
+
     res = shell.privileged(
         "nodejs-worker-sync",
-        helper_args=_worker_sync_helper_args(
-            linux_user,
-            site_root,
-            app_dir,
-            node_major=clean_major,
-            port=clean_port,
-            memory_mb=clean_mem,
-            start_mode=clean_mode,
-            start_arg=clean_arg,
-            node_env=clean_env,
-            enabled=enabled,
-        ),
+        helper_args=helper_args,
         check=False,
         timeout=60,
     )

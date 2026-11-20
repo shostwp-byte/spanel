@@ -7947,7 +7947,9 @@ delete_laravel_worker_units_for_user() {
 sync_laravel_worker_unit() {
   local user="$1" site_root="$2" app_dir="$3" php_ver="$4"
   local workers="$5" queue_name="$6" tries="$7" timeout_sec="$8" memory_mb="$9" enabled_flag="${10}"
+  local restart_mode="${11:-always}"
   local uid root_target app_target php_bin base unit_file tmp_file open_basedir mem_cap i
+  local unit_unchanged=0 all_running=1 extra_active=0
 
   require_linux_user "$user"
   uid="$(id -u "$user" 2>/dev/null)" || deny "panel Linux user does not exist: $user"
@@ -8027,7 +8029,34 @@ WantedBy=multi-user.target
 UNIT
   chown root:root "$tmp_file"
   chmod 0644 "$tmp_file"
-  mv -f -- "$tmp_file" "$unit_file"
+  if [[ -f "$unit_file" ]] && cmp -s "$tmp_file" "$unit_file"; then
+    unit_unchanged=1
+    rm -f -- "$tmp_file"
+  else
+    mv -f -- "$tmp_file" "$unit_file"
+  fi
+
+  if [[ "$restart_mode" == "if-changed" && "$unit_unchanged" -eq 1 ]]; then
+    for (( i = 1; i <= 10#$workers; i++ )); do
+      if ! systemctl is-active --quiet "${base}@${i}.service" 2>/dev/null; then
+        all_running=0
+        break
+      fi
+    done
+    for (( i = 10#$workers + 1; i <= 8; i++ )); do
+      if systemctl is-active --quiet "${base}@${i}.service" 2>/dev/null; then
+        extra_active=1
+        break
+      fi
+    done
+    if (( all_running == 1 && extra_active == 0 )); then
+      echo "status=running"
+      echo "unit=${base}@.service"
+      echo "active_workers=${workers}"
+      echo "unchanged=1"
+      return 0
+    fi
+  fi
 
   systemctl daemon-reload
   for (( i = 1; i <= 10#$workers; i++ )); do
@@ -8117,7 +8146,12 @@ copy_site_env_as_user() {
   fi
   chown root:root "$tmp_dest"
   chmod 0600 "$tmp_dest"
+  if [[ -f "$dest" ]] && cmp -s "$tmp_dest" "$dest"; then
+    rm -f -- "$tmp_dest"
+    return 1
+  fi
   mv -f -- "$tmp_dest" "$dest"
+  return 0
 }
 
 # File repairs only, as the site user. npm install and npm run build are the
@@ -8202,7 +8236,9 @@ delete_nodejs_worker_units_for_user() {
 sync_nodejs_worker_unit() {
   local user="$1" site_root="$2" app_dir="$3" node_major="$4"
   local port="$5" memory_mb="$6" start_mode="$7" start_arg="$8" node_env="$9" enabled_flag="${10}"
+  local restart_mode="${11:-always}"
   local uid root_target app_target bin_dir exec_start base unit_file env_file tmp_file
+  local env_changed=1 unit_changed=1
 
   require_linux_user "$user"
   uid="$(id -u "$user" 2>/dev/null)" || deny "panel Linux user does not exist: $user"
@@ -8255,7 +8291,11 @@ sync_nodejs_worker_unit() {
   install -d -o "$user" -g "$user" -m 0700 "${HOME_ROOT}/${user}/.npm"
   install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
   prepare_nodejs_app_as_user "$user" "$app_target" "$bin_dir"
-  copy_site_env_as_user "$user" "$app_target" "$env_file"
+  if copy_site_env_as_user "$user" "$app_target" "$env_file"; then
+    env_changed=1
+  else
+    env_changed=0
+  fi
   tmp_file="${unit_file}.spanel-tmp-$$"
 
   cat >"$tmp_file" <<UNIT
@@ -8316,7 +8356,22 @@ WantedBy=multi-user.target
 UNIT
   chown root:root "$tmp_file"
   chmod 0644 "$tmp_file"
-  mv -f -- "$tmp_file" "$unit_file"
+  if [[ -f "$unit_file" ]] && cmp -s "$tmp_file" "$unit_file"; then
+    unit_changed=0
+    rm -f -- "$tmp_file"
+  else
+    unit_changed=1
+    mv -f -- "$tmp_file" "$unit_file"
+  fi
+
+  if [[ "$restart_mode" == "if-changed" && "$unit_changed" -eq 0 && "$env_changed" -eq 0 ]] \
+    && systemctl is-active --quiet "${base}.service" 2>/dev/null; then
+    echo "status=running"
+    echo "unit=${base}.service"
+    echo "port=${port}"
+    echo "unchanged=1"
+    return 0
+  fi
 
   systemctl daemon-reload
   systemctl enable "${base}.service" >/dev/null 2>&1 || true
@@ -12797,7 +12852,12 @@ PY
   user-limits-apply)
     # Apply Linux Cgroups v2 (systemd user-<UID>.slice & spanel-user-<user>.slice),
     # PHP-FPM pool limits, and optional Linux filesystem disk quota for a tenant account.
-    [[ $# -ge 9 && $# -le 11 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write> [storage_limit_mb] [inode_limit]"
+    if_changed_only=0
+    if [[ $# -ge 10 && "${!#}" == "--if-changed" ]]; then
+      if_changed_only=1
+      set -- "${@:1:$#-1}"
+    fi
+    [[ $# -ge 9 && $# -le 11 ]] || deny "usage: user-limits-apply <user> <cpu_pct> <mem_high_mb> <mem_max_mb> <tasks_max> <io_read_mbps> <io_write_mbps> <iops_read> <iops_write> [storage_limit_mb] [inode_limit] [--if-changed]"
     u_name="$1"
     cpu_pct="$2"; mem_high="$3"; mem_max="$4"; tasks_max="$5"
     io_r="$6"; io_w="$7"; iops_r="$8"; iops_w="$9"
@@ -12815,7 +12875,9 @@ PY
     slice_dir="/etc/systemd/system/${slice_unit}.d"
     install -d -o root -g root -m 0755 "$slice_dir"
     install -d -o root -g spanel -m 0750 /etc/spanel /etc/spanel/limits
-    cat >"/etc/spanel/limits/${u_name}.env" <<EOF
+    limits_env_file="/etc/spanel/limits/${u_name}.env"
+    limits_env_tmp="${limits_env_file}.spanel-tmp-$$"
+    cat >"$limits_env_tmp" <<EOF
 CPU_PCT=${cpu_pct}
 MEM_HIGH_MB=${mem_high}
 MEM_MAX_MB=${mem_max}
@@ -12827,8 +12889,15 @@ IOPS_WRITE=${iops_w}
 STORAGE_MB=${storage_mb}
 INODE_LIMIT=${inode_limit}
 EOF
-    chown root:spanel "/etc/spanel/limits/${u_name}.env"
-    chmod 0640 "/etc/spanel/limits/${u_name}.env"
+    chown root:spanel "$limits_env_tmp"
+    chmod 0640 "$limits_env_tmp"
+    limits_env_changed=1
+    if [[ -f "$limits_env_file" ]] && cmp -s "$limits_env_tmp" "$limits_env_file"; then
+      limits_env_changed=0
+      rm -f -- "$limits_env_tmp"
+    else
+      mv -f -- "$limits_env_tmp" "$limits_env_file"
+    fi
 
     base_dev="$(tenant_io_base_device)"
     cgroup_tasks_max="$tasks_max"
@@ -12836,6 +12905,8 @@ EOF
       cgroup_tasks_max=2048
     fi
 
+    slice_conf_file="${slice_dir}/50-spanel-limits.conf"
+    slice_conf_tmp="${slice_conf_file}.spanel-tmp-$$"
     {
       echo "# Generated by SPanel Resource Limits for user ${u_name} (UID ${u_uid})"
       echo "[Slice]"
@@ -12869,8 +12940,21 @@ EOF
         (( iops_r > 0 )) && echo "IOReadIOPSMax=${base_dev} ${iops_r}"
         (( iops_w > 0 )) && echo "IOWriteIOPSMax=${base_dev} ${iops_w}"
       fi
-    } >"${slice_dir}/50-spanel-limits.conf"
-    chmod 0644 "${slice_dir}/50-spanel-limits.conf"
+    } >"$slice_conf_tmp"
+    chmod 0644 "$slice_conf_tmp"
+    slice_conf_changed=1
+    if [[ -f "$slice_conf_file" ]] && cmp -s "$slice_conf_tmp" "$slice_conf_file"; then
+      slice_conf_changed=0
+      rm -f -- "$slice_conf_tmp"
+    else
+      mv -f -- "$slice_conf_tmp" "$slice_conf_file"
+    fi
+
+    if (( if_changed_only == 1 && limits_env_changed == 0 && slice_conf_changed == 0 )); then
+      echo "unchanged=1"
+      echo "Cgroups v2 & PHP-FPM resource limits already up to date for ${u_name} (UID ${u_uid})"
+      exit 0
+    fi
 
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl start "$slice_unit" >/dev/null 2>&1 || true
@@ -13781,8 +13865,9 @@ EOF
     ;;
 
   laravel-worker-sync)
-    [[ $# -eq 10 ]] || deny "usage: laravel-worker-sync <site-user> <site-root> <app-dir> <php-version> <workers> <queue> <tries> <timeout> <memory> <0|1>"
-    sync_laravel_worker_unit "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"
+    [[ $# -eq 10 || $# -eq 11 ]] || deny "usage: laravel-worker-sync <site-user> <site-root> <app-dir> <php-version> <workers> <queue> <tries> <timeout> <memory> <0|1> [always|if-changed]"
+    is_in "${11:-always}" always if-changed || deny "invalid restart mode: ${11:-}"
+    sync_laravel_worker_unit "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11:-always}"
     ;;
 
   laravel-worker-status)
@@ -13805,8 +13890,9 @@ EOF
     ;;
 
   nodejs-worker-sync)
-    [[ $# -eq 10 ]] || deny "usage: nodejs-worker-sync <site-user> <site-root> <app-dir> <node-major> <port> <memory-mb> <start-mode> <start-arg> <node-env> <0|1>"
-    sync_nodejs_worker_unit "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"
+    [[ $# -eq 10 || $# -eq 11 ]] || deny "usage: nodejs-worker-sync <site-user> <site-root> <app-dir> <node-major> <port> <memory-mb> <start-mode> <start-arg> <node-env> <0|1> [always|if-changed]"
+    is_in "${11:-always}" always if-changed || deny "invalid restart mode: ${11:-}"
+    sync_nodejs_worker_unit "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11:-always}"
     ;;
 
   nodejs-worker-status)

@@ -175,7 +175,7 @@ def snipe_user_slow_queries(db: Session, user_id: int, max_time_sec: int = 2) ->
     return killed
 
 
-def apply_user_cgroup_limits(user: User) -> bool:
+def apply_user_cgroup_limits(user: User, *, if_changed: bool = False) -> bool:
     """Apply Linux Cgroups v2 & PHP-FPM resource limits for a panel user."""
     if is_admin_role(user.role):
         return True
@@ -198,6 +198,8 @@ def apply_user_cgroup_limits(user: User) -> bool:
         # Enforced by kernel quota (setquota) when quota-enable turned it on.
         str(max(0, int(getattr(user, "inode_limit", 0) or 0))),
     ]
+    if if_changed:
+        args.append("--if-changed")
     try:
         shell.privileged(
             "user-limits-apply",

@@ -586,7 +586,7 @@ def test_p1_8_update_sh_does_not_force_user_slice_tasks_max_to_2048(monkeypatch)
     db.commit()
     applied = []
     monkeypatch.setattr(core_db, "SessionLocal", _sessionmaker_for(db))
-    monkeypatch.setattr(resource_monitor, "apply_user_cgroup_limits", lambda u: applied.append((u.username, u.tasks_max)) or True)
+    monkeypatch.setattr(resource_monitor, "apply_user_cgroup_limits", lambda u, **kw: applied.append((u.username, u.tasks_max)) or True)
     exec(compile(_update_heredoc("PY_SYNC_SLICE_LIMITS"), "update.sh:PY_SYNC_SLICE_LIMITS", "exec"), {"__name__": "__main__"})
     assert applied == [("dave", 300)]
 

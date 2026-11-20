@@ -506,3 +506,71 @@ def test_v6_broken_zip_bin_stub_triggers_npm_install_before_worker_start(tmp_pat
     (app_dir / "node_modules" / "next" / "dist" / "bin" / "next").write_text("#!/usr/bin/env node\n", encoding="utf-8")
     nm._ensure_nodejs_app_ready("alice", app_dir, app_dir, node_major="22", run_build_if_needed=False)
     assert install_calls == []
+
+
+# --------------------------------------------------------------------------- V3
+
+
+def test_v3_update_migrations_skip_restart_and_reload_when_units_and_limits_unchanged(monkeypatch):
+    from pathlib import Path
+    from app.api import laravel_manager as lm
+    from app.api import nodejs_manager as nm
+    from app.core.config import settings
+    from app.models.entities import User
+    from app.services import resource_monitor
+
+    update_sh = (REPO_ROOT / "installer" / "update.sh").read_text(encoding="utf-8")
+    helper_sh = (REPO_ROOT / "installer" / "files" / "spanel-helper.sh").read_text(encoding="utf-8")
+
+    assert "restart_only_if_changed=True" in update_sh
+    assert "apply_user_cgroup_limits(user, if_changed=True)" in update_sh
+    assert 'if [[ "$restart_mode" == "if-changed"' in helper_sh
+    assert 'if [[ $# -ge 10 && "${!#}" == "--if-changed" ]]' in helper_sh
+
+    calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(settings, "command_dry_run", False)
+    monkeypatch.setattr(
+        nm.shell,
+        "privileged",
+        lambda verb, helper_args=None, **kw: calls.append((verb, list(helper_args or [])))
+        or SimpleNamespace(returncode=0, stdout="status=running\nunchanged=1\n", stderr=""),
+    )
+    monkeypatch.setattr(
+        lm.shell,
+        "privileged",
+        lambda verb, helper_args=None, **kw: calls.append((verb, list(helper_args or [])))
+        or SimpleNamespace(returncode=0, stdout="status=running\nunchanged=1\n", stderr=""),
+    )
+    monkeypatch.setattr(
+        resource_monitor.shell,
+        "privileged",
+        lambda verb, helper_args=None, **kw: calls.append((verb, list(helper_args or [])))
+        or SimpleNamespace(returncode=0, stdout="unchanged=1\n", stderr=""),
+    )
+
+    nm._sync_nodejs_worker_unit(
+        "alice",
+        Path("/home/alice/a.example.com"),
+        Path("/home/alice/a.example.com/public_html"),
+        node_major="22",
+        start_mode="node",
+        start_arg="server.js",
+        port=21022,
+        restart_only_if_changed=True,
+    )
+    lm._sync_laravel_worker_unit(
+        "alice",
+        Path("/home/alice/a.example.com"),
+        Path("/home/alice/a.example.com"),
+        "8.3",
+        {"enabled": True, "workers": 1},
+        restart_only_if_changed=True,
+    )
+    resource_monitor.apply_user_cgroup_limits(
+        User(username="alice", email="a@example.com", hashed_password="x", role="end_user"),
+        if_changed=True,
+    )
+
+    assert calls[0][0] == "nodejs-worker-sync" and calls[0][1][-1] == "if-changed"
+    assert calls[1][0] == "laravel-worker-sync" and calls[1][1][-1] == "if-changed"
+    assert calls[2][0] == "user-limits-apply" and calls[2][1][-1] == "--if-changed"
