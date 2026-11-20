@@ -293,6 +293,51 @@ jobs:
           test "${#units[@]}" -eq 0
           test "${#envs[@]}" -eq 0
 
+  mariadb-integration:
+    name: MariaDB live integration (V1 & V5)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+      - name: Install and configure MariaDB with skip-name-resolve
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server
+          sudo tee /etc/mysql/mariadb.conf.d/99-spanel-ci.cnf >/dev/null <<'EOF'
+          [mysqld]
+          bind-address = *
+          skip-name-resolve = 1
+          EOF
+          sudo systemctl restart mariadb
+          sudo mysql <<'SQL'
+          CREATE USER IF NOT EXISTS 'spanel_ci'@'localhost' IDENTIFIED BY 'Sp4nelCiRoot!2026';
+          GRANT ALL PRIVILEGES ON *.* TO 'spanel_ci'@'localhost' WITH GRANT OPTION;
+          FLUSH PRIVILEGES;
+          SQL
+          cat > "$HOME/.my.cnf" <<'EOF'
+          [client]
+          user=spanel_ci
+          password=Sp4nelCiRoot!2026
+          host=localhost
+          EOF
+          chmod 0600 "$HOME/.my.cnf"
+          mysql -e "SELECT VERSION(), @@skip_name_resolve;"
+      - name: Run live MariaDB integration tests
+        env:
+          PYTHONPATH: backend
+          SPANEL_LIVE_MARIADB: "1"
+        run: python -m pytest tests/test_mariadb_live_integration.py -v
+
   whmcs-module:
     name: WHMCS module (PHP ${{ matrix.php }})
     runs-on: ubuntu-24.04
