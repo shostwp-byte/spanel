@@ -31,7 +31,9 @@ def _run_as_tenant_tcp(db_user: str, db_password: str, db_name: str, sql: str, h
     env = dict(os.environ)
     env["MYSQL_PWD"] = db_password
     return subprocess.run(
-        ["mysql", "--protocol=TCP", "-h", host, "-u", db_user, "-N", "-B", db_name, "-e", sql],
+        # --no-defaults ensures $HOME/.my.cnf (panel admin credentials in CI)
+        # cannot override MYSQL_PWD for the tenant connection.
+        ["mysql", "--no-defaults", "--protocol=TCP", "-h", host, "-u", db_user, "-N", "-B", db_name, "-e", sql],
         env=env,
         capture_output=True,
         text=True,
