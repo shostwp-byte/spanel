@@ -10,7 +10,7 @@
 [![Security](https://img.shields.io/badge/Security-Privilege%20Separated%20%2B%20Cgroups%20v2-10b981?style=flat-square)](docs/ADMIN_AND_CLI_GUIDE.md)
 [![License](https://img.shields.io/badge/License-GNU%20AGPLv3-blue?style=flat-square)](LICENSE)
 
-**SPanel** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, hiệu năng cao, được thiết kế chuyên biệt cho **Ubuntu 24.04 LTS**. Hệ thống kết hợp kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)** chuẩn DirectAdmin với cơ chế cô lập đặc quyền `spanel-helper`, giới hạn tài nguyên phần cứng **Linux Cgroups v2, Kernel Disk/Inode Quota & MySQL Governor**, bộ ba trình quản trị ứng dụng chuyên sâu (**Node.js Manager**, **Laravel Manager**, **WordPress Manager**), hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh**, chế độ **Sáng / Tối (Light / Dark Mode)** và tương thích hoàn hảo trên thiết bị di động (**Mobile-First Responsive**).
+**SPanel** là bảng điều khiển quản trị máy chủ và web hosting hiện đại, hiệu năng cao, được thiết kế chuyên biệt cho **Ubuntu 24.04 LTS**. Hệ thống kết hợp kiến trúc phân quyền **3 cấp độ (Admin / Reseller / End User)** với cơ chế cô lập đặc quyền `spanel-helper`, giới hạn tài nguyên phần cứng **Linux Cgroups v2, Kernel Disk/Inode Quota & MySQL Governor**, bộ ba trình quản trị ứng dụng chuyên sâu (**Node.js Manager**, **Laravel Manager**, **WordPress Manager**), hỗ trợ song ngữ **Tiếng Việt / Tiếng Anh**, chế độ **Sáng / Tối (Light / Dark Mode)** và tương thích hoàn hảo trên thiết bị di động (**Mobile-First Responsive**).
 
 [Cài đặt Nhanh](#-cài-đặt-nhanh-quick-start) • [Tính năng Chi tiết](#-danh-mục-tính-năng-toàn-diện) • [Kiến trúc Bảo mật](#-kiến-trúc-hệ-thống--bảo-mật-đa-lớp) • [Tài liệu Kỹ thuật (`docs/`)](#-tài-liệu-kỹ-thuật-docs) • [Báo lỗi & Đóng góp](https://github.com/shostwp-byte/spanel/issues)
 
@@ -98,7 +98,7 @@ flowchart TB
 ### 2. Quản trị Tên miền, Subdomain, Chuyển hướng & SSL/TLS
 
 - **Domain Setup (`/website`):**
-  - Quản lý tập trung toàn bộ tên miền chính và tên miền phụ trên cùng một bảng điều khiển chuẩn DirectAdmin.
+  - Quản lý tập trung toàn bộ tên miền chính và tên miền phụ trên cùng một bảng điều khiển trực quan.
   - **Đổi tên miền (`Rename Domain`):** Tự động cập nhật cấu hình Nginx vhost, chứng chỉ và thư mục gốc.
   - **Hành động hàng loạt:** Bật/tắt bắt buộc HTTPS (`Force SSL`), đổi phiên bản PHP (`5.6` – `8.5`), bật/tắt cô lập `Open_basedir`, bật/tắt `FastCGI Cache` và xóa tên miền an toàn.
   - **Domain Aliases & Pointers:** Hỗ trợ chế độ song song (`alias`) hoặc chuyển hướng (`redirect`) kèm đồng bộ chứng chỉ SSL.
@@ -232,8 +232,8 @@ flowchart TB
 - **Khôi phục Chi tiết (`Granular Restore`) & Kiểm chứng SHA-256:**
   - Cho phép chọn chế độ khôi phục linh hoạt: **Toàn bộ (`Web + DB + Email`)**, **Chỉ mã nguồn Website**, **Chỉ Database MariaDB** hoặc **Chỉ Hộp thư Email**.
   - Kiểm tra mã băm **SHA-256** trước khi giải nén và tự động khôi phục nguyên trạng cấu hình Nginx vhost, chế độ SSL và phiên bản PHP của từng website.
-- **Công cụ Di chuyển Hệ thống (`cPanel & DirectAdmin Migration` — `/migration`):**
-  - Nhập trực tiếp file sao lưu từ **DirectAdmin** (`user.*.tar.zst`, `.tar.gz`) và **cPanel** (`cpmove-*.tar.gz`, `backup-*.tar.gz`), tự động tái tạo tài khoản, mã nguồn web, cơ sở dữ liệu, hộp thư email và bản ghi DNS.
+- **Công cụ Di chuyển Hệ thống (`Panel Migration` — `/migration`):**
+  - Nhập trực tiếp gói sao lưu từ các bảng điều khiển hosting phổ biến (như **cPanel** `cpmove-*.tar.gz`, `backup-*.tar.gz` và các gói backup tài khoản tiêu chuẩn `.tar.gz` / `.tar.zst`), tự động tái tạo tài khoản, mã nguồn web, cơ sở dữ liệu, hộp thư email và bản ghi DNS.
 
 ---
 
@@ -377,7 +377,7 @@ Toàn bộ tài liệu chuyên sâu dành cho Quản trị viên hệ thống v�
 1. 📘 [**Tổng quan & Kiến trúc Hệ thống (`docs/README.md`)**](docs/README.md) — Kiến trúc tổng thể, ngăn xếp công nghệ và luồng xử lý.
 2. 📗 [**Danh mục Tính năng Chi tiết (`docs/FEATURES.md`)**](docs/FEATURES.md) — Mô tả chi tiết các tính năng theo 3 vai trò Admin, Reseller, End User và hệ thống Add-ons.
 3. 📙 [**Hướng dẫn Cài đặt & Cập nhật Trực tuyến (`docs/INSTALLATION_AND_UPDATE.md`)**](docs/INSTALLATION_AND_UPDATE.md) — Quy trình cài đặt trên VPS mới, tham số tự động hóa và cơ chế Online Update.
-4. 📕 [**Cẩm nang Quản trị CLI, Bảo mật & Di chuyển Dữ liệu (`docs/ADMIN_AND_CLI_GUIDE.md`)**](docs/ADMIN_AND_CLI_GUIDE.md) — Mô hình bảo mật `spanel-helper`, lệnh cứu hộ `spanel`, tường lửa, WAF và công cụ Migration từ DirectAdmin / cPanel.
+4. 📕 [**Cẩm nang Quản trị CLI, Bảo mật & Di chuyển Dữ liệu (`docs/ADMIN_AND_CLI_GUIDE.md`)**](docs/ADMIN_AND_CLI_GUIDE.md) — Mô hình bảo mật `spanel-helper`, lệnh cứu hộ `spanel`, tường lửa, WAF và công cụ di chuyển dữ liệu (Migration).
 5. 📓 [**Tài liệu Provisioning API, WHMCS & MCP AI (`docs/API_AND_WHMCS.md`)**](docs/API_AND_WHMCS.md) — Hướng dẫn tích hợp WHMCS tự động cấp phát hosting và kết nối trợ lý AI qua giao thức MCP.
 6. 🌐 [**Cổng thông tin Tài liệu Trực quan (`docs/index.html`)**](docs/index.html) — Giao diện tra cứu tài liệu hỗ trợ GitHub Pages.
 
@@ -386,7 +386,7 @@ Toàn bộ tài liệu chuyên sâu dành cho Quản trị viên hệ thống v�
 ## ⚠️ Giới hạn đã biết (Known Limitations)
 
 - **Kiến trúc Điều khiển Đơn điểm (Single-Node Control Plane):** SPanel sử dụng SQLite ở chế độ `WAL` (`busy_timeout=15000ms`) cho cơ sở dữ liệu điều khiển (`spanel.db`). Thiết kế này tối ưu cho một máy chủ VPS/Dedicated độc lập (vận hành từ vài chục đến vài trăm website), không hướng tới mô hình cụm điều khiển đa điểm ghi đồng thời (multi-master control plane).
-- **Cơ sở dữ liệu MySQL Từ xa (`Remote MySQL`):** Quản trị viên có thể cấu hình máy chủ MySQL/MariaDB từ xa trong **Multi-Server → Remote MySQL** để người dùng chọn khi tạo database mới, đổi mật khẩu, tải/nạp SQL, khóa ghi khi vượt hạn mức, sao lưu/khôi phục và đăng nhập phpMyAdmin SSO. Tuy nhiên, các database được tạo tự động kèm luồng cài đặt nhanh WordPress 1-Click, WHMCS Provisioning hoặc nhập từ gói cPanel/DirectAdmin mặc định vẫn khởi tạo trên MariaDB nội bộ của máy chủ.
+- **Cơ sở dữ liệu MySQL Từ xa (`Remote MySQL`):** Quản trị viên có thể cấu hình máy chủ MySQL/MariaDB từ xa trong **Multi-Server → Remote MySQL** để người dùng chọn khi tạo database mới, đổi mật khẩu, tải/nạp SQL, khóa ghi khi vượt hạn mức, sao lưu/khôi phục và đăng nhập phpMyAdmin SSO. Tuy nhiên, các database được tạo tự động kèm luồng cài đặt nhanh WordPress 1-Click, WHMCS Provisioning hoặc nhập từ công cụ Migration mặc định vẫn khởi tạo trên MariaDB nội bộ của máy chủ.
 - **Hạn mức Ổ đĩa Tầng Kernel (`setquota`):** Cưỡng chế dung lượng đĩa bằng lệnh `setquota` yêu cầu phân vùng `/home` hoặc `/` của máy chủ đã bật cờ mount `usrquota` / `usrjquota`. Trên các môi trường VPS chưa bật `usrquota` ở tầng filesystem, SPanel vẫn cưỡng chế đầy đủ hạn mức dung lượng ở tầng ứng dụng (File Manager, Upload, Giải nén, Khởi tạo Website, Sao lưu và MySQL Governor).
 - **HTTP/3 (`QUIC`):** Chỉ thị `listen 443 quic reuseport` và header `Alt-Svc` được kích hoạt tự động khi binary Nginx trên máy chủ có biên dịch module `ngx_http_v3_module` (như gói Nginx mainline chính thức từ `nginx.org`). Với gói Nginx mặc định của Ubuntu chưa bật module này, SPanel tự động phục vụ qua giao thức chuẩn `HTTP/2 + TLSv1.3`.
 
