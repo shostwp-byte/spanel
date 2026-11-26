@@ -1603,12 +1603,27 @@ def update_website(
                         rb_worker_msg = _format_worker_warning(website.domain, _resync_site_workers(db, website))
                         if rb_worker_msg:
                             rollback_notes.append(rb_worker_msg)
+                        db.rollback()
                     elif new_root_path and new_linux_user:
-                        # Files remain on disk at new_root_path; do not overwrite
-                        # DB/vhost back to old_root_path when reverse move failed
-                        # or old_linux_user was empty (Round 20 N4).
+                        # Files remain on disk at new_root_path under new_linux_user.
+                        # Persist BOTH ownership (website + NodejsInstance) and
+                        # runtime path to DB so a subsequent session never reads
+                        # stale old_root_path or a cross-tenant owner_id/linux_user
+                        # mismatch (Round 21 R1).
+                        website.owner_id = payload.owner_id
                         website.root_path = new_root_path
                         website.linux_user = new_linux_user
+                        for node_row in db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).all():
+                            node_row.owner_id = payload.owner_id
+                        try:
+                            db.commit()
+                            rollback_notes.append(
+                                f"database updated to keep ownership/path aligned with moved files at {new_root_path}"
+                            )
+                        except Exception as commit_exc:
+                            db.rollback()
+                            logger.exception("owner-change rollback of %s could not persist moved state", website.domain)
+                            rollback_notes.append(f"could not persist moved runtime state: {commit_exc}")
                 suffix = f" ({'; '.join(rollback_notes)})" if rollback_notes else ""
                 if isinstance(exc, HTTPException):
                     raise HTTPException(status_code=exc.status_code, detail=f"{exc.detail}{suffix}") from exc
@@ -2548,21 +2563,44 @@ def _transfer_website_owner_locked(
             except Exception:
                 pass
         rollback_notes: list[str] = []
-        if moved_runtime and old_linux_user:
+        if moved_runtime:
             restored_runtime = False
-            try:
-                site_users.move_site_runtime(new_root_path, old_root_path, old_linux_user, runtime_php)
-                restored_runtime = True
-                website.root_path = old_root_path
-                website.linux_user = old_linux_user
-                _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
-            except Exception as rb_exc:
-                logger.exception("transfer rollback of %s could not restore the site runtime", website.domain)
-                rollback_notes.append(f"rollback could not move runtime back: {rb_exc}")
+            if old_linux_user:
+                try:
+                    site_users.move_site_runtime(new_root_path, old_root_path, old_linux_user, runtime_php)
+                    restored_runtime = True
+                    website.root_path = old_root_path
+                    website.linux_user = old_linux_user
+                    _rewrite_website_vhost(website, root_path=old_root_path, linux_user=old_linux_user)
+                except Exception as rb_exc:
+                    logger.exception("transfer rollback of %s could not restore the site runtime", website.domain)
+                    rollback_notes.append(f"rollback could not move runtime back: {rb_exc}")
+            else:
+                rollback_notes.append(
+                    f"rollback skipped moving runtime from {new_root_path}: previous linux_user was empty"
+                )
             if restored_runtime:
                 rb_worker_msg = _format_worker_warning(website.domain, _resync_site_workers(db, website))
                 if rb_worker_msg:
                     rollback_notes.append(rb_worker_msg)
+            else:
+                # Files remain at new_root_path under new_linux_user; persist
+                # consistent owner_id/root_path/linux_user after db.rollback()
+                # so DB and disk never split across tenants (Round 21 R1).
+                website.owner_id = target_owner.id
+                website.root_path = new_root_path
+                website.linux_user = new_linux_user
+                for node_row in db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).all():
+                    node_row.owner_id = target_owner.id
+                try:
+                    db.commit()
+                    rollback_notes.append(
+                        f"database updated to keep ownership/path aligned with moved files at {new_root_path}"
+                    )
+                except Exception as commit_exc:
+                    db.rollback()
+                    logger.exception("transfer rollback of %s could not persist moved state", website.domain)
+                    rollback_notes.append(f"could not persist moved runtime state: {commit_exc}")
         suffix = f" ({'; '.join(rollback_notes)})" if rollback_notes else ""
         if isinstance(exc, HTTPException):
             raise HTTPException(status_code=exc.status_code, detail=f"{exc.detail}{suffix}") from exc

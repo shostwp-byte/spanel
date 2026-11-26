@@ -111,9 +111,10 @@ def test_v1_live_mariadb_upgrade_write_locked_and_suspended_across_three_loopbac
             if len(parts) == 4 and parts[0] != "Host":
                 rows[parts[0]] = (parts[1], int(parts[2]), int(parts[3]))
         assert set(rows.keys()) == {"localhost", "127.0.0.1", "::1"}, rows
+        expected_conns = {"localhost": 17, "127.0.0.1": 6, "::1": 2}
         for host, (locked_flag, max_conns, max_qph) in rows.items():
             assert str(locked_flag).lower() in {"1", "true"}, f"{host} not locked: {rows}"
-            assert 5 <= max_conns <= 15, f"{host} unexpected max_user_connections={max_conns}"
+            assert max_conns == expected_conns[host], f"{host} unexpected max_user_connections={max_conns}"
             assert max_qph == 750, f"{host} unexpected max_questions={max_qph}"
 
         # Real TCP login over 127.0.0.1 MUST be rejected because account is locked
@@ -300,10 +301,24 @@ def test_n2_live_mariadb_password_change_preserves_under_attack_limits(monkeypat
     )
 
     try:
-        # Apply under-attack throttle (8 conns, 3s)
+        # First verify normal password rotation preserves weighted defaults (localhost=17, NOT clamped to ::1's 2)
+        mariadb.change_database_password(db_user, db_pass)
+        res_norm = mariadb._run_sql(
+            "SELECT Host, CAST(IFNULL(JSON_VALUE(Priv, '$.max_user_connections'), 0) AS SIGNED) "
+            f"FROM mysql.global_priv WHERE User = '{db_user}' ORDER BY Host;\n"
+        )
+        norm_rows = {
+            parts[0]: int(parts[1])
+            for line in (res_norm.stdout or "").splitlines()
+            for parts in [line.split("\t")]
+            if len(parts) == 2 and parts[0] != "Host"
+        }
+        assert norm_rows == {"localhost": 17, "127.0.0.1": 6, "::1": 2}, norm_rows
+
+        # Apply under-attack throttle (8 conns, 3s) -> weighted localhost=5, 127.0.0.1=2, ::1=1 (sum 8)
         mariadb.enforce_db_user_resource_limits(db_user, max_user_connections=8, max_statement_time=3)
 
-        # Rotate password — MUST preserve 3 conns/host & 3s statement cap
+        # Rotate password — MUST preserve weighted throttled caps & 3s statement cap
         mariadb.change_database_password(db_user, new_pass)
 
         res = mariadb._run_sql(
@@ -318,8 +333,9 @@ def test_n2_live_mariadb_password_change_preserves_under_attack_limits(monkeypat
             if len(parts) == 3 and parts[0] != "Host":
                 rows[parts[0]] = (int(parts[1]), int(parts[2]))
         assert set(rows.keys()) == {"localhost", "127.0.0.1", "::1"}, rows
+        expected_throttled = {"localhost": 5, "127.0.0.1": 2, "::1": 1}
         for host, (max_conns, max_stmt) in rows.items():
-            assert max_conns == 3, f"{host} lost throttled max_user_connections: {rows}"
+            assert max_conns == expected_throttled[host], f"{host} lost throttled max_user_connections: {rows}"
             assert max_stmt == 3, f"{host} lost throttled max_statement_time: {rows}"
 
         # Confirm rotated password works over TCP 127.0.0.1
