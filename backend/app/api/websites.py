@@ -1090,9 +1090,19 @@ def _rename_single_website(
     owner: User | None,
     current_user_id: int | None = None,
 ) -> list[str]:
-    from app.api.nodejs_manager import ensure_no_active_nodejs_operation
+    from app.api.nodejs_manager import site_operation_lock
 
-    ensure_no_active_nodejs_operation(website.id)
+    with site_operation_lock(website.id, "website:rename"):
+        return _rename_single_website_locked(db, website, new_domain, owner, current_user_id)
+
+
+def _rename_single_website_locked(
+    db: Session,
+    website: Website,
+    new_domain: str,
+    owner: User | None,
+    current_user_id: int | None = None,
+) -> list[str]:
     old_domain = website.domain
     old_root_path = website.root_path
     old_linux_user = website.linux_user
@@ -1512,6 +1522,9 @@ def update_website(
             new_linux_user = None
             new_root_path = None
             moved_runtime = False
+            from app.api.nodejs_manager import _acquire_deploy_lock, _release_deploy_lock
+
+            owner_op_lock = _acquire_deploy_lock(website.id, operation="website:owner-change")
             try:
                 storage_quota.enforce_user_storage_quota(
                     db,
@@ -1583,6 +1596,8 @@ def update_website(
                 if isinstance(exc, HTTPException):
                     raise HTTPException(status_code=exc.status_code, detail=f"{exc.detail}{suffix}") from exc
                 raise HTTPException(status_code=400, detail=f"{exc}{suffix}") from exc
+            finally:
+                _release_deploy_lock(owner_op_lock)
         website.owner_id = payload.owner_id
     if payload.nginx_custom is not None:
         try:
@@ -1873,9 +1888,13 @@ def set_website_nginx_custom(website_id: int, payload: WebsiteNginxCustom, reque
 def delete_website(website_id: int, request: Request, delete_files: bool = True, delete_database: bool = True, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     website = _get_authorized_website(db, website_id, current_user)
     _block_if_source(db, website)
-    from app.api.nodejs_manager import ensure_no_active_nodejs_operation
+    from app.api.nodejs_manager import site_operation_lock
 
-    ensure_no_active_nodejs_operation(website.id)
+    with site_operation_lock(website.id, "website:delete"):
+        return _delete_website_locked(website, request, delete_files, delete_database, db, current_user)
+
+
+def _delete_website_locked(website: Website, request: Request, delete_files: bool, delete_database: bool, db: Session, current_user: User):
     domain = website.domain
     db_item = db.query(DatabaseAccount).filter(DatabaseAccount.website_id == website.id).first()
     if delete_database and db_item:
@@ -2331,10 +2350,20 @@ def transfer_website_owner(
     website = db.query(Website).filter(Website.id == website_id).first()
     if not website:
         raise HTTPException(status_code=404, detail="Website not found")
-    from app.api.nodejs_manager import ensure_no_active_nodejs_operation
+    from app.api.nodejs_manager import site_operation_lock
 
-    ensure_no_active_nodejs_operation(website.id)
+    with site_operation_lock(website.id, "website:transfer"):
+        return _transfer_website_owner_locked(website, payload, request, db, current_user, response)
 
+
+def _transfer_website_owner_locked(
+    website: Website,
+    payload: WebsiteTransferOwnerPayload,
+    request: Request,
+    db: Session,
+    current_user: User,
+    response: Response = None,
+):
     target_owner = db.query(User).filter(User.id == payload.target_owner_id).first()
     if not target_owner:
         raise HTTPException(status_code=404, detail="Target owner not found")

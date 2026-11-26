@@ -2266,6 +2266,9 @@ def _site_operation_lock(website_id: int, operation: str) -> Iterator[Path]:
         _release_deploy_lock(lock_path)
 
 
+site_operation_lock = _site_operation_lock
+
+
 def _serialized_site_operation(operation: str) -> Callable:
     """Decorator that verifies website access (when db/current_user are present)
     and holds the per-site operation lock for the duration of the endpoint."""
@@ -2378,14 +2381,17 @@ def _get_site_operation_status(website_id: int) -> Dict[str, Any]:
             error="Tác vụ nền bị gián đoạn trước khi hoàn tất.",
             started_at=float(data.get("started_at") or time.time()),
         )
-    elif not data and lock_live:
+    elif lock_live and data.get("status") != "running":
+        # A live per-site lock (e.g. sync npm/env/remove or website mutation)
+        # takes precedence over any completed status file from an earlier
+        # background task (Round 20 N1).
         return {
             "website_id": int(website_id),
             "active": True,
-            "operation": str(lock_meta.get("operation") or "git-deploy"),
+            "operation": str(lock_meta.get("operation") or "background"),
             "status": "running",
             "phase": "running",
-            "message": "Đang thực thi tác vụ nền...",
+            "message": "Đang thực thi tác vụ...",
             "error": "",
             "started_at": lock_started or time.time(),
             "updated_at": time.time(),
