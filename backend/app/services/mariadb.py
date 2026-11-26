@@ -294,7 +294,7 @@ def create_database_credentials(
         statements.extend(_grant_statements(q_db, f"{q_user}@{q_host}", write_locked))
     statements.append("FLUSH PRIVILEGES;")
     _run_sql("\n".join(statements) + "\n")
-    enforce_db_user_resource_limits(db_user)
+    enforce_db_user_resource_limits(db_user, preserve_existing=bool(allow_existing_user))
     return {"db_name": db_name, "db_user": db_user, "db_password": db_password}
 
 
@@ -424,7 +424,7 @@ def change_database_password(db_user: str, db_password: str):
             stmts.append(f"ALTER USER {q_user}@{q_host} ACCOUNT LOCK;")
     stmts.append("FLUSH PRIVILEGES;")
     res = _run_sql("\n".join(stmts) + "\n")
-    enforce_db_user_resource_limits(safe_user)
+    enforce_db_user_resource_limits(safe_user, preserve_existing=True)
     return res
 
 
@@ -699,26 +699,104 @@ def optimize_database(db_name: str) -> dict:
 
 
 
+def _panel_user_under_attack(db_user: str) -> bool:
+    """Return True if any panel owner of this local db_user is currently under
+    the resource_monitor blast-radius / anti-scraping shield."""
+    try:
+        from app.core.database import SessionLocal
+        from app.models.entities import DatabaseAccount
+        from app.services import resource_monitor
+
+        with SessionLocal() as session:
+            owner_ids = [
+                row[0]
+                for row in session.query(DatabaseAccount.owner_id)
+                .filter(DatabaseAccount.db_host_id.is_(None), DatabaseAccount.db_user == db_user)
+                .distinct()
+                .all()
+                if row[0] is not None
+            ]
+        return any(
+            bool(resource_monitor.cached_user_attack_state(int(oid)).get("under_attack"))
+            for oid in owner_ids
+        )
+    except Exception:
+        return False
+
+
+def _read_existing_user_resource_limits(safe_user: str) -> tuple[int, int]:
+    """Read the strictest positive per-host MAX_USER_CONNECTIONS and
+    MAX_STATEMENT_TIME currently stored in MariaDB for ``safe_user`` across
+    LOCAL_CLIENT_HOSTS. Returns ``(0, 0)`` if none or unavailable."""
+    if settings.command_dry_run:
+        return 0, 0
+    q_user = _quote_sql_string(safe_user)
+    hosts_in = ", ".join(_quote_sql_string(h) for h in LOCAL_CLIENT_HOSTS)
+    sql = (
+        "SELECT JSON_VALUE(Priv, '$.max_user_connections'), "
+        "JSON_VALUE(Priv, '$.max_statement_time') "
+        f"FROM mysql.global_priv WHERE User = {q_user} AND Host IN ({hosts_in});\n"
+    )
+    res = _run_sql(sql, check=False)
+    if getattr(res, "returncode", 1) != 0:
+        return 0, 0
+    best_conns = 0
+    best_stmt = 0
+    for line in (getattr(res, "stdout", "") or "").splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) < 2:
+            continue
+        raw_c, raw_s = parts[0].strip(), parts[1].strip()
+        try:
+            c_val = int(round(float(raw_c)))
+            if c_val > 0 and (best_conns == 0 or c_val < best_conns):
+                best_conns = c_val
+        except (TypeError, ValueError):
+            pass
+        try:
+            s_val = int(round(float(raw_s)))
+            if s_val > 0 and (best_stmt == 0 or s_val < best_stmt):
+                best_stmt = s_val
+        except (TypeError, ValueError):
+            pass
+    return best_conns, best_stmt
+
+
 def enforce_db_user_resource_limits(
     db_user: str,
     max_user_connections: int = 25,
     max_statement_time: int = 15,
+    *,
+    preserve_existing: bool = False,
 ) -> None:
     """Enforce MariaDB per-user MAX_USER_CONNECTIONS and query timeout so one attacked site
-    can never exhaust global max_connections or lock up MariaDB for other users."""
+    can never exhaust global max_connections or lock up MariaDB for other users.
+
+    When ``preserve_existing=True`` (password changes, loopback host re-sync),
+    any stricter under-attack or existing MariaDB limit is preserved so a user
+    cannot lift an active throttle by rotating their DB password (Round 20 N2).
+    """
     safe_user = _validate_identifier(db_user)
     _reject_reserved_user(safe_user)
     if settings.command_dry_run:
         return
     q_user_name = _quote_sql_string(safe_user)
-    total_conns = max(5, min(500, int(max_user_connections or 25)))
-    # MariaDB enforces MAX_USER_CONNECTIONS independently per user@host entry.
-    # Distribute the per-account budget across LOCAL_CLIENT_HOSTS (with a floor
-    # of 10/host when total_conns >= 20, else 5/host) so the aggregate ceiling
-    # across localhost/127.0.0.1/::1 stays close to total_conns instead of 3x.
-    per_host_floor = 10 if total_conns >= 20 else 5
-    conns = max(per_host_floor, math.ceil(total_conns / max(1, len(LOCAL_CLIENT_HOSTS))))
+    total_conns = max(1, min(500, int(max_user_connections or 25)))
     stmt_sec = max(2, min(300, int(max_statement_time or 15)))
+    if preserve_existing and _panel_user_under_attack(safe_user):
+        total_conns = min(total_conns, 8)
+        stmt_sec = min(stmt_sec, 3)
+    # MariaDB enforces MAX_USER_CONNECTIONS independently per user@host entry.
+    # Split total_conns evenly across LOCAL_CLIENT_HOSTS with no artificial
+    # low-limit floor so throttled budgets (e.g. 8 -> 3/host = 9 aggregate)
+    # stay tight instead of inflating to 15 (Round 20 N2).
+    conns = max(1, math.ceil(total_conns / max(1, len(LOCAL_CLIENT_HOSTS))))
+    if preserve_existing:
+        existing_conns, existing_stmt = _read_existing_user_resource_limits(safe_user)
+        if existing_conns > 0:
+            conns = min(conns, existing_conns)
+        if existing_stmt > 0:
+            stmt_sec = min(stmt_sec, existing_stmt)
     stmts_with_time = [
         f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {conns} MAX_STATEMENT_TIME {stmt_sec};"
         for host in LOCAL_CLIENT_HOSTS

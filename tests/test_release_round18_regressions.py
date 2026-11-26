@@ -49,7 +49,7 @@ def test_v1_create_credentials_locks_atomically_and_avoids_revoke_error_1141_and
 
     assert len(sent) >= 2
     main_sql = sent[0]
-    limits_sql = sent[1]
+    limits_sql = sent[-1]
     for host in mariadb.LOCAL_CLIENT_HOSTS:
         target = f"'shop_u'@'{host}'"
         create_stmt = f"CREATE USER IF NOT EXISTS {target} IDENTIFIED BY 'StrongPass!2026' ACCOUNT LOCK;"
@@ -71,18 +71,18 @@ def test_v1_create_credentials_locks_atomically_and_avoids_revoke_error_1141_and
         idx_second_grant = main_sql.index(seed_grant, idx_revoke)
         assert idx_create < idx_lock < idx_first_grant < idx_revoke < idx_second_grant
 
-        # MAX_USER_CONNECTIONS budget (25 default) is split across 3 hosts (10/host -> 30 total, not 75)
-        assert f"ALTER USER IF EXISTS {target} WITH MAX_USER_CONNECTIONS 10 MAX_STATEMENT_TIME 15;" in limits_sql
+        # MAX_USER_CONNECTIONS budget (25 default) is split across 3 hosts (ceil(25/3)=9/host -> 27 total)
+        assert f"ALTER USER IF EXISTS {target} WITH MAX_USER_CONNECTIONS 9 MAX_STATEMENT_TIME 15;" in limits_sql
 
     # change_database_password also creates locked hosts atomically and enforces resource limits
     sent.clear()
     monkeypatch.setattr(mariadb, "_panel_user_is_suspended", lambda u: True)
     mariadb.change_database_password("shop_u", "RotatedPass!99")
-    assert len(sent) == 2
+    assert len(sent) >= 2
     for host in mariadb.LOCAL_CLIENT_HOSTS:
         target = f"'shop_u'@'{host}'"
         assert f"CREATE USER IF NOT EXISTS {target} IDENTIFIED BY 'RotatedPass!99' ACCOUNT LOCK;" in sent[0]
-        assert f"MAX_USER_CONNECTIONS 10" in sent[1]
+        assert "MAX_USER_CONNECTIONS 9" in sent[-1]
 
 
 # --------------------------------------------------------------------------- V5
