@@ -259,3 +259,54 @@ def test_r2_delete_user_acquires_all_site_locks_before_deleting_anything(tmp_pat
         assert nm._get_site_operation_status(s1_id)["active"] is False
         assert nm._get_site_operation_status(s2_id)["active"] is False
 
+
+# --------------------------------------------------------------------------- R4
+
+
+def test_r4_weighted_localhost_connection_split_and_host_aware_preservation(monkeypatch):
+    """Round 21 R4:
+    1) Weighted budget gives ~65% to 'localhost' (PHP-FPM Unix socket), ~25% to
+       '127.0.0.1' (Node.js IPv4 TCP), and ~10% to '::1', summing exactly to total.
+    2) Rotating password on a normal account MUST NOT accidentally clamp
+       'localhost' (17) down to '::1' (2).
+    3) Upgrading a pre-1.0.10 localhost-only throttled account scales newly
+       minted loopback hosts down proportionally rather than giving full default.
+    """
+    from app.services import mariadb
+
+    assert mariadb._per_host_connection_limits(25) == {"localhost": 17, "127.0.0.1": 6, "::1": 2}
+    assert sum(mariadb._per_host_connection_limits(25).values()) == 25
+    assert mariadb._per_host_connection_limits(8) == {"localhost": 5, "127.0.0.1": 2, "::1": 1}
+    assert sum(mariadb._per_host_connection_limits(8).values()) == 8
+    assert mariadb._per_host_connection_limits(50) == {"localhost": 33, "127.0.0.1": 12, "::1": 5}
+    assert sum(mariadb._per_host_connection_limits(50).values()) == 50
+
+    monkeypatch.setattr(mariadb.settings, "command_dry_run", False)
+    monkeypatch.setattr(mariadb, "_panel_user_is_suspended", lambda u: False)
+    monkeypatch.setattr(mariadb, "_panel_user_under_attack", lambda u: False)
+    sent: list[str] = []
+    mock_priv = {"stdout": "localhost\t17\t15\n127.0.0.1\t6\t15\n::1\t2\t15\n"}
+
+    def _fake_sql(sql: str, *, check: bool = True):
+        sent.append(sql)
+        if "FROM mysql.global_priv" in sql:
+            return SimpleNamespace(returncode=0, stdout=mock_priv["stdout"], stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(mariadb, "_run_sql", _fake_sql)
+
+    # Normal password rotation preserves localhost=17 (never clamped by ::1=2)
+    mariadb.change_database_password("r4_u", "Pass!1234")
+    assert "'r4_u'@'localhost' WITH MAX_USER_CONNECTIONS 17 MAX_STATEMENT_TIME 15;" in sent[-1]
+    assert "'r4_u'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 6 MAX_STATEMENT_TIME 15;" in sent[-1]
+    assert "'r4_u'@'::1' WITH MAX_USER_CONNECTIONS 2 MAX_STATEMENT_TIME 15;" in sent[-1]
+
+    # Pre-1.0.10 throttled localhost-only user (only localhost=5 exists) -> new loopback hosts scale down!
+    sent.clear()
+    mock_priv["stdout"] = "localhost\t5\t3\n"
+    mariadb.enforce_db_user_resource_limits("r4_u", preserve_existing=True)
+    assert "'r4_u'@'localhost' WITH MAX_USER_CONNECTIONS 5 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'r4_u'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 2 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'r4_u'@'::1' WITH MAX_USER_CONNECTIONS 1 MAX_STATEMENT_TIME 3;" in sent[-1]
+
+

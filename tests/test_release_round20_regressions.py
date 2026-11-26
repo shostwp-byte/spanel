@@ -181,34 +181,44 @@ def test_n2_mariadb_split_has_no_low_limit_floor_and_preserves_active_throttle_o
     monkeypatch.setattr(mariadb, "_panel_user_is_suspended", lambda u: False)
     monkeypatch.setattr(mariadb, "_panel_user_under_attack", lambda u: False)
 
-    # 1. Under-attack throttle 8 conns / 3s -> 3/host (total 9, NOT 15)
+    # 1. Under-attack throttle 8 conns / 3s -> weighted localhost=5, 127.0.0.1=2, ::1=1 (sum 8, NOT 15)
     mariadb.enforce_db_user_resource_limits("n2_u", max_user_connections=8, max_statement_time=3)
-    assert "MAX_USER_CONNECTIONS 3 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'localhost' WITH MAX_USER_CONNECTIONS 5 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 2 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'::1' WITH MAX_USER_CONNECTIONS 1 MAX_STATEMENT_TIME 3;" in sent[-1]
 
-    # 2. Even tighter cap 5 -> 2/host (total 6, NOT 15)
+    # 2. Even tighter cap 5 -> weighted localhost=3, 127.0.0.1=1, ::1=1 (sum 5, NOT 15)
     sent.clear()
     mariadb.enforce_db_user_resource_limits("n2_u", max_user_connections=5, max_statement_time=2)
-    assert "MAX_USER_CONNECTIONS 2 MAX_STATEMENT_TIME 2;" in sent[-1]
+    assert "'n2_u'@'localhost' WITH MAX_USER_CONNECTIONS 3 MAX_STATEMENT_TIME 2;" in sent[-1]
+    assert "'n2_u'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 1 MAX_STATEMENT_TIME 2;" in sent[-1]
+    assert "'n2_u'@'::1' WITH MAX_USER_CONNECTIONS 1 MAX_STATEMENT_TIME 2;" in sent[-1]
 
-    # 3. Password change while existing MariaDB Priv already has tight 3 / 3s -> preserved!
+    # 3. Password change while existing MariaDB Priv already has tight 5/2/1 & 3s -> preserved!
     sent.clear()
-    mock_global_priv["stdout"] = "3\t3.0\n3\t3.0\n"
+    mock_global_priv["stdout"] = "localhost\t5\t3.0\n127.0.0.1\t2\t3.0\n::1\t1\t3.0\n"
     mariadb.change_database_password("n2_u", "NewPass!2026")
-    assert "MAX_USER_CONNECTIONS 3 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'localhost' WITH MAX_USER_CONNECTIONS 5 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 2 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'::1' WITH MAX_USER_CONNECTIONS 1 MAX_STATEMENT_TIME 3;" in sent[-1]
 
     # 4. ensure_local_database_user_hosts (allow_existing_user=True) while under attack -> preserved!
     sent.clear()
     mock_global_priv["stdout"] = ""
     monkeypatch.setattr(mariadb, "_panel_user_under_attack", lambda u: True)
     mariadb.ensure_local_database_user_hosts("n2_db", "n2_u", "NewPass!2026", write_locked=False, account_locked=False, hourly_limits=(0, 0, 0))
-    assert "MAX_USER_CONNECTIONS 3 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'localhost' WITH MAX_USER_CONNECTIONS 5 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 2 MAX_STATEMENT_TIME 3;" in sent[-1]
+    assert "'n2_u'@'::1' WITH MAX_USER_CONNECTIONS 1 MAX_STATEMENT_TIME 3;" in sent[-1]
 
-    # 5. Explicitly lifting under-attack mode (preserve_existing=False) restores default 9/host / 15s
+    # 5. Explicitly lifting under-attack mode (preserve_existing=False) restores default 17/6/2 & 15s
     sent.clear()
     monkeypatch.setattr(mariadb, "_panel_user_under_attack", lambda u: False)
-    mock_global_priv["stdout"] = "3\t3.0\n"
+    mock_global_priv["stdout"] = "localhost\t5\t3.0\n127.0.0.1\t2\t3.0\n::1\t1\t3.0\n"
     mariadb.enforce_db_user_resource_limits("n2_u", max_user_connections=25, max_statement_time=15)
-    assert "MAX_USER_CONNECTIONS 9 MAX_STATEMENT_TIME 15;" in sent[-1]
+    assert "'n2_u'@'localhost' WITH MAX_USER_CONNECTIONS 17 MAX_STATEMENT_TIME 15;" in sent[-1]
+    assert "'n2_u'@'127.0.0.1' WITH MAX_USER_CONNECTIONS 6 MAX_STATEMENT_TIME 15;" in sent[-1]
+    assert "'n2_u'@'::1' WITH MAX_USER_CONNECTIONS 2 MAX_STATEMENT_TIME 15;" in sent[-1]
 
 
 # --------------------------------------------------------------------------- N4

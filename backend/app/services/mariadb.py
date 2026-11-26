@@ -724,33 +724,57 @@ def _panel_user_under_attack(db_user: str) -> bool:
         return False
 
 
-def _read_existing_user_resource_limits(safe_user: str) -> tuple[int, int]:
-    """Read the strictest positive per-host MAX_USER_CONNECTIONS and
+def _per_host_connection_limits(total_conns: int) -> dict[str, int]:
+    """Allocate a user's MAX_USER_CONNECTIONS budget across LOCAL_CLIENT_HOSTS.
+
+    PHP-FPM / WordPress connects over the Unix socket ('localhost'), where
+    pm.max_children routinely exceeds 10, while Node.js TCP drivers use
+    '127.0.0.1' (and occasionally '::1'). Weight ~65% to 'localhost', ~25% to
+    '127.0.0.1', and ~10% (min 1) to '::1' so the aggregate across all 3 hosts
+    equals total_conns without starving PHP-FPM on 'localhost' (Round 21 R4):
+      - default 25  -> localhost=17, 127.0.0.1=6, ::1=2 (sum 25)
+      - throttled 8 -> localhost=5,  127.0.0.1=2, ::1=1 (sum 8)
+      - tight 5     -> localhost=3,  127.0.0.1=1, ::1=1 (sum 5)
+    """
+    total = max(1, min(500, int(total_conns or 25)))
+    if total <= len(LOCAL_CLIENT_HOSTS):
+        return {host: 1 for host in LOCAL_CLIENT_HOSTS}
+    ipv6 = max(1, round(total * 0.10))
+    ipv4 = max(1, round(total * 0.25))
+    local = max(1, total - ipv4 - ipv6)
+    return {"localhost": local, "127.0.0.1": ipv4, "::1": ipv6}
+
+
+def _read_existing_user_resource_limits(safe_user: str) -> tuple[dict[str, int], int]:
+    """Read existing per-host MAX_USER_CONNECTIONS and strictest positive
     MAX_STATEMENT_TIME currently stored in MariaDB for ``safe_user`` across
-    LOCAL_CLIENT_HOSTS. Returns ``(0, 0)`` if none or unavailable."""
+    LOCAL_CLIENT_HOSTS. Returns ``({}, 0)`` if none or unavailable."""
     if settings.command_dry_run:
-        return 0, 0
+        return {}, 0
     q_user = _quote_sql_string(safe_user)
     hosts_in = ", ".join(_quote_sql_string(h) for h in LOCAL_CLIENT_HOSTS)
     sql = (
-        "SELECT JSON_VALUE(Priv, '$.max_user_connections'), "
+        "SELECT Host, JSON_VALUE(Priv, '$.max_user_connections'), "
         "JSON_VALUE(Priv, '$.max_statement_time') "
         f"FROM mysql.global_priv WHERE User = {q_user} AND Host IN ({hosts_in});\n"
     )
     res = _run_sql(sql, check=False)
     if getattr(res, "returncode", 1) != 0:
-        return 0, 0
-    best_conns = 0
+        return {}, 0
+    per_host_conns: dict[str, int] = {}
     best_stmt = 0
     for line in (getattr(res, "stdout", "") or "").splitlines():
         parts = line.strip().split("\t")
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
-        raw_c, raw_s = parts[0].strip(), parts[1].strip()
+        host_name, raw_c, raw_s = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if host_name not in LOCAL_CLIENT_HOSTS:
+            continue
         try:
             c_val = int(round(float(raw_c)))
-            if c_val > 0 and (best_conns == 0 or c_val < best_conns):
-                best_conns = c_val
+            if c_val > 0:
+                prev = per_host_conns.get(host_name, 0)
+                per_host_conns[host_name] = c_val if prev == 0 else min(prev, c_val)
         except (TypeError, ValueError):
             pass
         try:
@@ -759,7 +783,7 @@ def _read_existing_user_resource_limits(safe_user: str) -> tuple[int, int]:
                 best_stmt = s_val
         except (TypeError, ValueError):
             pass
-    return best_conns, best_stmt
+    return per_host_conns, best_stmt
 
 
 def enforce_db_user_resource_limits(
@@ -773,8 +797,9 @@ def enforce_db_user_resource_limits(
     can never exhaust global max_connections or lock up MariaDB for other users.
 
     When ``preserve_existing=True`` (password changes, loopback host re-sync),
-    any stricter under-attack or existing MariaDB limit is preserved so a user
-    cannot lift an active throttle by rotating their DB password (Round 20 N2).
+    any stricter under-attack or existing per-host MariaDB limit is preserved
+    so a user cannot lift an active throttle by rotating their DB password
+    (Round 20 N2 / Round 21 R4).
     """
     safe_user = _validate_identifier(db_user)
     _reject_reserved_user(safe_user)
@@ -786,25 +811,30 @@ def enforce_db_user_resource_limits(
     if preserve_existing and _panel_user_under_attack(safe_user):
         total_conns = min(total_conns, 8)
         stmt_sec = min(stmt_sec, 3)
-    # MariaDB enforces MAX_USER_CONNECTIONS independently per user@host entry.
-    # Split total_conns evenly across LOCAL_CLIENT_HOSTS with no artificial
-    # low-limit floor so throttled budgets (e.g. 8 -> 3/host = 9 aggregate)
-    # stay tight instead of inflating to 15 (Round 20 N2).
-    conns = max(1, math.ceil(total_conns / max(1, len(LOCAL_CLIENT_HOSTS))))
+    host_conns = _per_host_connection_limits(total_conns)
     if preserve_existing:
-        existing_conns, existing_stmt = _read_existing_user_resource_limits(safe_user)
-        if existing_conns > 0:
-            conns = min(conns, existing_conns)
+        existing_by_host, existing_stmt = _read_existing_user_resource_limits(safe_user)
+        target_local = host_conns.get("localhost", 1)
+        existing_local = existing_by_host.get("localhost", 0)
+        for host in LOCAL_CLIENT_HOSTS:
+            existing_c = existing_by_host.get(host, 0)
+            if existing_c > 0:
+                host_conns[host] = min(host_conns[host], existing_c)
+            elif existing_local > 0 and existing_local < target_local:
+                # Newly added loopback host for a pre-existing throttled user:
+                # scale down proportionally instead of handing it full default.
+                scaled = max(1, round(host_conns[host] * existing_local / target_local))
+                host_conns[host] = min(host_conns[host], scaled)
         if existing_stmt > 0:
             stmt_sec = min(stmt_sec, existing_stmt)
     stmts_with_time = [
-        f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {conns} MAX_STATEMENT_TIME {stmt_sec};"
+        f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {host_conns[host]} MAX_STATEMENT_TIME {stmt_sec};"
         for host in LOCAL_CLIENT_HOSTS
     ]
     res = _run_sql("\n".join(stmts_with_time) + "\n", check=False)
     if res.returncode != 0:
         stmts_fallback = [
-            f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {conns};"
+            f"ALTER USER IF EXISTS {q_user_name}@{_quote_sql_string(host)} WITH MAX_USER_CONNECTIONS {host_conns[host]};"
             for host in LOCAL_CLIENT_HOSTS
         ]
         _run_sql("\n".join(stmts_fallback) + "\n", check=False)
