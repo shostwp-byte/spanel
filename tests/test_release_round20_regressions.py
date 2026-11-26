@@ -388,4 +388,85 @@ def test_n5_tenant_jail_creates_leaf_spanel_scope_applies_limits_and_logs_failur
     assert (scope / "pids.max").read_text(encoding="utf-8").strip() == "3000"
 
 
+# --------------------------------------------------------------------------- N6
+
+
+def test_n6_user_limits_apply_if_changed_requires_completed_stamp_and_nodejs_restarts_on_bin_repair(tmp_path):
+    """Round 20 N6:
+    1) user-limits-apply --if-changed must NOT return unchanged=1 unless the
+       .applied stamp matches the current limits/slice digest (so a prior run
+       that failed midway after writing config files is retried automatically).
+    2) prepare_nodejs_app_as_user signals when it repaired broken .bin stubs so
+       sync_nodejs_worker_unit in if-changed mode still restarts the app.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    helper_src = (REPO_ROOT / "installer" / "files" / "spanel-helper.sh").read_text(encoding="utf-8")
+    ul_block = helper_src.split("  user-limits-apply)", 1)[1].split("  quota-status)", 1)[0]
+    assert 'limits_applied_file="${SPANEL_LIMITS_DIR}/${u_name}.applied"' in ul_block
+    assert 'rm -f -- "$limits_applied_file"' in ul_block
+    assert 'limits_applied_digest" == "$limits_current_digest"' in ul_block
+    assert "limits_apply_ok=0" in ul_block
+
+    sync_fn = helper_src.split("sync_nodejs_worker_unit() {", 1)[1].split("\nstatus_nodejs_worker_unit()", 1)[0]
+    assert 'if prepare_nodejs_app_as_user "$user" "$app_target" "$bin_dir"; then' in sync_fn
+    assert '"$prep_changed" -eq 0' in sync_fn
+
+    # Behavioral bash test of prepare_nodejs_app_as_user return code (0=repaired, 1=unchanged)
+    bash_exe = None
+    for candidate in (shutil.which("bash"), "/bin/bash", "/usr/bin/bash"):
+        if not candidate or not Path(candidate).is_file():
+            continue
+        if os.name == "nt" and "system32" in candidate.lower():
+            continue
+        if subprocess.run([candidate, "--version"], capture_output=True, text=True, check=False).returncode == 0:
+            bash_exe = candidate
+            break
+    if not bash_exe:
+        return
+
+    fn_start = helper_src.index("prepare_nodejs_app_as_user() {")
+    fn_end = helper_src.index("\nresolve_or_install_node_bin_dir()", fn_start)
+    fn_body = helper_src[fn_start:fn_end]
+
+    app_dir = tmp_path / "app"
+    bin_dir = tmp_path / "nodebin"
+    (app_dir / "node_modules" / ".bin").mkdir(parents=True)
+    bin_dir.mkdir(parents=True)
+    (app_dir / "package.json").write_text('{"name":"demo"}\n', encoding="utf-8")
+    fake_npm = bin_dir / "npm"
+    fake_npm.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_npm.chmod(0o755)
+    # Plant a dangling zip-extracted stub (regular file pointing to missing ../pkg/cli.js)
+    stub = app_dir / "node_modules" / ".bin" / "broken-cli"
+    stub.write_text("../missing-pkg/cli.js\n", encoding="utf-8")
+
+    # Mock runuser so it runs directly as the test user
+    script_base = (
+        'runuser() { shift 2; [[ "$1" == "--" ]] && shift; "$@"; }\n'
+        f"{fn_body}\n"
+    )
+    # First run repairs/removes the broken stub -> exits 0 (prep_changed=1)
+    r1 = subprocess.run(
+        [bash_exe, "-c", script_base + f'prepare_nodejs_app_as_user "alice" "{app_dir.as_posix()}" "{bin_dir.as_posix()}"'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r1.returncode == 0, r1.stderr
+    assert not stub.exists()
+
+    # Second run finds nothing to repair -> exits 1 (prep_changed=0)
+    r2 = subprocess.run(
+        [bash_exe, "-c", script_base + f'prepare_nodejs_app_as_user "alice" "{app_dir.as_posix()}" "{bin_dir.as_posix()}"'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r2.returncode == 1, f"expected 1 (unchanged), got {r2.returncode}: {r2.stderr}"
+
+
+
 

@@ -8163,8 +8163,8 @@ copy_site_env_as_user() {
 # run it could tell apart from the jailed one and wait for.
 prepare_nodejs_app_as_user() {
   local user="$1" app_target="$2" bin_dir="$3"
-  local bin_entry first_line
-  [[ -f "${app_target}/package.json" && -x "${bin_dir}/npm" ]] || return 0
+  local bin_entry first_line repaired=0
+  [[ -f "${app_target}/package.json" && -x "${bin_dir}/npm" ]] || return 1
 
   # 1. Repair or remove broken zip-extracted symlink stubs in node_modules/.bin
   # (extract_zip writes zip symlink entries as regular 0644 files containing "../<pkg>/.../bin/<cli>").
@@ -8178,8 +8178,10 @@ prepare_nodejs_app_as_user() {
           if [[ "$first_line" =~ ^\.\./[A-Za-z0-9._/@-]+$ ]] && runuser -u "$user" -- test -f "${app_target}/node_modules/.bin/${first_line}"; then
             runuser -u "$user" -- ln -snf -- "$first_line" "$bin_entry" >/dev/null 2>&1 || true
             runuser -u "$user" -- chmod u+x,go+rx -- "${app_target}/node_modules/.bin/${first_line}" >/dev/null 2>&1 || true
+            repaired=1
           else
             runuser -u "$user" -- rm -f -- "$bin_entry" >/dev/null 2>&1 || true
+            repaired=1
           fi
         fi
       fi
@@ -8194,6 +8196,8 @@ prepare_nodejs_app_as_user() {
   if [[ -d "${app_target}/node_modules/next/dist/bin" ]]; then
     runuser -u "$user" -- chmod -R u+x,go+rx -- "${app_target}/node_modules/next/dist/bin" >/dev/null 2>&1 || true
   fi
+  (( repaired == 1 )) && return 0
+  return 1
 }
 
 resolve_or_install_node_bin_dir() {
@@ -8240,7 +8244,7 @@ sync_nodejs_worker_unit() {
   local port="$5" memory_mb="$6" start_mode="$7" start_arg="$8" node_env="$9" enabled_flag="${10}"
   local restart_mode="${11:-always}"
   local uid root_target app_target bin_dir exec_start base unit_file env_file tmp_file
-  local env_changed=1 unit_changed=1
+  local env_changed=1 unit_changed=1 prep_changed=0
 
   require_linux_user "$user"
   uid="$(id -u "$user" 2>/dev/null)" || deny "panel Linux user does not exist: $user"
@@ -8292,7 +8296,11 @@ sync_nodejs_worker_unit() {
 
   install -d -o "$user" -g "$user" -m 0700 "${HOME_ROOT}/${user}/.npm"
   install -d -o root -g root -m 0755 "$SYSTEMD_UNIT_DIR"
-  prepare_nodejs_app_as_user "$user" "$app_target" "$bin_dir"
+  if prepare_nodejs_app_as_user "$user" "$app_target" "$bin_dir"; then
+    prep_changed=1
+  else
+    prep_changed=0
+  fi
   if copy_site_env_as_user "$user" "$app_target" "$env_file"; then
     env_changed=1
   else
@@ -8366,7 +8374,7 @@ UNIT
     mv -f -- "$tmp_file" "$unit_file"
   fi
 
-  if [[ "$restart_mode" == "if-changed" && "$unit_changed" -eq 0 && "$env_changed" -eq 0 ]] \
+  if [[ "$restart_mode" == "if-changed" && "$unit_changed" -eq 0 && "$env_changed" -eq 0 && "$prep_changed" -eq 0 ]] \
     && systemctl is-active --quiet "${base}.service" 2>/dev/null; then
     echo "status=running"
     echo "unit=${base}.service"
@@ -12987,21 +12995,33 @@ EOF
       mv -f -- "$slice_conf_tmp" "$slice_conf_file"
     fi
 
-    if (( if_changed_only == 1 && limits_env_changed == 0 && slice_conf_changed == 0 )); then
+    limits_applied_file="${SPANEL_LIMITS_DIR}/${u_name}.applied"
+    limits_current_digest="$(sha256sum "$limits_env_file" "$slice_conf_file" 2>/dev/null | awk '{print $1}' | paste -sd ':' -)"
+    limits_applied_digest=""
+    if [[ -f "$limits_applied_file" ]]; then
+      limits_applied_digest="$(head -n 1 -- "$limits_applied_file" 2>/dev/null || true)"
+    fi
+
+    # Only skip with unchanged=1 when BOTH config files are unchanged AND a
+    # previous full apply completed cleanly for this exact digest (Round 20 N6).
+    if (( if_changed_only == 1 && limits_env_changed == 0 && slice_conf_changed == 0 )) \
+      && [[ -n "$limits_current_digest" && "$limits_applied_digest" == "$limits_current_digest" ]]; then
       echo "unchanged=1"
       echo "Cgroups v2 & PHP-FPM resource limits already up to date for ${u_name} (UID ${u_uid})"
       exit 0
     fi
 
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl start "$slice_unit" >/dev/null 2>&1 || true
+    rm -f -- "$limits_applied_file"
+    limits_apply_ok=1
+    systemctl daemon-reload >/dev/null 2>&1 || limits_apply_ok=0
+    systemctl start "$slice_unit" >/dev/null 2>&1 || limits_apply_ok=0
     # Apply live to active slice if running
     systemctl set-property "$slice_unit" \
       CPUAccounting=yes MemoryAccounting=yes TasksAccounting=yes IOAccounting=yes \
       CPUQuota="$( (( cpu_pct > 0 )) && printf '%s%%' "$cpu_pct" || printf '' )" \
       MemoryHigh="$( (( mem_high > 0 )) && printf '%sM' "$mem_high" || printf 'infinity' )" \
       MemoryMax="$( (( mem_max > 0 )) && printf '%sM' "$mem_max" || printf 'infinity' )" \
-      TasksMax="$( (( cgroup_tasks_max > 0 )) && printf '%s' "$cgroup_tasks_max" || printf 'infinity' )" >/dev/null 2>&1 || true
+      TasksMax="$( (( cgroup_tasks_max > 0 )) && printf '%s' "$cgroup_tasks_max" || printf 'infinity' )" >/dev/null 2>&1 || limits_apply_ok=0
 
     # Tune PHP-FPM pools owned by this user to respect persisted limits. The
     # account's own masters already run inside the slice limited above; pools
@@ -13027,6 +13047,14 @@ EOF
     # this user still runs outside it (cron jobs, a pool left on a distro
     # master) is moved into user-<UID>.slice/spanel.scope.
     classify_all_tenant_workers
+
+    if (( limits_apply_ok == 1 )) && [[ -n "$limits_current_digest" ]]; then
+      limits_applied_tmp="${limits_applied_file}.spanel-tmp-$$"
+      printf '%s\n' "$limits_current_digest" >"$limits_applied_tmp"
+      chown root:spanel "$limits_applied_tmp" 2>/dev/null || true
+      chmod 0640 "$limits_applied_tmp" 2>/dev/null || true
+      mv -f -- "$limits_applied_tmp" "$limits_applied_file"
+    fi
     echo "Applied Cgroups v2 & PHP-FPM resource limits for ${u_name} (UID ${u_uid})"
     ;;
 
