@@ -30,6 +30,8 @@ export PYTHONSAFEPATH
 ALLOWED_SERVICES=(nginx mariadb redis-server fail2ban clamav-daemon exim4 dovecot rspamd pdns maldet docker php5.6-fpm php7.4-fpm php8.0-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm spanel-api)
 ALLOWED_ACTIONS=(start stop restart reload status is-active is-enabled)
 HOME_ROOT="/home"
+CGROUP_ROOT="/sys/fs/cgroup"
+SPANEL_LIMITS_DIR="/etc/spanel/limits"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 PHP_CONF_DIRS=(/etc/php/{5.6,7.4,8.0,8.1,8.2,8.3,8.4,8.5}/fpm/conf.d)
 SPANEL_SITES_GROUP="spanel-sites"
@@ -9414,10 +9416,69 @@ require_terminal_cwd() {
 # between customers. /var/lib/php/{sessions,uploads}/<user> match the FPM pool.
 # /tmp and /usr/share/php are what composer and PEAR-era libraries expect. A
 # caller that runs a phar appends that tool's directory itself.
+# Ensure the leaf cgroup v2 scope user-<uid>.slice/spanel.scope exists and has
+# the account's persisted /etc/spanel/limits/<user>.env applied before moving a
+# process in (Round 20 N5: writing directly to non-leaf user-<uid>.slice fails
+# with EBUSY once controllers are delegated).
+ensure_tenant_cgroup_scope() {
+  local uname="$1" uid="$2" io_majmin="${3:-}"
+  local slice_unit cg_slice cg_scope limits_file io_dev io_line
+  local cpu_pct mem_high mem_max tasks_max io_r io_w iops_r iops_w
+  [[ -d "${CGROUP_ROOT}/user.slice" ]] || return 1
+  [[ "$uid" =~ ^[0-9]+$ ]] && (( uid >= 1000 && uid < 65000 )) || return 1
+  echo "+cpu +memory +io +pids" >"${CGROUP_ROOT}/user.slice/cgroup.subtree_control" 2>/dev/null || true
+  slice_unit="user-${uid}.slice"
+  cg_slice="${CGROUP_ROOT}/user.slice/${slice_unit}"
+  cg_scope="${cg_slice}/spanel.scope"
+  if [[ ! -d "$cg_slice" ]]; then
+    systemctl start "$slice_unit" >/dev/null 2>&1 || mkdir -p "$cg_slice" 2>/dev/null || true
+  fi
+  echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
+  if ! mkdir -p "$cg_scope" 2>/dev/null; then
+    logger -t spanel-helper -p daemon.warning "failed to create tenant cgroup scope ${cg_scope} for ${uname}" 2>/dev/null || true
+    return 1
+  fi
+  limits_file="${SPANEL_LIMITS_DIR}/${uname}.env"
+  if [[ -f "$limits_file" ]]; then
+    if [[ -z "$io_majmin" ]]; then
+      io_dev="$(tenant_io_base_device)"
+      if [[ -n "$io_dev" ]]; then
+        io_majmin="$(lsblk -dno MAJ:MIN "$io_dev" 2>/dev/null | tr -d '[:space:]' || true)"
+      fi
+    fi
+    cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    io_r="$(awk -F= '$1=="IO_READ_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    io_w="$(awk -F= '$1=="IO_WRITE_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    iops_r="$(awk -F= '$1=="IOPS_READ"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    iops_w="$(awk -F= '$1=="IOPS_WRITE"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
+    if [[ "$cpu_pct" =~ ^[0-9]+$ ]] && (( cpu_pct > 0 )); then
+      echo "$(( cpu_pct * 1000 )) 100000" >"${cg_scope}/cpu.max" 2>/dev/null || true
+    fi
+    if [[ "$mem_high" =~ ^[0-9]+$ ]] && (( mem_high > 0 )); then
+      echo "$(( mem_high * 1048576 ))" >"${cg_scope}/memory.high" 2>/dev/null || true
+    fi
+    if [[ "$mem_max" =~ ^[0-9]+$ ]] && (( mem_max > 0 )); then
+      echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
+    fi
+    if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
+      (( tasks_max < 2048 )) && tasks_max=2048
+      echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
+      echo "$tasks_max" >"${cg_slice}/pids.max" 2>/dev/null || true
+    fi
+    if [[ -n "$io_majmin" ]] && io_line="$(render_io_max_line "$io_majmin" "$io_r" "$io_w" "$iops_r" "$iops_w")"; then
+      echo "$io_line" >"${cg_scope}/io.max" 2>/dev/null || true
+    fi
+  fi
+  return 0
+}
+
 # Run a command as a panel Linux user inside a private mount namespace where
 # /home is replaced by a tmpfs containing ONLY /home/<user>, placed inside
-# user-<uid>.slice when cgroup v2 is available, and guarded by timeout with
-# --kill-after=10 (Round 18 V2 / P1-5).
+# user-<uid>.slice/spanel.scope when cgroup v2 is available, and guarded by
+# timeout with --kill-after=10 (Round 18 V2 / P1-5 / Round 20 N5).
 run_in_tenant_home_jail() {
   local user="$1" cwd="$2" timeout_sec="$3"
   shift 3
@@ -9426,6 +9487,7 @@ run_in_tenant_home_jail() {
   uid_num="$(id -u "$user" 2>/dev/null || true)"
   [[ "$uid_num" =~ ^[0-9]+$ && "$uid_num" -ge 1000 ]] || deny "panel Linux user does not exist: $user"
   [[ -d "$cwd" ]] || deny "working directory does not exist: $cwd"
+  ensure_tenant_cgroup_scope "$user" "$uid_num" || true
 
   jail_script='
     set -e
@@ -9433,11 +9495,17 @@ run_in_tenant_home_jail() {
     jail_root="$2"
     jail_cwd="$3"
     jail_uid="$4"
-    shift 4
-    if [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" ]]; then
-      echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" 2>/dev/null || true
-    elif [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" ]]; then
-      echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" 2>/dev/null || true
+    jail_cg_root="$5"
+    shift 5
+    if [[ -n "$jail_uid" && -d "${jail_cg_root}/user.slice" ]]; then
+      jail_cg_procs="${jail_cg_root}/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs"
+      if [[ -w "$jail_cg_procs" ]]; then
+        if ! echo "$$" > "$jail_cg_procs" 2>/dev/null; then
+          logger -t spanel-helper -p daemon.warning "failed to move tenant jail pid $$ for ${jail_user} into ${jail_cg_procs}" 2>/dev/null || true
+        fi
+      else
+        logger -t spanel-helper -p daemon.warning "tenant cgroup scope unavailable for ${jail_user}: ${jail_cg_procs}" 2>/dev/null || true
+      fi
     fi
     jail_home="$jail_root/$jail_user"
     hold="$(mktemp -d)"
@@ -9452,7 +9520,7 @@ run_in_tenant_home_jail() {
 
   local -a runner=(
     unshare --mount --propagation private --
-    bash -c "$jail_script" spanel-tenant-jail "$user" "$HOME_ROOT" "$cwd" "$uid_num"
+    bash -c "$jail_script" spanel-tenant-jail "$user" "$HOME_ROOT" "$cwd" "$uid_num" "$CGROUP_ROOT"
     runuser -u "$user" --
   )
   if [[ -n "$timeout_sec" && "$timeout_sec" != "0" ]] && command -v timeout >/dev/null 2>&1; then
@@ -10501,43 +10569,12 @@ classify_all_tenant_workers() {
     cg_current="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
     tenant_process_needs_scope "$cg_current" "$uid" || continue
     slice_unit="user-${uid}.slice"
-    cg_slice="/sys/fs/cgroup/user.slice/${slice_unit}"
+    cg_slice="${CGROUP_ROOT}/user.slice/${slice_unit}"
     cg_scope="${cg_slice}/spanel.scope"
     # Limits are written once per account per scan, not once per process.
     if [[ "$prepared" != *" ${uid} "* ]]; then
       prepared+="${uid} "
-      if [[ ! -d "$cg_slice" ]]; then
-        systemctl start "$slice_unit" >/dev/null 2>&1 || mkdir -p "$cg_slice" 2>/dev/null || true
-      fi
-      echo "+cpu +memory +io +pids" >"${cg_slice}/cgroup.subtree_control" 2>/dev/null || true
-      mkdir -p "$cg_scope" 2>/dev/null || true
-      if [[ -f "$limits_file" ]]; then
-        cpu_pct="$(awk -F= '$1=="CPU_PCT"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        mem_high="$(awk -F= '$1=="MEM_HIGH_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        mem_max="$(awk -F= '$1=="MEM_MAX_MB"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        tasks_max="$(awk -F= '$1=="TASKS_MAX"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        io_r="$(awk -F= '$1=="IO_READ_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        io_w="$(awk -F= '$1=="IO_WRITE_MBPS"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        iops_r="$(awk -F= '$1=="IOPS_READ"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        iops_w="$(awk -F= '$1=="IOPS_WRITE"{print $2; exit}' "$limits_file" 2>/dev/null || echo 0)"
-        if [[ "$cpu_pct" =~ ^[0-9]+$ ]] && (( cpu_pct > 0 )); then
-          echo "$(( cpu_pct * 1000 )) 100000" >"${cg_scope}/cpu.max" 2>/dev/null || true
-        fi
-        if [[ "$mem_high" =~ ^[0-9]+$ ]] && (( mem_high > 0 )); then
-          echo "$(( mem_high * 1048576 ))" >"${cg_scope}/memory.high" 2>/dev/null || true
-        fi
-        if [[ "$mem_max" =~ ^[0-9]+$ ]] && (( mem_max > 0 )); then
-          echo "$(( mem_max * 1048576 ))" >"${cg_scope}/memory.max" 2>/dev/null || true
-        fi
-        if [[ "$tasks_max" =~ ^[0-9]+$ ]] && (( tasks_max > 0 )); then
-          (( tasks_max < 2048 )) && tasks_max=2048
-          echo "$tasks_max" >"${cg_scope}/pids.max" 2>/dev/null || true
-          echo "$tasks_max" >"${cg_slice}/pids.max" 2>/dev/null || true
-        fi
-        if [[ -n "$io_majmin" ]] && io_line="$(render_io_max_line "$io_majmin" "$io_r" "$io_w" "$iops_r" "$iops_w")"; then
-          echo "$io_line" >"${cg_scope}/io.max" 2>/dev/null || true
-        fi
-      fi
+      ensure_tenant_cgroup_scope "$uname" "$uid" "$io_majmin" || true
     fi
     if [[ -w "${cg_scope}/cgroup.procs" ]]; then
       echo "$pid" >"${cg_scope}/cgroup.procs" 2>/dev/null || true
@@ -13488,17 +13525,24 @@ EOF
     # command. /etc/passwd stays readable: it is world-readable system data and
     # tools need it, and it no longer leads anywhere now the homes are gone.
     terminal_uid="$(id -u "$user" 2>/dev/null || true)"
+    ensure_tenant_cgroup_scope "$user" "$terminal_uid" || true
     terminal_jail='
       set -e
       jail_user="$1"
       jail_root="$2"
       jail_cwd="$3"
       jail_uid="$4"
-      shift 4
-      if [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" ]]; then
-        echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs" 2>/dev/null || true
-      elif [[ -n "$jail_uid" && -w "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" ]]; then
-        echo "$$" > "/sys/fs/cgroup/user.slice/user-${jail_uid}.slice/cgroup.procs" 2>/dev/null || true
+      jail_cg_root="$5"
+      shift 5
+      if [[ -n "$jail_uid" && -d "${jail_cg_root}/user.slice" ]]; then
+        jail_cg_procs="${jail_cg_root}/user.slice/user-${jail_uid}.slice/spanel.scope/cgroup.procs"
+        if [[ -w "$jail_cg_procs" ]]; then
+          if ! echo "$$" > "$jail_cg_procs" 2>/dev/null; then
+            logger -t spanel-helper -p daemon.warning "failed to move terminal jail pid $$ for ${jail_user} into ${jail_cg_procs}" 2>/dev/null || true
+          fi
+        else
+          logger -t spanel-helper -p daemon.warning "tenant cgroup scope unavailable for ${jail_user}: ${jail_cg_procs}" 2>/dev/null || true
+        fi
       fi
       jail_home="$jail_root/$jail_user"
       hold="$(mktemp -d)"
@@ -13519,7 +13563,7 @@ EOF
     # block on the pipe until the client gives up.
     terminal_runner=(
       unshare --mount --propagation private --
-      bash -c "$terminal_jail" spanel-terminal-jail "$user" "$HOME_ROOT" "$target" "$terminal_uid"
+      bash -c "$terminal_jail" spanel-terminal-jail "$user" "$HOME_ROOT" "$target" "$terminal_uid" "$CGROUP_ROOT"
       runuser -u "$user" --
     )
     if [[ -n "$terminal_timeout" ]] && command -v timeout >/dev/null 2>&1; then

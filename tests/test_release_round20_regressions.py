@@ -310,3 +310,82 @@ def test_n4_owner_change_rollback_does_not_overwrite_db_or_vhost_when_reverse_mo
         assert legacy_site.linux_user == "n4bob"
 
 
+# --------------------------------------------------------------------------- N5
+
+
+def test_n5_tenant_jail_creates_leaf_spanel_scope_applies_limits_and_logs_failures(tmp_path):
+    """Round 20 N5:
+    1) ensure_tenant_cgroup_scope must create user-<uid>.slice/spanel.scope on
+       demand and apply CPU/memory/pids limits from /etc/spanel/limits/<user>.env.
+    2) Both run_in_tenant_home_jail and terminal-exec must call
+       ensure_tenant_cgroup_scope before entering unshare, only write to the
+       leaf spanel.scope/cgroup.procs (never non-leaf slice cgroup.procs), and
+       log a warning via logger if cgroup placement fails.
+    """
+    import shutil
+    import subprocess
+
+    helper_src = (REPO_ROOT / "installer" / "files" / "spanel-helper.sh").read_text(encoding="utf-8")
+    assert "ensure_tenant_cgroup_scope()" in helper_src
+    # Must NEVER attempt the EBUSY-prone fallback write to non-leaf user-<uid>.slice/cgroup.procs
+    assert 'user-${jail_uid}.slice/cgroup.procs' not in helper_src
+    # Both jail paths call ensure_tenant_cgroup_scope and log warnings on failure
+    jail_fn = helper_src.split("run_in_tenant_home_jail() {", 1)[1].split("\nsite_open_basedir()", 1)[0]
+    assert 'ensure_tenant_cgroup_scope "$user" "$uid_num"' in jail_fn
+    assert "logger -t spanel-helper -p daemon.warning" in jail_fn
+    term_block = helper_src.split("terminal-exec)", 1)[1].split("terminal_cli_open_basedir=", 1)[0]
+    assert 'ensure_tenant_cgroup_scope "$user" "$terminal_uid"' in term_block
+    assert "logger -t spanel-helper -p daemon.warning" in term_block
+
+    # Behavioral execution of ensure_tenant_cgroup_scope in bash against a temp cgroup tree
+    import os
+
+    bash_exe = None
+    for candidate in (
+        shutil.which("bash"),
+        "/bin/bash",
+        "/usr/bin/bash",
+    ):
+        if not candidate or not Path(candidate).is_file():
+            continue
+        if os.name == "nt" and "system32" in candidate.lower():
+            continue
+        probe = subprocess.run([candidate, "--version"], capture_output=True, text=True, check=False)
+        if probe.returncode == 0:
+            bash_exe = candidate
+            break
+    if not bash_exe:
+        return
+    fn_start = helper_src.index("ensure_tenant_cgroup_scope() {")
+    fn_end = helper_src.index("\n# Run a command as a panel Linux user", fn_start)
+    fn_body = helper_src[fn_start:fn_end]
+
+    cg_root = tmp_path / "cgroup"
+    (cg_root / "user.slice").mkdir(parents=True)
+    limits_dir = tmp_path / "limits"
+    limits_dir.mkdir(parents=True)
+    (limits_dir / "alice.env").write_text(
+        "CPU_PCT=150\nMEM_HIGH_MB=512\nMEM_MAX_MB=1024\nTASKS_MAX=3000\n",
+        encoding="utf-8",
+    )
+    script = (
+        f"set -e\n"
+        f'CGROUP_ROOT="{cg_root.as_posix()}"\n'
+        f'SPANEL_LIMITS_DIR="{limits_dir.as_posix()}"\n'
+        "systemctl() { return 1; }\n"
+        "tenant_io_base_device() { echo ''; }\n"
+        "logger() { :; }\n"
+        f"{fn_body}\n"
+        'ensure_tenant_cgroup_scope "alice" "1055"\n'
+    )
+    res = subprocess.run([bash_exe, "-c", script], capture_output=True, text=True, check=False)
+    assert res.returncode == 0, res.stderr
+    scope = cg_root / "user.slice" / "user-1055.slice" / "spanel.scope"
+    assert scope.is_dir()
+    assert (scope / "cpu.max").read_text(encoding="utf-8").strip() == "150000 100000"
+    assert (scope / "memory.high").read_text(encoding="utf-8").strip() == str(512 * 1048576)
+    assert (scope / "memory.max").read_text(encoding="utf-8").strip() == str(1024 * 1048576)
+    assert (scope / "pids.max").read_text(encoding="utf-8").strip() == "3000"
+
+
+
