@@ -13012,6 +13012,13 @@ EOF
     fi
 
     rm -f -- "$limits_applied_file"
+    # limits_apply_ok tracks systemd slice activation/reload steps (which use
+    # non-fatal error handling so limits still apply on non-systemd containers).
+    # Downstream steps (PHP-FPM pool tuning/reload, apply_kernel_quota,
+    # classify_all_tenant_workers) run under set -e: any hard failure aborts
+    # before writing the .applied stamp, while intentional best-effort skips
+    # inside those helpers (e.g. filesystem without usrquota) still allow
+    # stamping (Round 20 N6 / Round 21 R3).
     limits_apply_ok=1
     systemctl daemon-reload >/dev/null 2>&1 || limits_apply_ok=0
     systemctl start "$slice_unit" >/dev/null 2>&1 || limits_apply_ok=0
