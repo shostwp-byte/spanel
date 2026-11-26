@@ -423,7 +423,12 @@ def collect_and_enforce_mysql_quotas(db: Session) -> dict[int, int]:
                 _db_limits_initialized.add(db_acc.db_user)
         if need_conn_limit:
             try:
-                db_backends.backend_for(db_acc).enforce_resource_limits(db_acc.db_user, max_user_connections=25, max_statement_time=15)
+                under_attack = bool(cached_user_attack_state(db_acc.owner_id).get("under_attack"))
+                db_backends.backend_for(db_acc).enforce_resource_limits(
+                    db_acc.db_user,
+                    max_user_connections=8 if under_attack else 25,
+                    max_statement_time=3 if under_attack else 15,
+                )
             except Exception:
                 pass
             # Accounts created by any path (site provisioning, imports,

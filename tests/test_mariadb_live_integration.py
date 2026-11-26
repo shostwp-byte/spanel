@@ -273,3 +273,57 @@ def test_v5_live_mariadb_backup_restore_keeps_write_lock_and_account_lock(tmp_pa
         assert "denied" in (ins_denied.stderr or "").lower(), ins_denied.stderr
     finally:
         mariadb.drop_database(db_name, db_user)
+
+
+def test_n2_live_mariadb_password_change_preserves_under_attack_limits(monkeypatch):
+    """Round 20 N2 live check:
+    Throttling a DB user to 8 conns / 3s applies 3 conns/host (sum 9, not 15),
+    and rotating the DB password via change_database_password MUST keep those
+    tight limits intact on all 3 loopback hosts.
+    """
+    from app.services import mariadb
+
+    monkeypatch.setattr(mariadb.settings, "command_dry_run", False)
+    db_name = "ci_n2_thr_db"
+    db_user = "ci_n2_thr_u"
+    db_pass = "Str0ng!N2Pass11"
+    new_pass = "Str0ng!N2Pass22"
+
+    mariadb.drop_database(db_name, db_user)
+    mariadb.ensure_local_database_user_hosts(
+        db_name,
+        db_user,
+        db_pass,
+        write_locked=False,
+        account_locked=False,
+        hourly_limits=(0, 0, 0),
+    )
+
+    try:
+        # Apply under-attack throttle (8 conns, 3s)
+        mariadb.enforce_db_user_resource_limits(db_user, max_user_connections=8, max_statement_time=3)
+
+        # Rotate password — MUST preserve 3 conns/host & 3s statement cap
+        mariadb.change_database_password(db_user, new_pass)
+
+        res = mariadb._run_sql(
+            "SELECT Host, "
+            "CAST(IFNULL(JSON_VALUE(Priv, '$.max_user_connections'), 0) AS SIGNED), "
+            "CAST(IFNULL(JSON_VALUE(Priv, '$.max_statement_time'), 0) AS SIGNED) "
+            f"FROM mysql.global_priv WHERE User = '{db_user}' ORDER BY Host;\n"
+        )
+        rows = {}
+        for line in (res.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3 and parts[0] != "Host":
+                rows[parts[0]] = (int(parts[1]), int(parts[2]))
+        assert set(rows.keys()) == {"localhost", "127.0.0.1", "::1"}, rows
+        for host, (max_conns, max_stmt) in rows.items():
+            assert max_conns == 3, f"{host} lost throttled max_user_connections: {rows}"
+            assert max_stmt == 3, f"{host} lost throttled max_statement_time: {rows}"
+
+        # Confirm rotated password works over TCP 127.0.0.1
+        ok = _run_as_tenant_tcp(db_user, new_pass, db_name, "SELECT 42;")
+        assert ok.returncode == 0 and ok.stdout.strip() == "42", ok.stderr
+    finally:
+        mariadb.drop_database(db_name, db_user)
