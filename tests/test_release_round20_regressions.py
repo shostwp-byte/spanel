@@ -210,3 +210,103 @@ def test_n2_mariadb_split_has_no_low_limit_floor_and_preserves_active_throttle_o
     mariadb.enforce_db_user_resource_limits("n2_u", max_user_connections=25, max_statement_time=15)
     assert "MAX_USER_CONNECTIONS 9 MAX_STATEMENT_TIME 15;" in sent[-1]
 
+
+# --------------------------------------------------------------------------- N4
+
+
+def test_n4_owner_change_rollback_does_not_overwrite_db_or_vhost_when_reverse_move_fails_or_legacy_empty(tmp_path, monkeypatch):
+    """Round 20 N4:
+    In update_website owner_id change rollback, website.root_path/linux_user
+    and Nginx vhost MUST NOT be reverted to old_root_path if reverse move fails
+    or if old_linux_user was empty (legacy site).
+    """
+    from app.api import nodejs_manager as nm
+    from app.api import websites as websites_api
+    from app.core.permissions import Role
+    from app.models.entities import User, Website
+    from app.schemas.schemas import WebsiteUpdate
+
+    monkeypatch.setattr(nm, "_deploy_locks_dir", lambda: tmp_path)
+    SessionLocal = _make_session()
+    with SessionLocal() as db:
+        admin = User(username="n4admin", email="n4a@example.com", hashed_password="x", role=Role.admin)
+        alice = User(username="n4alice", email="n4al@example.com", hashed_password="x", role=Role.end_user)
+        bob = User(username="n4bob", email="n4bo@example.com", hashed_password="x", role=Role.end_user)
+        db.add_all([admin, alice, bob])
+        db.commit()
+        db.refresh(admin)
+        db.refresh(alice)
+        db.refresh(bob)
+
+        # Case 1: Reverse move fails -> must NOT rewrite vhost back to old_root_path or resync workers
+        site = Website(
+            domain="n4-fail.example.com",
+            root_path="/home/n4alice/domains/n4-fail.example.com",
+            linux_user="n4alice",
+            owner_id=alice.id,
+            app_type="php",
+            php_version="8.4",
+        )
+        db.add(site)
+        db.commit()
+        db.refresh(site)
+
+        vhost_calls: list[str] = []
+        resync_calls: list[str] = []
+        move_n = {"n": 0}
+
+        def _move_fail_reverse(old_p, new_p, user, php_v=None):
+            move_n["n"] += 1
+            if move_n["n"] == 2:
+                raise RuntimeError("target busy on reverse move")
+
+        def _vhost_fail_forward(w, **kw):
+            vhost_calls.append(kw.get("root_path") or w.root_path)
+            if len(vhost_calls) == 1:
+                raise RuntimeError("nginx syntax error")
+
+        with patch.object(websites_api.storage_quota, "enforce_user_storage_quota"), \
+             patch.object(websites_api.storage_quota, "website_storage_used_bytes", return_value=0), \
+             patch.object(websites_api.site_users, "move_site_runtime", side_effect=_move_fail_reverse), \
+             patch.object(websites_api.waf, "sync_website_rules", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+             patch.object(websites_api, "_rewrite_website_vhost", side_effect=_vhost_fail_forward), \
+             patch.object(websites_api, "_resync_site_workers", side_effect=lambda sdb, w: resync_calls.append(w.root_path) or []):
+            with pytest.raises(HTTPException) as exc1:
+                websites_api.update_website(site.id, WebsiteUpdate(owner_id=bob.id), db=db, current_user=admin)
+
+        assert "target busy on reverse move" in exc1.value.detail
+        # Only the 1st (failed forward) vhost call happened — NO rollback rewrite to old_root_path!
+        assert len(vhost_calls) == 1
+        assert resync_calls == []
+        # In-memory model stays aligned with where files actually live on disk
+        assert site.root_path.replace("\\", "/").endswith("/n4bob/n4-fail.example.com")
+        assert site.linux_user == "n4bob"
+
+        # Case 2: Legacy site with empty old_linux_user -> rollback skips move and does NOT rewrite vhost to old path
+        legacy_site = Website(
+            domain="n4-legacy.example.com",
+            root_path="/var/www/n4-legacy.example.com",
+            linux_user="",
+            owner_id=alice.id,
+            app_type="php",
+            php_version="8.4",
+        )
+        db.add(legacy_site)
+        db.commit()
+        db.refresh(legacy_site)
+
+        vhost_calls.clear()
+        with patch.object(websites_api.storage_quota, "enforce_user_storage_quota"), \
+             patch.object(websites_api.storage_quota, "website_storage_used_bytes", return_value=0), \
+             patch.object(websites_api.site_users, "move_site_runtime"), \
+             patch.object(websites_api.waf, "sync_website_rules", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+             patch.object(websites_api, "_rewrite_website_vhost", side_effect=_vhost_fail_forward):
+            with pytest.raises(HTTPException) as exc2:
+                websites_api.update_website(legacy_site.id, WebsiteUpdate(owner_id=bob.id), db=db, current_user=admin)
+
+        assert "previous linux_user was empty" in exc2.value.detail
+        assert len(vhost_calls) == 1
+        assert legacy_site.root_path.replace("\\", "/").endswith("/n4bob/n4-legacy.example.com")
+        assert legacy_site.linux_user == "n4bob"
+
+

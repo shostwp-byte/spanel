@@ -1560,9 +1560,6 @@ def update_website(
             except (RuntimeError, ValueError, HTTPException) as exc:
                 rollback_notes: list[str] = []
                 if moved_runtime:
-                    website.owner_id = old_owner_id
-                    website.root_path = old_root_path
-                    website.linux_user = old_linux_user
                     restored_runtime = False
                     if old_linux_user and new_root_path:
                         try:
@@ -1573,25 +1570,40 @@ def update_website(
                         except Exception as rb_exc:
                             logger.exception("owner-change rollback of %s could not restore runtime", website.domain)
                             rollback_notes.append(f"rollback could not move runtime back: {rb_exc}")
-                    try:
-                        _ensure_default_waf_file(website.domain)
-                        waf.sync_website_rules(website)
-                    except Exception:
-                        logger.exception("owner-change rollback of %s could not restore WAF rules", website.domain)
-                    try:
-                        _rewrite_website_vhost(
-                            website,
-                            root_path=old_root_path,
-                            linux_user=old_linux_user,
-                            app_type=website.app_type or "wordpress",
-                            php_version=website.php_version,
+                    elif new_root_path and not old_linux_user:
+                        rollback_notes.append(
+                            f"rollback skipped moving runtime from {new_root_path}: previous linux_user was empty"
                         )
-                    except Exception:
-                        logger.exception("owner-change rollback of %s could not restore vhost", website.domain)
                     if restored_runtime:
+                        website.owner_id = old_owner_id
+                        website.root_path = old_root_path
+                        website.linux_user = old_linux_user
+                        for node_row in db.query(NodejsInstance).filter(NodejsInstance.website_id == website.id).all():
+                            node_row.owner_id = old_owner_id
+                        try:
+                            _ensure_default_waf_file(website.domain)
+                            waf.sync_website_rules(website)
+                        except Exception:
+                            logger.exception("owner-change rollback of %s could not restore WAF rules", website.domain)
+                        try:
+                            _rewrite_website_vhost(
+                                website,
+                                root_path=old_root_path,
+                                linux_user=old_linux_user,
+                                app_type=website.app_type or "wordpress",
+                                php_version=website.php_version,
+                            )
+                        except Exception:
+                            logger.exception("owner-change rollback of %s could not restore vhost", website.domain)
                         rb_worker_msg = _format_worker_warning(website.domain, _resync_site_workers(db, website))
                         if rb_worker_msg:
                             rollback_notes.append(rb_worker_msg)
+                    elif new_root_path and new_linux_user:
+                        # Files remain on disk at new_root_path; do not overwrite
+                        # DB/vhost back to old_root_path when reverse move failed
+                        # or old_linux_user was empty (Round 20 N4).
+                        website.root_path = new_root_path
+                        website.linux_user = new_linux_user
                 suffix = f" ({'; '.join(rollback_notes)})" if rollback_notes else ""
                 if isinstance(exc, HTTPException):
                     raise HTTPException(status_code=exc.status_code, detail=f"{exc.detail}{suffix}") from exc
