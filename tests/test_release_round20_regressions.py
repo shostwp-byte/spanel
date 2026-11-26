@@ -468,5 +468,77 @@ def test_n6_user_limits_apply_if_changed_requires_completed_stamp_and_nodejs_res
     assert r2.returncode == 1, f"expected 1 (unchanged), got {r2.returncode}: {r2.stderr}"
 
 
+# --------------------------------------------------------------------------- N3
+
+
+def test_n3_rename_inheriting_letsencrypt_emits_renewal_warning(tmp_path, monkeypatch):
+    """Round 20 N3:
+    When renaming a domain with ssl_mode='letsencrypt' inherits the old domain's
+    Let's Encrypt SAN lineage via ssl_mode='shared', the response warnings and
+    X-SPanel-Warning header MUST warn that renewal depends on old_domain DNS.
+    """
+    from fastapi import Response
+
+    from app.api import nodejs_manager as nm
+    from app.api import websites as websites_api
+    from app.core.permissions import Role
+    from app.models.entities import User, Website
+    from app.schemas.schemas import WebsiteUpdate
+
+    monkeypatch.setattr(nm, "_deploy_locks_dir", lambda: tmp_path)
+    SessionLocal = _make_session()
+    with SessionLocal() as db:
+        owner = User(username="n3user", email="n3@example.com", hashed_password="x", role=Role.end_user)
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+
+        site = Website(
+            domain="old.example.com",
+            root_path="/home/n3user/old.example.com",
+            linux_user="n3user",
+            owner_id=owner.id,
+            app_type="php",
+            php_version="8.4",
+            ssl_enabled=True,
+            ssl_mode="letsencrypt",
+        )
+        db.add(site)
+        db.commit()
+        db.refresh(site)
+
+        resp = Response()
+        with patch.object(websites_api.site_users, "move_site_runtime"), \
+             patch.object(websites_api.ssl, "cert_info", return_value={"sans": ["old.example.com", "new.example.com"]}), \
+             patch.object(websites_api.ssl, "cert_covers", side_effect=lambda sans, d: d in sans), \
+             patch.object(websites_api, "_ensure_default_waf_file"), \
+             patch.object(websites_api.waf, "sync_website_rules", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), \
+             patch.object(websites_api, "_rewrite_website_vhost"), \
+             patch.object(websites_api.nginx, "delete_wordpress_vhost"), \
+             patch.object(websites_api.waf, "remove_site_rules"), \
+             patch.object(websites_api, "_refresh_placeholder_page_if_unchanged"), \
+             patch.object(websites_api, "_resync_site_workers", return_value=[]), \
+             patch.object(websites_api.ssl, "release_site_certificates"), \
+             patch.object(websites_api.dns, "zone_for_new_website"), \
+             patch.object(websites_api.storage_quota, "forget_user_storage"), \
+             patch.object(websites_api, "log_action"):
+            out = websites_api.update_website(
+                site.id,
+                WebsiteUpdate(domain="new.example.com"),
+                db=db,
+                current_user=owner,
+                response=resp,
+            )
+
+        assert out.ssl_enabled is True
+        assert out.ssl_mode == "shared"
+        assert out.ssl_source_domain == "old.example.com"
+        warnings = getattr(out, "warnings", []) or []
+        assert any("old.example.com" in w and "new.example.com" in w and "renewal" in w.lower() for w in warnings), warnings
+        assert "old.example.com" in resp.headers.get("X-SPanel-Warning", "")
+        assert "new.example.com" in resp.headers.get("X-SPanel-Warning", "")
+
+
+
 
 

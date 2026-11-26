@@ -1174,6 +1174,11 @@ def _rename_single_website_locked(
                     website.ssl_cert_path = None
                     website.ssl_key_path = None
                     website.ssl_ca_path = None
+                    rename_warnings.append(
+                        f"SSL for {new_domain} is temporarily inherited from {old_domain}'s Let's Encrypt certificate. "
+                        f"Automatic renewal requires {old_domain} to remain pointed to this server; issue a dedicated "
+                        f"Let's Encrypt certificate for {new_domain} if {old_domain} will be retired."
+                    )
                 else:
                     website.ssl_mode = old_ssl_mode
                     website.ssl_source_domain = old_ssl_source_domain
