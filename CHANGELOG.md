@@ -4,6 +4,22 @@ Mọi thay đổi, bản vá bảo mật, tối ưu hiệu năng và tính năng
 
 ---
 
+## [v1.0.12] — 2026-11-26
+
+Bản vá `v1.0.12` đóng toàn bộ các phát hiện P2/P3 qua hai vòng Thẩm định Độc lập Lần 20 (`PR #35`: `N1`–`N7`) và Lần 21 (`PR #36`: `R1`–`R4`), đồng thời chuẩn hóa tài liệu README (`PR #34`):
+
+### 🔒 Bảo mật, Khóa Đồng bộ & Cách ly Tài nguyên (`N1`, `N2`, `N5`, `R2`, `R4`)
+- **Khóa theo site xuyên suốt mọi thao tác phá hủy Website & Xóa Tài khoản (`N1`, `R2`):** `_get_site_operation_status` kiểm tra trực tiếp `lock_live` độc lập với file trạng thái hoàn tất trước đó; các thao tác `_rename_single_website`, `delete_website`, `transfer_website_owner`, đổi `owner_id` trong `update_website` và `delete_user` (qua `ExitStack` theo thứ tự `Website.id.asc()`) đều giữ trực tiếp `site_operation_lock` trong suốt quá trình thực thi để triệt tiêu TOCTOU và chặn xóa tài khoản khi bất kỳ site nào còn đang chạy `npm install` / `git-deploy`.
+- **Bảo toàn mức hạn chế chống tấn công MariaDB & phân bổ kết nối ưu tiên `localhost` (`N2`, `R4`):** `change_database_password` và `create_database_credentials(allow_existing_user=True)` bảo toàn mức hạn chế chống tấn công từ cả `resource_monitor.cached_user_attack_state` lẫn giới hạn thực tế theo từng host trong `mysql.global_priv` (ngăn xoay mật khẩu DB để thoát chế độ chống tấn công); phân bổ ngân sách `MAX_USER_CONNECTIONS` theo trọng số phù hợp lưu lượng thực tế (`~65%` cho Unix socket `localhost` phục vụ PHP-FPM/WordPress, `~25%` cho `127.0.0.1`, `~10%` cho `::1` — mặc định `25` → `17 / 6 / 2` tổng `25`, chống tấn công `8` → `5 / 2 / 1` tổng `8`), kiểm chứng trực tiếp trên MariaDB 10.11 thật trong CI.
+- **Tạo sẵn leaf cgroup scope cho Tenant Jail (`N5`):** Tách `ensure_tenant_cgroup_scope` tạo sẵn lá `user-<uid>.slice/spanel.scope` và áp hạn mức từ `/etc/spanel/limits/<user>.env` trước khi vào `unshare` ở cả `run_in_tenant_home_jail`, `terminal-exec` và `classify_all_tenant_workers`, bỏ nhánh ghi vào slice không phải lá (`EBUSY`) và ghi cảnh báo qua `logger` khi thất bại.
+
+### 🛠️ Độ tin cậy Rollback, Cập nhật & Tài liệu (`N3`, `N4`, `N6`, `N7`, `R1`, `R3`)
+- **Đồng bộ bền vững DB khi rollback đổi chủ/chuyển chủ thất bại (`N4`, `R1`):** Chỉ khôi phục `root_path`/`linux_user`, ghi lại vhost và resync worker sau khi di chuyển ngược runtime thành công; nếu di chuyển ngược thất bại (hoặc site cũ thiếu `old_linux_user`), lưu đồng bộ cả `website.owner_id`, `root_path`, `linux_user` và `NodejsInstance.owner_id` xuống DB (`db.commit()`) trước khi trả lỗi nhằm tránh lệch quyền giữa hai tenant và lệch giữa DB với đĩa.
+- **Dấu `.applied` tin cậy cho `user-limits-apply --if-changed` & Restart Node.js khi sửa `.bin` (`N6`, `R3`):** Chỉ bỏ qua với `unchanged=1` khi tồn tại stamp `.applied` khớp digest hiện tại (xóa trước khi áp và chỉ ghi sau khi hoàn tất); `prepare_nodejs_app_as_user` báo hiệu khi có sửa/xóa stub `.bin` hỏng để `sync_nodejs_worker_unit` vẫn restart app trong chế độ `if-changed`.
+- **Cảnh báo gia hạn Let's Encrypt khi đổi tên miền & Dọn mã mặc định (`N3`, `N7`):** Trả cảnh báo rõ trong `warnings` và `X-SPanel-Warning` khi đổi tên miền kế thừa chứng chỉ Let's Encrypt từ tên miền cũ; dẫn xuất `_DEFAULT_USER_RESOURCE_LIMITS` trực tiếp từ cột mặc định trên model `User`.
+
+---
+
 ## [v1.0.11] — 2026-11-20
 
 Bản phát hành `v1.0.11` chính thức kích hoạt **Node.js Manager** mặc định (`NODEJS_MANAGER_ENABLED=true`) sau khi hoàn tất toàn bộ hạng mục nhóm P2 của Thẩm định Lần 17 (`PR #31`) và khép kín 15/15 phát hiện bảo mật, độ tin cậy, cách ly đa người thuê, vận hành không gián đoạn và kiểm thử tích hợp MariaDB thật của Thẩm định Độc lập Lần 18 (`PR #32`):
