@@ -843,36 +843,46 @@ def delete_user(user_id: int, request: Request, db: Session = Depends(get_db), c
     websites = db.query(Website).filter(Website.owner_id == user.id).order_by(Website.id.asc()).all()
     deleted_domains = []
     panel_linux_user = site_users.linux_user_for_panel_username(user.username)
-    try:
+    from contextlib import ExitStack
+    from app.api.nodejs_manager import site_operation_lock
+
+    with ExitStack() as lock_stack:
+        # Acquire per-site locks for ALL owned websites in deterministic ID order
+        # before deleting anything; if any site has an active Node.js operation
+        # (e.g. npm install / git-deploy), return 409 immediately with zero
+        # partial deletions and release earlier locks (Round 21 R2).
         for website in websites:
-            if website.linux_user and website.linux_user != panel_linux_user:
-                raise ValueError(f"Website {website.domain} is not owned by Linux user {panel_linux_user}")
-        for website in websites:
-            _delete_owned_website(db, website)
-            deleted_domains.append(website.domain)
-        _remove_user_from_backup_schedules(db, user.id)
-        # Databases and applications are keyed on owner_id, not website_id, so
-        # the website loop above cannot reach a database that belongs to no
-        # website - which is the only kind POST /api/databases creates - nor any
-        # application at all. Migrations 0014/0015 and 0025 re-parented both
-        # tables onto users; nothing here followed, and the panel database does
-        # not enforce the cleanup it declares (see services/teardown.py).
-        purged = teardown.purge_owned_resources(db, user.id)
-        # The FK declares ON DELETE CASCADE, but SQLite only honours that with
-        # PRAGMA foreign_keys on, and this database does not enforce the
-        # cleanup it declares - the same reason purge_owned_resources exists.
-        # A leftover token row would be an orphan, not a way in (authenticate
-        # refuses a token whose owner is gone), but it would still be a row
-        # nobody can see or revoke.
-        db.query(McpToken).filter(McpToken.user_id == user.id).delete(synchronize_session=False)
-        # Their mail is in the home that goes next; the rows go with it.
-        mail.delete_for_owner(db, user)
-        site_users.delete_panel_user(user.username)
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    username = user.username
-    db.delete(user)
-    db.commit()
+            lock_stack.enter_context(site_operation_lock(website.id, "user:delete"))
+        try:
+            for website in websites:
+                if website.linux_user and website.linux_user != panel_linux_user:
+                    raise ValueError(f"Website {website.domain} is not owned by Linux user {panel_linux_user}")
+            for website in websites:
+                _delete_owned_website(db, website)
+                deleted_domains.append(website.domain)
+            _remove_user_from_backup_schedules(db, user.id)
+            # Databases and applications are keyed on owner_id, not website_id, so
+            # the website loop above cannot reach a database that belongs to no
+            # website - which is the only kind POST /api/databases creates - nor any
+            # application at all. Migrations 0014/0015 and 0025 re-parented both
+            # tables onto users; nothing here followed, and the panel database does
+            # not enforce the cleanup it declares (see services/teardown.py).
+            purged = teardown.purge_owned_resources(db, user.id)
+            # The FK declares ON DELETE CASCADE, but SQLite only honours that with
+            # PRAGMA foreign_keys on, and this database does not enforce the
+            # cleanup it declares - the same reason purge_owned_resources exists.
+            # A leftover token row would be an orphan, not a way in (authenticate
+            # refuses a token whose owner is gone), but it would still be a row
+            # nobody can see or revoke.
+            db.query(McpToken).filter(McpToken.user_id == user.id).delete(synchronize_session=False)
+            # Their mail is in the home that goes next; the rows go with it.
+            mail.delete_for_owner(db, user)
+            site_users.delete_panel_user(user.username)
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        username = user.username
+        db.delete(user)
+        db.commit()
     mail.sync_quietly(db)
     detail = ",".join(deleted_domains)
     if purged["databases"] or purged["applications"]:

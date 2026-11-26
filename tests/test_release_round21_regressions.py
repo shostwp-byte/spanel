@@ -169,3 +169,93 @@ def test_r1_failed_owner_change_and_transfer_rollback_persists_consistent_db_sta
         assert s3.owner_id == alice.id
         assert s3.linux_user == "r1alice"
         assert s3.root_path == "/home/r1alice/r1-ok.example.com"
+
+
+# --------------------------------------------------------------------------- R2
+
+
+def test_r2_delete_user_acquires_all_site_locks_before_deleting_anything(tmp_path, monkeypatch):
+    """Round 21 R2:
+    delete_user must acquire site_operation_lock for every website owned by the
+    user BEFORE deleting anything.
+    1) If the 2nd site has an active Node.js lock, delete_user returns 409,
+       deletes NEITHER site nor the user, and releases the 1st site's lock.
+    2) When idle, all owned site locks stay held throughout _delete_owned_website
+       (blocking concurrent deploys) and are released upon completion.
+    """
+    from app.api import nodejs_manager as nm
+    from app.api import users as users_api
+    from app.core.permissions import Role
+    from app.models.entities import User, Website
+
+    monkeypatch.setattr(nm, "_deploy_locks_dir", lambda: tmp_path)
+    SessionLocal = _make_session()
+    with SessionLocal() as db:
+        admin = User(username="r2admin", email="r2a@example.com", hashed_password="x", role=Role.admin)
+        victim = User(username="r2victim", email="r2v@example.com", hashed_password="x", role=Role.end_user)
+        db.add_all([admin, victim])
+        db.commit()
+        db.refresh(admin)
+        db.refresh(victim)
+
+        site1 = Website(
+            domain="r2-one.example.com",
+            root_path="/home/r2victim/r2-one.example.com",
+            linux_user="r2victim",
+            owner_id=victim.id,
+            app_type="nodejs",
+        )
+        site2 = Website(
+            domain="r2-two.example.com",
+            root_path="/home/r2victim/r2-two.example.com",
+            linux_user="r2victim",
+            owner_id=victim.id,
+            app_type="nodejs",
+        )
+        db.add_all([site1, site2])
+        db.commit()
+        db.refresh(site1)
+        db.refresh(site2)
+        s1_id, s2_id, v_id = site1.id, site2.id, victim.id
+
+        # 1. site2 is busy -> delete_user fails 409 BEFORE touching site1 or victim
+        deleted_sites: list[str] = []
+        with nm.site_operation_lock(s2_id, "npm:install"):
+            with patch.object(users_api, "enforce_rate_limit"), \
+                 patch.object(users_api, "_delete_owned_website", side_effect=lambda sdb, w: deleted_sites.append(w.domain)):
+                with pytest.raises(HTTPException) as exc_busy:
+                    users_api.delete_user(v_id, SimpleNamespace(), db=db, current_user=admin)
+            assert exc_busy.value.status_code == 409
+            assert deleted_sites == []
+            # site1's lock acquired earlier in the loop MUST have been released cleanly
+            assert nm._get_site_operation_status(s1_id)["active"] is False
+
+        # Verify both sites and user still exist in DB
+        assert db.query(Website).filter(Website.owner_id == v_id).count() == 2
+        assert db.query(User).filter(User.id == v_id).first() is not None
+
+        # 2. When idle, locks for BOTH site1 & site2 are held mid-deletion
+        mid_flight_locked = {"s1": False, "s2": False}
+
+        def _check_locks_during_delete(sdb, w):
+            for key, sid in (("s1", s1_id), ("s2", s2_id)):
+                with pytest.raises(HTTPException) as exc_c:
+                    nm._acquire_deploy_lock(sid, operation="git-deploy")
+                assert exc_c.value.status_code == 409
+                mid_flight_locked[key] = True
+            sdb.delete(w)
+
+        with patch.object(users_api, "enforce_rate_limit"), \
+             patch.object(users_api, "_delete_owned_website", side_effect=_check_locks_during_delete), \
+             patch.object(users_api.teardown, "purge_owned_resources", return_value={"databases": [], "applications": []}), \
+             patch.object(users_api.mail, "delete_for_owner"), \
+             patch.object(users_api.mail, "sync_quietly"), \
+             patch.object(users_api.site_users, "delete_panel_user"), \
+             patch.object(users_api, "log_action"):
+            res = users_api.delete_user(v_id, SimpleNamespace(), db=db, current_user=admin)
+            assert res["ok"] is True
+
+        assert mid_flight_locked == {"s1": True, "s2": True}
+        assert nm._get_site_operation_status(s1_id)["active"] is False
+        assert nm._get_site_operation_status(s2_id)["active"] is False
+
