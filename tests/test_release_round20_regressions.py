@@ -278,9 +278,13 @@ def test_n4_owner_change_rollback_does_not_overwrite_db_or_vhost_when_reverse_mo
         # Only the 1st (failed forward) vhost call happened — NO rollback rewrite to old_root_path!
         assert len(vhost_calls) == 1
         assert resync_calls == []
-        # In-memory model stays aligned with where files actually live on disk
-        assert site.root_path.replace("\\", "/").endswith("/n4bob/n4-fail.example.com")
-        assert site.linux_user == "n4bob"
+        # Verify from a FRESH DB session that persisted state matches disk & has no tenant mismatch (Round 21 R1)
+        with SessionLocal() as verify_db:
+            persisted = verify_db.query(Website).filter(Website.id == site.id).first()
+            assert persisted is not None
+            assert persisted.root_path.replace("\\", "/").endswith("/n4bob/n4-fail.example.com")
+            assert persisted.linux_user == "n4bob"
+            assert persisted.owner_id == bob.id
 
         # Case 2: Legacy site with empty old_linux_user -> rollback skips move and does NOT rewrite vhost to old path
         legacy_site = Website(
@@ -306,8 +310,12 @@ def test_n4_owner_change_rollback_does_not_overwrite_db_or_vhost_when_reverse_mo
 
         assert "previous linux_user was empty" in exc2.value.detail
         assert len(vhost_calls) == 1
-        assert legacy_site.root_path.replace("\\", "/").endswith("/n4bob/n4-legacy.example.com")
-        assert legacy_site.linux_user == "n4bob"
+        with SessionLocal() as verify_db:
+            persisted_legacy = verify_db.query(Website).filter(Website.id == legacy_site.id).first()
+            assert persisted_legacy is not None
+            assert persisted_legacy.root_path.replace("\\", "/").endswith("/n4bob/n4-legacy.example.com")
+            assert persisted_legacy.linux_user == "n4bob"
+            assert persisted_legacy.owner_id == bob.id
 
 
 # --------------------------------------------------------------------------- N5
