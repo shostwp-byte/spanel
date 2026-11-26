@@ -213,22 +213,18 @@ _RESELLER_CEILING_FIELDS: tuple[str, ...] = (
     "iops_write_max",
 )
 
+def _user_column_int_default(column_name: str) -> int:
+    col = User.__table__.columns[column_name]
+    default = col.default
+    if default is None or not getattr(default, "is_scalar", False):
+        return 0
+    return int(default.arg or 0)
+
+
+# Derived directly from User model column defaults so reseller ceiling previews
+# can never drift from the defaults an actual created User receives (Round 20 N7).
 _DEFAULT_USER_RESOURCE_LIMITS: dict[str, int] = {
-    "bandwidth_limit_mb": 0,
-    "inode_limit": 0,
-    "cpu_quota_percent": 100,
-    "io_read_mbps": 0,
-    "io_write_mbps": 0,
-    "iops_read_max": 0,
-    "iops_write_max": 0,
-    "memory_high_mb": 1024,
-    "memory_max_mb": 2048,
-    "tasks_max": 2048,
-    "mysql_storage_limit_mb": 0,
-    "mysql_max_db_size_mb": 0,
-    "mysql_max_queries_per_hour": 0,
-    "mysql_max_updates_per_hour": 0,
-    "mysql_max_connections_per_hour": 0,
+    field: _user_column_int_default(field) for field in _RESELLER_CEILING_FIELDS
 }
 
 

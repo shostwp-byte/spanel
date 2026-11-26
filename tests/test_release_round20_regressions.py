@@ -539,6 +539,29 @@ def test_n3_rename_inheriting_letsencrypt_emits_renewal_warning(tmp_path, monkey
         assert "new.example.com" in resp.headers.get("X-SPanel-Warning", "")
 
 
+# --------------------------------------------------------------------------- N7
+
+
+def test_n7_default_user_resource_limits_derived_from_user_model_columns():
+    """Round 20 N7:
+    _DEFAULT_USER_RESOURCE_LIMITS must stay in lockstep with User model column
+    defaults for every reseller ceiling field.
+    """
+    from app.api import users as users_api
+    from app.models.entities import User
+
+    assert set(users_api._DEFAULT_USER_RESOURCE_LIMITS.keys()) == set(users_api._RESELLER_CEILING_FIELDS)
+    for field in users_api._RESELLER_CEILING_FIELDS:
+        col_default = User.__table__.columns[field].default
+        expected = int(col_default.arg or 0) if (col_default is not None and getattr(col_default, "is_scalar", False)) else 0
+        assert users_api._DEFAULT_USER_RESOURCE_LIMITS[field] == expected, field
+    assert users_api._DEFAULT_USER_RESOURCE_LIMITS["cpu_quota_percent"] == 100
+    assert users_api._DEFAULT_USER_RESOURCE_LIMITS["memory_high_mb"] == 1024
+    assert users_api._DEFAULT_USER_RESOURCE_LIMITS["memory_max_mb"] == 2048
+    assert users_api._DEFAULT_USER_RESOURCE_LIMITS["tasks_max"] == 2048
+
+
+
 
 
 
